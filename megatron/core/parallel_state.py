@@ -523,6 +523,165 @@ class RankGenerator(object):
         return ranks
 
 
+class HeterogeneousRankGenerator:
+    """A rank generator for heterogeneous MoE replicas.
+
+    Supports tp/cp/dp for attention and etp/ep/edp for experts, where different
+    MoE replicas can have different sizes (measured in tp*cp units).
+
+    All replicas hold the same experts but may shard them differently (different ep).
+    Larger replicas have more tp*cp units, so more tokens flow through them.
+    For edp gradient sync, only the first min(k) tp*cp units per replica participate.
+
+    No PP or FSDP/distributed optimizer support.
+
+    Args:
+        tp: Attention tensor parallel size.
+        cp: Context parallel size.
+        num_tp_cp_per_replica: List where each entry k_i is the number of tp*cp
+            units in MoE replica i. world_size = sum(k_i) * tp * cp.
+        etp: Expert tensor parallel size. Must be <= tp and divide tp.
+            Defaults to tp.
+        rank_offset: Optional rank offset for multi-segment use.
+    """
+
+    # Keys that are handled by the uniform attention layout
+    _ATTENTION_KEYS = {'tp', 'cp', 'dp', 'dp-cp', 'tp-dp', 'tp-dp-cp', 'tp-cp'}
+    # Keys that require heterogeneous expert logic
+    _EXPERT_KEYS = {'etp', 'ep', 'etp-ep', 'edp'}
+
+    def __init__(
+        self,
+        tp: int,
+        cp: int,
+        num_tp_cp_per_replica: List[int],
+        etp: Optional[int] = None,
+        rank_offset: int = 0,
+    ) -> None:
+        self.tp = tp
+        self.cp = cp
+        self.tp_cp = tp * cp
+        self.etp = etp if etp is not None else tp
+        self.rank_offset = rank_offset
+        self.num_tp_cp_per_replica = list(num_tp_cp_per_replica)
+        self.num_replicas = len(num_tp_cp_per_replica)
+
+        assert self.etp <= self.tp, (
+            f"etp ({self.etp}) must be <= tp ({self.tp})"
+        )
+        assert self.tp % self.etp == 0, (
+            f"tp ({self.tp}) must be divisible by etp ({self.etp})"
+        )
+        assert all(k >= 1 for k in self.num_tp_cp_per_replica), (
+            f"All entries in num_tp_cp_per_replica must be >= 1, "
+            f"got {self.num_tp_cp_per_replica}"
+        )
+
+        self.world_size = sum(self.num_tp_cp_per_replica) * self.tp_cp
+        self.dp = sum(self.num_tp_cp_per_replica)  # attention dp = total tp*cp units
+        self.min_k = min(self.num_tp_cp_per_replica)
+
+        # Precompute replica offsets: replica_offsets[r] = starting rank of replica r
+        self.replica_offsets = [0]
+        for k in self.num_tp_cp_per_replica:
+            self.replica_offsets.append(self.replica_offsets[-1] + k * self.tp_cp)
+
+    def get_ranks(self, key: str) -> List[List[int]]:
+        """Get rank groups for the given key.
+
+        Args:
+            key: Specifies which rank groups to return. Supported keys:
+                Attention: 'tp', 'cp', 'dp', 'dp-cp', 'tp-dp', 'tp-dp-cp', 'tp-cp'
+                Expert: 'etp', 'ep', 'etp-ep', 'edp'
+        """
+        if key in self._ATTENTION_KEYS:
+            return self._get_attention_ranks(key)
+        elif key in self._EXPERT_KEYS:
+            return self._get_expert_ranks(key)
+        else:
+            raise ValueError(
+                f"Unknown key '{key}'. Supported keys: "
+                f"{sorted(self._ATTENTION_KEYS | self._EXPERT_KEYS)}"
+            )
+
+    def _get_attention_ranks(self, key: str) -> List[List[int]]:
+        """Get attention rank groups using the uniform orthogonal algorithm.
+
+        Attention ignores replica boundaries — all tp*cp units are uniform peers.
+        Layout is a flat tp × cp × dp tensor.
+        """
+        name_to_size = {"tp": self.tp, "cp": self.cp, "dp": self.dp}
+        order = "tp-cp-dp"
+        ordered_tokens = order.split("-")
+        ordered_size = [name_to_size[t] for t in ordered_tokens]
+
+        token_list = key.split("-")
+        mask = [t in token_list for t in ordered_tokens]
+
+        ranks = generate_masked_orthogonal_rank_groups(self.world_size, ordered_size, mask)
+        if self.rank_offset > 0:
+            for rank_group in ranks:
+                for i in range(len(rank_group)):
+                    rank_group[i] += self.rank_offset
+        return ranks
+
+    def _get_expert_ranks(self, key: str) -> List[List[int]]:
+        """Get expert rank groups with heterogeneous replica sizes.
+
+        Each replica's ranks form a (ep_r, etp) matrix where ep_r varies per replica.
+        """
+        if key == 'etp-ep':
+            return self._get_etp_ep_ranks()
+        elif key == 'etp':
+            return self._get_etp_ranks()
+        elif key == 'ep':
+            return self._get_ep_ranks()
+        elif key == 'edp':
+            return self._get_edp_ranks()
+        else:
+            raise ValueError(f"Unknown expert key '{key}'")
+
+    def _get_etp_ep_ranks(self) -> List[List[int]]:
+        """Each replica as one group (all ranks in the replica)."""
+        groups = []
+        for r, k in enumerate(self.num_tp_cp_per_replica):
+            start = self.rank_offset + self.replica_offsets[r]
+            groups.append(list(range(start, start + k * self.tp_cp)))
+        return groups
+
+    def _get_etp_ranks(self) -> List[List[int]]:
+        """Expert tensor parallel groups — each row of the (ep_r, etp) matrix."""
+        groups = []
+        for r, k in enumerate(self.num_tp_cp_per_replica):
+            start = self.rank_offset + self.replica_offsets[r]
+            ep_r = k * self.tp_cp // self.etp
+            for ep_idx in range(ep_r):
+                groups.append(
+                    list(range(start + ep_idx * self.etp, start + (ep_idx + 1) * self.etp))
+                )
+        return groups
+
+    def _get_ep_ranks(self) -> List[List[int]]:
+        """Expert model parallel groups — each column of the (ep_r, etp) matrix."""
+        groups = []
+        for r, k in enumerate(self.num_tp_cp_per_replica):
+            start = self.rank_offset + self.replica_offsets[r]
+            block = list(range(start, start + k * self.tp_cp))
+            for etp_pos in range(self.etp):
+                groups.append(block[etp_pos :: self.etp])
+        return groups
+
+    def _get_edp_ranks(self) -> List[List[int]]:
+        """Expert data parallel groups — first min_k tp_cp units across replicas."""
+        groups = []
+        for pos in range(self.min_k * self.tp_cp):
+            group = []
+            for r in range(self.num_replicas):
+                group.append(self.rank_offset + self.replica_offsets[r] + pos)
+            groups.append(group)
+        return groups
+
+
 def default_embedding_ranks(pp_ranks):
     """Return the default ranks that constitute the stages on which the word embeddings live.
     For most models, these are the first and last pipeline stages."""
