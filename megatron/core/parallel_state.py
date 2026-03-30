@@ -1518,6 +1518,388 @@ def initialize_model_parallel(
     _set_global_memory_buffer()
 
 
+def initialize_heterogeneous_model_parallel(
+    tensor_model_parallel_size: int,
+    context_parallel_size: int,
+    num_tp_cp_per_replica: List[int],
+    expert_tensor_parallel_size: Optional[int] = None,
+    num_moe_experts: Optional[int] = None,
+    nccl_communicator_config_path: Optional[str] = None,
+    distributed_timeout_minutes: int = 30,
+    create_gloo_process_groups: bool = True,
+) -> None:
+    """Initialize process groups for heterogeneous MoE replicas.
+
+    Creates attention and expert process groups where different MoE replicas
+    can have different sizes (different numbers of tp*cp units). Attention
+    uses uniform groups across all ranks; experts use per-replica groups
+    with varying ep sizes.
+
+    No pipeline parallelism or distributed optimizer support.
+
+    Args:
+        tensor_model_parallel_size: Tensor parallel size for attention.
+        context_parallel_size: Context parallel size.
+        num_tp_cp_per_replica: List where entry k_i = number of tp*cp units
+            in MoE replica i. world_size = sum(k_i) * tp * cp.
+        expert_tensor_parallel_size: Expert tensor parallel size. Must be
+            <= tp and divide tp. Defaults to tp.
+        num_moe_experts: If provided, validates num_experts % ep_i == 0
+            for every replica.
+        nccl_communicator_config_path: Path to NCCL communicator config yaml.
+        distributed_timeout_minutes: Timeout for distributed operations.
+        create_gloo_process_groups: Whether to create Gloo process groups.
+    """
+    assert torch.distributed.is_initialized()
+    world_size: int = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank()
+
+    tp = tensor_model_parallel_size
+    cp = context_parallel_size
+    etp = expert_tensor_parallel_size if expert_tensor_parallel_size is not None else tp
+
+    generator = HeterogeneousRankGenerator(
+        tp=tp, cp=cp, num_tp_cp_per_replica=num_tp_cp_per_replica, etp=etp,
+    )
+    assert generator.world_size == world_size, (
+        f"HeterogeneousRankGenerator world_size ({generator.world_size}) != "
+        f"torch.distributed world_size ({world_size}). "
+        f"sum(num_tp_cp_per_replica) * tp * cp must equal world_size."
+    )
+
+    # Validate that num_moe_experts is divisible by every replica's ep_i.
+    if num_moe_experts is not None:
+        tp_cp = tp * cp
+        for i, k in enumerate(num_tp_cp_per_replica):
+            ep_i = k * tp_cp // etp
+            assert num_moe_experts % ep_i == 0, (
+                f"num_moe_experts ({num_moe_experts}) must be divisible by ep "
+                f"({ep_i}) for replica {i} (k={k}, tp*cp={tp_cp}, etp={etp})"
+            )
+
+    nccl_comm_cfgs = {}
+    if nccl_communicator_config_path is not None:
+        try:
+            import yaml
+        except ImportError:
+            raise RuntimeError(
+                "Cannot import `yaml`. Setting custom nccl communicator configs "
+                "requires the yaml package."
+            )
+        with open(nccl_communicator_config_path, "r") as stream:
+            nccl_comm_cfgs = yaml.safe_load(stream)
+
+    timeout = timedelta(minutes=distributed_timeout_minutes)
+
+    # ── Attention groups ──
+
+    # Data parallel with context parallel (dp-cp).
+    global _DATA_PARALLEL_GROUP_WITH_CP
+    global _DATA_PARALLEL_GROUP_WITH_CP_GLOO
+    global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
+    global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+    global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
+    assert _DATA_PARALLEL_GROUP_WITH_CP is None, (
+        'data parallel group with cp is already initialized'
+    )
+
+    for ranks_group in generator.get_ranks('dp-cp'):
+        group = create_group(
+            ranks_group,
+            timeout=timeout,
+            pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
+            group_desc="DATA_PARALLEL_GROUP_WITH_CP",
+        )
+        if create_gloo_process_groups:
+            group_gloo = create_group(
+                ranks_group,
+                timeout=timeout,
+                backend="gloo",
+                group_desc="DATA_PARALLEL_GROUP_WITH_CP_GLOO",
+            )
+        else:
+            group_gloo = None
+        if rank in ranks_group:
+            _DATA_PARALLEL_GROUP_WITH_CP = group
+            _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_gloo
+            _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks_group
+
+    # No distributed optimizer: intra partial = full dp-cp.
+    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = _DATA_PARALLEL_GROUP_WITH_CP
+    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = _DATA_PARALLEL_GROUP_WITH_CP_GLOO
+
+    # Data parallel (dp).
+    global _DATA_PARALLEL_GROUP
+    global _DATA_PARALLEL_GROUP_GLOO
+    global _DATA_PARALLEL_GLOBAL_RANKS
+    assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
+
+    for ranks_group in generator.get_ranks('dp'):
+        group = create_group(
+            ranks_group,
+            timeout=timeout,
+            pg_options=get_nccl_options("dp", nccl_comm_cfgs),
+            group_desc="DATA_PARALLEL_GROUP",
+        )
+        if create_gloo_process_groups:
+            group_gloo = create_group(
+                ranks_group,
+                timeout=timeout,
+                backend="gloo",
+                group_desc="DATA_PARALLEL_GROUP_GLOO",
+            )
+        else:
+            group_gloo = None
+        if rank in ranks_group:
+            _DATA_PARALLEL_GROUP = group
+            _DATA_PARALLEL_GROUP_GLOO = group_gloo
+            _DATA_PARALLEL_GLOBAL_RANKS = ranks_group
+
+    # Context parallel (cp).
+    global _CONTEXT_PARALLEL_GROUP
+    global _CONTEXT_PARALLEL_GLOBAL_RANKS
+    assert _CONTEXT_PARALLEL_GROUP is None, 'context parallel group is already initialized'
+
+    for ranks_group in generator.get_ranks('cp'):
+        group = create_group(
+            ranks_group,
+            timeout=timeout,
+            pg_options=get_nccl_options("cp", nccl_comm_cfgs),
+            group_desc="CONTEXT_PARALLEL_GROUP",
+        )
+        if rank in ranks_group:
+            _CONTEXT_PARALLEL_GROUP = group
+            _CONTEXT_PARALLEL_GLOBAL_RANKS = ranks_group
+
+    # Tensor model parallel (tp).
+    global _TENSOR_MODEL_PARALLEL_GROUP
+    global _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
+    assert (
+        _TENSOR_MODEL_PARALLEL_GROUP is None
+    ), 'tensor model parallel group is already initialized'
+
+    for ranks_group in generator.get_ranks('tp'):
+        group = create_group(
+            ranks_group,
+            timeout=timeout,
+            pg_options=get_nccl_options("tp", nccl_comm_cfgs),
+            group_desc="TENSOR_MODEL_PARALLEL_GROUP",
+        )
+        if rank in ranks_group:
+            _TENSOR_MODEL_PARALLEL_GROUP = group
+            _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = ranks_group
+
+    # Model parallel group (tp-pp; pp=1 so same ranks as tp).
+    global _MODEL_PARALLEL_GROUP
+    global _MODEL_PARALLEL_GLOBAL_RANKS
+    assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
+
+    for ranks_group in generator.get_ranks('tp'):
+        group = create_group(
+            ranks_group,
+            timeout=timeout,
+            pg_options=get_nccl_options("mp", nccl_comm_cfgs),
+            group_desc="MODEL_PARALLEL_GROUP",
+        )
+        if rank in ranks_group:
+            _MODEL_PARALLEL_GROUP = group
+            _MODEL_PARALLEL_GLOBAL_RANKS = ranks_group
+
+    # Pipeline parallel (pp=1: each rank is its own group).
+    global _PIPELINE_MODEL_PARALLEL_GROUP
+    global _PIPELINE_GLOBAL_RANKS
+    assert (
+        _PIPELINE_MODEL_PARALLEL_GROUP is None
+    ), 'pipeline model parallel group is already initialized'
+    global _EMBEDDING_GROUP
+    global _EMBEDDING_GLOBAL_RANKS
+    global _POSITION_EMBEDDING_GROUP
+    global _POSITION_EMBEDDING_GLOBAL_RANKS
+
+    for r in range(world_size):
+        pp_ranks = [r]
+        pp_group = create_group(
+            pp_ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options("pp", nccl_comm_cfgs),
+            group_desc="PIPELINE_MODEL_PARALLEL_GROUP",
+        )
+        embedding_ranks = default_embedding_ranks(pp_ranks)
+        embd_group = create_group(
+            embedding_ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options("embd", nccl_comm_cfgs),
+            group_desc="EMBEDDING_GROUP",
+        )
+        position_embedding_ranks = default_position_embedding_ranks(pp_ranks)
+        pos_embd_group = create_group(
+            position_embedding_ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options("pos_embd", nccl_comm_cfgs),
+            group_desc="POSITION_EMBEDDING_GROUP",
+        )
+        if rank == r:
+            _PIPELINE_MODEL_PARALLEL_GROUP = pp_group
+            _PIPELINE_GLOBAL_RANKS = pp_ranks
+            _EMBEDDING_GROUP = embd_group
+            _EMBEDDING_GLOBAL_RANKS = embedding_ranks
+            _POSITION_EMBEDDING_GROUP = pos_embd_group
+            _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
+
+    # Tensor + data parallel groups.
+    global _TENSOR_AND_DATA_PARALLEL_GROUP
+    global _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
+    assert (
+        _TENSOR_AND_DATA_PARALLEL_GROUP is None
+    ), 'tensor + data parallel group is already initialized'
+
+    for ranks_group in generator.get_ranks('tp-dp-cp'):
+        group = create_group(
+            ranks_group,
+            timeout=timeout,
+            pg_options=get_nccl_options("tp_dp_cp", nccl_comm_cfgs),
+            group_desc="TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP",
+        )
+        if rank in ranks_group:
+            _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
+    for ranks_group in generator.get_ranks('tp-dp'):
+        group = create_group(
+            ranks_group,
+            timeout=timeout,
+            pg_options=get_nccl_options("tp_dp", nccl_comm_cfgs),
+            group_desc="TENSOR_AND_DATA_PARALLEL_GROUP",
+        )
+        if rank in ranks_group:
+            _TENSOR_AND_DATA_PARALLEL_GROUP = group
+
+    # Tensor + context parallel group.
+    global _TENSOR_AND_CONTEXT_PARALLEL_GROUP
+    assert (
+        _TENSOR_AND_CONTEXT_PARALLEL_GROUP is None
+    ), 'tensor + context parallel group is already initialized'
+
+    for ranks_group in generator.get_ranks('tp-cp'):
+        group = create_group(
+            ranks_group,
+            timeout=timeout,
+            pg_options=get_nccl_options("tp_cp", nccl_comm_cfgs),
+            group_desc="TENSOR_AND_CONTEXT_PARALLEL_GROUP",
+        )
+        if rank in ranks_group:
+            _TENSOR_AND_CONTEXT_PARALLEL_GROUP = group
+
+    # ── Expert groups ──
+
+    # Expert model parallel (ep) — different sizes per replica.
+    global _EXPERT_MODEL_PARALLEL_GROUP, _EXPERT_MODEL_PARALLEL_RANKS
+    assert _EXPERT_MODEL_PARALLEL_GROUP is None, 'expert parallel group is already initialized'
+
+    for ranks_group in generator.get_ranks('ep'):
+        group = create_group(
+            ranks_group,
+            timeout=timeout,
+            pg_options=get_nccl_options("ep", nccl_comm_cfgs),
+            group_desc="EXPERT_MODEL_PARALLEL_GROUP",
+        )
+        if rank in ranks_group:
+            _EXPERT_MODEL_PARALLEL_GROUP = group
+            _EXPERT_MODEL_PARALLEL_RANKS = ranks_group
+
+    # Expert tensor parallel (etp).
+    global _EXPERT_TENSOR_PARALLEL_GROUP
+    assert (
+        _EXPERT_TENSOR_PARALLEL_GROUP is None
+    ), 'expert tensor model parallel group is already initialized'
+
+    for ranks_group in generator.get_ranks('etp'):
+        group = create_group(
+            ranks_group,
+            timeout=timeout,
+            pg_options=get_nccl_options("ep_tp", nccl_comm_cfgs),
+            group_desc="EXPERT_TENSOR_PARALLEL_GROUP",
+        )
+        if rank in ranks_group:
+            _EXPERT_TENSOR_PARALLEL_GROUP = group
+
+    # Expert tensor + model parallel (etp-ep) — different sizes per replica.
+    global _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP
+    assert (
+        _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP is None
+    ), 'expert tensor + model parallel group is already initialized'
+
+    for ranks_group in generator.get_ranks('etp-ep'):
+        group = create_group(
+            ranks_group,
+            timeout=timeout,
+            pg_options=get_nccl_options("tp_ep_mp", nccl_comm_cfgs),
+            group_desc="EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP",
+        )
+        if rank in ranks_group:
+            _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP = group
+
+    # Expert tensor+model+pipeline parallel (pp=1, same ranks as etp-ep).
+    global _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
+    assert (
+        _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP is None
+    ), 'expert tensor model pipeline parallel group is already initialized'
+
+    for ranks_group in generator.get_ranks('etp-ep'):
+        group = create_group(
+            ranks_group,
+            timeout=timeout,
+            pg_options=get_nccl_options("tp_ep_pp", nccl_comm_cfgs),
+            group_desc="EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP",
+        )
+        if rank in ranks_group:
+            _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP = group
+
+    # Expert data parallel (edp).
+    # edp groups from the generator cover only the first min_k*tp_cp positions
+    # per replica. Ranks beyond that get single-rank groups (no cross-replica
+    # gradient sync — that requires resharding, which is future work).
+    global _EXPERT_DATA_PARALLEL_GROUP
+    global _EXPERT_DATA_PARALLEL_GROUP_GLOO
+    global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+    global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO
+    global _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+    assert _EXPERT_DATA_PARALLEL_GROUP is None, 'expert data group is already initialized'
+
+    edp_groups = generator.get_ranks('edp')
+    edp_covered_ranks = set()
+    for g in edp_groups:
+        edp_covered_ranks.update(g)
+    uncovered_ranks = sorted(set(range(world_size)) - edp_covered_ranks)
+
+    all_edp_groups = edp_groups + [[r] for r in uncovered_ranks]
+
+    for ranks_group in all_edp_groups:
+        group = create_group(
+            ranks_group,
+            timeout=timeout,
+            pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs),
+            group_desc="EXPERT_DATA_PARALLEL_GROUP",
+        )
+        if create_gloo_process_groups:
+            group_gloo = create_group(
+                ranks_group,
+                timeout=timeout,
+                backend="gloo",
+                group_desc="EXPERT_DATA_PARALLEL_GROUP_GLOO",
+            )
+        else:
+            group_gloo = None
+        if rank in ranks_group:
+            _EXPERT_DATA_PARALLEL_GROUP = group
+            _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
+
+    # No distributed optimizer: intra partial = full edp.
+    _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = _EXPERT_DATA_PARALLEL_GROUP
+    _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = _EXPERT_DATA_PARALLEL_GROUP_GLOO
+
+    # Initialize global memory buffer.
+    _set_global_memory_buffer()
+
+
 def is_initialized():
     """Useful for code segments that may be accessed with or without mpu initialization"""
     return _DATA_PARALLEL_GROUP is not None

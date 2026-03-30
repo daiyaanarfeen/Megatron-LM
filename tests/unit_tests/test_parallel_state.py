@@ -806,3 +806,168 @@ def test_heterogeneous_rank_generator_single_replica():
     assert len(edp_groups) == 8
     for g in edp_groups:
         assert len(g) == 1
+
+
+# ── initialize_heterogeneous_model_parallel distributed tests ──
+# These tests require WORLD_SIZE=8 and run with torchrun.
+
+
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
+def test_initialize_heterogeneous_model_parallel():
+    """8 GPUs, tp=2, cp=1, k=[1,3], etp=2, num_experts=6.
+
+    Replica 0 (ranks 0-1): ep=1, 6 local experts per etp peer
+    Replica 1 (ranks 2-7): ep=3, 2 local experts per etp peer
+    """
+    ps.destroy_model_parallel()
+    Utils.initialize_distributed()
+    ps.initialize_heterogeneous_model_parallel(
+        tensor_model_parallel_size=2,
+        context_parallel_size=1,
+        num_tp_cp_per_replica=[1, 3],
+        expert_tensor_parallel_size=2,
+        num_moe_experts=6,
+    )
+
+    r = torch.distributed.get_rank()
+
+    # ── Attention groups (uniform across all ranks) ──
+    assert ps.get_tensor_model_parallel_group() is not None
+    assert torch.distributed.get_world_size(ps.get_tensor_model_parallel_group()) == 2
+
+    assert ps.get_data_parallel_group() is not None
+    assert torch.distributed.get_world_size(ps.get_data_parallel_group()) == 4
+
+    assert ps.get_context_parallel_group() is not None
+    assert torch.distributed.get_world_size(ps.get_context_parallel_group()) == 1
+
+    assert ps.get_tensor_and_context_parallel_group() is not None
+    assert torch.distributed.get_world_size(ps.get_tensor_and_context_parallel_group()) == 2
+
+    # dp-cp (cp=1, so same size as dp)
+    assert ps.get_data_parallel_group(with_context_parallel=True) is not None
+    assert (
+        torch.distributed.get_world_size(ps.get_data_parallel_group(with_context_parallel=True))
+        == 4
+    )
+
+    # pp=1
+    assert ps.get_pipeline_model_parallel_group() is not None
+    assert torch.distributed.get_world_size(ps.get_pipeline_model_parallel_group()) == 1
+
+    # model parallel = tp (pp=1)
+    assert ps.get_model_parallel_group() is not None
+    assert torch.distributed.get_world_size(ps.get_model_parallel_group()) == 2
+
+    # ── Expert groups (heterogeneous per replica) ──
+
+    # etp: always 2
+    assert ps.get_expert_tensor_parallel_group() is not None
+    assert torch.distributed.get_world_size(ps.get_expert_tensor_parallel_group()) == 2
+
+    # ep: replica 0 has ep=1, replica 1 has ep=3
+    ep_group = ps.get_expert_model_parallel_group()
+    assert ep_group is not None
+    if r < 2:  # replica 0
+        assert torch.distributed.get_world_size(ep_group) == 1
+    else:  # replica 1
+        assert torch.distributed.get_world_size(ep_group) == 3
+
+    # etp-ep: replica 0 has 2 ranks, replica 1 has 6 ranks
+    tp_ep_group = ps.get_expert_tensor_and_model_parallel_group()
+    assert tp_ep_group is not None
+    if r < 2:
+        assert torch.distributed.get_world_size(tp_ep_group) == 2
+    else:
+        assert torch.distributed.get_world_size(tp_ep_group) == 6
+
+    # etp-ep-pp (pp=1, same as etp-ep)
+    tp_ep_pp_group = ps.get_expert_tensor_model_pipeline_parallel_group()
+    assert tp_ep_pp_group is not None
+    if r < 2:
+        assert torch.distributed.get_world_size(tp_ep_pp_group) == 2
+    else:
+        assert torch.distributed.get_world_size(tp_ep_pp_group) == 6
+
+    # edp: ranks 0-3 have cross-replica groups (size 2),
+    # ranks 4-7 have single-rank groups (not in edp)
+    edp_group = ps.get_expert_data_parallel_group()
+    assert edp_group is not None
+    if r < 4:
+        assert torch.distributed.get_world_size(edp_group) == 2
+    else:
+        assert torch.distributed.get_world_size(edp_group) == 1
+
+    # Verify num_local_experts derivation (what MoELayer would compute)
+    ep_size = torch.distributed.get_world_size(ep_group)
+    num_local_experts = 6 // ep_size
+    if r < 2:
+        assert num_local_experts == 6
+    else:
+        assert num_local_experts == 2
+
+    ps.destroy_model_parallel()
+
+
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
+def test_initialize_heterogeneous_model_parallel_uniform():
+    """8 GPUs, tp=2, cp=1, k=[2,2], etp=2 — uniform replicas should behave
+    identically to standard initialize_model_parallel with ep=2."""
+    ps.destroy_model_parallel()
+    Utils.initialize_distributed()
+    ps.initialize_heterogeneous_model_parallel(
+        tensor_model_parallel_size=2,
+        context_parallel_size=1,
+        num_tp_cp_per_replica=[2, 2],
+        expert_tensor_parallel_size=2,
+        num_moe_experts=8,
+    )
+
+    r = torch.distributed.get_rank()
+
+    # All ranks should have ep=2
+    ep_group = ps.get_expert_model_parallel_group()
+    assert torch.distributed.get_world_size(ep_group) == 2
+
+    # etp=2
+    etp_group = ps.get_expert_tensor_parallel_group()
+    assert torch.distributed.get_world_size(etp_group) == 2
+
+    # etp-ep = 4 (full replica)
+    tp_ep_group = ps.get_expert_tensor_and_model_parallel_group()
+    assert torch.distributed.get_world_size(tp_ep_group) == 4
+
+    # edp: all ranks covered, size 2 (2 replicas)
+    edp_group = ps.get_expert_data_parallel_group()
+    assert torch.distributed.get_world_size(edp_group) == 2
+
+    # dp=4
+    assert torch.distributed.get_world_size(ps.get_data_parallel_group()) == 4
+
+    # num_local_experts = 8 / 2 = 4
+    assert 8 // torch.distributed.get_world_size(ep_group) == 4
+
+    ps.destroy_model_parallel()
+
+
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
+def test_initialize_heterogeneous_model_parallel_validation():
+    """Validate that bad num_moe_experts is caught at init time."""
+    ps.destroy_model_parallel()
+    Utils.initialize_distributed()
+    # tp=2, cp=1, k=[1,3], etp=2
+    # ep for replica 0: 1*2/2 = 1
+    # ep for replica 1: 3*2/2 = 3
+    # num_moe_experts=5 is not divisible by 3
+    with pytest.raises(AssertionError, match="must be divisible by ep"):
+        ps.initialize_heterogeneous_model_parallel(
+            tensor_model_parallel_size=2,
+            context_parallel_size=1,
+            num_tp_cp_per_replica=[1, 3],
+            expert_tensor_parallel_size=2,
+            num_moe_experts=5,
+        )
+    ps.destroy_model_parallel()
