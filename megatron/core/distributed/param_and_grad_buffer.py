@@ -283,6 +283,7 @@ class _ParamAndGradBucketGroup:
                 ep_group=config['ep_group'],
                 edp_group=config['edp_group'],
                 local_ep_size=config['local_ep_size'],
+                ep_rank=config['ep_rank'],
                 is_edp_eligible=config['is_edp_eligible'],
                 num_chunks=num_pipeline_chunks,
                 reduce_op=reduce_op,
@@ -592,8 +593,8 @@ class _ParamAndGradBucketGroup:
         # Approach B: fused intra-bucket pipeline.
         if self._pipelined_collectives is not None:
             for idx, bucket in enumerate(self.buckets):
-                if not needs_reshard:
-                    self._pipelined_collectives.execute_min_ep(bucket.grad_data)
+                if local_ep_size == 1:
+                    self._pipelined_collectives.execute_ep1(bucket.grad_data)
                 else:
                     gather_buf = self._gather_buffers[idx] if is_edp_eligible else None
                     self._pipelined_collectives.execute(bucket.grad_data, gather_buf)

@@ -242,50 +242,41 @@ def _run_cross_rank_consistency_test(topo, use_pipelined, num_pipeline_chunks=4)
     for bucket_group in ep_bucket_groups:
         bucket_group.finish_grad_sync()
 
-    # Gather all expert grad data to all ranks for cross-checking.
-    world_size = torch.distributed.get_world_size()
-    local_data = ep_buffer.grad_data.clone()
-    all_data = [torch.zeros_like(local_data) for _ in range(world_size)]
-    torch.distributed.all_gather(all_data, local_data)
+    # Cross-check: compare rank 0's expert grads with the first reshard rank's.
+    # Use broadcast so all ranks participate (avoids send/recv deadlocks).
+    first_reshard_rank = sum(topo['k'][:1]) * topo['tp'] * topo['cp']
+    reshard_ep = topo['k'][1] * topo['tp'] * topo['cp'] // topo['etp']
+    experts_per_reshard_rank = topo['num_moe_experts'] // reshard_ep
 
-    # Verify: for each etp position, the min-ep replica's edp-eligible rank
-    # and the reshard replica's edp-eligible rank should have matching expert
-    # grads on the overlapping experts (the edp-eligible rank's grad_data after
-    # scatter contains its local experts, which are a subset of all experts).
-    #
-    # For 8-GPU: rank 0 (all 6 experts) vs rank 2 (experts 0-1 after scatter)
-    # For 24-GPU: rank 0 (experts [0..5]) vs rank 8 (experts [0..2] after scatter)
-    #
-    # We check on rank 0 only (etp_rank=0 in min-ep replica).
-    min_ep = het_cfg['min_ep_size']
+    # Determine the common buffer size: reshard rank's buffer size.
+    reshard_buf_size = ep_buffer.grad_data.numel() if rank == first_reshard_rank else 0
+    # Broadcast the size from first_reshard_rank so all ranks know it.
+    size_tensor = torch.tensor([reshard_buf_size], device='cuda')
+    torch.distributed.broadcast(size_tensor, src=first_reshard_rank)
+    common_size = size_tensor.item()
+
+    # Rank 0 broadcasts its first `common_size` elements (matching reshard rank's experts).
     if rank == 0:
-        # Find the first reshard replica's edp-eligible rank (etp_rank=0).
-        # It's the first rank of the second replica.
-        first_reshard_rank = sum(topo['k'][:1]) * topo['tp'] * topo['cp']
-        # That rank's etp_rank=0 position is at the first rank of that replica.
-        # Its local experts are the first (num_experts / reshard_ep) experts.
-        reshard_ep = topo['k'][1] * topo['tp'] * topo['cp'] // topo['etp']
-        experts_per_reshard_rank = topo['num_moe_experts'] // reshard_ep
+        local_data = ep_buffer.grad_data.clone()
+        bcast_buf = local_data[:common_size].contiguous()
+    else:
+        bcast_buf = torch.empty(common_size, dtype=ep_buffer.grad_data.dtype, device='cuda')
+    torch.distributed.broadcast(bcast_buf, src=0)
 
-        reshard_data = all_data[first_reshard_rank]
-        min_ep_data = all_data[0]
-
-        # The first reshard rank holds experts [0 .. experts_per_reshard_rank-1].
-        # On the min-ep side (rank 0), these are the first portion of the buffer.
-        # Expert params are laid out contiguously in index order.
-        numel_per_expert = reshard_data.numel() // experts_per_reshard_rank
-
+    # First reshard rank compares.
+    if rank == first_reshard_rank:
+        local_data = ep_buffer.grad_data.clone()
+        numel_per_expert = local_data.numel() // experts_per_reshard_rank
         for exp_idx in range(experts_per_reshard_rank):
-            r0_slice = min_ep_data[
+            r0_slice = bcast_buf[
                 exp_idx * numel_per_expert : (exp_idx + 1) * numel_per_expert
             ]
-            rR_slice = reshard_data[
+            local_slice = local_data[
                 exp_idx * numel_per_expert : (exp_idx + 1) * numel_per_expert
             ]
-            assert torch.allclose(r0_slice, rR_slice, atol=1e-5), (
+            assert torch.allclose(r0_slice, local_slice, atol=1e-5), (
                 f"Expert {exp_idx} grad mismatch between rank 0 and rank {first_reshard_rank}"
             )
-
     parallel_state.destroy_model_parallel()
 
 
