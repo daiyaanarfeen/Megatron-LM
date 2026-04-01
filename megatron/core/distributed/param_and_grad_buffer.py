@@ -239,6 +239,55 @@ class _ParamAndGradBucketGroup:
         self.cached_param_buffer_shard_list = [None] * len(self.buckets)
         self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
 
+        # Heterogeneous EP state (set via set_heterogeneous_ep_config).
+        self._het_ep_config = None
+        self._gather_buffers = None
+
+    def set_heterogeneous_ep_config(self, config: dict, use_pipelined: bool = False,
+                                     num_pipeline_chunks: int = 4):
+        """Configure this bucket group for heterogeneous EP gradient sync.
+
+        On reshard replicas (needs_reshard=True), allocates gather buffers
+        on the edp-eligible rank to hold gathered grads from all ep peers.
+
+        Args:
+            config: Dict from parallel_state.get_heterogeneous_ep_config().
+            use_pipelined: If True, use Approach B (fused intra-bucket pipeline).
+                If False (default), use Approach A (cross-bucket pipeline).
+            num_pipeline_chunks: Number of chunks for Approach B pipeline.
+        """
+        self._het_ep_config = config
+        self._pipelined_collectives = None
+
+        if config['local_ep_size'] > 1 and config['is_edp_eligible']:
+            # Edp-eligible rank with ep>1 needs gather buffers to hold all ep
+            # peers' grads (ep_size * local_bucket_size). This applies to both
+            # min-ep and reshard replicas when min_ep > 1.
+            self._gather_buffers = []
+            for bucket in self.buckets:
+                gather_buf = torch.zeros(
+                    bucket.grad_data.numel() * config['local_ep_size'],
+                    dtype=bucket.grad_data.dtype,
+                    device=bucket.grad_data.device,
+                )
+                self._gather_buffers.append(gather_buf)
+
+        if use_pipelined:
+            from .pipelined_reshard_collective import PipelinedReshardCollective
+
+            reduce_op = torch.distributed.ReduceOp.SUM
+            if self.ddp_config.average_in_collective:
+                reduce_op = torch.distributed.ReduceOp.AVG
+
+            self._pipelined_collectives = PipelinedReshardCollective(
+                ep_group=config['ep_group'],
+                edp_group=config['edp_group'],
+                local_ep_size=config['local_ep_size'],
+                is_edp_eligible=config['is_edp_eligible'],
+                num_chunks=num_pipeline_chunks,
+                reduce_op=reduce_op,
+            )
+
     def reset(self):
         """
         Reset metadata in bucket group in preparation for the next iteration of training.
@@ -512,6 +561,101 @@ class _ParamAndGradBucketGroup:
                 if len(fp8_params) > 0:
                     post_all_gather_processing(fp8_params)
 
+    def _start_heterogeneous_ep_grad_sync(self):
+        """Gradient sync for heterogeneous EP: gather → allreduce → scatter.
+
+        Uses Approach B (pipelined intra-bucket) if a PipelinedReshardCollective
+        was configured, otherwise falls back to Approach A (per-bucket synchronous).
+
+        Three cases per rank:
+        1. Min-ep replica (needs_reshard=False): standard allreduce on edp group.
+        2. Reshard replica, edp-eligible (ep_rank == 0):
+           - Gather from ep peers into gather_buffer
+           - Allreduce on edp group using gather_buffer
+           - Scatter synced grads back to ep peers
+        3. Reshard replica, extra rank (ep_rank > 0):
+           - Participate in gather (send grads to ep_rank=0)
+           - Skip allreduce (edp group is single-rank for extra ranks)
+           - Participate in scatter (receive synced grads from ep_rank=0)
+
+        All ranks in the ep group must call gather/scatter collectively.
+        The edp-eligible rank (ep_rank=0) does the allreduce in between.
+        Extra ranks do a no-op single-rank allreduce on their edp group.
+        """
+        cfg = self._het_ep_config
+        ep_group = cfg['ep_group']
+        edp_group = cfg['edp_group']
+        local_ep_size = cfg['local_ep_size']
+        needs_reshard = cfg['needs_reshard']
+        is_edp_eligible = cfg['is_edp_eligible']
+
+        # Approach B: fused intra-bucket pipeline.
+        if self._pipelined_collectives is not None:
+            for idx, bucket in enumerate(self.buckets):
+                if not needs_reshard:
+                    self._pipelined_collectives.execute_min_ep(bucket.grad_data)
+                else:
+                    gather_buf = self._gather_buffers[idx] if is_edp_eligible else None
+                    self._pipelined_collectives.execute(bucket.grad_data, gather_buf)
+            return
+
+        # Approach A: per-bucket synchronous gather → allreduce → scatter.
+        reduce_op = torch.distributed.ReduceOp.SUM
+        if self.ddp_config.average_in_collective:
+            reduce_op = torch.distributed.ReduceOp.AVG
+
+        for idx, bucket in enumerate(self.buckets):
+            grad_data = bucket.grad_data
+            chunk_size = grad_data.numel()
+
+            if local_ep_size == 1:
+                # ep=1: this rank already holds all experts, no gather/scatter needed.
+                torch.distributed.all_reduce(grad_data, op=reduce_op, group=edp_group)
+            else:
+                # ep > 1: all ranks in ep group participate in gather/allreduce/distribute.
+                # Both min-ep and reshard replicas follow the same 3-stage pattern
+                # when min_ep > 1, since all need to gather to get all experts.
+
+                # Stage 1: Gather grads from all ep peers.
+                if is_edp_eligible:
+                    gather_buf = self._gather_buffers[idx]
+                    gather_list = [
+                        gather_buf[i * chunk_size : (i + 1) * chunk_size]
+                        for i in range(local_ep_size)
+                    ]
+                else:
+                    gather_list = [
+                        torch.empty(chunk_size, dtype=grad_data.dtype, device=grad_data.device)
+                        for _ in range(local_ep_size)
+                    ]
+                torch.distributed.all_gather(gather_list, grad_data, group=ep_group)
+
+                # Stage 2: Allreduce across replicas.
+                # All ranks call allreduce on their edp group. Extra ranks have
+                # single-rank edp groups (no-op), but must call to avoid racing
+                # ahead to stage 3 while edp-eligible ranks are still in allreduce.
+                if is_edp_eligible:
+                    torch.distributed.all_reduce(gather_buf, op=reduce_op, group=edp_group)
+                else:
+                    torch.distributed.all_reduce(grad_data, op=reduce_op, group=edp_group)
+
+                # Stage 3: Distribute synced grads back to ep peers.
+                # Use all_reduce SUM on ep group. Only ep_rank=0 keeps gather_buf;
+                # all other ranks use zeros. After SUM, everyone has the synced data.
+                ep_r = cfg['ep_rank']
+                if ep_r != 0:
+                    if is_edp_eligible:
+                        gather_buf.zero_()
+                    else:
+                        gather_buf = torch.zeros(
+                            chunk_size * local_ep_size,
+                            dtype=grad_data.dtype, device=grad_data.device,
+                        )
+                torch.distributed.all_reduce(
+                    gather_buf, op=torch.distributed.ReduceOp.SUM, group=ep_group
+                )
+                grad_data.copy_(gather_buf[ep_r * chunk_size : (ep_r + 1) * chunk_size])
+
     def start_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
         Initiates grad sync (all-reduce or reduce-scatter) communication operations
@@ -541,6 +685,12 @@ class _ParamAndGradBucketGroup:
         for bucket in self.buckets:
             if bucket.gradient_scaling_factor != 1.0:
                 bucket.grad_data *= bucket.gradient_scaling_factor
+
+        # Heterogeneous EP path: gather → allreduce → scatter (Approach A).
+        if self._het_ep_config is not None:
+            self._start_heterogeneous_ep_grad_sync()
+            # Synchronous for now; grad_reduce_handle stays None.
+            return
 
         # Decide reduce_op.
         reduce_op = torch.distributed.ReduceOp.SUM
@@ -678,6 +828,10 @@ class _ParamAndGradBucketGroup:
         # communications on a separate communication stream.
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             torch.cuda.default_stream().wait_stream(self.communication_stream)
+            return
+        # Heterogeneous EP grad sync is synchronous even with overlap_grad_reduce;
+        # grad_reduce_handle is None after start_grad_sync returns.
+        if self._het_ep_config is not None:
             return
         assert self.grad_reduce_handle is not None, (
             f"Communication call has not been issued for this bucket "

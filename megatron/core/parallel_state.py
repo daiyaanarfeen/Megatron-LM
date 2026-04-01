@@ -67,6 +67,8 @@ _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE = None
 _MPU_EXPERT_MODEL_PARALLEL_RANK = None
 _MPU_EXPERT_TENSOR_PARALLEL_WORLD_SIZE = None
 _MPU_EXPERT_TENSOR_PARALLEL_RANK = None
+# Heterogeneous EP configuration (set by initialize_heterogeneous_model_parallel).
+_HETEROGENEOUS_EP_CONFIG = None
 ### End of expert related parallel states
 
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = None
@@ -1896,6 +1898,36 @@ def initialize_heterogeneous_model_parallel(
     _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = _EXPERT_DATA_PARALLEL_GROUP
     _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = _EXPERT_DATA_PARALLEL_GROUP_GLOO
 
+    # ── Store heterogeneous EP metadata ──
+    global _HETEROGENEOUS_EP_CONFIG
+    min_k = generator.min_k
+    # Determine which replica this rank belongs to and its local ep size.
+    local_ep_size = None
+    for r, k in enumerate(num_tp_cp_per_replica):
+        replica_start = generator.replica_offsets[r]
+        replica_end = generator.replica_offsets[r + 1]
+        if replica_start <= rank < replica_end:
+            local_ep_size = k * tp * cp // etp
+            break
+    assert local_ep_size is not None, f"Rank {rank} not found in any replica"
+    min_ep_size = min_k * tp * cp // etp
+    ep_rank = _EXPERT_MODEL_PARALLEL_GROUP.rank()
+    # edp-eligible: only the first min_ep ranks per etp position participate in allreduce.
+    # For min-ep replicas (local_ep == min_ep), all ranks are eligible.
+    # For reshard replicas (local_ep > min_ep), only ep_rank < min_ep_size are eligible.
+    is_edp_eligible = ep_rank < min_ep_size
+    _HETEROGENEOUS_EP_CONFIG = {
+        'needs_reshard': local_ep_size > min_ep_size,
+        'local_ep_size': local_ep_size,
+        'min_ep_size': min_ep_size,
+        'num_replicas': generator.num_replicas,
+        'dp_size': sum(num_tp_cp_per_replica),
+        'ep_group': _EXPERT_MODEL_PARALLEL_GROUP,
+        'edp_group': _EXPERT_DATA_PARALLEL_GROUP,
+        'ep_rank': ep_rank,
+        'is_edp_eligible': is_edp_eligible,
+    }
+
     # Initialize global memory buffer.
     _set_global_memory_buffer()
 
@@ -2526,6 +2558,32 @@ def get_expert_data_parallel_world_size(partial_expert_data_parallel=False):
         return 0
 
 
+def is_heterogeneous_ep() -> bool:
+    """Return True if heterogeneous EP is active (set by initialize_heterogeneous_model_parallel)."""
+    return _HETEROGENEOUS_EP_CONFIG is not None
+
+
+def get_heterogeneous_ep_config() -> dict:
+    """Return the heterogeneous EP configuration dict.
+
+    Keys:
+        needs_reshard (bool): True if this rank's replica has ep > min_ep.
+        local_ep_size (int): EP size of this rank's replica.
+        min_ep_size (int): Minimum EP size across all replicas.
+        num_replicas (int): Number of MoE replicas.
+        dp_size (int): Total data parallel size = sum(k_i).
+        ep_group (ProcessGroup): This rank's expert model parallel group.
+        edp_group (ProcessGroup): This rank's expert data parallel group.
+        ep_rank (int): This rank's position within its ep group.
+        is_edp_eligible (bool): True if this rank participates in cross-replica allreduce.
+    """
+    assert _HETEROGENEOUS_EP_CONFIG is not None, (
+        "Heterogeneous EP config is not initialized. "
+        "Call initialize_heterogeneous_model_parallel() first."
+    )
+    return _HETEROGENEOUS_EP_CONFIG
+
+
 def get_intra_distributed_optimizer_instance_group(check_initialized=True):
     """Get the group of all GPUs in a distributed optimizer instance."""
     if check_initialized:
@@ -2773,6 +2831,9 @@ def destroy_model_parallel():
 
     global _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
+
+    global _HETEROGENEOUS_EP_CONFIG
+    _HETEROGENEOUS_EP_CONFIG = None
     # End of expert parallelism destroy.
 
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP

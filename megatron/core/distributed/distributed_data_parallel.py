@@ -254,6 +254,13 @@ class DistributedDataParallel(_BaseDataParallel):
 
             return buffers, bucket_groups
 
+        # Check for heterogeneous EP configuration.
+        from megatron.core import parallel_state
+
+        self._heterogeneous_ep_config = None
+        if parallel_state.is_heterogeneous_ep():
+            self._heterogeneous_ep_config = parallel_state.get_heterogeneous_ep_config()
+
         if config.calculate_per_token_loss:
             assert (
                 not self.ddp_config.average_in_collective
@@ -283,12 +290,27 @@ class DistributedDataParallel(_BaseDataParallel):
             #   3. Final result is scaled by 1/dp_size as desired
             if self.ddp_config.average_in_collective:
                 gradient_scaling_factor = 1.0
-                expert_gradient_scaling_factor = self.expt_dp_group.size() / self.dp_cp_group.size()
+                if self._heterogeneous_ep_config is not None:
+                    # With heterogeneous EP, the edp allreduce group has num_replicas members.
+                    # Pre-scale: num_replicas / dp_size, then AVG divides by num_replicas,
+                    # giving 1/dp_size.
+                    het_cfg = self._heterogeneous_ep_config
+                    expert_gradient_scaling_factor = (
+                        het_cfg['num_replicas'] / het_cfg['dp_size']
+                    )
+                else:
+                    expert_gradient_scaling_factor = (
+                        self.expt_dp_group.size() / self.dp_cp_group.size()
+                    )
             else:
                 data_parallel_world_size = self.dp_cp_group.size()
-
                 gradient_scaling_factor = 1.0 / data_parallel_world_size
-                expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
+                if self._heterogeneous_ep_config is not None:
+                    expert_gradient_scaling_factor = (
+                        1.0 / self._heterogeneous_ep_config['dp_size']
+                    )
+                else:
+                    expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
         # Allocate the param+grad buffers for dense params' grads.
         self.buffers, self.bucket_groups = _allocate_buffers_for_parameters(
@@ -303,6 +325,15 @@ class DistributedDataParallel(_BaseDataParallel):
                 gradient_scaling_factor=expert_gradient_scaling_factor,
             )
         )
+
+        # Pass heterogeneous EP config to expert bucket groups for reshard-aware grad sync.
+        if self._heterogeneous_ep_config is not None:
+            for bucket_group in self.expert_parallel_bucket_groups:
+                bucket_group.set_heterogeneous_ep_config(
+                    self._heterogeneous_ep_config,
+                    use_pipelined=self.ddp_config.use_pipelined_ep_reshard,
+                    num_pipeline_chunks=self.ddp_config.num_ep_reshard_pipeline_chunks,
+                )
 
         # Delete references to weight_tensor if they exist since we don't want two parameter copies
         # if we re-mapped parameters (which happens when we use the distributed optimizer).

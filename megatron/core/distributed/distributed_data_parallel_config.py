@@ -162,6 +162,15 @@ class DistributedDataParallelConfig:
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
 
+    use_pipelined_ep_reshard: bool = False
+    """If true, use Approach B (fused intra-bucket pipelined reshard) for heterogeneous EP
+       gradient sync instead of Approach A (per-bucket synchronous reshard). Approach B chunks
+       each bucket's gather→allreduce→scatter into K pipeline stages for better overlap."""
+
+    num_ep_reshard_pipeline_chunks: int = 4
+    """Number of pipeline chunks (K) for Approach B. Sweet spot is 4-8. Beyond that,
+       per-chunk NCCL launch overhead dominates."""
+
     def __post_init__(self):
         import os
 

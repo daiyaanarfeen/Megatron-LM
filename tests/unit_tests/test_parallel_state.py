@@ -971,3 +971,50 @@ def test_initialize_heterogeneous_model_parallel_validation():
             num_moe_experts=5,
         )
     ps.destroy_model_parallel()
+
+
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
+def test_heterogeneous_ep_config():
+    """Validate heterogeneous EP config metadata set by initialize_heterogeneous_model_parallel."""
+    ps.destroy_model_parallel()
+    Utils.initialize_distributed()
+    ps.initialize_heterogeneous_model_parallel(
+        tensor_model_parallel_size=2,
+        context_parallel_size=1,
+        num_tp_cp_per_replica=[1, 3],
+        expert_tensor_parallel_size=2,
+        num_moe_experts=6,
+    )
+
+    r = torch.distributed.get_rank()
+
+    assert ps.is_heterogeneous_ep()
+    cfg = ps.get_heterogeneous_ep_config()
+
+    # Common values across all ranks.
+    assert cfg['min_ep_size'] == 1  # min(k) * tp * cp / etp = 1 * 2 / 2 = 1
+    assert cfg['num_replicas'] == 2
+    assert cfg['dp_size'] == 4  # sum([1, 3])
+
+    if r < 2:
+        # Replica 0: ep=1 (min), no reshard needed.
+        assert cfg['local_ep_size'] == 1
+        assert cfg['needs_reshard'] is False
+        assert cfg['is_edp_eligible'] is True
+        assert cfg['ep_rank'] == 0
+    elif r < 4:
+        # Replica 1, ranks 2-3: ep_rank=0, edp-eligible, needs reshard.
+        assert cfg['local_ep_size'] == 3
+        assert cfg['needs_reshard'] is True
+        assert cfg['is_edp_eligible'] is True
+        assert cfg['ep_rank'] == 0
+    else:
+        # Replica 1, ranks 4-7: extra ranks, not edp-eligible.
+        assert cfg['local_ep_size'] == 3
+        assert cfg['needs_reshard'] is True
+        assert cfg['is_edp_eligible'] is False
+        assert cfg['ep_rank'] > 0
+
+    ps.destroy_model_parallel()
+    assert not ps.is_heterogeneous_ep()
