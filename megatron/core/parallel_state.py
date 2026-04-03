@@ -683,7 +683,6 @@ class HeterogeneousRankGenerator:
             groups.append(group)
         return groups
 
-
 def default_embedding_ranks(pp_ranks):
     """Return the default ranks that constitute the stages on which the word embeddings live.
     For most models, these are the first and last pipeline stages."""
@@ -1927,6 +1926,47 @@ def initialize_heterogeneous_model_parallel(
         'ep_rank': ep_rank,
         'is_edp_eligible': is_edp_eligible,
     }
+
+    # ── Initialize NVSHMEM (world-scoped) for Approach B ──
+    # Must be called collectively by ALL ranks at the same point.
+    try:
+        import nvshmem.core as _nvshmem_core
+        from megatron.core.resharding.nvshmem_copy_service.compat import (
+            ensure_nvshmem_compat,
+            get_cuda_core_device_class,
+        )
+        ensure_nvshmem_compat()
+
+        _nvshmem_uid = _nvshmem_core.get_unique_id(empty=True)
+        if rank == 0:
+            _nvshmem_uid = _nvshmem_core.get_unique_id()
+        _uid_list = [_nvshmem_uid]
+        torch.distributed.broadcast_object_list(_uid_list, src=0)
+
+        _Device = get_cuda_core_device_class()
+        _local_rank = rank % torch.cuda.device_count()
+        _dev = _Device(_local_rank)
+        _dev.set_current()
+        _nvshmem_core.init(
+            device=_dev, uid=_uid_list[0],
+            rank=rank, nranks=world_size, initializer_method="uid",
+        )
+        _nvshmem_stream = _dev.create_stream()
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_initialized'] = True
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_stream'] = _nvshmem_stream
+        # Build ep_rank → global PE mapping.
+        _ep_peer_pes = []
+        for i in range(local_ep_size):
+            _ep_peer_pes.append(
+                torch.distributed.get_global_rank(_EXPERT_MODEL_PARALLEL_GROUP, i)
+            )
+        _HETEROGENEOUS_EP_CONFIG['ep_peer_pes'] = _ep_peer_pes
+        logger.info(
+                        f"NVSHMEM initialized (world_size={world_size})")
+    except (ImportError, RuntimeError) as e:
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_initialized'] = False
+        logger.info(
+                        f"NVSHMEM not available ({e}), Approach B will use NCCL fallback")
 
     # Initialize global memory buffer.
     _set_global_memory_buffer()

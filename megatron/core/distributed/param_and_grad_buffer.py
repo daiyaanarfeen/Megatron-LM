@@ -288,6 +288,7 @@ class _ParamAndGradBucketGroup:
                 num_chunks=num_pipeline_chunks,
                 reduce_op=reduce_op,
             )
+            self._pipelined_collectives.set_nvshmem_state(config)
 
     def reset(self):
         """
