@@ -83,49 +83,24 @@ class PipelinedReshardCollective:
         self._ep_peer_pes = None
         self._gather_symm_buf = None
         self._local_symm_buf = None
+        self._gather_signals = None
+        self._scatter_signal = None
 
     def set_nvshmem_state(self, het_ep_config: dict):
-        """Adopt pre-initialized NVSHMEM state from the het EP config.
-
-        Called by set_heterogeneous_ep_config in param_and_grad_buffer.py
-        after NVSHMEM is initialized in parallel_state.py.
-        """
+        """Adopt pre-initialized NVSHMEM state from the het EP config."""
         if het_ep_config.get('nvshmem_initialized', False) and self.local_ep_size > 1:
             self._use_nvshmem = True
             self._nvshmem_stream = het_ep_config['nvshmem_stream']
             self._ep_peer_pes = het_ep_config['ep_peer_pes']
+            self._gather_signals = het_ep_config['nvshmem_gather_signals']
+            self._scatter_signal = het_ep_config['nvshmem_scatter_signal']
+            self._gather_symm_buf = het_ep_config['nvshmem_gather_symm_buf']
+            self._local_symm_buf = het_ep_config['nvshmem_local_symm_buf']
             logger.info(
                 f"PipelinedReshardCollective: using NVSHMEM "
                 f"(ep_rank={self.ep_rank}, ep_size={self.local_ep_size}, "
                 f"ep_peer_pes={self._ep_peer_pes})"
             )
-
-    def _ensure_symm_buffers(self, gather_numel: int, local_numel: int, dtype: torch.dtype):
-        """Allocate or resize NVSHMEM symmetric buffers."""
-        elem_size = torch.tensor([], dtype=dtype).element_size()
-
-        # Gather buffer: ep_rank=0 needs space for all ep peers' data.
-        gather_bytes = gather_numel * elem_size
-        if self._gather_symm_buf is None or self._gather_symm_buf.numel() < gather_bytes:
-            if self._gather_symm_buf is not None:
-                nvshmem.core.interop.torch.free_tensor(self._gather_symm_buf)
-            self._gather_symm_buf = nvshmem.core.interop.torch.bytetensor(
-                (gather_bytes,), dtype=torch.uint8
-            )
-            self._gather_symm_buf.zero_()
-
-        # Local buffer: each rank needs space for its own data (for scatter receive).
-        local_bytes = local_numel * elem_size
-        if self._local_symm_buf is None or self._local_symm_buf.numel() < local_bytes:
-            if self._local_symm_buf is not None:
-                nvshmem.core.interop.torch.free_tensor(self._local_symm_buf)
-            self._local_symm_buf = nvshmem.core.interop.torch.bytetensor(
-                (local_bytes,), dtype=torch.uint8
-            )
-            self._local_symm_buf.zero_()
-
-        torch.cuda.synchronize()
-        nvshmem.core.barrier_all(stream=self._nvshmem_stream)
 
     def _get_gather_view(self, numel: int, dtype: torch.dtype) -> torch.Tensor:
         """View of gather symmetric buffer as the given dtype."""
@@ -160,8 +135,6 @@ class PipelinedReshardCollective:
         )
         local_chunk = total_chunk // self.local_ep_size
 
-        # Ensure symmetric buffers are allocated.
-        self._ensure_symm_buffers(L_total, L_local, grad_data.dtype)
 
         default_stream = torch.cuda.current_stream()
         allreduce_done = [torch.cuda.Event() for _ in range(K)]
@@ -185,9 +158,9 @@ class PipelinedReshardCollective:
             t_start = i * total_chunk
             t_end = t_start + actual_total
 
-            # ── Stage 1: Gather via NVSHMEM put ──
-            # Each ep rank puts its local_slice into ep_rank=0's gather buffer
-            # at the offset corresponding to its ep_rank.
+            # ── Stage 1: Gather via NVSHMEM put_signal ──
+            _grank = torch.distributed.get_rank()
+            logger.info(f"[nvshmem] rank {_grank}: chunk {i} stage 1 start")
             if i > 0:
                 default_stream.wait_event(allreduce_done[i - 1])
 
@@ -195,26 +168,48 @@ class PipelinedReshardCollective:
             dest_offset = self.ep_rank * actual_local
             dest_slice = gather_view[dest_offset : dest_offset + actual_local]
 
-            # Copy local grad data into symmetric send buffer, then put.
+            # Copy local grad data into symmetric send buffer.
             local_symm = self._get_local_view(actual_local, grad_data.dtype)
             local_symm.copy_(local_slice)
 
-            # Put to ep_rank=0's gather buffer using global PE.
             ep_rank0_pe = self._ep_peer_pes[0]
+
+            # Each rank puts its local_slice into ep_rank=0's _gather_symm_buf
+            # at the correct offset. Both src and dst are slices of NVSHMEM
+            # bytetensors (slicing works for put, just not put_signal).
+            elem_size = grad_data.element_size()
+            local_bytes = actual_local * elem_size
+
+            # Copy grad data into local_symm_buf (NVSHMEM source).
+            src_view = self._local_symm_buf[:local_bytes].view(grad_data.dtype)
+            src_view.copy_(local_slice)
+
+            # Destination on ep_rank=0: _gather_symm_buf at ep_rank's offset.
+            dst_offset_bytes = self.ep_rank * local_bytes
+            dst_view = self._gather_symm_buf[dst_offset_bytes:dst_offset_bytes + local_bytes].view(grad_data.dtype)
+
+            ep_rank0_pe = self._ep_peer_pes[0]
+            logger.info(f"[nvshmem] rank {_grank}: put to PE {ep_rank0_pe}")
             nvshmem.core.put(
-                dest_slice,      # destination on ep_rank=0 (symmetric)
-                local_symm,      # source (symmetric)
-                ep_rank0_pe,     # dest PE = global rank of ep_rank 0
-                stream=self._nvshmem_stream,
+                dst_view, src_view, ep_rank0_pe, stream=self._nvshmem_stream,
             )
             nvshmem.core.quiet(stream=self._nvshmem_stream)
-            # Global barrier: all world ranks sync. Safe because all ranks
-            # execute the same 3-stage sequence (NVSHMEM is world-scoped).
-            nvshmem.core.barrier_all(stream=self._nvshmem_stream)
             torch_nvshmem_stream.synchronize()
+
+            # NCCL barrier: ep_rank=0 knows all peers' data has arrived.
+            torch.distributed.barrier(group=self.ep_group)
+
+            # ep_rank=0: copy gathered data from _gather_symm_buf to gather_buffer.
+            if self.ep_rank == 0:
+                total_bytes = actual_total * elem_size
+                gathered = self._gather_symm_buf[:total_bytes].view(grad_data.dtype)
+                gather_view.copy_(gathered)
+
+            logger.info(f"[nvshmem] rank {_grank}: chunk {i} stage 1 done")
             gather_done[i].record(default_stream)
 
-            # ── Stage 2: Allreduce on edp group (NCCL, edp-eligible only) ──
+            # ── Stage 2: Allreduce on edp group (NCCL only, no NVSHMEM) ──
+            logger.info(f"[nvshmem] rank {_grank}: chunk {i} stage 2 start")
             self.allreduce_stream.wait_event(gather_done[i])
             with torch.cuda.stream(self.allreduce_stream):
                 if self.is_edp_eligible and self.ep_rank == 0:
@@ -237,27 +232,35 @@ class PipelinedReshardCollective:
             allreduce_done[i].record(self.allreduce_stream)
 
             # ── Stage 3: Scatter via NVSHMEM put ──
+            logger.info(f"[nvshmem] rank {_grank}: chunk {i} stage 3 start")
             default_stream.wait_event(allreduce_done[i])
+            torch_nvshmem_stream.wait_event(allreduce_done[i])
 
+            # ep_rank=0: copy synced gather_buffer back to _gather_symm_buf,
+            # then each peer reads its slice from their _local_symm_buf.
             if self.ep_rank == 0:
+                # Copy allreduced data into gather_symm_buf.
+                total_bytes = actual_total * elem_size
+                self._gather_symm_buf[:total_bytes].view(grad_data.dtype).copy_(gather_view)
+                # Put each peer's slice into their _local_symm_buf.
                 for peer in range(self.local_ep_size):
                     peer_pe = self._ep_peer_pes[peer]
-                    src_offset = peer * actual_local
-                    src_slice = gather_view[src_offset : src_offset + actual_local]
-                    local_view = self._get_local_view(actual_local, grad_data.dtype)
+                    src_offset_bytes = peer * local_bytes
+                    src_view = self._gather_symm_buf[src_offset_bytes:src_offset_bytes + local_bytes]
+                    dst_view = self._local_symm_buf[:local_bytes]
                     nvshmem.core.put(
-                        local_view,   # dest on remote PE (symmetric)
-                        src_slice,    # source (symmetric)
-                        peer_pe,      # dest PE = global rank
-                        stream=self._nvshmem_stream,
+                        dst_view, src_view, peer_pe, stream=self._nvshmem_stream,
                     )
+                nvshmem.core.quiet(stream=self._nvshmem_stream)
+                torch_nvshmem_stream.synchronize()
 
-            nvshmem.core.quiet(stream=self._nvshmem_stream)
-            nvshmem.core.barrier_all(stream=self._nvshmem_stream)
-            torch_nvshmem_stream.synchronize()
+            # NCCL barrier: all peers wait for scatter to complete.
+            torch.distributed.barrier(group=self.ep_group)
 
-            local_view = self._get_local_view(actual_local, grad_data.dtype)
-            local_slice.copy_(local_view)
+            # Copy from symmetric buffer to grad_data.
+            logger.info(f"[nvshmem] rank {_grank}: chunk {i} stage 3 done")
+            recv_view = self._local_symm_buf[:local_bytes].view(grad_data.dtype)
+            local_slice.copy_(recv_view)
 
         if num_actual > 0:
             torch.cuda.synchronize()

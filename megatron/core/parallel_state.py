@@ -1961,6 +1961,29 @@ def initialize_heterogeneous_model_parallel(
                 torch.distributed.get_global_rank(_EXPERT_MODEL_PARALLEL_GROUP, i)
             )
         _HETEROGENEOUS_EP_CONFIG['ep_peer_pes'] = _ep_peer_pes
+
+        # Pre-allocate NVSHMEM symmetric buffers (collective — all PEs must call).
+        _max_ep = max(k * tp * cp // etp for k in num_tp_cp_per_replica)
+        # Signal buffers for put_signal/signal_wait (one per ep peer + one for scatter).
+        _gather_signals = [_nvshmem_core.buffer(8) for _ in range(_max_ep)]
+        _scatter_signal = _nvshmem_core.buffer(8)
+        # Data buffers: gather (ep_size * local_expert_params) and local (local_expert_params).
+        # Size generously at 256MB each; will be sliced at runtime.
+        _symm_data_size = 256 * 1024 * 1024  # 256MB in bytes
+        _gather_symm_buf = _nvshmem_core.interop.torch.bytetensor(
+            (_symm_data_size,), dtype=torch.uint8
+        )
+        _local_symm_buf = _nvshmem_core.interop.torch.bytetensor(
+            (_symm_data_size,), dtype=torch.uint8
+        )
+        _gather_symm_buf.zero_()
+        _local_symm_buf.zero_()
+        torch.cuda.synchronize()
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_gather_signals'] = _gather_signals
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_scatter_signal'] = _scatter_signal
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_gather_symm_buf'] = _gather_symm_buf
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_local_symm_buf'] = _local_symm_buf
+
         logger.info(
                         f"NVSHMEM initialized (world_size={world_size})")
     except (ImportError, RuntimeError) as e:
