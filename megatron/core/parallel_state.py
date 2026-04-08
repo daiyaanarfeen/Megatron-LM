@@ -1568,6 +1568,50 @@ def initialize_heterogeneous_model_parallel(
         f"sum(num_tp_cp_per_replica) * tp * cp must equal world_size."
     )
 
+    # ── Initialize NVSHMEM early, BEFORE creating NCCL groups ──
+    # NVSHMEM + NCCL coexist better when NVSHMEM inits first (fewer resource conflicts).
+    _nvshmem_ok = False
+    _nvshmem_stream = None
+    _nvshmem_dev = None
+    try:
+        import nvshmem.core as _nvshmem_core
+        from megatron.core.resharding.nvshmem_copy_service.compat import (
+            ensure_nvshmem_compat,
+            get_cuda_core_device_class,
+        )
+        ensure_nvshmem_compat()
+
+        _init_st = _nvshmem_core.init_status()
+        if _init_st != _nvshmem_core.InitStatus.STATUS_IS_INITIALIZED:
+            _nvshmem_uid = _nvshmem_core.get_unique_id(empty=True)
+            if rank == 0:
+                _nvshmem_uid = _nvshmem_core.get_unique_id()
+            _uid_list = [_nvshmem_uid]
+            torch.distributed.broadcast_object_list(_uid_list, src=0)
+
+            _Device = get_cuda_core_device_class()
+            _nvshmem_dev = _Device(rank % torch.cuda.device_count())
+            _nvshmem_dev.set_current()
+            _nvshmem_core.init(
+                device=_nvshmem_dev, uid=_uid_list[0],
+                rank=rank, nranks=world_size, initializer_method="uid",
+            )
+        else:
+            _Device = get_cuda_core_device_class()
+            _nvshmem_dev = _Device(rank % torch.cuda.device_count())
+            _nvshmem_dev.set_current()
+
+        _nvshmem_stream = _nvshmem_dev.create_stream()
+        _nvshmem_ok = True
+        logger.info(f"NVSHMEM initialized early (PE={rank}, nPEs={world_size})")
+    except ImportError:
+        pass  # nvshmem4py not installed
+    except Exception as e:
+        import traceback
+        logger.warning(f"NVSHMEM early init failed: {e}")
+        logger.warning(traceback.format_exc())
+        _nvshmem_ok = False
+
     # Validate that num_moe_experts is divisible by every replica's ep_i.
     if num_moe_experts is not None:
         tp_cp = tp * cp
@@ -1927,64 +1971,33 @@ def initialize_heterogeneous_model_parallel(
         'is_edp_eligible': is_edp_eligible,
     }
 
-    # ── Initialize NVSHMEM (world-scoped) for Approach B ──
-    # Must be called collectively by ALL ranks at the same point.
-    try:
+    # ── Allocate NVSHMEM symmetric buffers (after NCCL groups, using ep info) ──
+    if _nvshmem_ok:
         import nvshmem.core as _nvshmem_core
-        from megatron.core.resharding.nvshmem_copy_service.compat import (
-            ensure_nvshmem_compat,
-            get_cuda_core_device_class,
-        )
-        ensure_nvshmem_compat()
-
-        # Guard against re-init (e.g., test retries calling this function again).
-        if _nvshmem_core.init_status() != _nvshmem_core.InitStatus.INITIALIZED:
-            _nvshmem_uid = _nvshmem_core.get_unique_id(empty=True)
-            if rank == 0:
-                _nvshmem_uid = _nvshmem_core.get_unique_id()
-            _uid_list = [_nvshmem_uid]
-            torch.distributed.broadcast_object_list(_uid_list, src=0)
-
-            _Device = get_cuda_core_device_class()
-            _local_rank = rank % torch.cuda.device_count()
-            _dev = _Device(_local_rank)
-            _dev.set_current()
-            _nvshmem_core.init(
-                device=_dev, uid=_uid_list[0],
-                rank=rank, nranks=world_size, initializer_method="uid",
-            )
-
-        _nvshmem_stream = _nvshmem_core.NvshmemStream()
-        _HETEROGENEOUS_EP_CONFIG['nvshmem_initialized'] = True
-        _HETEROGENEOUS_EP_CONFIG['nvshmem_stream'] = _nvshmem_stream
-
-        # Build ep_rank → global PE mapping.
-        _ep_peer_pes = []
-        for i in range(local_ep_size):
-            _ep_peer_pes.append(
-                torch.distributed.get_global_rank(_EXPERT_MODEL_PARALLEL_GROUP, i)
-            )
-        _HETEROGENEOUS_EP_CONFIG['ep_peer_pes'] = _ep_peer_pes
-
-        # Pre-allocate NVSHMEM symmetric data buffers (collective — all PEs call).
-        # 256MB each; sliced at runtime for actual expert grad sizes.
-        _symm_data_size = 256 * 1024 * 1024
-        _gather_symm_buf = _nvshmem_core.interop.torch.bytetensor(
-            (_symm_data_size,), dtype=torch.uint8
-        )
+        _ep_peer_pes = [
+            torch.distributed.get_global_rank(_EXPERT_MODEL_PARALLEL_GROUP, i)
+            for i in range(local_ep_size)
+        ]
+        _max_ep = max(k * tp * cp // etp for k in num_tp_cp_per_replica)
+        _slot_size = 64 * 1024 * 1024  # 64MB per slot
+        _gather_slots = []
+        for _ in range(_max_ep):
+            _buf = _nvshmem_core.interop.torch.bytetensor((_slot_size,), dtype=torch.uint8)
+            _buf.zero_()
+            _gather_slots.append(_buf)
         _local_symm_buf = _nvshmem_core.interop.torch.bytetensor(
-            (_symm_data_size,), dtype=torch.uint8
-        )
-        _gather_symm_buf.zero_()
+            (_slot_size,), dtype=torch.uint8)
         _local_symm_buf.zero_()
         torch.cuda.synchronize()
-        _HETEROGENEOUS_EP_CONFIG['nvshmem_gather_symm_buf'] = _gather_symm_buf
-        _HETEROGENEOUS_EP_CONFIG['nvshmem_local_symm_buf'] = _local_symm_buf
 
-        logger.info(f"NVSHMEM initialized (world_size={world_size})")
-    except (ImportError, RuntimeError) as e:
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_initialized'] = True
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_stream'] = _nvshmem_stream
+        _HETEROGENEOUS_EP_CONFIG['ep_peer_pes'] = _ep_peer_pes
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_gather_slots'] = _gather_slots
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_local_symm_buf'] = _local_symm_buf
+        logger.info(f"NVSHMEM buffers allocated ({_max_ep} gather slots + 1 local)")
+    else:
         _HETEROGENEOUS_EP_CONFIG['nvshmem_initialized'] = False
-        logger.info(f"NVSHMEM not available ({e}), Approach B will use NCCL fallback")
 
     # Initialize global memory buffer.
     _set_global_memory_buffer()
