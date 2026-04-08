@@ -1,14 +1,10 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-"""Fused intra-bucket pipelined reshard collective for heterogeneous EP.
+"""NVSHMEM-based pipelined reshard collective for heterogeneous EP.
 
-Approach B: uses NVSHMEM P2P put for gather/scatter stages (NVLink),
-NCCL allreduce for cross-replica reduction. NVSHMEM is world-scoped
-(PE = global rank), initialized in parallel_state.py.
-
-Stages 1 and 3 use nvshmem.core.rma.put() with sliced symmetric tensors
-for offset-based transfers. Sync between stages uses NCCL barrier on the
-ep group (no NVSHMEM collectives, avoiding cross-library deadlocks).
+Uses NVSHMEM P2P put for gather/scatter (NVLink), NCCL allreduce for
+cross-replica reduction. All ranks put concurrently to ep_rank=0's
+symmetric gather slots. No NVSHMEM collectives — only put + quiet.
 """
 
 import logging
@@ -19,7 +15,6 @@ import torch.distributed
 
 try:
     import nvshmem.core
-
     HAVE_NVSHMEM = True
 except ImportError:
     HAVE_NVSHMEM = False
@@ -28,17 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 class PipelinedReshardCollective:
-    """NVSHMEM-based gather → allreduce → scatter for heterogeneous EP.
-
-    Args:
-        ep_group: Expert model parallel process group (intra-replica).
-        edp_group: Expert data parallel process group (cross-replica).
-        local_ep_size: Number of EP ranks in this replica.
-        ep_rank: This rank's position within the ep group.
-        is_edp_eligible: Whether this rank participates in cross-replica allreduce.
-        num_chunks: Number of pipeline chunks (K).
-        reduce_op: Reduction operation for the edp allreduce.
-    """
+    """NVSHMEM gather → NCCL allreduce → NVSHMEM scatter."""
 
     def __init__(self, ep_group, edp_group, local_ep_size, ep_rank,
                  is_edp_eligible, num_chunks=4, reduce_op=None):
@@ -49,10 +34,8 @@ class PipelinedReshardCollective:
         self.is_edp_eligible = is_edp_eligible
         self.num_chunks = num_chunks
         self.reduce_op = reduce_op or torch.distributed.ReduceOp.SUM
-
         self.allreduce_stream = torch.cuda.Stream(device=torch.cuda.current_device())
 
-        # NVSHMEM state — set by set_nvshmem_state().
         self._use_nvshmem = False
         self._nvshmem_stream = None
         self._ep_peer_pes = None
@@ -60,110 +43,95 @@ class PipelinedReshardCollective:
         self._local_symm_buf = None
 
     def set_nvshmem_state(self, het_ep_config: dict):
-        """Adopt pre-initialized NVSHMEM state from het EP config."""
         if self.local_ep_size <= 1:
-            return  # ep=1 uses execute_ep1, no NVSHMEM needed.
+            return
         if not het_ep_config.get('nvshmem_initialized', False):
             raise RuntimeError(
-                "PipelinedReshardCollective requires NVSHMEM but initialization failed. "
-                "Check that nvshmem4py-cu12 and nvidia-nvshmem-cu12 are installed, "
-                "libnvshmem_host.so.3 is on LD_LIBRARY_PATH, and nodes are in the "
-                "same NVL domain."
+                "PipelinedReshardCollective requires NVSHMEM but initialization failed."
             )
         self._use_nvshmem = True
         self._nvshmem_stream = het_ep_config['nvshmem_stream']
         self._ep_peer_pes = het_ep_config['ep_peer_pes']
         self._gather_slots = het_ep_config['nvshmem_gather_slots']
         self._local_symm_buf = het_ep_config['nvshmem_local_symm_buf']
-        logger.info(
-            f"PipelinedReshardCollective: NVSHMEM active "
-            f"(ep_rank={self.ep_rank}, ep_size={self.local_ep_size}, "
-            f"ep_peer_pes={self._ep_peer_pes})"
-        )
 
     def execute(self, grad_data: torch.Tensor, gather_buffer: Optional[torch.Tensor]):
-        """Run gather → allreduce → scatter for ranks with ep > 1."""
         if not self._use_nvshmem:
+            raise RuntimeError("NVSHMEM not initialized for PipelinedReshardCollective")
+
+        L = grad_data.numel()
+        elem = grad_data.element_size()
+        nbytes = L * elem
+        ep0_pe = self._ep_peer_pes[0]
+
+        # PyTorch stream wrapper for NVSHMEM stream (for event sync).
+        _, sp = self._nvshmem_stream.__cuda_stream__()
+        nv_torch = torch.cuda.ExternalStream(sp)
+
+        # Verify slot buffers are large enough.
+        if nbytes > self._local_symm_buf.numel():
             raise RuntimeError(
-                "PipelinedReshardCollective requires NVSHMEM but it is not initialized. "
-                "Ensure nvshmem4py-cu12 and nvidia-nvshmem-cu12 are installed, "
-                "libnvshmem_host.so.3 is on LD_LIBRARY_PATH, and all nodes are "
-                "in the same NVL domain (--segment=N in sbatch)."
+                f"NVSHMEM slot buffer too small: need {nbytes} bytes, "
+                f"have {self._local_symm_buf.numel()}. Increase slot_size in parallel_state.py"
             )
 
-        L_local = grad_data.numel()
-        elem_size = grad_data.element_size()
-        local_bytes = L_local * elem_size
-        total_bytes = local_bytes * self.local_ep_size
-        ep_rank0_pe = self._ep_peer_pes[0]
-
-        # Get NVSHMEM stream as PyTorch ExternalStream for event sync.
-        _, stream_ptr = self._nvshmem_stream.__cuda_stream__()
-        nvshmem_torch_stream = torch.cuda.ExternalStream(stream_ptr)
-        default_stream = torch.cuda.current_stream()
-
-        # ── Stage 1: Gather via NVSHMEM put ──
-        # Each rank puts its grads into ep_rank=0's gather_slot[ep_rank].
-        # Each slot is a separate NVSHMEM allocation — no slicing needed.
-        # Copy local grads into _local_symm_buf (NVSHMEM src).
-        self._local_symm_buf[:local_bytes].view(grad_data.dtype).copy_(grad_data)
-        torch.cuda.synchronize()
-
-        # Put _local_symm_buf → ep_rank=0's gather_slot[my_ep_rank].
+        # ── Stage 1: Gather — all ranks put to ep_rank=0 concurrently ──
+        self._local_symm_buf[:nbytes].view(grad_data.dtype).copy_(grad_data)
         my_slot = self._gather_slots[self.ep_rank]
-        nvshmem.core.put(my_slot, self._local_symm_buf, ep_rank0_pe,
-                         stream=self._nvshmem_stream)
+        nvshmem.core.put(my_slot[:nbytes], self._local_symm_buf[:nbytes],
+                         ep0_pe, stream=self._nvshmem_stream)
         nvshmem.core.quiet(stream=self._nvshmem_stream)
-        nvshmem_torch_stream.synchronize()
-
-        # Sync: all puts complete before ep_rank=0 reads.
+        # Event-based sync: nvshmem stream → default stream.
+        gather_event = torch.cuda.Event()
+        gather_event.record(nv_torch)
+        torch.cuda.current_stream().wait_event(gather_event)
+        # Single barrier: all puts delivered, PE 0 can read slots.
         torch.distributed.barrier(group=self.ep_group)
 
-        # ep_rank=0: copy from gather_slots to regular gather_buffer.
+        # PE 0: assemble from slots into gather_buffer.
         if self.ep_rank == 0:
             for peer in range(self.local_ep_size):
-                slot = self._gather_slots[peer]
-                gather_buffer[peer * L_local : (peer + 1) * L_local].copy_(
-                    slot[:local_bytes].view(grad_data.dtype)
+                gather_buffer[peer * L:(peer + 1) * L].copy_(
+                    self._gather_slots[peer][:nbytes].view(grad_data.dtype)
                 )
 
-        # ── Stage 2: Allreduce on edp group (NCCL only) ──
-        allreduce_event = torch.cuda.Event()
+        # ── Stage 2: Allreduce (NCCL, separate stream) ──
+        ar_event = torch.cuda.Event()
         with torch.cuda.stream(self.allreduce_stream):
             if self.is_edp_eligible:
-                ar_buf = gather_buffer[:L_local * self.local_ep_size]
-                torch.distributed.all_reduce(ar_buf, op=self.reduce_op, group=self.edp_group)
+                torch.distributed.all_reduce(
+                    gather_buffer[:L * self.local_ep_size],
+                    op=self.reduce_op, group=self.edp_group)
             else:
                 torch.distributed.all_reduce(
-                    grad_data, op=self.reduce_op, group=self.edp_group
-                )
-        allreduce_event.record(self.allreduce_stream)
-        default_stream.wait_event(allreduce_event)
+                    grad_data, op=self.reduce_op, group=self.edp_group)
+        ar_event.record(self.allreduce_stream)
+        torch.cuda.current_stream().wait_event(ar_event)
 
-        # ── Stage 3: Scatter via NVSHMEM put ──
-        # ep_rank=0: copy each peer's synced grads into gather_slots, then
-        # put each slot to the peer's _local_symm_buf.
+        # ── Stage 3: Scatter — PE 0 puts to all peers concurrently ──
         if self.ep_rank == 0:
+            # Pack slots from gather_buffer.
             for peer in range(self.local_ep_size):
-                slot = self._gather_slots[peer]
-                slot[:local_bytes].view(grad_data.dtype).copy_(
-                    gather_buffer[peer * L_local : (peer + 1) * L_local]
+                self._gather_slots[peer][:nbytes].view(grad_data.dtype).copy_(
+                    gather_buffer[peer * L:(peer + 1) * L]
                 )
-            torch.cuda.synchronize()
+            torch.cuda.synchronize()  # ensure copies visible before put
+            # Batch puts to all peers.
             for peer in range(self.local_ep_size):
                 peer_pe = self._ep_peer_pes[peer]
-                nvshmem.core.put(self._local_symm_buf, self._gather_slots[peer],
-                                 peer_pe, stream=self._nvshmem_stream)
+                nvshmem.core.put(
+                    self._local_symm_buf[:nbytes], self._gather_slots[peer][:nbytes],
+                    peer_pe, stream=self._nvshmem_stream)
             nvshmem.core.quiet(stream=self._nvshmem_stream)
-            nvshmem_torch_stream.synchronize()
+            scatter_event = torch.cuda.Event()
+            scatter_event.record(nv_torch)
+            torch.cuda.current_stream().wait_event(scatter_event)
 
-        # Sync: all peers wait for scatter to complete.
+        # Single barrier: scatter complete, all peers can read.
         torch.distributed.barrier(group=self.ep_group)
 
-        # Copy received data from symm buf to grad_data.
-        grad_data.copy_(self._local_symm_buf[:local_bytes].view(grad_data.dtype))
+        # Copy from symmetric buffer to grad_data.
+        grad_data.copy_(self._local_symm_buf[:nbytes].view(grad_data.dtype))
 
     def execute_ep1(self, grad_data: torch.Tensor):
-        """Simple allreduce for ep=1 replicas."""
         torch.distributed.all_reduce(grad_data, op=self.reduce_op, group=self.edp_group)
-

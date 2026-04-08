@@ -1979,7 +1979,7 @@ def initialize_heterogeneous_model_parallel(
             for i in range(local_ep_size)
         ]
         _max_ep = max(k * tp * cp // etp for k in num_tp_cp_per_replica)
-        _slot_size = 64 * 1024 * 1024  # 64MB per slot
+        _slot_size = 64 * 1024 * 1024  # 64MB per slot (resized in execute if needed)
         _gather_slots = []
         for _ in range(_max_ep):
             _buf = _nvshmem_core.interop.torch.bytetensor((_slot_size,), dtype=torch.uint8)
