@@ -3,8 +3,8 @@
 """NVSHMEM-based pipelined reshard collective for heterogeneous EP.
 
 Uses NVSHMEM P2P put for gather/scatter (NVLink), NCCL allreduce for
-cross-replica reduction. All ranks put concurrently to ep_rank=0's
-symmetric gather slots. No NVSHMEM collectives — only put + quiet.
+cross-replica reduction. NVSHMEM team barriers for ep-group sync.
+No host-side synchronize() in the critical path — all sync via CUDA events.
 """
 
 import logging
@@ -41,6 +41,7 @@ class PipelinedReshardCollective:
         self._ep_peer_pes = None
         self._gather_slots = None
         self._local_symm_buf = None
+        self._ep_team = None
 
     def set_nvshmem_state(self, het_ep_config: dict):
         if self.local_ep_size <= 1:
@@ -54,6 +55,7 @@ class PipelinedReshardCollective:
         self._ep_peer_pes = het_ep_config['ep_peer_pes']
         self._gather_slots = het_ep_config['nvshmem_gather_slots']
         self._local_symm_buf = het_ep_config['nvshmem_local_symm_buf']
+        self._ep_team = het_ep_config['nvshmem_ep_team']
 
     def execute(self, grad_data: torch.Tensor, gather_buffer: Optional[torch.Tensor]):
         if not self._use_nvshmem:
@@ -64,39 +66,43 @@ class PipelinedReshardCollective:
         nbytes = L * elem
         ep0_pe = self._ep_peer_pes[0]
 
-        # PyTorch stream wrapper for NVSHMEM stream (for event sync).
-        _, sp = self._nvshmem_stream.__cuda_stream__()
-        nv_torch = torch.cuda.ExternalStream(sp)
-
-        # Verify slot buffers are large enough.
         if nbytes > self._local_symm_buf.numel():
             raise RuntimeError(
-                f"NVSHMEM slot buffer too small: need {nbytes} bytes, "
-                f"have {self._local_symm_buf.numel()}. Increase slot_size in parallel_state.py"
+                f"NVSHMEM slot too small: need {nbytes} bytes, have {self._local_symm_buf.numel()}"
             )
 
-        # ── Stage 1: Gather — all ranks put to ep_rank=0 concurrently ──
-        self._local_symm_buf[:nbytes].view(grad_data.dtype).copy_(grad_data)
-        my_slot = self._gather_slots[self.ep_rank]
-        nvshmem.core.put(my_slot[:nbytes], self._local_symm_buf[:nbytes],
-                         ep0_pe, stream=self._nvshmem_stream)
-        nvshmem.core.quiet(stream=self._nvshmem_stream)
-        # Event-based sync: nvshmem stream → default stream.
-        gather_event = torch.cuda.Event()
-        gather_event.record(nv_torch)
-        torch.cuda.current_stream().wait_event(gather_event)
-        # Single barrier: all puts delivered, PE 0 can read slots.
-        torch.distributed.barrier(group=self.ep_group)
+        _, sp = self._nvshmem_stream.__cuda_stream__()
+        nv_torch = torch.cuda.ExternalStream(sp)
+        default = torch.cuda.current_stream()
 
-        # PE 0: assemble from slots into gather_buffer.
+        # ── Stage 1: Gather ──
+        # Copy grad_data → local_symm_buf (on default stream).
+        self._local_symm_buf[:nbytes].view(grad_data.dtype).copy_(grad_data)
+        # Make nvshmem stream wait for the copy.
+        copy_ev = torch.cuda.Event()
+        copy_ev.record(default)
+        nv_torch.wait_event(copy_ev)
+        # All ranks put concurrently to ep_rank=0's gather slots.
+        nvshmem.core.put(
+            self._gather_slots[self.ep_rank][:nbytes],
+            self._local_symm_buf[:nbytes],
+            ep0_pe, stream=self._nvshmem_stream)
+        nvshmem.core.quiet(stream=self._nvshmem_stream)
+        # Team barrier: all ep peers' puts complete and visible.
+        nvshmem.core.collective.barrier(team=self._ep_team, stream=self._nvshmem_stream)
+        # Default stream waits for barrier completion (no host sync).
+        barrier1_ev = torch.cuda.Event()
+        barrier1_ev.record(nv_torch)
+        default.wait_event(barrier1_ev)
+
+        # PE 0: copy from gather slots to regular gather_buffer (on default stream).
         if self.ep_rank == 0:
             for peer in range(self.local_ep_size):
                 gather_buffer[peer * L:(peer + 1) * L].copy_(
-                    self._gather_slots[peer][:nbytes].view(grad_data.dtype)
-                )
+                    self._gather_slots[peer][:nbytes].view(grad_data.dtype))
 
-        # ── Stage 2: Allreduce (NCCL, separate stream) ──
-        ar_event = torch.cuda.Event()
+        # ── Stage 2: Allreduce (NCCL) ──
+        ar_ev = torch.cuda.Event()
         with torch.cuda.stream(self.allreduce_stream):
             if self.is_edp_eligible:
                 torch.distributed.all_reduce(
@@ -105,32 +111,34 @@ class PipelinedReshardCollective:
             else:
                 torch.distributed.all_reduce(
                     grad_data, op=self.reduce_op, group=self.edp_group)
-        ar_event.record(self.allreduce_stream)
-        torch.cuda.current_stream().wait_event(ar_event)
+        ar_ev.record(self.allreduce_stream)
+        default.wait_event(ar_ev)
 
-        # ── Stage 3: Scatter — PE 0 puts to all peers concurrently ──
+        # ── Stage 3: Scatter ──
         if self.ep_rank == 0:
-            # Pack slots from gather_buffer.
+            # Copy from gather_buffer to gather slots (on default stream).
             for peer in range(self.local_ep_size):
                 self._gather_slots[peer][:nbytes].view(grad_data.dtype).copy_(
-                    gather_buffer[peer * L:(peer + 1) * L]
-                )
-            torch.cuda.synchronize()  # ensure copies visible before put
+                    gather_buffer[peer * L:(peer + 1) * L])
+            # Make nvshmem stream wait for the copies.
+            pack_ev = torch.cuda.Event()
+            pack_ev.record(default)
+            nv_torch.wait_event(pack_ev)
             # Batch puts to all peers.
             for peer in range(self.local_ep_size):
-                peer_pe = self._ep_peer_pes[peer]
                 nvshmem.core.put(
-                    self._local_symm_buf[:nbytes], self._gather_slots[peer][:nbytes],
-                    peer_pe, stream=self._nvshmem_stream)
+                    self._local_symm_buf[:nbytes],
+                    self._gather_slots[peer][:nbytes],
+                    self._ep_peer_pes[peer], stream=self._nvshmem_stream)
             nvshmem.core.quiet(stream=self._nvshmem_stream)
-            scatter_event = torch.cuda.Event()
-            scatter_event.record(nv_torch)
-            torch.cuda.current_stream().wait_event(scatter_event)
 
-        # Single barrier: scatter complete, all peers can read.
-        torch.distributed.barrier(group=self.ep_group)
+        # Team barrier: scatter complete.
+        nvshmem.core.collective.barrier(team=self._ep_team, stream=self._nvshmem_stream)
+        barrier2_ev = torch.cuda.Event()
+        barrier2_ev.record(nv_torch)
+        default.wait_event(barrier2_ev)
 
-        # Copy from symmetric buffer to grad_data.
+        # Copy from symmetric buffer to grad_data (on default stream).
         grad_data.copy_(self._local_symm_buf[:nbytes].view(grad_data.dtype))
 
     def execute_ep1(self, grad_data: torch.Tensor):

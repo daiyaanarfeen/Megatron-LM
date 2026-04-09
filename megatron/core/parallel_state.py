@@ -1525,6 +1525,8 @@ def initialize_heterogeneous_model_parallel(
     num_tp_cp_per_replica: List[int],
     expert_tensor_parallel_size: Optional[int] = None,
     num_moe_experts: Optional[int] = None,
+    hidden_size: Optional[int] = None,
+    ffn_hidden_size: Optional[int] = None,
     nccl_communicator_config_path: Optional[str] = None,
     distributed_timeout_minutes: int = 30,
     create_gloo_process_groups: bool = True,
@@ -1979,7 +1981,22 @@ def initialize_heterogeneous_model_parallel(
             for i in range(local_ep_size)
         ]
         _max_ep = max(k * tp * cp // etp for k in num_tp_cp_per_replica)
-        _slot_size = 64 * 1024 * 1024  # 64MB per slot (resized in execute if needed)
+        # Compute slot size from model config. Each slot holds one ep rank's
+        # expert grads: num_local_experts * (fc1 + fc2 weights) / etp.
+        # Use 2x headroom for safety. Fallback to 256MB if config not provided.
+        _ffn = ffn_hidden_size or (4 * hidden_size if hidden_size else None)
+        if hidden_size and _ffn and num_moe_experts:
+            _min_ep = min(k * tp * cp // etp for k in num_tp_cp_per_replica)
+            _experts_per_rank = num_moe_experts // _min_ep
+            # fc1: hidden_size * ffn_hidden_size / etp, fc2: same. Plus router.
+            _params_per_expert = 2 * hidden_size * _ffn // etp
+            _params_per_rank = _experts_per_rank * _params_per_expert + hidden_size * num_moe_experts
+            _slot_size = _params_per_rank * 4  # float32, exact fit
+            _slot_size = max(_slot_size, 1024 * 1024)  # at least 1MB
+            logger.info(f"NVSHMEM slot size: {_slot_size / 1024 / 1024:.1f}MB "
+                        f"({_experts_per_rank} experts/rank, {_params_per_rank} params)")
+        else:
+            _slot_size = 256 * 1024 * 1024  # 256MB fallback
         _gather_slots = []
         for _ in range(_max_ep):
             _buf = _nvshmem_core.interop.torch.bytetensor((_slot_size,), dtype=torch.uint8)
@@ -1989,6 +2006,20 @@ def initialize_heterogeneous_model_parallel(
             (_slot_size,), dtype=torch.uint8)
         _local_symm_buf.zero_()
         torch.cuda.synchronize()
+
+        # Create NVSHMEM team for the ep group (for team-scoped barriers).
+        # EP groups are strided: PEs at [start, start+etp, start+2*etp, ...].
+        _ep_team = _nvshmem_core.team_split_strided(
+            _nvshmem_core.Teams.TEAM_WORLD,
+            _ep_peer_pes[0],  # start PE
+            etp,              # stride
+            local_ep_size,    # size
+            _nvshmem_core.TeamConfig(),  # default config
+            0,                # config_mask (no fields set)
+        )
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_ep_team'] = _ep_team
+        logger.info(f"NVSHMEM ep team created (start={_ep_peer_pes[0]}, "
+                    f"stride={etp}, size={local_ep_size})")
 
         _HETEROGENEOUS_EP_CONFIG['nvshmem_initialized'] = True
         _HETEROGENEOUS_EP_CONFIG['nvshmem_stream'] = _nvshmem_stream

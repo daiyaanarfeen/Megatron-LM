@@ -98,6 +98,7 @@ def _setup_heterogeneous(topo):
         num_tp_cp_per_replica=topo['k'],
         expert_tensor_parallel_size=topo['etp'],
         num_moe_experts=topo['num_moe_experts'],
+        hidden_size=16,  # matches HeterogeneousMoEModel default
     )
 
 
