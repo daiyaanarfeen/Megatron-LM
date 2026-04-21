@@ -259,10 +259,14 @@ class _ParamAndGradBucketGroup:
         self._het_ep_config = config
         self._pipelined_collectives = None
 
-        if config['local_ep_size'] > 1 and config['is_edp_eligible']:
-            # Edp-eligible rank with ep>1 needs gather buffers to hold all ep
-            # peers' grads (ep_size * local_bucket_size). This applies to both
-            # min-ep and reshard replicas when min_ep > 1.
+        # Determine who needs gather buffers:
+        # Approach A: is_edp_eligible (ep_rank < min_ep), gathers from all ep peers.
+        # Approach B: is_b_leader (ep_rank % ratio == 0), gathers from sub-group.
+        should_alloc_gather = (
+            config.get('is_b_leader', config['is_edp_eligible'])
+            if use_pipelined else config['is_edp_eligible']
+        )
+        if config['local_ep_size'] > 1 and should_alloc_gather:
             self._gather_buffers = []
             for bucket in self.buckets:
                 gather_buf = torch.zeros(
@@ -591,13 +595,14 @@ class _ParamAndGradBucketGroup:
         needs_reshard = cfg['needs_reshard']
         is_edp_eligible = cfg['is_edp_eligible']
 
-        # Approach B: fused intra-bucket pipeline.
+        # Approach B: fused intra-bucket pipeline (multi-leader).
         if self._pipelined_collectives is not None:
+            is_b_leader = cfg.get('is_b_leader', is_edp_eligible)
             for idx, bucket in enumerate(self.buckets):
                 if local_ep_size == 1:
                     self._pipelined_collectives.execute_ep1(bucket.grad_data)
                 else:
-                    gather_buf = self._gather_buffers[idx] if is_edp_eligible else None
+                    gather_buf = self._gather_buffers[idx] if is_b_leader else None
                     self._pipelined_collectives.execute(bucket.grad_data, gather_buf)
             return
 

@@ -1957,9 +1957,15 @@ def initialize_heterogeneous_model_parallel(
     assert local_ep_size is not None, f"Rank {rank} not found in any replica"
     min_ep_size = min_k * tp * cp // etp
     ep_rank = _EXPERT_MODEL_PARALLEL_GROUP.rank()
-    # edp-eligible: only the first min_ep ranks per etp position participate in allreduce.
-    # For min-ep replicas (local_ep == min_ep), all ranks are eligible.
-    # For reshard replicas (local_ep > min_ep), only ep_rank < min_ep_size are eligible.
+    # Multi-leader sub-group mapping for Approach B.
+    # ratio = sub-group size per leader. Leaders at ep_rank {0, ratio, 2*ratio, ...}.
+    ratio = local_ep_size // min_ep_size if min_ep_size > 0 else 1
+    is_b_leader = (ep_rank % ratio == 0) if ratio > 0 else (ep_rank == 0)
+    my_leader_idx = ep_rank // ratio if ratio > 0 else 0
+    my_sub_rank = ep_rank % ratio if ratio > 0 else 0
+    # Approach A uses ep_rank < min_ep_size for eligibility.
+    # Approach B uses leaders at ep_rank % ratio == 0.
+    # is_edp_eligible covers Approach A; is_b_leader covers Approach B.
     is_edp_eligible = ep_rank < min_ep_size
     _HETEROGENEOUS_EP_CONFIG = {
         'needs_reshard': local_ep_size > min_ep_size,
@@ -1971,9 +1977,13 @@ def initialize_heterogeneous_model_parallel(
         'edp_group': _EXPERT_DATA_PARALLEL_GROUP,
         'ep_rank': ep_rank,
         'is_edp_eligible': is_edp_eligible,
+        'ratio': ratio,
+        'is_b_leader': is_b_leader,
+        'my_leader_idx': my_leader_idx,
+        'my_sub_rank': my_sub_rank,
     }
 
-    # ── Allocate NVSHMEM symmetric buffers (after NCCL groups, using ep info) ──
+    # ── Allocate NVSHMEM symmetric buffers + Approach B edp groups ──
     if _nvshmem_ok:
         import nvshmem.core as _nvshmem_core
         _ep_peer_pes = [
@@ -1981,52 +1991,125 @@ def initialize_heterogeneous_model_parallel(
             for i in range(local_ep_size)
         ]
         _max_ep = max(k * tp * cp // etp for k in num_tp_cp_per_replica)
-        # Compute slot size from model config. Each slot holds one ep rank's
-        # expert grads: num_local_experts * (fc1 + fc2 weights) / etp.
-        # Use 2x headroom for safety. Fallback to 256MB if config not provided.
-        _ffn = ffn_hidden_size or (4 * hidden_size if hidden_size else None)
-        if hidden_size and _ffn and num_moe_experts:
-            _min_ep = min(k * tp * cp // etp for k in num_tp_cp_per_replica)
-            _experts_per_rank = num_moe_experts // _min_ep
-            # fc1: hidden_size * ffn_hidden_size / etp, fc2: same. Plus router.
-            _params_per_expert = 2 * hidden_size * _ffn // etp
-            _params_per_rank = _experts_per_rank * _params_per_expert + hidden_size * num_moe_experts
-            _slot_size = _params_per_rank * 4  # float32, exact fit
-            _slot_size = max(_slot_size, 1024 * 1024)  # at least 1MB
-            logger.info(f"NVSHMEM slot size: {_slot_size / 1024 / 1024:.1f}MB "
-                        f"({_experts_per_rank} experts/rank, {_params_per_rank} params)")
-        else:
-            _slot_size = 256 * 1024 * 1024  # 256MB fallback
-        _gather_slots = []
-        for _ in range(_max_ep):
-            _buf = _nvshmem_core.interop.torch.bytetensor((_slot_size,), dtype=torch.uint8)
-            _buf.zero_()
-            _gather_slots.append(_buf)
-        _local_symm_buf = _nvshmem_core.interop.torch.bytetensor(
-            (_slot_size,), dtype=torch.uint8)
-        _local_symm_buf.zero_()
-        torch.cuda.synchronize()
 
-        # Create NVSHMEM team for the ep group (for team-scoped barriers).
-        # EP groups are strided: PEs at [start, start+etp, start+2*etp, ...].
-        _ep_team = _nvshmem_core.team_split_strided(
-            _nvshmem_core.Teams.TEAM_WORLD,
-            _ep_peer_pes[0],  # start PE
-            etp,              # stride
-            local_ep_size,    # size
-            _nvshmem_core.TeamConfig(),  # default config
-            0,                # config_mask (no fields set)
-        )
-        _HETEROGENEOUS_EP_CONFIG['nvshmem_ep_team'] = _ep_team
-        logger.info(f"NVSHMEM ep team created (start={_ep_peer_pes[0]}, "
-                    f"stride={etp}, size={local_ep_size})")
+        # Chunk size for pipeline slots. Larger slots → fewer chunks K → fewer
+        # NCCL allreduce launches → better throughput at large buffer sizes.
+        # Trade-off: larger slots consume more NVSHMEM symmetric heap.
+        # Default 32MB; override via MEGATRON_NVSHMEM_SLOT_MB env var.
+        _slot_mb = int(os.environ.get('MEGATRON_NVSHMEM_SLOT_MB', '32'))
+        _chunk_size = _slot_mb * 1024 * 1024
+        # Double-buffered gather_slots: [parity][sub_rank] for pipeline handshake.
+        # Non-leader: wait(EMPTY) → put → set(FULL).
+        # Leader: wait(FULL) → assemble → set(EMPTY).
+        _gather_slots = [[], []]
+        for p in range(2):
+            for _ in range(_max_ep):
+                _buf = _nvshmem_core.interop.torch.bytetensor(
+                    (_chunk_size,), dtype=torch.uint8)
+                _buf.zero_()
+                _gather_slots[p].append(_buf)
+        # Double-buffered local_slots for scatter: leader puts to peers'
+        # local_slots[parity], peers copy out, then ack via scatter_states.
+        _local_slots = [
+            _nvshmem_core.interop.torch.bytetensor((_chunk_size,), dtype=torch.uint8),
+            _nvshmem_core.interop.torch.bytetensor((_chunk_size,), dtype=torch.uint8),
+        ]
+        _local_slots[0].zero_()
+        _local_slots[1].zero_()
+        # Signal buffers for inter-stage sync.
+        _gather_signals = [_nvshmem_core.buffer(8) for _ in range(_max_ep)]
+        _scatter_signal = _nvshmem_core.buffer(8)
+        # Epoch-based full/empty handshake signals (double-buffered by parity).
+        # gather_states[p]: coordinates gather_slot[p] reuse between non-leaders and leader.
+        # scatter_states[p]: coordinates local_slot[p] reuse between leader and non-leaders.
+        _gather_states = [_nvshmem_core.buffer(8), _nvshmem_core.buffer(8)]
+        _scatter_states = [_nvshmem_core.buffer(8), _nvshmem_core.buffer(8)]
+        # Ring allreduce buffers: exchange_buf receives one sub-chunk from
+        # the ring neighbor. exchange_signal for ring step signaling.
+        _num_replicas = len(num_tp_cp_per_replica)
+        _exchange_buf_size = _chunk_size // max(_num_replicas, 1)
+        # Double-buffered exchange: ping-pong between [0] and [1] per ring step
+        # to avoid data races (remote put for step s+1 arriving while local
+        # add_ for step s is still reading).
+        _exchange_bufs = [
+            _nvshmem_core.interop.torch.bytetensor((_exchange_buf_size,), dtype=torch.uint8),
+            _nvshmem_core.interop.torch.bytetensor((_exchange_buf_size,), dtype=torch.uint8),
+        ]
+        _exchange_bufs[0].zero_()
+        _exchange_bufs[1].zero_()
+        _exchange_signals = [_nvshmem_core.buffer(8), _nvshmem_core.buffer(8)]
+        # Zero ALL signal buffers via put-to-self (buffer objects don't have .zero_()).
+        _zero8 = _nvshmem_core.interop.torch.bytetensor((8,), dtype=torch.uint8)
+        _zero8.zero_()
+        _all_sigs = (_gather_signals + [_scatter_signal]
+                     + _exchange_signals + _gather_states + _scatter_states)
+        for _sig in _all_sigs:
+            _nvshmem_core.put(_sig, _zero8, rank, stream=_nvshmem_stream)
+        _nvshmem_core.quiet(stream=_nvshmem_stream)
+        torch.cuda.synchronize()
+        logger.info(f"NVSHMEM slots: 2x{_max_ep} gather + 1 local + 2 exchange "
+                    f"({_chunk_size / 1024 / 1024:.0f}MB/{_exchange_buf_size / 1024 / 1024:.1f}MB), "
+                    f"signals zeroed (incl gather_states)")
+
+        # Approach B edp groups: multi-leader. For each leader index l
+        # (0..min_ep-1) and each etp position, connect the leader across replicas.
+        # Leaders at ep_rank = l * ratio_r (where ratio_r is per-replica).
+        # Non-leader ranks get single-rank groups (no allreduce).
+        _b_edp_group = None
+        _b_edp_groups = []
+        for leader_idx in range(min_ep_size):
+            for etp_pos in range(etp):
+                group_ranks = []
+                for r in range(len(num_tp_cp_per_replica)):
+                    ep_r = num_tp_cp_per_replica[r] * tp * cp // etp
+                    ratio_r = ep_r // min_ep_size
+                    leader_ep_rank_r = leader_idx * ratio_r
+                    global_rank = (generator.replica_offsets[r]
+                                   + leader_ep_rank_r * etp + etp_pos)
+                    group_ranks.append(global_rank)
+                _b_edp_groups.append(group_ranks)
+        # Non-leader ranks get single-rank groups.
+        _b_covered = set()
+        for g in _b_edp_groups:
+            _b_covered.update(g)
+        _b_uncovered = sorted(set(range(world_size)) - _b_covered)
+        _b_all_groups = _b_edp_groups + [[r] for r in _b_uncovered]
+        for ranks_group in _b_all_groups:
+            group = create_group(
+                ranks_group,
+                timeout=timeout,
+                pg_options=get_nccl_options("b_edp", nccl_comm_cfgs),
+                group_desc="APPROACH_B_EDP_GROUP",
+            )
+            if rank in ranks_group:
+                _b_edp_group = group
+        logger.info(f"Approach B edp groups ({len(_b_edp_groups)}): {_b_edp_groups}")
+
+        # Store ring peer PEs for this rank's b_edp_group (for NVSHMEM ring allreduce).
+        # b_edp_peer_pes: ordered list of global ranks (= NVSHMEM PEs) in my group.
+        _b_edp_peer_pes = None
+        for g in _b_all_groups:
+            if rank in g:
+                _b_edp_peer_pes = list(g)
+                break
 
         _HETEROGENEOUS_EP_CONFIG['nvshmem_initialized'] = True
         _HETEROGENEOUS_EP_CONFIG['nvshmem_stream'] = _nvshmem_stream
         _HETEROGENEOUS_EP_CONFIG['ep_peer_pes'] = _ep_peer_pes
         _HETEROGENEOUS_EP_CONFIG['nvshmem_gather_slots'] = _gather_slots
-        _HETEROGENEOUS_EP_CONFIG['nvshmem_local_symm_buf'] = _local_symm_buf
-        logger.info(f"NVSHMEM buffers allocated ({_max_ep} gather slots + 1 local)")
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_local_slots'] = _local_slots
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_chunk_size'] = _chunk_size
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_edp_group'] = _b_edp_group
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_gather_signals'] = _gather_signals
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_scatter_signal'] = _scatter_signal
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_gather_states'] = _gather_states
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_scatter_states'] = _scatter_states
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_exchange_bufs'] = _exchange_bufs
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_exchange_signals'] = _exchange_signals
+        _HETEROGENEOUS_EP_CONFIG['b_edp_peer_pes'] = _b_edp_peer_pes
+        _HETEROGENEOUS_EP_CONFIG['max_ep_size'] = _max_ep
+        logger.info(f"NVSHMEM buffers allocated ({_max_ep} gather + 1 local + 1 exchange, "
+                    f"ring peers={_b_edp_peer_pes})")
     else:
         _HETEROGENEOUS_EP_CONFIG['nvshmem_initialized'] = False
 
