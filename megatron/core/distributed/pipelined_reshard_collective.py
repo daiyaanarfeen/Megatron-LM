@@ -200,15 +200,14 @@ class PipelinedReshardCollective:
                         ring_signal_base: Optional[int] = None):
         """Ring allreduce on data[0:n_elems] across ring peers via NVSHMEM.
 
-        Implements reduce-scatter (N-1 steps) then allgather (N-1 steps).
-        Each step: put one sub-chunk to next ring neighbor, wait for one from
-        prev neighbor, accumulate (reduce-scatter) or copy (allgather).
+        GPU-pipelined: no per-step quiet(). Uses double-buffered send staging
+        (local_slots[0] and [1]) and double-buffered exchange buffers with ack
+        signals. All operations enqueued on nv_stream without host blocking.
 
         Args:
             data: Buffer to allreduce in-place. Must have >= n_elems elements.
             n_elems: Number of elements to allreduce.
-            send_staging: Symmetric NVSHMEM buffer for staging puts. Must be
-                >= (n_elems // ring_size) * elem_size bytes.
+            send_staging: Ignored (kept for API compat). Ring uses local_slots.
             nv_torch: The NVSHMEM stream as a torch.cuda.ExternalStream.
             ring_signal_base: If provided, use this as starting signal counter
                 for the ring (overrides self._signal_base). All ring members
@@ -242,15 +241,16 @@ class PipelinedReshardCollective:
             sub_sizes.append(sz)
             off += sz
 
-        # Ping-pong buffer selection with ack-based reuse protection.
-        # Step s uses xbuf[s%2]. After reading from xbuf[parity], signal
-        # prev_pe that buffer is free (ack). Before putting to next_pe's
-        # xbuf[parity], wait for next_pe's ack. This prevents the N>2
-        # race where step s+2 overwrites xbuf[parity] before step s reads it.
+        # GPU-pipelined ring: no per-step quiet(). All operations enqueued
+        # on nv_stream without host blocking. signal_wait acts as GPU-side
+        # barrier. Double-buffered send_staging (local_slots[0] and [1])
+        # prevents consecutive steps from conflicting on the staging buffer.
+        # Double-buffered exchange_bufs with ack signals prevent remote puts
+        # from overwriting data before local reads complete.
         step = 0
         prev_pe = self._ring_prev_pe
-        # Ack counter: increments each time a parity's buffer is freed.
-        ack_count = [0, 0]  # per-parity ack counter
+        ack_count = [0, 0]
+        staging = [self._local_slots[0], self._local_slots[1]]
 
         def _ring_step(send_idx, recv_idx, accumulate):
             nonlocal step
@@ -266,10 +266,10 @@ class PipelinedReshardCollective:
             xsig = self._exchange_signals[parity]
             sig_val = self._signal_base
             self._signal_base += 1
+            sbuf = staging[step % 2]  # double-buffered staging
             step += 1
 
             # Wait for next_pe to ack that its xbuf[parity] is free.
-            # First use of each parity (ack_count=0): ack initialized to 0, passes.
             if self._exchange_acks[0] is not None:
                 nvshmem.core.signal_wait(
                     self._exchange_acks[parity],
@@ -277,18 +277,19 @@ class PipelinedReshardCollective:
                     nvshmem.core.ComparisonType.CMP_GE,
                     stream=self._nvshmem_stream)
 
-            # Copy + put + signal to next_pe.
+            # Copy to staging + put + signal (no quiet — GPU-pipelined).
             with torch.cuda.stream(nv_torch):
-                send_staging[:send_bytes].view(dtype)[:send_n].copy_(
+                sbuf[:send_bytes].view(dtype)[:send_n].copy_(
                     data[send_off:send_off + send_n])
             nvshmem.core.put(
-                xbuf[:send_bytes], send_staging[:send_bytes],
+                xbuf[:send_bytes], sbuf[:send_bytes],
                 next_pe, stream=self._nvshmem_stream)
             nvshmem.core.signal_op(
                 xsig, sig_val,
                 nvshmem.core.SignalOp.SIGNAL_SET,
                 next_pe, stream=self._nvshmem_stream)
-            nvshmem.core.quiet(stream=self._nvshmem_stream)
+            # No quiet() here — signal_wait on receiver guarantees visibility.
+            # Double-buffered staging prevents copy/put conflicts.
 
             # Wait for data from prev_pe.
             nvshmem.core.signal_wait(
@@ -326,6 +327,9 @@ class PipelinedReshardCollective:
             send_idx = (my_idx - s + 1) % N
             recv_idx = (my_idx - s) % N
             _ring_step(send_idx, recv_idx, accumulate=False)
+
+        # One quiet at the end to ensure all puts complete.
+        nvshmem.core.quiet(stream=self._nvshmem_stream)
 
         # Restore signal_base if we overrode it.
         if ring_signal_base is not None:
