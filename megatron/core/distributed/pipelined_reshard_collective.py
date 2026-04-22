@@ -346,25 +346,26 @@ class PipelinedReshardCollective:
 
     def _execute_interleaved(self, grad_data: torch.Tensor,
                               gather_buffer: Optional[torch.Tensor]):
-        """Per-expert gather/scatter for interleaved expert placement.
+        """Per-expert pipelined gather + ring + scatter.
 
-        Signal protocol: epoch-based. Each execute() call increments epoch.
-        Gather signal for follower f, route k: gather_signals[f] = epoch * MAX_ROUTES + k.
-        Scatter signal for follower f, route k: scatter_signal on f = epoch * MAX_ROUTES + k.
-        Both sides compute the same values from the static routing map.
-        Ring: uses its own signal_base (managed by _ring_allreduce).
+        All ring members (leaders across replicas) process experts in the
+        same order (0..experts_per_leader-1). For each expert:
+          - If locally held: data is already in place, ring proceeds.
+          - If offloaded: wait for that expert's gather signal, then ring.
+          - After ring: scatter offloaded experts back to followers.
+
+        Followers batch all gather puts upfront, then wait for scatter.
+        The gather of offloaded expert E overlaps with ring of expert E-1.
         """
         _, sp = self._nvshmem_stream.__cuda_stream__()
         nv_torch = torch.cuda.ExternalStream(sp)
 
         dtype = grad_data.dtype
         elem = grad_data.element_size()
-        min_ep = self._min_ep_size
         experts_per_leader = self._experts_per_leader
         local_experts = self._local_expert_indices
         experts_per_rank = len(local_experts)
-        params_per_expert = grad_data.numel() // experts_per_rank
-        P = params_per_expert
+        P = grad_data.numel() // experts_per_rank  # params per expert
         Pbytes = P * elem
 
         default_stream = torch.cuda.current_stream()
@@ -375,133 +376,109 @@ class PipelinedReshardCollective:
         self._signal_base += 1
         MAX_ROUTES = max(len(r) for r in self._expert_gather_map.values()) if self._expert_gather_map else 1
 
-        # Ring signal_base: must be identical across all ring members.
-        # Compute deterministically from epoch (not from gather signal increments).
-        # Reserve a separate range for ring signals.
-        ring_signal_base = epoch * 10000  # large offset to avoid collisions
+        # Per-expert ring signal bases: expert e uses ring_base + e * ring_steps.
+        ring_steps = 2 * (self._ring_size - 1) if self._ring_size > 1 else 0
+        ring_base = epoch * 100000  # large offset, each expert gets ring_steps signals
 
-        import os
-        _debug = os.environ.get('DEBUG_INTERLEAVED', '')
-        _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-        def _log(msg):
-            if _debug:
-                print(f"[R{_rank} ep_rank={self.ep_rank}] {msg}", flush=True)
+        if self._is_leader or not self._needs_reshard:
+            # ── Leader / min-ep: per-expert ring pipeline ──
+            # Both paths process experts in the same order. The difference:
+            # - Min-ep: data is in grad_data, contiguous (3 experts for ep=4)
+            # - Reshard leader: data is in ar_buf, assembled from local + gathered
 
-        _log(f"execute_interleaved: epoch={epoch}, needs_reshard={self._needs_reshard}, "
-             f"is_leader={self._is_leader}, local_experts={local_experts}, "
-             f"P={P}, experts_per_leader={experts_per_leader}")
-        _log(f"  grad_data[:4]={grad_data[:4].tolist()}, numel={grad_data.numel()}")
-
-        if not self._needs_reshard:
-            # ── Min-ep replica: ring allreduce directly on grad_data ──
-            _log(f"  min-ep path: ring_allreduce on {grad_data.numel()} elems")
-            self._ring_allreduce(grad_data, grad_data.numel(),
-                                self._local_slots[0], nv_torch,
-                                ring_signal_base=ring_signal_base)
-            _log(f"  min-ep after ring: grad_data[:4]={grad_data[:4].tolist()}")
-        elif self._is_leader:
-            # ── Reshard leader: gather → ring → scatter ──
-            leader_idx = self.ep_rank
-            ar_buf_size = experts_per_leader * P
-            ar_buf = gather_buffer[:ar_buf_size]
-
-            # Step 1: Copy own experts into ar_buf.
-            ev_ready.record(default_stream)
-            nv_torch.wait_event(ev_ready)
-            with torch.cuda.stream(nv_torch):
-                for local_idx, expert_id in enumerate(local_experts):
-                    slot = expert_id - leader_idx * experts_per_leader
-                    _log(f"  leader copy own: local_idx={local_idx}, expert={expert_id}, "
-                         f"slot={slot}, val={grad_data[local_idx*P].item():.4f}")
-                    ar_buf[slot * P:(slot + 1) * P].copy_(
-                        grad_data[local_idx * P:(local_idx + 1) * P])
-
-            # Step 2: Receive follower experts.
-            # Build receive list: which (follower, route_idx) sends to this leader.
-            receive_list = []
-            for f_rank, routes in self._expert_gather_map.items():
-                for route_idx, (local_idx, dest_leader, dest_slot) in enumerate(routes):
-                    if dest_leader == leader_idx:
-                        # Signal value: epoch * MAX_ROUTES + route_idx.
-                        # gather_signals[f_rank] is per-follower.
-                        sig_val = epoch * MAX_ROUTES + route_idx
-                        receive_list.append((f_rank, local_idx, dest_slot, sig_val))
-
-            _log(f"  leader receive_list: {[(f,li,ds,sv) for f,li,ds,sv in receive_list]}")
-            for f_rank, f_local_idx, dest_slot, sig_val in receive_list:
-                _log(f"  leader wait: gather_signals[{f_rank}] >= {sig_val}")
-                nvshmem.core.signal_wait(
-                    self._gather_signals[f_rank], sig_val,
-                    nvshmem.core.ComparisonType.CMP_GE,
-                    stream=self._nvshmem_stream,
-                )
-                nv_torch.synchronize()
-                _log(f"  leader received from f_rank={f_rank}: slot[{f_local_idx}][:1]="
-                     f"{self._gather_slots[0][f_local_idx][:elem].view(dtype)[0].item():.4f}, "
-                     f"copying to ar_buf slot {dest_slot}")
+            if self._needs_reshard:
+                leader_idx = self.ep_rank
+                ar_buf = gather_buffer[:experts_per_leader * P]
+                # Copy own experts into ar_buf.
+                ev_ready.record(default_stream)
+                nv_torch.wait_event(ev_ready)
+                local_expert_set = set(local_experts)
                 with torch.cuda.stream(nv_torch):
-                    ar_buf[dest_slot * P:(dest_slot + 1) * P].copy_(
-                        self._gather_slots[0][f_local_idx][:Pbytes].view(dtype)[:P])
+                    for local_idx, expert_id in enumerate(local_experts):
+                        slot = expert_id - leader_idx * experts_per_leader
+                        ar_buf[slot * P:(slot + 1) * P].copy_(
+                            grad_data[local_idx * P:(local_idx + 1) * P])
+                # Build per-slot receive info: slot -> (f_rank, f_local_idx, sig_val) or None.
+                slot_receive = {}
+                for f_rank, routes in self._expert_gather_map.items():
+                    for route_idx, (f_local_idx, dest_leader, dest_slot) in enumerate(routes):
+                        if dest_leader == leader_idx:
+                            sig_val = epoch * MAX_ROUTES + route_idx
+                            slot_receive[dest_slot] = (f_rank, f_local_idx, sig_val)
+                data_buf = ar_buf
+            else:
+                # Min-ep: data is directly in grad_data.
+                leader_idx = self.ep_rank
+                ev_ready.record(default_stream)
+                nv_torch.wait_event(ev_ready)
+                slot_receive = {}  # no offloaded experts
+                data_buf = grad_data
 
-            nv_torch.synchronize()
-            _log(f"  leader ar_buf before ring: [{', '.join(f'{ar_buf[i*P].item():.4f}' for i in range(experts_per_leader))}]")
+            # Per-expert loop: all ring members process expert e simultaneously.
+            for e in range(experts_per_leader):
+                e_off = e * P
+                expert_ring_base = ring_base + e * (ring_steps + 1)
 
-            # Step 3: Ring allreduce (ring_signal_base ensures all ring
-            # members use the same signal values regardless of gather phase).
-            self._ring_allreduce(ar_buf, ar_buf_size,
-                                self._gather_slots[0][0], nv_torch,
-                                ring_signal_base=ring_signal_base)
+                # If this expert slot is offloaded, wait for gather.
+                if e in slot_receive:
+                    f_rank, f_local_idx, sig_val = slot_receive[e]
+                    nvshmem.core.signal_wait(
+                        self._gather_signals[f_rank], sig_val,
+                        nvshmem.core.ComparisonType.CMP_GE,
+                        stream=self._nvshmem_stream,
+                    )
+                    # Copy from gather_slots to data_buf at slot e.
+                    with torch.cuda.stream(nv_torch):
+                        data_buf[e_off:e_off + P].copy_(
+                            self._gather_slots[0][f_local_idx][:Pbytes].view(dtype)[:P])
 
-            nv_torch.synchronize()
-            _log(f"  leader ar_buf after ring: [{', '.join(f'{ar_buf[i*P].item():.4f}' for i in range(experts_per_leader))}]")
+                # Ring allreduce on this expert's P elements.
+                self._ring_allreduce(
+                    data_buf[e_off:e_off + P], P,
+                    self._local_slots[0], nv_torch,
+                    ring_signal_base=expert_ring_base)
 
-            # Step 4: Copy own experts back to grad_data.
-            with torch.cuda.stream(nv_torch):
+                # If this expert was offloaded, scatter back to follower.
+                if e in slot_receive:
+                    f_rank, f_local_idx, _ = slot_receive[e]
+                    scatter_sig = epoch * MAX_ROUTES + f_local_idx
+                    with torch.cuda.stream(nv_torch):
+                        self._gather_slots[0][f_local_idx][:Pbytes].view(dtype)[:P].copy_(
+                            data_buf[e_off:e_off + P])
+                    f_pe = self._ep_peer_pes[f_rank]
+                    nvshmem.core.put(
+                        self._local_slots[0][:Pbytes],
+                        self._gather_slots[0][f_local_idx][:Pbytes],
+                        f_pe, stream=self._nvshmem_stream,
+                    )
+                    nvshmem.core.signal_op(
+                        self._scatter_signal, scatter_sig,
+                        nvshmem.core.SignalOp.SIGNAL_SET,
+                        f_pe, stream=self._nvshmem_stream,
+                    )
+
+            nvshmem.core.quiet(stream=self._nvshmem_stream)
+
+            # Copy allreduced data back to grad_data (reshard leader only).
+            if self._needs_reshard:
+                ev_done.record(nv_torch)
+                default_stream.wait_event(ev_done)
                 for local_idx, expert_id in enumerate(local_experts):
                     slot = expert_id - leader_idx * experts_per_leader
                     grad_data[local_idx * P:(local_idx + 1) * P].copy_(
                         ar_buf[slot * P:(slot + 1) * P])
 
-            # Step 5: Scatter follower experts back.
-            for f_rank, f_local_idx, dest_slot, _ in receive_list:
-                scatter_sig = epoch * MAX_ROUTES + f_local_idx
-                _log(f"  leader scatter: f_rank={f_rank}, f_local_idx={f_local_idx}, "
-                     f"dest_slot={dest_slot}, scatter_sig={scatter_sig}, "
-                     f"val={ar_buf[dest_slot*P].item():.4f}")
-                with torch.cuda.stream(nv_torch):
-                    self._gather_slots[0][f_local_idx][:Pbytes].view(dtype)[:P].copy_(
-                        ar_buf[dest_slot * P:(dest_slot + 1) * P])
-                f_pe = self._ep_peer_pes[f_rank]
-                nvshmem.core.put(
-                    self._local_slots[0][:Pbytes],
-                    self._gather_slots[0][f_local_idx][:Pbytes],
-                    f_pe, stream=self._nvshmem_stream,
-                )
-                nvshmem.core.signal_op(
-                    self._scatter_signal, scatter_sig,
-                    nvshmem.core.SignalOp.SIGNAL_SET,
-                    f_pe, stream=self._nvshmem_stream,
-                )
-            nvshmem.core.quiet(stream=self._nvshmem_stream)
-            ev_done.record(nv_torch)
-            default_stream.wait_event(ev_done)
-
         else:
-            # ── Reshard follower: send experts → leaders, wait for scatter ──
+            # ── Follower: batch gather puts, then wait for scatter ──
             my_routes = self._expert_gather_map.get(self.ep_rank, [])
 
             ev_ready.record(default_stream)
             nv_torch.wait_event(ev_ready)
 
-            _log(f"  follower routes: {my_routes}")
-            # Gather: put each expert to its leader.
+            # Batch all gather puts upfront.
             for route_idx, (local_idx, dest_leader, dest_slot) in enumerate(my_routes):
                 sig_val = epoch * MAX_ROUTES + route_idx
                 leader_pe = self._ep_peer_pes[dest_leader]
-                _log(f"  follower put: route_idx={route_idx}, local_idx={local_idx}, "
-                     f"expert={local_experts[local_idx]}, dest_leader={dest_leader}, "
-                     f"dest_slot={dest_slot}, sig_val={sig_val}, leader_pe={leader_pe}, "
-                     f"val={grad_data[local_idx*P].item():.4f}")
                 with torch.cuda.stream(nv_torch):
                     self._local_slots[0][:Pbytes].view(dtype)[:P].copy_(
                         grad_data[local_idx * P:(local_idx + 1) * P])
@@ -517,11 +494,9 @@ class PipelinedReshardCollective:
                 )
             nvshmem.core.quiet(stream=self._nvshmem_stream)
 
-            # Scatter: wait for each expert to come back.
+            # Wait for scatter of each expert.
             for route_idx, (local_idx, dest_leader, dest_slot) in enumerate(my_routes):
                 scatter_sig = epoch * MAX_ROUTES + local_idx
-                _log(f"  follower scatter wait: route_idx={route_idx}, local_idx={local_idx}, "
-                     f"scatter_sig={scatter_sig}")
                 nvshmem.core.signal_wait(
                     self._scatter_signal, scatter_sig,
                     nvshmem.core.ComparisonType.CMP_GE,
@@ -531,8 +506,6 @@ class PipelinedReshardCollective:
                 default_stream.wait_event(ev_done)
                 grad_data[local_idx * P:(local_idx + 1) * P].copy_(
                     self._local_slots[0][:Pbytes].view(dtype)[:P])
-                _log(f"  follower scatter received: local_idx={local_idx}, "
-                     f"val={grad_data[local_idx*P].item():.4f}")
 
         # Persist epoch counter.
         if self._het_ep_config is not None:
