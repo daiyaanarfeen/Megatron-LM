@@ -284,13 +284,10 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         self.hidden_shape_before_permute = hidden_states.shape
 
         # The routing map and probs that for local experts.
-        self.local_map = self.routing_map[
-            :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
-        ].contiguous()
+        idx = torch.tensor(self.local_expert_indices, device=self.routing_map.device)
+        self.local_map = self.routing_map.index_select(1, idx).contiguous()
         # probs of global token assignment to local experts.
-        self.local_probs = probs[
-            :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
-        ].contiguous()
+        self.local_probs = probs.index_select(1, idx).contiguous()
 
         tokens_per_expert = self.local_map.sum(dim=0).long().cpu()
 
@@ -389,10 +386,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         assert (
             len(self.local_expert_indices) == self.num_local_experts
         ), "Invalid local expert indices"
-        for i in range(len(self.local_expert_indices) - 1):
-            assert (
-                self.local_expert_indices[i] == self.local_expert_indices[i + 1] - 1
-            ), "local_expert_indices must be continuous"
 
         # [ep_size]. Represents the number of tokens sent by the current rank to other
         # EP ranks.
@@ -404,17 +397,57 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # other TP ranks.
         self.output_splits_tp = None
         self.permute_idx_device = torch.device("cuda") if self.config.moe_permute_fusion else "cpu"
+
+        # Build expert-to-ep_rank mapping for non-contiguous expert indices.
+        from megatron.core.parallel_state import get_expert_to_ep_rank_map
+        expert_to_ep_rank = get_expert_to_ep_rank_map()
+        if expert_to_ep_rank is not None:
+            self.expert_to_ep_rank = torch.tensor(
+                expert_to_ep_rank, device=self.permute_idx_device)
+        else:
+            # Contiguous: expert i -> ep_rank i // num_local_experts
+            self.expert_to_ep_rank = torch.arange(
+                self.num_experts, device=self.permute_idx_device
+            ) // self.num_local_experts
+
+        # Build sort/restore permutation indices for local expert chunks.
+        # With non-contiguous indices, we need to find where each local expert's
+        # chunks are in the global [tp_size * ep_size * num_experts] layout.
+        # Each chunk is identified by (tp_rank, ep_rank, expert_id). After
+        # AlltoAll, this rank receives chunks for its local experts from all
+        # (tp_rank, ep_rank) pairs. The chunks arrive grouped by source
+        # (tp_rank, ep_rank), but we need them grouped by local expert.
         input_chunk_idxs = torch.arange(
             self.num_experts * self.tp_size, device=self.permute_idx_device
         )
-        # [num_local_experts, tp_size * ep_size]. Sort the input chunks by local experts.
-        self.sort_input_by_local_experts = input_chunk_idxs.reshape(
-            -1, self.num_local_experts
-        ).T.ravel()
-        # [tp_size * ep_size, num_local_experts]. Restore the output chunks by local experts.
-        self.restore_output_by_local_experts = input_chunk_idxs.reshape(
-            self.num_local_experts, -1
-        ).T.ravel()
+        # For contiguous experts, the original reshape trick works.
+        # For non-contiguous, we build the permutation explicitly.
+        local_idx_set = set(self.local_expert_indices)
+        if (self.local_expert_indices ==
+                list(range(self.local_expert_indices[0],
+                           self.local_expert_indices[0] + self.num_local_experts))):
+            # Contiguous case: use original reshape approach (faster).
+            self.sort_input_by_local_experts = input_chunk_idxs.reshape(
+                -1, self.num_local_experts
+            ).T.ravel()
+            self.restore_output_by_local_experts = input_chunk_idxs.reshape(
+                self.num_local_experts, -1
+            ).T.ravel()
+        else:
+            # Non-contiguous: build permutation from the global chunk layout.
+            # Global layout after AlltoAll: chunks ordered by (source_rank, expert).
+            # We want to reorder to (expert, source_rank) for local processing.
+            # Total chunks = tp_size * ep_size * num_local_experts.
+            n_sources = self.tp_size * self.ep_size
+            n_chunks = n_sources * self.num_local_experts
+            # sort: from [source, local_expert] to [local_expert, source]
+            sort_idx = torch.arange(n_chunks, device=self.permute_idx_device)
+            sort_idx = sort_idx.reshape(n_sources, self.num_local_experts).T.ravel()
+            self.sort_input_by_local_experts = sort_idx
+            # restore: from [local_expert, source] to [source, local_expert]
+            restore_idx = sort_idx.reshape(
+                self.num_local_experts, n_sources).T.ravel()
+            self.restore_output_by_local_experts = restore_idx
 
         # Token drop and padding.
         # Drop and pad the input to capacity.
@@ -529,10 +562,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             # Calculate input_splits, output_splits for alltoall/allgather in variable size.
             # ===================================================
             # [ep_size]. Represents the number of tokens sent by the current rank to other
-            # EP ranks.
-            self.input_splits = num_local_tokens_per_expert.reshape(
-                self.ep_size, self.num_local_experts
-            ).sum(axis=1)
+            # EP ranks. Group token counts by the ep_rank that holds each expert.
+            self.input_splits = torch.zeros(
+                self.ep_size, dtype=num_local_tokens_per_expert.dtype,
+                device=num_local_tokens_per_expert.device)
+            self.input_splits.scatter_add_(
+                0, self.expert_to_ep_rank.to(num_local_tokens_per_expert.device),
+                num_local_tokens_per_expert)
             # Gather the global distribution of tokens across ranks.
             # num_global_tokens_per_expert represents the number of tokens sent to each
             # expert by all ranks.
@@ -545,9 +581,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 .transpose(0, 1)
             )
             # [tp_size, ep_size, num_experts] -> [tp_size, ep_size, num_local_experts]
-            num_global_tokens_per_local_expert = num_global_tokens_per_expert[
-                :, :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
-            ].contiguous()
+            idx = torch.tensor(
+                self.local_expert_indices, device=num_global_tokens_per_expert.device)
+            num_global_tokens_per_local_expert = num_global_tokens_per_expert.index_select(
+                2, idx).contiguous()
             # [tp_size, ep_size, num_local_experts] -> [tp_size, ep_size]
             num_global_tokens_per_rank = num_global_tokens_per_local_expert.sum(axis=2)
             # [tp_size, ep_size] -> [ep_size]

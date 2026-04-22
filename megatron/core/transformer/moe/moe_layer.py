@@ -122,14 +122,21 @@ class BaseMoELayer(MegatronModule, ABC):
 
         assert self.config.num_moe_experts % ep_size == 0
         self.num_local_experts = self.config.num_moe_experts // ep_size
-        local_expert_indices_offset = ep_rank * self.num_local_experts
 
         self.use_shared_expert = self.config.moe_shared_expert_intermediate_size is not None
         self.shared_expert_overlap = self.config.moe_shared_expert_overlap
 
-        self.local_expert_indices = [
-            local_expert_indices_offset + i for i in range(self.num_local_experts)
-        ]
+        # Use interleaved placement from heterogeneous EP config if available,
+        # otherwise fall back to contiguous assignment.
+        from megatron.core import parallel_state as ps
+        het_cfg = ps.get_heterogeneous_ep_config() if ps.is_heterogeneous_ep() else None
+        if het_cfg is not None and 'local_expert_indices' in het_cfg:
+            self.local_expert_indices = list(het_cfg['local_expert_indices'])
+        else:
+            local_expert_indices_offset = ep_rank * self.num_local_experts
+            self.local_expert_indices = [
+                local_expert_indices_offset + i for i in range(self.num_local_experts)
+            ]
         assert all(map(lambda x: x < self.config.num_moe_experts, self.local_expert_indices))
         self.router: RouterInterface = None
         self.experts = None

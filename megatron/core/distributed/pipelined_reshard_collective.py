@@ -72,12 +72,20 @@ class PipelinedReshardCollective:
         self._use_nvshmem_ring = False
         self._exchange_bufs = [None, None]   # ping-pong buffers
         self._exchange_signals = [None, None]
+        self._exchange_acks = [None, None]  # ack signals for buffer reuse
         self._ring_peers: List[int] = []  # PEs in ring order
         self._ring_size = 1
         self._my_ring_idx = 0
         self._ring_next_pe = 0
         self._ring_prev_pe = 0
         self._num_replicas = 1  # for signal_base advancement on non-leaders
+
+        # Interleaved expert placement routing.
+        self._expert_placement = None   # [ep_rank] -> [expert_ids]
+        self._expert_gather_map = None  # {follower_rank: [(local_idx, leader, slot)]}
+        self._needs_reshard = False
+        self._local_expert_indices = None
+        self._experts_per_leader = 0    # E / min_ep
 
         # Lazy-init events.
         self._events_assembly = []
@@ -92,6 +100,9 @@ class PipelinedReshardCollective:
             self._exchange_bufs = bufs
         if sigs:
             self._exchange_signals = sigs
+        acks = het_ep_config.get('nvshmem_exchange_acks')
+        if acks:
+            self._exchange_acks = acks
         peers = het_ep_config.get('b_edp_peer_pes')
         if peers and len(peers) > 1 and self._exchange_bufs[0] is not None:
             self._use_nvshmem_ring = True
@@ -143,11 +154,14 @@ class PipelinedReshardCollective:
             self._scatter_states = ss
 
         # Multi-leader fields.
-        self._ratio = het_ep_config.get('ratio', 1)
         self._is_leader = het_ep_config.get('is_b_leader', self.ep_rank == 0)
-        self._my_leader_idx = het_ep_config.get('my_leader_idx', 0)
-        self._my_sub_rank = het_ep_config.get('my_sub_rank', 0)
-        self._my_leader_ep_rank = self._my_leader_idx * self._ratio
+        self._needs_reshard = het_ep_config.get('needs_reshard', False)
+        self._expert_placement = het_ep_config.get('expert_placement')
+        self._expert_gather_map = het_ep_config.get('expert_gather_map')
+        self._local_expert_indices = het_ep_config.get('local_expert_indices')
+        min_ep = het_ep_config.get('min_ep_size', 1)
+        num_experts = sum(len(p) for p in self._expert_placement) if self._expert_placement else 0
+        self._experts_per_leader = num_experts // min_ep if min_ep > 0 else 0
 
         # Ring allreduce.
         self._setup_ring_state(het_ep_config)
@@ -182,7 +196,8 @@ class PipelinedReshardCollective:
         return per_member_elems, effective_ar_chunk, K
 
     def _ring_allreduce(self, data: torch.Tensor, n_elems: int,
-                        send_staging: torch.Tensor, nv_torch):
+                        send_staging: torch.Tensor, nv_torch,
+                        ring_signal_base: Optional[int] = None):
         """Ring allreduce on data[0:n_elems] across ring peers via NVSHMEM.
 
         Implements reduce-scatter (N-1 steps) then allgather (N-1 steps).
@@ -195,10 +210,18 @@ class PipelinedReshardCollective:
             send_staging: Symmetric NVSHMEM buffer for staging puts. Must be
                 >= (n_elems // ring_size) * elem_size bytes.
             nv_torch: The NVSHMEM stream as a torch.cuda.ExternalStream.
+            ring_signal_base: If provided, use this as starting signal counter
+                for the ring (overrides self._signal_base). All ring members
+                must pass the same value.
         """
         N = self._ring_size
         if N <= 1:
             return  # single-rank group, nothing to do
+
+        # Use provided ring_signal_base if given, otherwise self._signal_base.
+        if ring_signal_base is not None:
+            saved_base = self._signal_base
+            self._signal_base = ring_signal_base
 
         dtype = data.dtype
         elem = data.element_size()
@@ -219,108 +242,308 @@ class PipelinedReshardCollective:
             sub_sizes.append(sz)
             off += sz
 
-        # Global step counter for ping-pong buffer selection.
-        # Even steps use exchange_bufs[0]/exchange_signals[0],
-        # odd steps use [1]. Prevents data race where remote put for
-        # step s+1 overwrites exchange_buf before local add_ for step s.
+        # Ping-pong buffer selection with ack-based reuse protection.
+        # Step s uses xbuf[s%2]. After reading from xbuf[parity], signal
+        # prev_pe that buffer is free (ack). Before putting to next_pe's
+        # xbuf[parity], wait for next_pe's ack. This prevents the N>2
+        # race where step s+2 overwrites xbuf[parity] before step s reads it.
         step = 0
+        prev_pe = self._ring_prev_pe
+        # Ack counter: increments each time a parity's buffer is freed.
+        ack_count = [0, 0]  # per-parity ack counter
+
+        def _ring_step(send_idx, recv_idx, accumulate):
+            nonlocal step
+            send_n = sub_sizes[send_idx]
+            recv_n = sub_sizes[recv_idx]
+            send_off = sub_offsets[send_idx]
+            recv_off = sub_offsets[recv_idx]
+            send_bytes = send_n * elem
+            recv_bytes = recv_n * elem
+
+            parity = step % 2
+            xbuf = self._exchange_bufs[parity]
+            xsig = self._exchange_signals[parity]
+            sig_val = self._signal_base
+            self._signal_base += 1
+            step += 1
+
+            # Wait for next_pe to ack that its xbuf[parity] is free.
+            # First use of each parity (ack_count=0): ack initialized to 0, passes.
+            if self._exchange_acks[0] is not None:
+                nvshmem.core.signal_wait(
+                    self._exchange_acks[parity],
+                    ack_count[parity],
+                    nvshmem.core.ComparisonType.CMP_GE,
+                    stream=self._nvshmem_stream)
+
+            # Copy + put + signal to next_pe.
+            with torch.cuda.stream(nv_torch):
+                send_staging[:send_bytes].view(dtype)[:send_n].copy_(
+                    data[send_off:send_off + send_n])
+            nvshmem.core.put(
+                xbuf[:send_bytes], send_staging[:send_bytes],
+                next_pe, stream=self._nvshmem_stream)
+            nvshmem.core.signal_op(
+                xsig, sig_val,
+                nvshmem.core.SignalOp.SIGNAL_SET,
+                next_pe, stream=self._nvshmem_stream)
+            nvshmem.core.quiet(stream=self._nvshmem_stream)
+
+            # Wait for data from prev_pe.
+            nvshmem.core.signal_wait(
+                xsig, sig_val,
+                nvshmem.core.ComparisonType.CMP_GE,
+                stream=self._nvshmem_stream)
+
+            # Read from own xbuf[parity].
+            if accumulate:
+                with torch.cuda.stream(nv_torch):
+                    data[recv_off:recv_off + recv_n].add_(
+                        xbuf[:recv_bytes].view(dtype)[:recv_n])
+            else:
+                with torch.cuda.stream(nv_torch):
+                    data[recv_off:recv_off + recv_n].copy_(
+                        xbuf[:recv_bytes].view(dtype)[:recv_n])
+
+            # Ack prev_pe: "I've read xbuf[parity], safe to overwrite."
+            ack_count[parity] += 1
+            if self._exchange_acks[0] is not None:
+                nvshmem.core.signal_op(
+                    self._exchange_acks[parity],
+                    ack_count[parity],
+                    nvshmem.core.SignalOp.SIGNAL_SET,
+                    prev_pe, stream=self._nvshmem_stream)
 
         # ── Phase 1: Reduce-scatter (N-1 steps) ──
         for s in range(N - 1):
             send_idx = (my_idx - s) % N
             recv_idx = (my_idx - s - 1) % N
-            send_n = sub_sizes[send_idx]
-            recv_n = sub_sizes[recv_idx]
-            send_off = sub_offsets[send_idx]
-            recv_off = sub_offsets[recv_idx]
-            send_bytes = send_n * elem
-            recv_bytes = recv_n * elem
-
-            parity = step % 2
-            xbuf = self._exchange_bufs[parity]
-            xsig = self._exchange_signals[parity]
-            sig_val = self._signal_base
-            self._signal_base += 1
-            step += 1
-
-            # Copy sub-chunk from data to symmetric send_staging, then put.
-            with torch.cuda.stream(nv_torch):
-                send_staging[:send_bytes].view(dtype)[:send_n].copy_(
-                    data[send_off:send_off + send_n])
-            nvshmem.core.put(
-                xbuf[:send_bytes], send_staging[:send_bytes],
-                next_pe, stream=self._nvshmem_stream)
-            nvshmem.core.signal_op(
-                xsig, sig_val,
-                nvshmem.core.SignalOp.SIGNAL_SET,
-                next_pe, stream=self._nvshmem_stream)
-            nvshmem.core.quiet(stream=self._nvshmem_stream)
-
-            # Wait for data from prev ring neighbor.
-            nvshmem.core.signal_wait(
-                xsig, sig_val,
-                nvshmem.core.ComparisonType.CMP_GE,
-                stream=self._nvshmem_stream)
-
-            # Accumulate: data[recv_idx] += received data.
-            with torch.cuda.stream(nv_torch):
-                data[recv_off:recv_off + recv_n].add_(
-                    xbuf[:recv_bytes].view(dtype)[:recv_n])
+            _ring_step(send_idx, recv_idx, accumulate=True)
 
         # ── Phase 2: Allgather (N-1 steps) ──
         for s in range(N - 1):
             send_idx = (my_idx - s + 1) % N
             recv_idx = (my_idx - s) % N
-            send_n = sub_sizes[send_idx]
-            recv_n = sub_sizes[recv_idx]
-            send_off = sub_offsets[send_idx]
-            recv_off = sub_offsets[recv_idx]
-            send_bytes = send_n * elem
-            recv_bytes = recv_n * elem
+            _ring_step(send_idx, recv_idx, accumulate=False)
 
-            parity = step % 2
-            xbuf = self._exchange_bufs[parity]
-            xsig = self._exchange_signals[parity]
-            sig_val = self._signal_base
-            self._signal_base += 1
-            step += 1
-
-            with torch.cuda.stream(nv_torch):
-                send_staging[:send_bytes].view(dtype)[:send_n].copy_(
-                    data[send_off:send_off + send_n])
-            nvshmem.core.put(
-                xbuf[:send_bytes], send_staging[:send_bytes],
-                next_pe, stream=self._nvshmem_stream)
-            nvshmem.core.signal_op(
-                xsig, sig_val,
-                nvshmem.core.SignalOp.SIGNAL_SET,
-                next_pe, stream=self._nvshmem_stream)
-            nvshmem.core.quiet(stream=self._nvshmem_stream)
-
-            nvshmem.core.signal_wait(
-                xsig, sig_val,
-                nvshmem.core.ComparisonType.CMP_GE,
-                stream=self._nvshmem_stream)
-
-            # Copy (not accumulate) the fully-reduced sub-chunk.
-            with torch.cuda.stream(nv_torch):
-                data[recv_off:recv_off + recv_n].copy_(
-                    xbuf[:recv_bytes].view(dtype)[:recv_n])
+        # Restore signal_base if we overrode it.
+        if ring_signal_base is not None:
+            self._signal_base = saved_base
 
     def execute(self, grad_data: torch.Tensor, gather_buffer: Optional[torch.Tensor]):
-        """Multi-leader NVSHMEM pipeline: gather → ring allreduce → scatter.
+        """Dispatch to the appropriate execution path.
 
-        Each rank belongs to a sub-group led by a leader. Leaders gather from
-        sub-group members, ring-allreduce across replicas, and scatter back.
-        No NCCL in the loop — all communication via NVSHMEM.
-
-        Args:
-            grad_data: This rank's expert gradient tensor (modified in-place).
-            gather_buffer: Pre-allocated buffer for leaders to assemble gathered
-                data. None for non-leader ranks.
+        For interleaved expert placement: per-expert routing.
+        For sub-group placement (legacy): chunk-based pipelining.
         """
         if not self._use_nvshmem:
             raise RuntimeError("NVSHMEM not initialized for execute()")
+
+        if self._expert_gather_map is not None:
+            return self._execute_interleaved(grad_data, gather_buffer)
+        return self._execute_chunked(grad_data, gather_buffer)
+
+    def _execute_interleaved(self, grad_data: torch.Tensor,
+                              gather_buffer: Optional[torch.Tensor]):
+        """Per-expert gather/scatter for interleaved expert placement.
+
+        Signal protocol: epoch-based. Each execute() call increments epoch.
+        Gather signal for follower f, route k: gather_signals[f] = epoch * MAX_ROUTES + k.
+        Scatter signal for follower f, route k: scatter_signal on f = epoch * MAX_ROUTES + k.
+        Both sides compute the same values from the static routing map.
+        Ring: uses its own signal_base (managed by _ring_allreduce).
+        """
+        _, sp = self._nvshmem_stream.__cuda_stream__()
+        nv_torch = torch.cuda.ExternalStream(sp)
+
+        dtype = grad_data.dtype
+        elem = grad_data.element_size()
+        min_ep = self._min_ep_size
+        experts_per_leader = self._experts_per_leader
+        local_experts = self._local_expert_indices
+        experts_per_rank = len(local_experts)
+        params_per_expert = grad_data.numel() // experts_per_rank
+        P = params_per_expert
+        Pbytes = P * elem
+
+        default_stream = torch.cuda.current_stream()
+        ev_ready = torch.cuda.Event()
+        ev_done = torch.cuda.Event()
+
+        epoch = self._signal_base
+        self._signal_base += 1
+        MAX_ROUTES = max(len(r) for r in self._expert_gather_map.values()) if self._expert_gather_map else 1
+
+        # Ring signal_base: must be identical across all ring members.
+        # Compute deterministically from epoch (not from gather signal increments).
+        # Reserve a separate range for ring signals.
+        ring_signal_base = epoch * 10000  # large offset to avoid collisions
+
+        import os
+        _debug = os.environ.get('DEBUG_INTERLEAVED', '')
+        _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        def _log(msg):
+            if _debug:
+                print(f"[R{_rank} ep_rank={self.ep_rank}] {msg}", flush=True)
+
+        _log(f"execute_interleaved: epoch={epoch}, needs_reshard={self._needs_reshard}, "
+             f"is_leader={self._is_leader}, local_experts={local_experts}, "
+             f"P={P}, experts_per_leader={experts_per_leader}")
+        _log(f"  grad_data[:4]={grad_data[:4].tolist()}, numel={grad_data.numel()}")
+
+        if not self._needs_reshard:
+            # ── Min-ep replica: ring allreduce directly on grad_data ──
+            _log(f"  min-ep path: ring_allreduce on {grad_data.numel()} elems")
+            self._ring_allreduce(grad_data, grad_data.numel(),
+                                self._local_slots[0], nv_torch,
+                                ring_signal_base=ring_signal_base)
+            _log(f"  min-ep after ring: grad_data[:4]={grad_data[:4].tolist()}")
+        elif self._is_leader:
+            # ── Reshard leader: gather → ring → scatter ──
+            leader_idx = self.ep_rank
+            ar_buf_size = experts_per_leader * P
+            ar_buf = gather_buffer[:ar_buf_size]
+
+            # Step 1: Copy own experts into ar_buf.
+            ev_ready.record(default_stream)
+            nv_torch.wait_event(ev_ready)
+            with torch.cuda.stream(nv_torch):
+                for local_idx, expert_id in enumerate(local_experts):
+                    slot = expert_id - leader_idx * experts_per_leader
+                    _log(f"  leader copy own: local_idx={local_idx}, expert={expert_id}, "
+                         f"slot={slot}, val={grad_data[local_idx*P].item():.4f}")
+                    ar_buf[slot * P:(slot + 1) * P].copy_(
+                        grad_data[local_idx * P:(local_idx + 1) * P])
+
+            # Step 2: Receive follower experts.
+            # Build receive list: which (follower, route_idx) sends to this leader.
+            receive_list = []
+            for f_rank, routes in self._expert_gather_map.items():
+                for route_idx, (local_idx, dest_leader, dest_slot) in enumerate(routes):
+                    if dest_leader == leader_idx:
+                        # Signal value: epoch * MAX_ROUTES + route_idx.
+                        # gather_signals[f_rank] is per-follower.
+                        sig_val = epoch * MAX_ROUTES + route_idx
+                        receive_list.append((f_rank, local_idx, dest_slot, sig_val))
+
+            _log(f"  leader receive_list: {[(f,li,ds,sv) for f,li,ds,sv in receive_list]}")
+            for f_rank, f_local_idx, dest_slot, sig_val in receive_list:
+                _log(f"  leader wait: gather_signals[{f_rank}] >= {sig_val}")
+                nvshmem.core.signal_wait(
+                    self._gather_signals[f_rank], sig_val,
+                    nvshmem.core.ComparisonType.CMP_GE,
+                    stream=self._nvshmem_stream,
+                )
+                nv_torch.synchronize()
+                _log(f"  leader received from f_rank={f_rank}: slot[{f_local_idx}][:1]="
+                     f"{self._gather_slots[0][f_local_idx][:elem].view(dtype)[0].item():.4f}, "
+                     f"copying to ar_buf slot {dest_slot}")
+                with torch.cuda.stream(nv_torch):
+                    ar_buf[dest_slot * P:(dest_slot + 1) * P].copy_(
+                        self._gather_slots[0][f_local_idx][:Pbytes].view(dtype)[:P])
+
+            nv_torch.synchronize()
+            _log(f"  leader ar_buf before ring: [{', '.join(f'{ar_buf[i*P].item():.4f}' for i in range(experts_per_leader))}]")
+
+            # Step 3: Ring allreduce (ring_signal_base ensures all ring
+            # members use the same signal values regardless of gather phase).
+            self._ring_allreduce(ar_buf, ar_buf_size,
+                                self._gather_slots[0][0], nv_torch,
+                                ring_signal_base=ring_signal_base)
+
+            nv_torch.synchronize()
+            _log(f"  leader ar_buf after ring: [{', '.join(f'{ar_buf[i*P].item():.4f}' for i in range(experts_per_leader))}]")
+
+            # Step 4: Copy own experts back to grad_data.
+            with torch.cuda.stream(nv_torch):
+                for local_idx, expert_id in enumerate(local_experts):
+                    slot = expert_id - leader_idx * experts_per_leader
+                    grad_data[local_idx * P:(local_idx + 1) * P].copy_(
+                        ar_buf[slot * P:(slot + 1) * P])
+
+            # Step 5: Scatter follower experts back.
+            for f_rank, f_local_idx, dest_slot, _ in receive_list:
+                scatter_sig = epoch * MAX_ROUTES + f_local_idx
+                _log(f"  leader scatter: f_rank={f_rank}, f_local_idx={f_local_idx}, "
+                     f"dest_slot={dest_slot}, scatter_sig={scatter_sig}, "
+                     f"val={ar_buf[dest_slot*P].item():.4f}")
+                with torch.cuda.stream(nv_torch):
+                    self._gather_slots[0][f_local_idx][:Pbytes].view(dtype)[:P].copy_(
+                        ar_buf[dest_slot * P:(dest_slot + 1) * P])
+                f_pe = self._ep_peer_pes[f_rank]
+                nvshmem.core.put(
+                    self._local_slots[0][:Pbytes],
+                    self._gather_slots[0][f_local_idx][:Pbytes],
+                    f_pe, stream=self._nvshmem_stream,
+                )
+                nvshmem.core.signal_op(
+                    self._scatter_signal, scatter_sig,
+                    nvshmem.core.SignalOp.SIGNAL_SET,
+                    f_pe, stream=self._nvshmem_stream,
+                )
+            nvshmem.core.quiet(stream=self._nvshmem_stream)
+            ev_done.record(nv_torch)
+            default_stream.wait_event(ev_done)
+
+        else:
+            # ── Reshard follower: send experts → leaders, wait for scatter ──
+            my_routes = self._expert_gather_map.get(self.ep_rank, [])
+
+            ev_ready.record(default_stream)
+            nv_torch.wait_event(ev_ready)
+
+            _log(f"  follower routes: {my_routes}")
+            # Gather: put each expert to its leader.
+            for route_idx, (local_idx, dest_leader, dest_slot) in enumerate(my_routes):
+                sig_val = epoch * MAX_ROUTES + route_idx
+                leader_pe = self._ep_peer_pes[dest_leader]
+                _log(f"  follower put: route_idx={route_idx}, local_idx={local_idx}, "
+                     f"expert={local_experts[local_idx]}, dest_leader={dest_leader}, "
+                     f"dest_slot={dest_slot}, sig_val={sig_val}, leader_pe={leader_pe}, "
+                     f"val={grad_data[local_idx*P].item():.4f}")
+                with torch.cuda.stream(nv_torch):
+                    self._local_slots[0][:Pbytes].view(dtype)[:P].copy_(
+                        grad_data[local_idx * P:(local_idx + 1) * P])
+                nvshmem.core.put(
+                    self._gather_slots[0][local_idx][:Pbytes],
+                    self._local_slots[0][:Pbytes],
+                    leader_pe, stream=self._nvshmem_stream,
+                )
+                nvshmem.core.signal_op(
+                    self._gather_signals[self.ep_rank], sig_val,
+                    nvshmem.core.SignalOp.SIGNAL_SET,
+                    leader_pe, stream=self._nvshmem_stream,
+                )
+            nvshmem.core.quiet(stream=self._nvshmem_stream)
+
+            # Scatter: wait for each expert to come back.
+            for route_idx, (local_idx, dest_leader, dest_slot) in enumerate(my_routes):
+                scatter_sig = epoch * MAX_ROUTES + local_idx
+                _log(f"  follower scatter wait: route_idx={route_idx}, local_idx={local_idx}, "
+                     f"scatter_sig={scatter_sig}")
+                nvshmem.core.signal_wait(
+                    self._scatter_signal, scatter_sig,
+                    nvshmem.core.ComparisonType.CMP_GE,
+                    stream=self._nvshmem_stream,
+                )
+                ev_done.record(nv_torch)
+                default_stream.wait_event(ev_done)
+                grad_data[local_idx * P:(local_idx + 1) * P].copy_(
+                    self._local_slots[0][:Pbytes].view(dtype)[:P])
+                _log(f"  follower scatter received: local_idx={local_idx}, "
+                     f"val={grad_data[local_idx*P].item():.4f}")
+
+        # Persist epoch counter.
+        if self._het_ep_config is not None:
+            self._het_ep_config['_signal_base'] = self._signal_base
+
+    def _execute_chunked(self, grad_data: torch.Tensor,
+                          gather_buffer: Optional[torch.Tensor]):
+        """Chunk-based pipelined execution for sub-group placement (legacy).
+
+        Used when ep % min_ep == 0 (integer ratio sub-groups).
+        """
 
         L = grad_data.numel()
         elem = grad_data.element_size()

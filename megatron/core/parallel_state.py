@@ -525,6 +525,61 @@ class RankGenerator(object):
         return ranks
 
 
+def compute_expert_placement(num_experts, local_ep_size, min_ep_size):
+    """Compute interleaved expert placement for a reshard replica.
+
+    Min-ep replicas use contiguous assignment (rank l gets experts
+    [l*E/min_ep, (l+1)*E/min_ep)). Reshard replicas interleave: leaders
+    keep the first E/ep experts from their contiguous range, and offload
+    the rest round-robin to followers. After gather, leaders reconstruct
+    the same contiguous layout as min_ep replicas.
+
+    Returns:
+        placement: list of length local_ep_size, where placement[ep_rank]
+            is the sorted list of expert indices assigned to that rank.
+        gather_map: dict mapping follower ep_rank to list of
+            (local_expert_idx, dest_leader_ep_rank, dest_slot) tuples.
+            dest_slot is the position within the leader's E/min_ep range.
+    """
+    E, ep, min_ep = num_experts, local_ep_size, min_ep_size
+    assert E % ep == 0 and E % min_ep == 0
+    assert ep >= min_ep
+
+    experts_per_rank = E // ep
+    experts_per_leader = E // min_ep
+    experts_offloaded = experts_per_leader - experts_per_rank
+    num_followers = ep - min_ep
+
+    placement = [[] for _ in range(ep)]
+
+    # Leaders keep the first experts_per_rank from their contiguous range.
+    for l in range(min_ep):
+        start = l * experts_per_leader
+        placement[l] = list(range(start, start + experts_per_rank))
+
+    # Offloaded experts distributed round-robin across followers.
+    if num_followers > 0 and experts_offloaded > 0:
+        follower_idx = 0
+        for l in range(min_ep):
+            offload_start = l * experts_per_leader + experts_per_rank
+            for off in range(experts_offloaded):
+                expert_id = offload_start + off
+                f_rank = min_ep + (follower_idx % num_followers)
+                placement[f_rank].append(expert_id)
+                follower_idx += 1
+
+    # Build gather routing map: follower → [(local_idx, leader, slot)].
+    gather_map = {}
+    for f_rank in range(min_ep, ep):
+        gather_map[f_rank] = []
+        for local_idx, expert_id in enumerate(placement[f_rank]):
+            leader = expert_id // experts_per_leader
+            slot = expert_id - leader * experts_per_leader
+            gather_map[f_rank].append((local_idx, leader, slot))
+
+    return placement, gather_map
+
+
 class HeterogeneousRankGenerator:
     """A rank generator for heterogeneous MoE replicas.
 
@@ -1957,16 +2012,17 @@ def initialize_heterogeneous_model_parallel(
     assert local_ep_size is not None, f"Rank {rank} not found in any replica"
     min_ep_size = min_k * tp * cp // etp
     ep_rank = _EXPERT_MODEL_PARALLEL_GROUP.rank()
-    # Multi-leader sub-group mapping for Approach B.
-    # ratio = sub-group size per leader. Leaders at ep_rank {0, ratio, 2*ratio, ...}.
-    ratio = local_ep_size // min_ep_size if min_ep_size > 0 else 1
-    is_b_leader = (ep_rank % ratio == 0) if ratio > 0 else (ep_rank == 0)
-    my_leader_idx = ep_rank // ratio if ratio > 0 else 0
-    my_sub_rank = ep_rank % ratio if ratio > 0 else 0
-    # Approach A uses ep_rank < min_ep_size for eligibility.
-    # Approach B uses leaders at ep_rank % ratio == 0.
-    # is_edp_eligible covers Approach A; is_b_leader covers Approach B.
+    # Multi-leader mapping. Leaders = ep_rank 0..min_ep-1.
+    # Followers = ep_rank min_ep..local_ep-1.
+    # With interleaved placement, followers send specific experts to specific
+    # leaders (not a uniform sub-group split).
+    is_b_leader = ep_rank < min_ep_size
     is_edp_eligible = ep_rank < min_ep_size
+
+    # Compute interleaved expert placement for this replica.
+    expert_placement, expert_gather_map = compute_expert_placement(
+        num_moe_experts, local_ep_size, min_ep_size)
+    local_expert_indices = expert_placement[ep_rank]
     _HETEROGENEOUS_EP_CONFIG = {
         'needs_reshard': local_ep_size > min_ep_size,
         'local_ep_size': local_ep_size,
@@ -1977,10 +2033,10 @@ def initialize_heterogeneous_model_parallel(
         'edp_group': _EXPERT_DATA_PARALLEL_GROUP,
         'ep_rank': ep_rank,
         'is_edp_eligible': is_edp_eligible,
-        'ratio': ratio,
         'is_b_leader': is_b_leader,
-        'my_leader_idx': my_leader_idx,
-        'my_sub_rank': my_sub_rank,
+        'expert_placement': expert_placement,
+        'local_expert_indices': local_expert_indices,
+        'expert_gather_map': expert_gather_map,
     }
 
     # ── Allocate NVSHMEM symmetric buffers + Approach B edp groups ──
@@ -2038,11 +2094,15 @@ def initialize_heterogeneous_model_parallel(
         _exchange_bufs[0].zero_()
         _exchange_bufs[1].zero_()
         _exchange_signals = [_nvshmem_core.buffer(8), _nvshmem_core.buffer(8)]
+        # Ack signals for ring exchange buffer reuse (prevents N>2 race).
+        # exchange_acks[parity]: next_pe signals this rank after reading xbuf[parity].
+        _exchange_acks = [_nvshmem_core.buffer(8), _nvshmem_core.buffer(8)]
         # Zero ALL signal buffers via put-to-self (buffer objects don't have .zero_()).
         _zero8 = _nvshmem_core.interop.torch.bytetensor((8,), dtype=torch.uint8)
         _zero8.zero_()
         _all_sigs = (_gather_signals + [_scatter_signal]
-                     + _exchange_signals + _gather_states + _scatter_states)
+                     + _exchange_signals + _exchange_acks
+                     + _gather_states + _scatter_states)
         for _sig in _all_sigs:
             _nvshmem_core.put(_sig, _zero8, rank, stream=_nvshmem_stream)
         _nvshmem_core.quiet(stream=_nvshmem_stream)
@@ -2051,21 +2111,17 @@ def initialize_heterogeneous_model_parallel(
                     f"({_chunk_size / 1024 / 1024:.0f}MB/{_exchange_buf_size / 1024 / 1024:.1f}MB), "
                     f"signals zeroed (incl gather_states)")
 
-        # Approach B edp groups: multi-leader. For each leader index l
-        # (0..min_ep-1) and each etp position, connect the leader across replicas.
-        # Leaders at ep_rank = l * ratio_r (where ratio_r is per-replica).
-        # Non-leader ranks get single-rank groups (no allreduce).
+        # Approach B edp groups: leaders = ep_rank 0..min_ep-1 on each replica.
+        # For each leader index and etp position, connect across replicas.
         _b_edp_group = None
         _b_edp_groups = []
         for leader_idx in range(min_ep_size):
             for etp_pos in range(etp):
                 group_ranks = []
                 for r in range(len(num_tp_cp_per_replica)):
-                    ep_r = num_tp_cp_per_replica[r] * tp * cp // etp
-                    ratio_r = ep_r // min_ep_size
-                    leader_ep_rank_r = leader_idx * ratio_r
+                    # Leader ep_rank = leader_idx (same on all replicas).
                     global_rank = (generator.replica_offsets[r]
-                                   + leader_ep_rank_r * etp + etp_pos)
+                                   + leader_idx * etp + etp_pos)
                     group_ranks.append(global_rank)
                 _b_edp_groups.append(group_ranks)
         # Non-leader ranks get single-rank groups.
@@ -2106,6 +2162,7 @@ def initialize_heterogeneous_model_parallel(
         _HETEROGENEOUS_EP_CONFIG['nvshmem_scatter_states'] = _scatter_states
         _HETEROGENEOUS_EP_CONFIG['nvshmem_exchange_bufs'] = _exchange_bufs
         _HETEROGENEOUS_EP_CONFIG['nvshmem_exchange_signals'] = _exchange_signals
+        _HETEROGENEOUS_EP_CONFIG['nvshmem_exchange_acks'] = _exchange_acks
         _HETEROGENEOUS_EP_CONFIG['b_edp_peer_pes'] = _b_edp_peer_pes
         _HETEROGENEOUS_EP_CONFIG['max_ep_size'] = _max_ep
         logger.info(f"NVSHMEM buffers allocated ({_max_ep} gather + 1 local + 1 exchange, "
@@ -2741,6 +2798,25 @@ def get_expert_data_parallel_world_size(partial_expert_data_parallel=False):
         ).size()
     else:
         return 0
+
+
+def get_expert_to_ep_rank_map() -> Optional[List[int]]:
+    """Return a list where map[expert_id] = ep_rank that holds that expert.
+
+    Returns None if heterogeneous EP is not active (contiguous mapping is used).
+    """
+    if _HETEROGENEOUS_EP_CONFIG is None:
+        return None
+    placement = _HETEROGENEOUS_EP_CONFIG.get('expert_placement')
+    if placement is None:
+        return None
+    # Build inverse map from placement[ep_rank] = [expert_ids].
+    num_experts = sum(len(p) for p in placement)
+    expert_to_rank = [0] * num_experts
+    for ep_rank, experts in enumerate(placement):
+        for eid in experts:
+            expert_to_rank[eid] = ep_rank
+    return expert_to_rank
 
 
 def is_heterogeneous_ep() -> bool:
