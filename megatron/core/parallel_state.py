@@ -2083,7 +2083,10 @@ def initialize_heterogeneous_model_parallel(
         # Ring allreduce buffers: exchange_buf receives one sub-chunk from
         # the ring neighbor. exchange_signal for ring step signaling.
         _num_replicas = len(num_tp_cp_per_replica)
-        _exchange_buf_size = _chunk_size // max(_num_replicas, 1)
+        # Round UP to ensure largest ring sub-chunk fits (ceil division),
+        # then align to 8 bytes for float32/float64 views.
+        _exchange_buf_size = ((_chunk_size + max(_num_replicas, 1) - 1) // max(_num_replicas, 1))
+        _exchange_buf_size = (_exchange_buf_size + 7) // 8 * 8
         # Double-buffered exchange: ping-pong between [0] and [1] per ring step
         # to avoid data races (remote put for step s+1 arriving while local
         # add_ for step s is still reading).

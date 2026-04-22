@@ -29,6 +29,7 @@ from megatron.core.transformer.moe.moe_layer import MoELayer
 TOPOLOGIES = {
     '12gpu': dict(tp=2, cp=1, k=[2, 4], etp=2, num_moe_experts=8, world_size=12),
     '24gpu': dict(tp=2, cp=1, k=[4, 8], etp=2, num_moe_experts=24, world_size=24),
+    '28gpu': dict(tp=2, cp=1, k=[4, 4, 6], etp=2, num_moe_experts=12, world_size=28),
     '32gpu': dict(tp=2, cp=1, k=[4, 4, 8], etp=2, num_moe_experts=16, world_size=32),
 }
 
