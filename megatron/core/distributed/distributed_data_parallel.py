@@ -333,6 +333,7 @@ class DistributedDataParallel(_BaseDataParallel):
                     self._heterogeneous_ep_config,
                     use_pipelined=self.ddp_config.use_pipelined_ep_reshard,
                     num_pipeline_chunks=self.ddp_config.num_ep_reshard_pipeline_chunks,
+                    use_phased=self.ddp_config.use_phased_ep_reshard,
                 )
 
         # Delete references to weight_tensor if they exist since we don't want two parameter copies

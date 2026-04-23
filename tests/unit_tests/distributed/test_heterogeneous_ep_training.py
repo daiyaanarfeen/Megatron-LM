@@ -91,7 +91,7 @@ def setup_groups(topo):
     )
 
 
-def create_model(topo, hidden_size, use_pipelined):
+def create_model(topo, hidden_size, use_pipelined, use_phased=False):
     het_cfg = parallel_state.get_heterogeneous_ep_config()
     ddp_config = DistributedDataParallelConfig(
         grad_reduce_in_fp32=True,
@@ -99,6 +99,7 @@ def create_model(topo, hidden_size, use_pipelined):
         average_in_collective=False,
         use_pipelined_ep_reshard=use_pipelined,
         num_ep_reshard_pipeline_chunks=4,
+        use_phased_ep_reshard=use_phased,
     )
     module = SimpleMoEModel(
         hidden_size=hidden_size,
@@ -179,13 +180,19 @@ def main():
     setup_groups(topo)
 
     results = {}
-    for approach, use_pipe in [('A (NCCL)', False), ('B (NVSHMEM)', True)]:
+    approaches = [
+        ('A (NCCL)', False, False),
+        ('B (NVSHMEM)', True, False),
+        ('C (phased)', False, True),
+    ]
+    for approach, use_pipe, use_phased in approaches:
         if rank == 0:
             print(f"\nRunning Approach {approach}...")
 
         torch.manual_seed(args.seed)
         torch.cuda.manual_seed(args.seed)
-        model = create_model(topo, args.hidden, use_pipelined=use_pipe)
+        model = create_model(topo, args.hidden, use_pipelined=use_pipe,
+                             use_phased=use_phased)
         losses, norms = train_steps(model, args.hidden, args.steps, args.seed)
         del model
         torch.cuda.empty_cache()

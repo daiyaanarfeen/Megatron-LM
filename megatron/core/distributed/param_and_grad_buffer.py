@@ -244,7 +244,8 @@ class _ParamAndGradBucketGroup:
         self._gather_buffers = None
 
     def set_heterogeneous_ep_config(self, config: dict, use_pipelined: bool = False,
-                                     num_pipeline_chunks: int = 4):
+                                     num_pipeline_chunks: int = 4,
+                                     use_phased: bool = False):
         """Configure this bucket group for heterogeneous EP gradient sync.
 
         On reshard replicas (needs_reshard=True), allocates gather buffers
@@ -255,16 +256,20 @@ class _ParamAndGradBucketGroup:
             use_pipelined: If True, use Approach B (fused intra-bucket pipeline).
                 If False (default), use Approach A (cross-bucket pipeline).
             num_pipeline_chunks: Number of chunks for Approach B pipeline.
+            use_phased: If True, use Approach C (phased: gather during backward,
+                allreduce overlapped, scatter batched after).
         """
         self._het_ep_config = config
         self._pipelined_collectives = None
+        self._use_phased_ep = use_phased
 
         # Determine who needs gather buffers:
         # Approach A: is_edp_eligible (ep_rank < min_ep), gathers from all ep peers.
-        # Approach B: is_b_leader (ep_rank % ratio == 0), gathers from sub-group.
+        # Approach B: is_b_leader, gathers from sub-group.
+        # Approach C: is_b_leader, receives via all_to_all.
         should_alloc_gather = (
             config.get('is_b_leader', config['is_edp_eligible'])
-            if use_pipelined else config['is_edp_eligible']
+            if (use_pipelined or use_phased) else config['is_edp_eligible']
         )
         if config['local_ep_size'] > 1 and should_alloc_gather:
             self._gather_buffers = []
@@ -275,6 +280,10 @@ class _ParamAndGradBucketGroup:
                     device=bucket.grad_data.device,
                 )
                 self._gather_buffers.append(gather_buf)
+
+        # Approach C: precompute all_to_all split sizes for gather/scatter.
+        if use_phased and config['local_ep_size'] > 1:
+            self._setup_phased_splits(config)
 
         if use_pipelined:
             from .pipelined_reshard_collective import PipelinedReshardCollective
@@ -293,6 +302,121 @@ class _ParamAndGradBucketGroup:
                 reduce_op=reduce_op,
             )
             self._pipelined_collectives.set_nvshmem_state(config)
+
+    def _setup_phased_splits(self, config):
+        """Precompute all_to_all split sizes for Approach C gather/scatter.
+
+        For each ep_rank pair (src, dst), compute how many expert params
+        src sends to dst during gather. Determined by expert placement:
+        src sends experts that belong to dst's leader range.
+        """
+        placement = config['expert_placement']
+        ep_size = config['local_ep_size']
+        min_ep = config['min_ep_size']
+        ep_rank = config['ep_rank']
+        num_experts = sum(len(p) for p in placement)
+        experts_per_leader = num_experts // min_ep
+
+        self._phased_gather_send = []  # per bucket: [ep_size] send counts
+        self._phased_gather_recv = []  # per bucket: [ep_size] recv counts
+        self._phased_gather_done = []  # per bucket: flag
+
+        for bucket in self.buckets:
+            local_expert_count = len(config['local_expert_indices'])
+            P = bucket.grad_data.numel() // local_expert_count  # params per expert
+            send_splits = [0] * ep_size
+            recv_splits = [0] * ep_size
+
+            for r in range(ep_size):
+                for expert_id in placement[r]:
+                    leader = expert_id // experts_per_leader
+                    if leader < min_ep:
+                        if r == ep_rank:
+                            send_splits[leader] += P
+                        if leader == ep_rank:
+                            recv_splits[r] += P
+
+            self._phased_gather_send.append(send_splits)
+            self._phased_gather_recv.append(recv_splits)
+            self._phased_gather_done.append(False)
+
+    def _start_phased_gather(self, bucket_idx):
+        """Approach C: gather phase (all_to_all on ep_group) for one bucket."""
+        cfg = self._het_ep_config
+        ep_group = cfg['ep_group']
+        is_leader = cfg.get('is_b_leader', False)
+        bucket = self.buckets[bucket_idx]
+
+        send_splits = self._phased_gather_send[bucket_idx]
+        recv_splits = self._phased_gather_recv[bucket_idx]
+        recv_total = sum(recv_splits)
+
+        input_tensor = bucket.grad_data
+        if is_leader:
+            output_tensor = self._gather_buffers[bucket_idx][:recv_total]
+        else:
+            output_tensor = torch.empty(
+                recv_total, dtype=input_tensor.dtype, device=input_tensor.device)
+
+        # Debug: verify split sizes match tensor dims.
+        import torch.distributed as _dist
+        _r = _dist.get_rank() if _dist.is_initialized() else -1
+        print(f"[R{_r}] phased_gather bucket={bucket_idx}: "
+              f"send={send_splits} sum={sum(send_splits)} input={input_tensor.numel()} "
+              f"recv={recv_splits} sum={recv_total} output={output_tensor.numel()} "
+              f"ep_rank={cfg['ep_rank']} experts={cfg['local_expert_indices']}", flush=True)
+
+        torch.distributed.all_to_all_single(
+            output_tensor, input_tensor,
+            output_split_sizes=recv_splits,
+            input_split_sizes=send_splits,
+            group=ep_group,
+        )
+        self._phased_gather_done[bucket_idx] = True
+
+    def _start_phased_allreduce(self, bucket_idx):
+        """Approach C: allreduce for one bucket (on edp_group)."""
+        cfg = self._het_ep_config
+        edp_group = cfg['edp_group']
+        is_leader = cfg.get('is_b_leader', False)
+
+        reduce_op = torch.distributed.ReduceOp.SUM
+        if self.ddp_config.average_in_collective:
+            reduce_op = torch.distributed.ReduceOp.AVG
+
+        if is_leader:
+            recv_total = sum(self._phased_gather_recv[bucket_idx])
+            torch.distributed.all_reduce(
+                self._gather_buffers[bucket_idx][:recv_total],
+                op=reduce_op, group=edp_group)
+        else:
+            torch.distributed.all_reduce(
+                self.buckets[bucket_idx].grad_data, op=reduce_op, group=edp_group)
+
+    def _finish_phased_scatter_all(self):
+        """Approach C: scatter ALL buckets (reverse all_to_all on ep_group)."""
+        cfg = self._het_ep_config
+        ep_group = cfg['ep_group']
+        is_leader = cfg.get('is_b_leader', False)
+
+        for bucket_idx, bucket in enumerate(self.buckets):
+            send_splits = self._phased_gather_recv[bucket_idx]  # reversed
+            recv_splits = self._phased_gather_send[bucket_idx]  # reversed
+            send_total = sum(send_splits)
+
+            if is_leader:
+                input_tensor = self._gather_buffers[bucket_idx][:send_total]
+            else:
+                input_tensor = torch.empty(
+                    send_total, dtype=bucket.grad_data.dtype,
+                    device=bucket.grad_data.device)
+
+            torch.distributed.all_to_all_single(
+                bucket.grad_data, input_tensor,
+                output_split_sizes=recv_splits,
+                input_split_sizes=send_splits,
+                group=ep_group,
+            )
 
     def reset(self):
         """
@@ -595,6 +719,14 @@ class _ParamAndGradBucketGroup:
         needs_reshard = cfg['needs_reshard']
         is_edp_eligible = cfg['is_edp_eligible']
 
+        # Approach C: phased (gather + allreduce now, scatter deferred to finish).
+        if getattr(self, '_use_phased_ep', False) and local_ep_size > 1:
+            for idx in range(len(self.buckets)):
+                self._start_phased_gather(idx)
+                self._start_phased_allreduce(idx)
+            # Scatter deferred to finish_grad_sync.
+            return
+
         # Approach B: fused intra-bucket pipeline (multi-leader).
         if self._pipelined_collectives is not None:
             is_b_leader = cfg.get('is_b_leader', is_edp_eligible)
@@ -836,9 +968,11 @@ class _ParamAndGradBucketGroup:
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             torch.cuda.default_stream().wait_stream(self.communication_stream)
             return
-        # Heterogeneous EP grad sync is synchronous even with overlap_grad_reduce;
-        # grad_reduce_handle is None after start_grad_sync returns.
+        # Heterogeneous EP grad sync.
         if self._het_ep_config is not None:
+            # Approach C: scatter all buckets now (gather + allreduce already done).
+            if getattr(self, '_use_phased_ep', False) and self._het_ep_config['local_ep_size'] > 1:
+                self._finish_phased_scatter_all()
             return
         assert self.grad_reduce_handle is not None, (
             f"Communication call has not been issued for this bucket "

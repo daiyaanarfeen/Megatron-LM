@@ -171,6 +171,11 @@ class DistributedDataParallelConfig:
     """Number of pipeline chunks (K) for Approach B. Sweet spot is 4-8. Beyond that,
        per-chunk NCCL launch overhead dominates."""
 
+    use_phased_ep_reshard: bool = False
+    """If true, use Approach C (phased reshard) for heterogeneous EP gradient sync.
+       Gather (all_to_all) overlaps with backward, allreduce overlaps across buckets,
+       scatter (all_to_all) is batched after all allreduces complete."""
+
     def __post_init__(self):
         import os
 
