@@ -39,7 +39,7 @@ Per bucket, three NCCL collectives:
 **Verification**: Unit tests fill grads with 1.0, sync, check result = num_replicas/dp_size. Cross-rank consistency test verifies matching grads across replicas.
 
 **Test files**: `tests/unit_tests/distributed/test_heterogeneous_ep_grad_sync.py`
-**Job scripts**: `run_het_ep_tests_12gpu.sh`, `run_het_ep_nvshmem_12gpu.sh`
+**Job scripts**: `scripts/heterogeneous_ep/run_het_ep_tests_12gpu.sh`, `scripts/heterogeneous_ep/run_het_ep_nvshmem_12gpu.sh`
 
 ---
 
@@ -246,13 +246,15 @@ Follower 1 (ep_rank 5): experts [5, 11]
 
 ### Standalone Diagnostics
 
-Various `check_*.py` scripts in the repo root:
+Standalone diagnostics live in `tools/heterogeneous_ep/`:
 - `check_ring.py`: standalone NVSHMEM ring allreduce test
 - `check_placement.py`: expert placement + forward/backward + grad sync test
 - `check_put_signal.py`: NVSHMEM put_signal/signal_wait verification
 - `check_combined_exact.py`: combined NVSHMEM+NCCL pattern test
 
 ### Job Scripts
+
+SLURM launchers live in `scripts/heterogeneous_ep/`. Set `IMAGE` to the container image path before submitting; `WORKDIR` defaults to the submission directory.
 
 - `run_het_ep_nvshmem_12gpu.sh`: correctness tests + benchmark (12 GPU)
 - `run_integration_12gpu.sh`, `run_integration_28gpu.sh`, `run_integration_32gpu.sh`: training integration
