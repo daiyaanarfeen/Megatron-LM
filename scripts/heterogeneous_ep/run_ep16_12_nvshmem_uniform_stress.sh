@@ -14,6 +14,8 @@
 # Standard Megatron GPT stress comparison:
 # - heterogeneous EP16/EP12, TP2, CP2, ETP1 on 28 ranks, NVSHMEM approach
 # - uniform EP16, TP2, CP2, ETP1 on 32 ranks, standard pretrain_gpt.py
+# - proportional per-replica samples: uniform 16-GPU replicas get 8 samples,
+#   hetero 16-GPU replica gets 8 and 12-GPU replica gets 6.
 
 set -euo pipefail
 
@@ -22,6 +24,11 @@ LOGDIR=${LOGDIR:-$WORKDIR/heterogeneous_ep_training_logs_ep16_12_stress}
 MASTER_PORT=${MASTER_PORT:-29520}
 GPUS_PER_NODE=${GPUS_PER_NODE:-4}
 TRAIN_ITERS=${TRAIN_ITERS:-20}
+HETERO_GBS=${HETERO_GBS:-14}
+UNIFORM_GBS=${UNIFORM_GBS:-16}
+SEQ_LENGTH=${SEQ_LENGTH:-8192}
+MAX_POSITION_EMBEDDINGS=${MAX_POSITION_EMBEDDINGS:-$SEQ_LENGTH}
+RECOMPUTE_NUM_LAYERS=${RECOMPUTE_NUM_LAYERS:-1}
 # The opt-in NVSHMEM path rebuilds expert buckets on layer boundaries. For this
 # model each layer/expert BF16 grad payload is 256 MiB, so 320 MiB leaves margin.
 NVSHMEM_SLOT_MB=${MEGATRON_NVSHMEM_SLOT_MB:-320}
@@ -57,6 +64,9 @@ common_args=(
   --overlap-grad-reduce
   --bf16
   --grad-reduce-in-bf16
+  --recompute-granularity full
+  --recompute-method uniform
+  --recompute-num-layers "$RECOMPUTE_NUM_LAYERS"
   --tensor-model-parallel-size 2
   --context-parallel-size 2
   --expert-tensor-parallel-size 1
@@ -65,8 +75,8 @@ common_args=(
   --hidden-size 4096
   --ffn-hidden-size 16384
   --num-attention-heads 32
-  --seq-length 4096
-  --max-position-embeddings 4096
+  --seq-length "$SEQ_LENGTH"
+  --max-position-embeddings "$MAX_POSITION_EMBEDDINGS"
   --micro-batch-size 1
   --num-experts 96
   --moe-router-topk 2
@@ -118,7 +128,7 @@ if [[ "$RUN_HETERO" == "1" ]]; then
   echo "=== hetero EP16/EP12 TP2 CP2 ETP1 approach=nvshmem ==="
   if ! run_in_allocation 7 "$LOGDIR/hetero_ep16_ep12_tp2_cp2_nvshmem.log" "$MASTER_PORT" \
     pretrain_gpt_heterogeneous_ep.py "${common_args[@]}" \
-    --global-batch-size 7 \
+    --global-batch-size "$HETERO_GBS" \
     --heterogeneous-ep-ddp-approach nvshmem \
     --heterogeneous-ep-num-tp-cp-per-replica 4 3; then
     status=1
@@ -129,7 +139,7 @@ if [[ "$RUN_UNIFORM" == "1" ]]; then
   echo "=== uniform EP16 TP2 CP2 ETP1 standard ==="
   if ! run_in_allocation 8 "$LOGDIR/uniform_ep16_tp2_cp2_standard.log" "$((MASTER_PORT + 1))" \
     pretrain_gpt.py "${common_args[@]}" \
-    --global-batch-size 8 \
+    --global-batch-size "$UNIFORM_GBS" \
     --expert-model-parallel-size 16; then
     status=1
   fi
