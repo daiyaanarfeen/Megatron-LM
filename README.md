@@ -130,6 +130,48 @@ We also strong scaled the standard GPT-3 model (our version has slightly more th
 ![Strong scaling](images/strong_scaling.png)
 
 
+# HSG Heterogeneous EP Benchmark
+
+The HSG GB200 Slurm cluster uses Enroot/Pyxis containers. For the nonuniform EP
+training comparison, use a saved `.sqsh` image with the runtime dependencies
+installed once, then run the benchmark from that cached image.
+
+```bash
+ssh hsg-1
+cd /lustre/fsw/portfolios/coreai/users/darfeen/Megatron-LM
+
+# One-time dependency image preparation. This starts from the base HSG image,
+# installs NVSHMEM Python packages plus an editable Megatron install, and saves
+# the result as pyt25.08-nvshmem-megatron-het-ep.sqsh via --container-save.
+sbatch scripts/heterogeneous_ep/prepare_hsg_cached_image.sh
+
+# After the cached image exists, run the standard Megatron GPT comparison:
+# - heterogeneous EP8/EP6, TP2, CP2, ETP2 on 28 ranks
+# - uniform EP8, TP2, CP2, ETP2 on 32 ranks
+# - hetero approaches: nccl, nvshmem, phased
+# - uniform baseline: one standard run
+IMAGE=/lustre/fsw/portfolios/coreai/users/darfeen/pyt25.08-nvshmem-megatron-het-ep.sqsh \
+INSTALL_NVSHMEM=0 \
+sbatch scripts/heterogeneous_ep/run_standard_training_ep8_6_compare.sh
+
+# To run only the standard uniform baseline:
+RUN_HETERO=0 RUN_UNIFORM=1 \
+IMAGE=/lustre/fsw/portfolios/coreai/users/darfeen/pyt25.08-nvshmem-megatron-het-ep.sqsh \
+INSTALL_NVSHMEM=0 \
+sbatch scripts/heterogeneous_ep/run_standard_training_ep8_6_compare.sh
+
+# To run a single heterogeneous approach for a quick check:
+RUN_HETERO=1 RUN_UNIFORM=0 HETERO_APPROACHES=nccl \
+IMAGE=/lustre/fsw/portfolios/coreai/users/darfeen/pyt25.08-nvshmem-megatron-het-ep.sqsh \
+INSTALL_NVSHMEM=0 \
+sbatch scripts/heterogeneous_ep/run_standard_training_ep8_6_compare.sh
+```
+
+This follows the HSG container guidance for persistent container changes:
+install packages inside a Pyxis-launched container with `--container-save`, then
+use the saved `.sqsh` through `srun --container-image` for future jobs.
+
+
 # Roadmaps
 
 - **[MoE Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729)** - DeepSeek-V3, Qwen3, advanced parallelism, FP8 optimizations, and Blackwell enhancements
