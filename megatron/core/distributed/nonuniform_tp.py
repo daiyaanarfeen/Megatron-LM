@@ -16,12 +16,11 @@ Usage:
 
 import fnmatch
 import functools
-import inspect
 import logging
 import math
 import sys
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -32,89 +31,29 @@ from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import log_on_each_pipeline_stage
-from . import distributed_data_parallel as ddp_module
 from . import param_and_grad_buffer as pgb
 from .distributed_data_parallel import DistributedDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
+from .nonuniform_common import (
+    FullParamLayout,
+    PerBufferParamLayout,
+    all_to_all_with_output_views,
+    configure_post_sync_handle_tracker,
+    filter_kwargs_for_callable,
+    pad_bucket_end,
+    pad_param_start,
+    patch_ddp_param_and_grad_buffer,
+    record_post_sync_handles,
+    wrap_bucket_groups_with_subclass,
+)
 from .param_and_grad_buffer import _ParamAndGradBucketGroup, _ParamAndGradBuffer
 
 logger = logging.getLogger(__name__)
 
 
-def pad_to_divisor(value: int, divisor: int) -> int:
-    """Round up ``value`` to the nearest multiple of ``divisor``."""
-    return int(math.ceil(value / divisor) * divisor)
-
-
-def pad_param_start(param_start_index: int) -> int:
-    """Align parameter start index to a 64-element boundary."""
-    return pad_to_divisor(param_start_index, 64)
-
-
-def pad_bucket_end(
-    bucket_end_index: int, data_parallel_world_size: int, pad_for_high_nccl_busbw: bool
-) -> int:
-    """Pad bucket end for DP divisibility and optionally high NCCL bus bandwidth."""
-    if pad_for_high_nccl_busbw:
-        divisor = math.lcm(data_parallel_world_size, 128, 2**16)
-    else:
-        divisor = math.lcm(data_parallel_world_size, 128)
-    return pad_to_divisor(bucket_end_index, divisor)
-
-
-@dataclass
-class PerBufferParamLayout:
-    """Layout for parameters within one NTP-owned contiguous DDP buffer."""
-
-    param_index_map: Dict[torch.nn.Parameter, Tuple[int, int, int]] = field(default_factory=dict)
-    side_grad_index_map: Dict[torch.nn.Parameter, Tuple[int, int, int]] = field(
-        default_factory=dict
-    )
-    bucket_indices: List[Tuple[int, int]] = field(default_factory=list)
-    per_bucket_numel_unpadded: List[int] = field(default_factory=list)
-    param_indices: List[int] = field(default_factory=list)
-
-
-@dataclass
-class FullParamLayout:
-    """Compatibility placeholder for callers that pass precomputed layouts."""
-
-    layouts: Dict[object, PerBufferParamLayout] = field(default_factory=dict)
-
-
-class _NTPAllToAllHandle:
-    """Async all_to_all handle that copies temporary contiguous outputs back into views."""
-
-    def __init__(self, handle, output_copies):
-        self.handle = handle
-        self.output_copies = output_copies
-
-    def wait(self):
-        self.handle.wait()
-        for dst, src in self.output_copies:
-            dst.copy_(src)
-        self.output_copies = []
-
-
 def _ntp_all_to_all(output_tensors, input_tensors, group, async_op: bool = False):
     """Run all_to_all, preserving non-contiguous output views via temporary buffers."""
-    output_list = []
-    output_copies = []
-    for tensor in output_tensors:
-        if tensor.is_contiguous():
-            output_list.append(tensor)
-        else:
-            contiguous = torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device)
-            output_list.append(contiguous)
-            output_copies.append((tensor, contiguous))
-
-    handle = dist.all_to_all(output_list, input_tensors, group=group, async_op=async_op)
-    if async_op:
-        return _NTPAllToAllHandle(handle, output_copies)
-
-    for dst, src in output_copies:
-        dst.copy_(src)
-    return None
+    return all_to_all_with_output_views(output_tensors, input_tensors, group, async_op)
 
 
 def _ntp_get_non_active_ranks(
@@ -761,6 +700,10 @@ class NonuniformTPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
 
     def __init__(self, *args, ntp_config: Optional[NonuniformTPConfig] = None, **kwargs):
         super().__init__(*args, **kwargs)
+        self.configure_nonuniform_tp(ntp_config)
+
+    def configure_nonuniform_tp(self, ntp_config: Optional[NonuniformTPConfig] = None):
+        """Attach NTP runtime state to an existing bucket group."""
         self.ntp_config = ntp_config or NonuniformTPConfig()
         self.ntp_post_sync_state = None
 
@@ -782,19 +725,7 @@ class NonuniformTPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
 
     def _record_ntp_post_sync_handles(self, handles):
         """Track post-sync handles and wait for all of them at the last bucket group."""
-        state = self.ntp_post_sync_state
-        if state is None:
-            for handle in handles:
-                handle.wait()
-            return
-
-        state['handles'].extend(handles)
-        if self is state['last_bucket_group']:
-            try:
-                for handle in state['handles']:
-                    handle.wait()
-            finally:
-                state['handles'] = []
+        record_post_sync_handles(self, 'ntp_post_sync_state', handles)
 
     def start_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """Start DP grad sync after any pending NTP reshard for this bucket is complete."""
@@ -1294,29 +1225,24 @@ class NonuniformTPDistributedDataParallel(DistributedDataParallel):
                 'module': module,
                 'disable_bucketing': disable_bucketing,
                 'pg_collection': pg_collection,
+                'full_param_layout': full_param_layout,
             }
-            if 'full_param_layout' in inspect.signature(
-                DistributedDataParallel.__init__
-            ).parameters:
-                parent_kwargs['full_param_layout'] = full_param_layout
-            elif full_param_layout is not None:
+            filtered_parent_kwargs = filter_kwargs_for_callable(
+                DistributedDataParallel.__init__, parent_kwargs
+            )
+            if full_param_layout is not None and 'full_param_layout' not in filtered_parent_kwargs:
                 logger.warning(
                     "Ignoring full_param_layout because this DDP base does not accept it"
                 )
-            super(NonuniformTPDistributedDataParallel, self).__init__(**parent_kwargs)
+            super(NonuniformTPDistributedDataParallel, self).__init__(**filtered_parent_kwargs)
 
         # Use NTP-aware buffer class
         if self.ntp_config.tp_spares > 0:
             # DDP imports _ParamAndGradBuffer into its module namespace, so patch that binding
             # while the parent constructor allocates buffers.
-            original_buffer_class = ddp_module._ParamAndGradBuffer
-            ddp_module._ParamAndGradBuffer = functools.partial(
-                NonuniformTPParamAndGradBuffer, ntp_config=self.ntp_config
-            )
-            try:
+            buffer_cls = functools.partial(NonuniformTPParamAndGradBuffer, ntp_config=self.ntp_config)
+            with patch_ddp_param_and_grad_buffer(buffer_cls):
                 _call_parent_init()
-            finally:
-                ddp_module._ParamAndGradBuffer = original_buffer_class
             self._wrap_bucket_groups_for_ntp()
         else:
             _call_parent_init()
@@ -1324,57 +1250,25 @@ class NonuniformTPDistributedDataParallel(DistributedDataParallel):
     def _wrap_bucket_groups_for_ntp(self):
         """Replace DDP bucket groups with NTP-aware groups and rebuild param lookup."""
 
-        def wrap_groups(bucket_groups):
-            wrapped_groups = []
-            old_to_new = {}
-            for bucket_group in bucket_groups:
-                if (
-                    self.ddp_config.use_distributed_optimizer
-                    or self.ddp_config.overlap_param_gather
-                ):
-                    collective_group = bucket_group.intra_distributed_optimizer_instance_group
-                    collective_group_size = bucket_group.intra_distributed_optimizer_instance_size
-                else:
-                    collective_group = bucket_group.data_parallel_group
-                    collective_group_size = bucket_group.data_parallel_group.size()
+        def configure(bucket_group):
+            bucket_group.configure_nonuniform_tp(self.ntp_config)
 
-                wrapped_group = NonuniformTPParamAndGradBucketGroup(
-                    bucket_group.buckets,
-                    bucket_group.ddp_config,
-                    collective_group,
-                    collective_group_size,
-                    ntp_config=self.ntp_config,
-                )
-                if hasattr(bucket_group, 'inter_distributed_optimizer_instance_group'):
-                    wrapped_group.inter_distributed_optimizer_instance_group = (
-                        bucket_group.inter_distributed_optimizer_instance_group
-                    )
-                if hasattr(bucket_group, 'communication_stream'):
-                    wrapped_group.communication_stream = bucket_group.communication_stream
-                old_to_new[bucket_group] = wrapped_group
-                wrapped_groups.append(wrapped_group)
-
-            for bucket_group, wrapped_group in old_to_new.items():
-                next_group = getattr(bucket_group, 'next_param_gather_bucket_group', None)
-                if next_group is not None:
-                    wrapped_group.next_param_gather_bucket_group = old_to_new[next_group]
-
-            return wrapped_groups
-
-        self.bucket_groups = wrap_groups(self.bucket_groups)
-        self.expert_parallel_bucket_groups = wrap_groups(self.expert_parallel_bucket_groups)
         self.param_to_bucket_group = {}
-        for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
-            for bucket_group in bucket_groups:
-                for bucket in bucket_group.buckets:
-                    for param in bucket.params_list:
-                        self.param_to_bucket_group[param] = bucket_group
+        self.bucket_groups = wrap_bucket_groups_with_subclass(
+            self.bucket_groups,
+            NonuniformTPParamAndGradBucketGroup,
+            configure,
+            self.param_to_bucket_group,
+        )
+        self.expert_parallel_bucket_groups = wrap_bucket_groups_with_subclass(
+            self.expert_parallel_bucket_groups,
+            NonuniformTPParamAndGradBucketGroup,
+            configure,
+            self.param_to_bucket_group,
+        )
 
         all_bucket_groups = self.bucket_groups + self.expert_parallel_bucket_groups
-        if all_bucket_groups:
-            post_sync_state = {'handles': [], 'last_bucket_group': all_bucket_groups[-1]}
-            for bucket_group in all_bucket_groups:
-                bucket_group.ntp_post_sync_state = post_sync_state
+        configure_post_sync_handle_tracker(all_bucket_groups, 'ntp_post_sync_state')
 
     def _make_backward_post_hook(self, param: torch.nn.Parameter):
         """
