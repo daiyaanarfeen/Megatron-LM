@@ -11,9 +11,14 @@ that own the local parameters before the normal optimizer step runs.
 from functools import partial
 import json
 from pathlib import Path
+import sys
 from typing import Dict, Optional
 
 import torch.distributed as dist
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import pretrain_gpt as gpt
 from megatron.core import parallel_state
