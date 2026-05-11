@@ -120,6 +120,177 @@ def local_expert_indices_are_contiguous(local_expert_indices: Sequence[int]) -> 
     )
 
 
+def compute_nonuniform_ep_expert_placement(
+    num_experts: int, local_ep_size: int, min_ep_size: int
+) -> Tuple[List[List[int]], Dict[int, List[Tuple[int, int, int]]]]:
+    """Compute placement for replicas with ``local_ep_size >= min_ep_size``.
+
+    Min-EP replicas use contiguous owner ranges. Wider replicas keep the first
+    slice of each owner range on owner ranks and place the remaining experts
+    round-robin on follower ranks. The returned gather map is shared by token
+    routing tests and NEP gradient ownership transfer setup.
+    """
+    if num_experts % local_ep_size != 0 or num_experts % min_ep_size != 0:
+        raise RuntimeError(
+            "NEP expert placement requires num_experts to be divisible by both "
+            f"local_ep_size ({local_ep_size}) and min_ep_size ({min_ep_size}); "
+            f"got num_experts={num_experts}"
+        )
+    if local_ep_size < min_ep_size:
+        raise RuntimeError(
+            f"local_ep_size ({local_ep_size}) must be >= min_ep_size ({min_ep_size})"
+        )
+
+    experts_per_rank = num_experts // local_ep_size
+    experts_per_owner = num_experts // min_ep_size
+    experts_offloaded = experts_per_owner - experts_per_rank
+    num_followers = local_ep_size - min_ep_size
+
+    placement = [[] for _ in range(local_ep_size)]
+    for owner_rank in range(min_ep_size):
+        start = owner_rank * experts_per_owner
+        placement[owner_rank] = list(range(start, start + experts_per_rank))
+
+    if num_followers > 0 and experts_offloaded > 0:
+        follower_index = 0
+        for owner_rank in range(min_ep_size):
+            offload_start = owner_rank * experts_per_owner + experts_per_rank
+            for offset in range(experts_offloaded):
+                expert_id = offload_start + offset
+                follower_rank = min_ep_size + (follower_index % num_followers)
+                placement[follower_rank].append(expert_id)
+                follower_index += 1
+
+    for expert_ids in placement:
+        expert_ids.sort()
+
+    gather_map = {}
+    for follower_rank in range(min_ep_size, local_ep_size):
+        gather_map[follower_rank] = []
+        for local_index, expert_id in enumerate(placement[follower_rank]):
+            owner_rank = expert_id // experts_per_owner
+            owner_slot = expert_id - owner_rank * experts_per_owner
+            gather_map[follower_rank].append((local_index, owner_rank, owner_slot))
+
+    return placement, gather_map
+
+
+class NonuniformEPRankGenerator:
+    """Generate process groups for opt-in NEP replicas with different EP sizes."""
+
+    _ATTENTION_KEYS = {'tp', 'cp', 'dp', 'dp-cp', 'tp-dp', 'tp-dp-cp', 'tp-cp'}
+    _EXPERT_KEYS = {'etp', 'ep', 'etp-ep', 'edp'}
+
+    def __init__(
+        self,
+        tp: int,
+        cp: int,
+        num_tp_cp_per_replica: Sequence[int],
+        etp: Optional[int] = None,
+        rank_offset: int = 0,
+    ) -> None:
+        self.tp = tp
+        self.cp = cp
+        self.tp_cp = tp * cp
+        self.etp = etp if etp is not None else tp
+        self.rank_offset = rank_offset
+        self.num_tp_cp_per_replica = [int(value) for value in num_tp_cp_per_replica]
+        self.num_replicas = len(self.num_tp_cp_per_replica)
+
+        if self.etp > self.tp or self.tp % self.etp != 0:
+            raise RuntimeError(f"expert TP ({self.etp}) must divide attention TP ({self.tp})")
+        if any(value < 1 for value in self.num_tp_cp_per_replica):
+            raise RuntimeError(
+                "Every NEP replica must contain at least one TP*CP unit; got "
+                f"{self.num_tp_cp_per_replica}"
+            )
+
+        self.world_size = sum(self.num_tp_cp_per_replica) * self.tp_cp
+        self.dp = sum(self.num_tp_cp_per_replica)
+        self.min_k = min(self.num_tp_cp_per_replica)
+
+        self.replica_offsets = [0]
+        for num_tp_cp in self.num_tp_cp_per_replica:
+            self.replica_offsets.append(self.replica_offsets[-1] + num_tp_cp * self.tp_cp)
+
+    def get_ranks(self, key: str) -> List[List[int]]:
+        """Return rank groups for attention or expert dimensions."""
+        if key in self._ATTENTION_KEYS:
+            return self._get_attention_ranks(key)
+        if key in self._EXPERT_KEYS:
+            return self._get_expert_ranks(key)
+        raise ValueError(
+            f"Unknown nonuniform EP rank key {key}; expected "
+            f"{sorted(self._ATTENTION_KEYS | self._EXPERT_KEYS)}"
+        )
+
+    def _get_attention_ranks(self, key: str) -> List[List[int]]:
+        from .. import parallel_state
+
+        name_to_size = {"tp": self.tp, "cp": self.cp, "dp": self.dp}
+        ordered_tokens = "tp-cp-dp".split("-")
+        ordered_size = [name_to_size[token] for token in ordered_tokens]
+        token_list = key.split("-")
+        mask = [token in token_list for token in ordered_tokens]
+        ranks = parallel_state.generate_masked_orthogonal_rank_groups(
+            self.world_size, ordered_size, mask
+        )
+        if self.rank_offset > 0:
+            for rank_group in ranks:
+                for index in range(len(rank_group)):
+                    rank_group[index] += self.rank_offset
+        return ranks
+
+    def _get_expert_ranks(self, key: str) -> List[List[int]]:
+        if key == 'etp-ep':
+            return self._get_etp_ep_ranks()
+        if key == 'etp':
+            return self._get_etp_ranks()
+        if key == 'ep':
+            return self._get_ep_ranks()
+        if key == 'edp':
+            return self._get_edp_ranks()
+        raise ValueError(f"Unknown expert key {key}")
+
+    def _get_etp_ep_ranks(self) -> List[List[int]]:
+        groups = []
+        for replica_index, num_tp_cp in enumerate(self.num_tp_cp_per_replica):
+            start = self.rank_offset + self.replica_offsets[replica_index]
+            groups.append(list(range(start, start + num_tp_cp * self.tp_cp)))
+        return groups
+
+    def _get_etp_ranks(self) -> List[List[int]]:
+        groups = []
+        for replica_index, num_tp_cp in enumerate(self.num_tp_cp_per_replica):
+            start = self.rank_offset + self.replica_offsets[replica_index]
+            ep_size = num_tp_cp * self.tp_cp // self.etp
+            for ep_index in range(ep_size):
+                groups.append(
+                    list(range(start + ep_index * self.etp, start + (ep_index + 1) * self.etp))
+                )
+        return groups
+
+    def _get_ep_ranks(self) -> List[List[int]]:
+        groups = []
+        for replica_index, num_tp_cp in enumerate(self.num_tp_cp_per_replica):
+            start = self.rank_offset + self.replica_offsets[replica_index]
+            block = list(range(start, start + num_tp_cp * self.tp_cp))
+            for etp_position in range(self.etp):
+                groups.append(block[etp_position::self.etp])
+        return groups
+
+    def _get_edp_ranks(self) -> List[List[int]]:
+        groups = []
+        for position in range(self.min_k * self.tp_cp):
+            groups.append(
+                [
+                    self.rank_offset + self.replica_offsets[replica_index] + position
+                    for replica_index in range(self.num_replicas)
+                ]
+            )
+        return groups
+
+
 @dataclass
 class PerBufferParamLayout:
     """Layout for parameters within one opt-in contiguous DDP buffer."""

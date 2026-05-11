@@ -8,8 +8,10 @@ import pytest
 import torch
 
 from megatron.core.distributed.nonuniform_common import (
+    NonuniformEPRankGenerator,
     build_expert_to_ep_rank_map,
     clear_nonuniform_ep_runtime_config,
+    compute_nonuniform_ep_expert_placement,
     get_nonuniform_ep_expert_to_ep_rank_map,
     get_nonuniform_ep_local_expert_indices,
     set_nonuniform_ep_runtime_config,
@@ -22,6 +24,7 @@ from megatron.core.distributed.nonuniform_ep import (
     _ExpertBucketPlan,
     _accumulate_flat_into_bucket,
     _build_expert_bucket_specs,
+    _build_synthetic_owner_bucket_specs,
     _copy_flat_into_bucket,
     _owner_for_expert,
     _pack_bucket_slices,
@@ -64,6 +67,32 @@ class TestNonuniformEPTokenRouting:
 
         assert get_nonuniform_ep_local_expert_indices() == [2, 6]
         assert get_nonuniform_ep_expert_to_ep_rank_map(8) == [0, 0, 2, 3, 1, 1, 2, 3]
+
+    def test_generated_placement_supports_ep32_ep28_shape(self):
+        placement, gather_map = compute_nonuniform_ep_expert_placement(
+            num_experts=224,
+            local_ep_size=32,
+            min_ep_size=28,
+        )
+
+        assert len(placement) == 32
+        assert all(len(experts) == 7 for experts in placement)
+        assert placement[0] == list(range(0, 7))
+        assert placement[28] == [7, 39, 71, 103, 135, 167, 199]
+        assert gather_map[28][0] == (0, 0, 7)
+
+    def test_rank_generator_builds_ep32_ep28_groups_from_tp2_cp2_etp1(self):
+        generator = NonuniformEPRankGenerator(
+            tp=2,
+            cp=2,
+            etp=1,
+            num_tp_cp_per_replica=[8, 7],
+        )
+
+        assert generator.world_size == 60
+        assert [len(group) for group in generator.get_ranks('ep')] == [32, 28]
+        assert len(generator.get_ranks('edp')) == 28
+        assert generator.get_ranks('edp')[0] == [0, 32]
 
 
 class TestNonuniformEPPlanning:
@@ -114,6 +143,22 @@ class TestNonuniformEPPlanning:
             (7, 4, 8),
         ]
         assert runtime_config['_local_expert_id_set'] == {4, 7}
+
+    def test_synthetic_owner_specs_cover_overflow_experts(self):
+        buffer = Mock()
+        runtime_config = {
+            'ep_rank': 0,
+            'min_ep_size': 2,
+            'expert_placement': [[0], [2], [1], [3]],
+        }
+        specs = _build_synthetic_owner_bucket_specs(
+            [buffer],
+            [(buffer, 0, [], 0, 4)],
+            runtime_config,
+            NonuniformEPConfig(),
+        )
+
+        assert specs == [(buffer, 1, [], 0, 4, True)]
 
 
 class TestNonuniformEPTransfers:

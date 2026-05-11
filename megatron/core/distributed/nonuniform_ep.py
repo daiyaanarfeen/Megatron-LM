@@ -11,9 +11,10 @@ the local expert params on every rank.
 """
 
 from dataclasses import dataclass, field
+from datetime import timedelta
 import logging
 import re
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -24,11 +25,14 @@ from ..transformer.transformer_config import TransformerConfig
 from .distributed_data_parallel import DistributedDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .nonuniform_common import (
+    NonuniformEPRankGenerator,
+    compute_nonuniform_ep_expert_placement,
     configure_ordered_bucket_group_scheduler,
     filter_kwargs_for_callable,
     get_global_rank,
     get_nonuniform_ep_runtime_config,
     reset_ordered_bucket_group_scheduler,
+    set_nonuniform_ep_runtime_config,
     try_start_ordered_bucket_groups,
 )
 from .param_and_grad_buffer import _ParamAndGradBucket, _ParamAndGradBucketGroup
@@ -47,7 +51,9 @@ class NonuniformEPConfig:
 
     runtime_config: Optional[dict] = None
     expert_owner: Optional[Dict[int, int]] = None
-    expert_name_pattern: Union[str, re.Pattern] = field(default_factory=_default_expert_name_pattern)
+    expert_name_pattern: Union[str, re.Pattern] = field(
+        default_factory=_default_expert_name_pattern
+    )
     require_owner_local_expert: bool = True
     grad_transfer_tag_base: int = 711_000
     grad_scatter_tag_base: int = 811_000
@@ -65,6 +71,7 @@ class _ExpertBucketPlan:
     source_global_ranks: List[int]
     bucket_slices: List[Tuple[int, int]]
     bucket_group_index: int
+    synthetic_owner: bool = False
 
     @property
     def numel(self) -> int:
@@ -162,6 +169,260 @@ def _get_runtime_config(config: NonuniformEPConfig) -> dict:
     return _runtime_config_from_parallel_state()
 
 
+def _set_parallel_state_attr(name: str, value) -> None:
+    setattr(parallel_state, name, value)
+
+
+def _get_nccl_communicator_configs(path: Optional[str]) -> dict:
+    if path is None:
+        return {}
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError(
+            "Cannot import `yaml`. Setting custom NCCL communicator configs "
+            "requires the yaml package."
+        ) from exc
+    with open(path, "r", encoding="utf-8") as stream:
+        return yaml.safe_load(stream)
+
+
+def _create_group(ranks, timeout, nccl_comm_cfgs, desc, backend=None):
+    return parallel_state.create_group(
+        ranks,
+        timeout=timeout,
+        backend=backend,
+        pg_options=(
+            None if backend == "gloo" else parallel_state.get_nccl_options(desc, nccl_comm_cfgs)
+        ),
+        group_desc=desc,
+    )
+
+
+def initialize_nonuniform_ep_process_groups(
+    tensor_model_parallel_size: int,
+    context_parallel_size: int,
+    num_tp_cp_per_replica: List[int],
+    expert_tensor_parallel_size: Optional[int] = None,
+    num_moe_experts: Optional[int] = None,
+    nccl_communicator_config_path: Optional[str] = None,
+    distributed_timeout_minutes: int = 30,
+    create_gloo_process_groups: bool = True,
+    get_embedding_ranks: Optional[Callable[[List[int]], List[int]]] = None,
+    get_position_embedding_ranks: Optional[Callable[[List[int]], List[int]]] = None,
+) -> dict:
+    """Initialize opt-in nonuniform EP process groups and runtime metadata.
+
+    This is the shared-branch equivalent of the older nonuniform EP rank
+    generator path, but it lives with the NEP opt-in implementation. It supports
+    PP=1, non-distributed optimizer runs where attention uses a uniform
+    TP/CP/DP layout and expert groups vary by replica size.
+    """
+    if num_moe_experts is None:
+        raise RuntimeError("num_moe_experts is required for nonuniform EP placement")
+    if get_embedding_ranks is None:
+        get_embedding_ranks = parallel_state.default_embedding_ranks
+    if get_position_embedding_ranks is None:
+        get_position_embedding_ranks = parallel_state.default_position_embedding_ranks
+
+    assert dist.is_initialized()
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    tp = tensor_model_parallel_size
+    cp = context_parallel_size
+    etp = expert_tensor_parallel_size if expert_tensor_parallel_size is not None else tp
+
+    generator = NonuniformEPRankGenerator(
+        tp=tp,
+        cp=cp,
+        num_tp_cp_per_replica=num_tp_cp_per_replica,
+        etp=etp,
+    )
+    if generator.world_size != world_size:
+        raise RuntimeError(
+            f"NonuniformEPRankGenerator world_size ({generator.world_size}) != "
+            f"distributed world_size ({world_size}). Expected "
+            "sum(num_tp_cp_per_replica) * TP * CP ranks."
+        )
+
+    for replica_index, num_tp_cp in enumerate(num_tp_cp_per_replica):
+        local_ep_size = num_tp_cp * tp * cp // etp
+        if num_moe_experts % local_ep_size != 0:
+            raise RuntimeError(
+                f"num_moe_experts ({num_moe_experts}) must be divisible by local EP "
+                f"size {local_ep_size} for replica {replica_index}"
+            )
+
+    timeout = timedelta(minutes=distributed_timeout_minutes)
+    nccl_comm_cfgs = _get_nccl_communicator_configs(nccl_communicator_config_path)
+
+    # Attention/data groups.
+    for ranks in generator.get_ranks('dp-cp'):
+        group = _create_group(ranks, timeout, nccl_comm_cfgs, "dp_cp")
+        group_gloo = (
+            _create_group(
+                ranks,
+                timeout,
+                nccl_comm_cfgs,
+                "DATA_PARALLEL_GROUP_WITH_CP_GLOO",
+                "gloo",
+            )
+            if create_gloo_process_groups
+            else None
+        )
+        if rank in ranks:
+            _set_parallel_state_attr("_DATA_PARALLEL_GROUP_WITH_CP", group)
+            _set_parallel_state_attr("_DATA_PARALLEL_GROUP_WITH_CP_GLOO", group_gloo)
+            _set_parallel_state_attr("_DATA_PARALLEL_GLOBAL_RANKS_WITH_CP", ranks)
+            _set_parallel_state_attr("_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP", group)
+            _set_parallel_state_attr("_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO", group_gloo)
+
+    for ranks in generator.get_ranks('dp'):
+        group = _create_group(ranks, timeout, nccl_comm_cfgs, "dp")
+        group_gloo = (
+            _create_group(ranks, timeout, nccl_comm_cfgs, "DATA_PARALLEL_GROUP_GLOO", "gloo")
+            if create_gloo_process_groups
+            else None
+        )
+        if rank in ranks:
+            _set_parallel_state_attr("_DATA_PARALLEL_GROUP", group)
+            _set_parallel_state_attr("_DATA_PARALLEL_GROUP_GLOO", group_gloo)
+            _set_parallel_state_attr("_DATA_PARALLEL_GLOBAL_RANKS", ranks)
+
+    for ranks in generator.get_ranks('cp'):
+        group = _create_group(ranks, timeout, nccl_comm_cfgs, "cp")
+        if rank in ranks:
+            _set_parallel_state_attr("_CONTEXT_PARALLEL_GROUP", group)
+            _set_parallel_state_attr("_CONTEXT_PARALLEL_GLOBAL_RANKS", ranks)
+
+    for ranks in generator.get_ranks('tp'):
+        group = _create_group(ranks, timeout, nccl_comm_cfgs, "tp")
+        if rank in ranks:
+            _set_parallel_state_attr("_TENSOR_MODEL_PARALLEL_GROUP", group)
+            _set_parallel_state_attr("_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS", ranks)
+
+    for ranks in generator.get_ranks('tp'):
+        group = _create_group(ranks, timeout, nccl_comm_cfgs, "mp")
+        if rank in ranks:
+            _set_parallel_state_attr("_MODEL_PARALLEL_GROUP", group)
+            _set_parallel_state_attr("_MODEL_PARALLEL_GLOBAL_RANKS", ranks)
+
+    for ranks in [[global_rank] for global_rank in range(world_size)]:
+        pp_group = _create_group(ranks, timeout, nccl_comm_cfgs, "pp")
+        if rank in ranks:
+            _set_parallel_state_attr("_PIPELINE_MODEL_PARALLEL_GROUP", pp_group)
+            _set_parallel_state_attr("_PIPELINE_GLOBAL_RANKS", ranks)
+
+        embedding_ranks = get_embedding_ranks(ranks)
+        embedding_group = _create_group(embedding_ranks, timeout, nccl_comm_cfgs, "embd")
+        if rank in embedding_ranks:
+            _set_parallel_state_attr("_EMBEDDING_GROUP", embedding_group)
+            _set_parallel_state_attr("_EMBEDDING_GLOBAL_RANKS", embedding_ranks)
+
+        position_embedding_ranks = get_position_embedding_ranks(ranks)
+        position_embedding_group = _create_group(
+            position_embedding_ranks, timeout, nccl_comm_cfgs, "pos_embd"
+        )
+        if rank in position_embedding_ranks:
+            _set_parallel_state_attr("_POSITION_EMBEDDING_GROUP", position_embedding_group)
+            _set_parallel_state_attr("_POSITION_EMBEDDING_GLOBAL_RANKS", position_embedding_ranks)
+
+    for ranks in generator.get_ranks('tp-dp-cp'):
+        group = _create_group(ranks, timeout, nccl_comm_cfgs, "tp_dp_cp")
+        if rank in ranks:
+            _set_parallel_state_attr("_TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP", group)
+
+    for ranks in generator.get_ranks('tp-dp'):
+        group = _create_group(ranks, timeout, nccl_comm_cfgs, "tp_dp")
+        if rank in ranks:
+            _set_parallel_state_attr("_TENSOR_AND_DATA_PARALLEL_GROUP", group)
+
+    for ranks in generator.get_ranks('tp-cp'):
+        group = _create_group(ranks, timeout, nccl_comm_cfgs, "tp_cp")
+        if rank in ranks:
+            _set_parallel_state_attr("_TENSOR_AND_CONTEXT_PARALLEL_GROUP", group)
+
+    # Expert groups.
+    for ranks in generator.get_ranks('ep'):
+        group = _create_group(ranks, timeout, nccl_comm_cfgs, "ep")
+        if rank in ranks:
+            _set_parallel_state_attr("_EXPERT_MODEL_PARALLEL_GROUP", group)
+            _set_parallel_state_attr("_EXPERT_MODEL_PARALLEL_RANKS", ranks)
+
+    for ranks in generator.get_ranks('etp'):
+        group = _create_group(ranks, timeout, nccl_comm_cfgs, "ep_tp")
+        if rank in ranks:
+            _set_parallel_state_attr("_EXPERT_TENSOR_PARALLEL_GROUP", group)
+
+    for ranks in generator.get_ranks('etp-ep'):
+        group = _create_group(ranks, timeout, nccl_comm_cfgs, "tp_ep_mp")
+        if rank in ranks:
+            _set_parallel_state_attr("_EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP", group)
+
+    for ranks in generator.get_ranks('etp-ep'):
+        group = _create_group(ranks, timeout, nccl_comm_cfgs, "tp_ep_pp")
+        if rank in ranks:
+            _set_parallel_state_attr("_EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP", group)
+
+    edp_groups = generator.get_ranks('edp')
+    covered_edp_ranks = {covered_rank for group in edp_groups for covered_rank in group}
+    all_edp_groups = edp_groups + [
+        [uncovered_rank] for uncovered_rank in sorted(set(range(world_size)) - covered_edp_ranks)
+    ]
+    for ranks in all_edp_groups:
+        group = _create_group(ranks, timeout, nccl_comm_cfgs, "ep_dp")
+        group_gloo = (
+            _create_group(ranks, timeout, nccl_comm_cfgs, "EXPERT_DATA_PARALLEL_GROUP_GLOO", "gloo")
+            if create_gloo_process_groups
+            else None
+        )
+        if rank in ranks:
+            _set_parallel_state_attr("_EXPERT_DATA_PARALLEL_GROUP", group)
+            _set_parallel_state_attr("_EXPERT_DATA_PARALLEL_GROUP_GLOO", group_gloo)
+            _set_parallel_state_attr("_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP", group)
+            _set_parallel_state_attr("_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO", group_gloo)
+            _set_parallel_state_attr("_INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP", None)
+
+    _set_parallel_state_attr("_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP", dist.group.WORLD)
+    parallel_state._set_global_memory_buffer()
+
+    local_ep_size = None
+    for replica_index, num_tp_cp in enumerate(num_tp_cp_per_replica):
+        replica_start = generator.replica_offsets[replica_index]
+        replica_end = generator.replica_offsets[replica_index + 1]
+        if replica_start <= rank < replica_end:
+            local_ep_size = num_tp_cp * tp * cp // etp
+            break
+    if local_ep_size is None:
+        raise RuntimeError(f"Rank {rank} is not in any nonuniform EP replica")
+
+    min_ep_size = generator.min_k * tp * cp // etp
+    ep_group = parallel_state.get_expert_model_parallel_group()
+    ep_rank = ep_group.rank()
+    expert_placement, expert_gather_map = compute_nonuniform_ep_expert_placement(
+        num_moe_experts,
+        local_ep_size,
+        min_ep_size,
+    )
+    runtime_config = {
+        'needs_reshard': local_ep_size > min_ep_size,
+        'local_ep_size': local_ep_size,
+        'min_ep_size': min_ep_size,
+        'num_replicas': generator.num_replicas,
+        'dp_size': sum(num_tp_cp_per_replica),
+        'ep_group': ep_group,
+        'edp_group': parallel_state.get_expert_data_parallel_group(),
+        'ep_rank': ep_rank,
+        'is_edp_eligible': ep_rank < min_ep_size,
+        'is_b_leader': ep_rank < min_ep_size,
+        'local_expert_indices': expert_placement[ep_rank],
+        'expert_placement': expert_placement,
+        'expert_gather_map': expert_gather_map,
+    }
+    set_nonuniform_ep_runtime_config(runtime_config)
+    return runtime_config
+
+
 def _owner_for_expert(
     expert_id: int,
     runtime_config: dict,
@@ -230,6 +491,7 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if (
             nonuniform_ep_config.require_owner_local_expert
             and self._nep_is_owner
+            and not plan.synthetic_owner
             and plan.expert_id not in runtime_config.get('_local_expert_id_set', set())
         ):
             raise RuntimeError(
@@ -281,10 +543,10 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             )
 
     def _grad_transfer_tag(self) -> int:
-        return self._nep_config.grad_transfer_tag_base + self._nep_plan.bucket_group_index
+        return self._nep_config.grad_transfer_tag_base + self._nep_plan.expert_id
 
     def _grad_scatter_tag(self) -> int:
-        return self._nep_config.grad_scatter_tag_base + self._nep_plan.bucket_group_index
+        return self._nep_config.grad_scatter_tag_base + self._nep_plan.expert_id
 
     def _copy_extra_main_grads_to_grad_buffer(self):
         for bucket in self.buckets:
@@ -391,10 +653,10 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
 
         self._copy_extra_main_grads_to_grad_buffer()
         self._start_nep_gather_to_owner()
-        self._wait_nep_gather_to_owner()
         if not self._nep_is_owner:
             self.grad_reduce_handle = None
             return
+        self._wait_nep_gather_to_owner()
         return self._start_owner_dp_sync_after_gather(force_all_reduce=force_all_reduce)
 
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
@@ -405,12 +667,16 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             if self._nep_is_owner and self.grad_reduce_handle is not None:
                 self.grad_reduce_handle.wait()
                 self.grad_reduce_handle = None
+            if not self._nep_is_owner:
+                self._wait_nep_gather_to_owner()
             self._start_nep_scatter_from_owner()
             self._wait_nep_scatter_from_owner()
             self._copy_back_extra_main_grads()
             return
 
         if self.is_first_batch:
+            self.start_grad_sync(force_all_reduce=force_all_reduce)
+        elif not self._nep_started and len(self.params) == 0:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
 
         if not self._nep_is_owner:
@@ -495,6 +761,53 @@ def _build_expert_bucket_specs(buffers, runtime_config, config, param_to_name):
     return specs
 
 
+def _build_synthetic_owner_bucket_specs(buffers, local_specs, runtime_config, config):
+    """Build owner-side buckets for experts physically held by extra EP ranks."""
+    placement = runtime_config.get('expert_placement')
+    if placement is None:
+        return []
+
+    local_ep_rank = runtime_config['ep_rank']
+    local_expert_ids = {expert_id for _, expert_id, _, _, _ in local_specs}
+    template_numel_by_buffer = {}
+    for buffer, _, _, start, end in local_specs:
+        numel = end - start
+        previous_numel = template_numel_by_buffer.setdefault(buffer, numel)
+        if previous_numel != numel:
+            raise RuntimeError(
+                "NEP synthetic owner buckets assume equal per-expert grad sizes "
+                "within each expert buffer."
+            )
+
+    if not template_numel_by_buffer:
+        return []
+
+    num_experts = sum(len(experts) for experts in placement)
+    synthetic_expert_ids = []
+    for expert_id in range(num_experts):
+        if expert_id in local_expert_ids:
+            continue
+        owner_ep_rank = _owner_for_expert(
+            expert_id,
+            runtime_config,
+            config.expert_owner,
+        )
+        if owner_ep_rank != local_ep_rank:
+            continue
+        if local_ep_rank in _source_ep_ranks_for_expert(expert_id, runtime_config):
+            continue
+        synthetic_expert_ids.append(expert_id)
+
+    specs = []
+    for buffer in buffers:
+        if buffer not in template_numel_by_buffer:
+            continue
+        numel = template_numel_by_buffer[buffer]
+        for expert_id in synthetic_expert_ids:
+            specs.append((buffer, expert_id, [], 0, numel, True))
+    return specs
+
+
 def build_nonuniform_ep_expert_bucket_groups(
     buffers,
     ddp_config: DistributedDataParallelConfig,
@@ -519,14 +832,29 @@ def build_nonuniform_ep_expert_bucket_groups(
             "NonuniformEPConfig.expert_name_pattern."
         )
 
-    for group_index, (buffer, expert_id, params, start, end) in enumerate(specs):
+    all_specs = [
+        (buffer, expert_id, params, start, end, False)
+        for buffer, expert_id, params, start, end in specs
+    ]
+    all_specs.extend(
+        _build_synthetic_owner_bucket_specs(
+            buffers,
+            specs,
+            runtime_config,
+            nonuniform_ep_config,
+        )
+    )
+    buffer_order = {buffer: index for index, buffer in enumerate(buffers)}
+    all_specs.sort(key=lambda spec: (buffer_order[spec[0]], spec[1], spec[5]))
+
+    for group_index, (buffer, expert_id, params, start, end, is_synthetic) in enumerate(all_specs):
         owner_ep_rank = _owner_for_expert(
             expert_id,
             runtime_config,
             nonuniform_ep_config.expert_owner,
         )
         source_ep_ranks = _source_ep_ranks_for_expert(expert_id, runtime_config)
-        if owner_ep_rank not in source_ep_ranks:
+        if owner_ep_rank not in source_ep_ranks and not is_synthetic:
             raise RuntimeError(
                 "NEP owner-transfer mode requires the owner rank to physically hold "
                 f"expert {expert_id}. owner_ep_rank={owner_ep_rank}, "
@@ -549,13 +877,23 @@ def build_nonuniform_ep_expert_bucket_groups(
             source_global_ranks=source_global_ranks,
             bucket_slices=[(0, end - start)],
             bucket_group_index=group_index,
+            synthetic_owner=is_synthetic,
         )
 
-        param_data = buffer.param_data[start:end] if buffer.param_data is not None else None
+        if is_synthetic:
+            param_data = None
+            grad_data = torch.empty(
+                end - start,
+                dtype=buffer.grad_data.dtype,
+                device=buffer.grad_data.device,
+            )
+        else:
+            param_data = buffer.param_data[start:end] if buffer.param_data is not None else None
+            grad_data = buffer.grad_data[start:end]
         bucket = _ParamAndGradBucket(
             params=params,
             param_data=param_data,
-            grad_data=buffer.grad_data[start:end],
+            grad_data=grad_data,
             offset=start,
             numel_unpadded=end - start,
             gradient_scaling_factor=buffer.gradient_scaling_factor,

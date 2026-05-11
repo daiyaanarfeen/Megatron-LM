@@ -34,9 +34,40 @@ torchrun --nproc-per-node 16 examples/nonuniform/pretrain_gpt_nonuniform.py \
   ...standard pretrain_gpt.py arguments...
 ```
 
-The NEP placement file is a JSON list with one entry per EP rank. Each entry lists the global
-expert IDs physically present on that EP rank in ascending order. Optional owner overrides use
-`--nonuniform-ep-expert-owner-path` with a JSON object mapping expert ID to owner EP rank.
-The same placement table is registered before model construction and is used by the MoE layer
-and token dispatcher, so forward token routing sends each expert's tokens to its physical holder
-inside the local EP group before the NEP DDP wrapper handles gradient ownership transfer.
+For full nonuniform EP topology setup, prefer the topology flag:
+
+```bash
+torchrun --nproc-per-node 4 --nnodes 15 examples/nonuniform/pretrain_gpt_nonuniform.py \
+  --nonuniform-mode ep \
+  --tensor-model-parallel-size 2 \
+  --context-parallel-size 2 \
+  --expert-tensor-parallel-size 1 \
+  --nonuniform-ep-num-tp-cp-per-replica 8 7 \
+  --num-experts 224 \
+  --overlap-grad-reduce \
+  ...standard pretrain_gpt.py arguments...
+```
+
+With `TP2 CP2 ETP1`, `8 7` creates EP32/EP28 expert replicas. The topology path
+creates the nonuniform expert process groups, generates an interleaved placement,
+registers that placement before model construction, and uses the same runtime config
+for token routing and NEP DDP gradient ownership transfer.
+
+HSG benchmark launcher:
+
+```bash
+ssh hsg-1
+cd /lustre/fsw/portfolios/coreai/users/darfeen/Megatron-LM-nep-ntp-shared-port
+sbatch scripts/nonuniform/run_hsg_ep32_28_tp2cp2_compare.sh
+```
+
+The launcher requests `--segment=16` so the 16-node uniform run and the 15-node
+nonuniform run are allocated inside one HSG segment. It compares standard
+`pretrain_gpt.py` uniform EP32 against `pretrain_gpt_nonuniform.py` with the
+script-local NEP opt-in wrapper for EP32/EP28. Defaults are configurable through
+environment variables such as `TRAIN_ITERS`, `SEQ_LENGTH`, `NUM_LAYERS`,
+`UNIFORM_GBS`, and `NONUNIFORM_GBS`.
+
+The manual NEP placement file is a JSON list with one entry per EP rank. Each entry lists the
+global expert IDs physically present on that EP rank in ascending order. Optional owner overrides
+use `--nonuniform-ep-expert-owner-path` with a JSON object mapping expert ID to owner EP rank.
