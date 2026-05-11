@@ -27,6 +27,7 @@ from .nonuniform_common import (
     configure_ordered_bucket_group_scheduler,
     filter_kwargs_for_callable,
     get_global_rank,
+    get_nonuniform_ep_runtime_config,
     reset_ordered_bucket_group_scheduler,
     try_start_ordered_bucket_groups,
 )
@@ -130,6 +131,10 @@ def _copy_flat_into_bucket(bucket, slices: List[Tuple[int, int]], flat: torch.Te
 
 
 def _runtime_config_from_parallel_state() -> dict:
+    runtime_config = get_nonuniform_ep_runtime_config()
+    if runtime_config is not None:
+        return dict(runtime_config)
+
     if hasattr(parallel_state, "is_nonuniform_ep") and parallel_state.is_nonuniform_ep():
         return dict(parallel_state.get_nonuniform_ep_config())
 

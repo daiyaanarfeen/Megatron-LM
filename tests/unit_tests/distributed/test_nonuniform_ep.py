@@ -4,8 +4,16 @@
 
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
+from megatron.core.distributed.nonuniform_common import (
+    build_expert_to_ep_rank_map,
+    clear_nonuniform_ep_runtime_config,
+    get_nonuniform_ep_expert_to_ep_rank_map,
+    get_nonuniform_ep_local_expert_indices,
+    set_nonuniform_ep_runtime_config,
+)
 from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBucketGroup
 from megatron.core.distributed.nonuniform_ep import (
     NonuniformEPConfig,
@@ -18,6 +26,44 @@ from megatron.core.distributed.nonuniform_ep import (
     _owner_for_expert,
     _pack_bucket_slices,
 )
+
+
+class TestNonuniformEPTokenRouting:
+    def teardown_method(self, method):
+        clear_nonuniform_ep_runtime_config()
+
+    def test_expert_to_ep_rank_map_handles_noncontiguous_placement(self):
+        placement = [[0, 1], [4, 5], [2, 6], [3, 7]]
+
+        assert build_expert_to_ep_rank_map(placement, num_experts=8) == [
+            0,
+            0,
+            2,
+            3,
+            1,
+            1,
+            2,
+            3,
+        ]
+
+    def test_expert_to_ep_rank_map_rejects_duplicate_expert_holders(self):
+        with pytest.raises(RuntimeError, match="one physical holder"):
+            build_expert_to_ep_rank_map([[0, 1], [1, 2]], num_experts=3)
+
+    def test_expert_to_ep_rank_map_rejects_unsorted_local_expert_order(self):
+        with pytest.raises(RuntimeError, match="ascending global expert order"):
+            build_expert_to_ep_rank_map([[1, 0], [2, 3]], num_experts=4)
+
+    def test_registered_runtime_config_drives_token_routing_metadata(self):
+        set_nonuniform_ep_runtime_config(
+            {
+                'local_expert_indices': [2, 6],
+                'expert_placement': [[0, 1], [4, 5], [2, 6], [3, 7]],
+            }
+        )
+
+        assert get_nonuniform_ep_local_expert_indices() == [2, 6]
+        assert get_nonuniform_ep_expert_to_ep_rank_map(8) == [0, 0, 2, 3, 1, 1, 2, 3]
 
 
 class TestNonuniformEPPlanning:

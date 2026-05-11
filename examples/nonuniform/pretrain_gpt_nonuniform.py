@@ -17,7 +17,10 @@ import torch.distributed as dist
 
 import pretrain_gpt as gpt
 from megatron.core import parallel_state
-from megatron.core.distributed.nonuniform_common import get_global_rank
+from megatron.core.distributed.nonuniform_common import (
+    get_global_rank,
+    set_nonuniform_ep_runtime_config,
+)
 from megatron.core.distributed.nonuniform_ep import (
     NonuniformEPConfig,
     NonuniformEPDistributedDataParallel,
@@ -33,6 +36,7 @@ import megatron.training.training as training_module
 
 
 _NTP_GROUPS_INITIALIZED = False
+_EP_CONFIG_CACHE = {}
 
 
 def _load_json_arg(value: Optional[str], path: Optional[str], default=None):
@@ -162,8 +166,21 @@ def _build_ep_config(args) -> NonuniformEPConfig:
     return NonuniformEPConfig(**kwargs)
 
 
+def _get_ep_config(args) -> NonuniformEPConfig:
+    if 'config' not in _EP_CONFIG_CACHE:
+        _EP_CONFIG_CACHE['config'] = _build_ep_config(args)
+        set_nonuniform_ep_runtime_config(_EP_CONFIG_CACHE['config'].runtime_config)
+    return _EP_CONFIG_CACHE['config']
+
+
+def _ep_model_provider(builder, args, *provider_args, **kwargs):
+    _get_ep_config(args)
+    return gpt.model_provider(builder, *provider_args, **kwargs)
+
+
 def _install_opt_in_ddp(args):
     if args.nonuniform_mode == "none":
+        set_nonuniform_ep_runtime_config(None)
         return None
     if args.use_distributed_optimizer:
         raise RuntimeError(
@@ -172,6 +189,7 @@ def _install_opt_in_ddp(args):
         )
 
     if args.nonuniform_mode == "tp":
+        set_nonuniform_ep_runtime_config(None)
         ntp_config = _build_ntp_config(args)
 
         class BenchmarkNonuniformTPDDP(NonuniformTPDistributedDataParallel):
@@ -181,15 +199,11 @@ def _install_opt_in_ddp(args):
         training_module.DDP = BenchmarkNonuniformTPDDP
         return ntp_config
 
-    ep_config_cache = {}
-
     class BenchmarkNonuniformEPDDP(NonuniformEPDistributedDataParallel):
         def __init__(self, *ddp_args, **kwargs):
-            if 'config' not in ep_config_cache:
-                ep_config_cache['config'] = _build_ep_config(args)
             super().__init__(
                 *ddp_args,
-                nonuniform_ep_config=ep_config_cache['config'],
+                nonuniform_ep_config=_get_ep_config(args),
                 **kwargs,
             )
 
@@ -253,6 +267,8 @@ if __name__ == "__main__":
             ntp_config,
             not args.nonuniform_tp_keep_inactive_ranks,
         )
+    elif args.nonuniform_mode == "ep":
+        model_provider = partial(_ep_model_provider, gpt.gpt_builder, args)
     else:
         model_provider = partial(gpt.model_provider, gpt.gpt_builder)
 

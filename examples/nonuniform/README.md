@@ -35,5 +35,8 @@ torchrun --nproc-per-node 16 examples/nonuniform/pretrain_gpt_nonuniform.py \
 ```
 
 The NEP placement file is a JSON list with one entry per EP rank. Each entry lists the global
-expert IDs physically present on that EP rank. Optional owner overrides use
+expert IDs physically present on that EP rank in ascending order. Optional owner overrides use
 `--nonuniform-ep-expert-owner-path` with a JSON object mapping expert ID to owner EP rank.
+The same placement table is registered before model construction and is used by the MoE layer
+and token dispatcher, so forward token routing sends each expert's tokens to its physical holder
+inside the local EP group before the NEP DDP wrapper handles gradient ownership transfer.

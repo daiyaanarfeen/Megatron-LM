@@ -11,12 +11,113 @@ import inspect
 import math
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
 
 from . import distributed_data_parallel as ddp_module
+
+
+_NONUNIFORM_EP_RUNTIME_CONFIG: Optional[dict] = None
+
+
+def set_nonuniform_ep_runtime_config(runtime_config: Optional[dict]) -> None:
+    """Register opt-in NEP runtime metadata for forward token routing."""
+    global _NONUNIFORM_EP_RUNTIME_CONFIG
+    _NONUNIFORM_EP_RUNTIME_CONFIG = dict(runtime_config) if runtime_config is not None else None
+
+
+def get_nonuniform_ep_runtime_config() -> Optional[dict]:
+    """Return the opt-in NEP runtime metadata registered by the entrypoint."""
+    return _NONUNIFORM_EP_RUNTIME_CONFIG
+
+
+def clear_nonuniform_ep_runtime_config() -> None:
+    """Clear opt-in NEP runtime metadata."""
+    set_nonuniform_ep_runtime_config(None)
+
+
+def get_nonuniform_ep_local_expert_indices() -> Optional[List[int]]:
+    """Return this rank's placement-aware local expert IDs, if NEP is active."""
+    runtime_config = get_nonuniform_ep_runtime_config()
+    if runtime_config is None:
+        return None
+    local_expert_indices = runtime_config.get('local_expert_indices')
+    if local_expert_indices is None:
+        return None
+    return [int(expert_id) for expert_id in local_expert_indices]
+
+
+def build_expert_to_ep_rank_map(
+    expert_placement: Optional[Sequence[Sequence[int]]],
+    num_experts: Optional[int] = None,
+) -> Optional[List[int]]:
+    """Build ``expert_id -> ep_rank`` from a placement table.
+
+    Token dispatch requires each global expert to have exactly one physical holder
+    inside the local EP group.  Replicated experts need a separate routing policy and
+    are intentionally rejected here.
+    """
+    if expert_placement is None:
+        return None
+
+    normalized_placement = [
+        [int(expert_id) for expert_id in expert_ids] for expert_ids in expert_placement
+    ]
+    for ep_rank, expert_ids in enumerate(normalized_placement):
+        if expert_ids != sorted(expert_ids):
+            raise RuntimeError(
+                "NEP expert placement entries must list local experts in ascending global "
+                f"expert order for token dispatch; ep_rank {ep_rank} has {expert_ids}"
+            )
+    if num_experts is None:
+        max_expert_id = max(
+            (expert_id for expert_ids in normalized_placement for expert_id in expert_ids),
+            default=-1,
+        )
+        num_experts = max_expert_id + 1
+
+    expert_to_ep_rank = [-1] * num_experts
+    for ep_rank, expert_ids in enumerate(normalized_placement):
+        for expert_id in expert_ids:
+            if expert_id < 0 or expert_id >= num_experts:
+                raise RuntimeError(
+                    f"NEP expert placement contains expert {expert_id}, but num_experts="
+                    f"{num_experts}"
+                )
+            if expert_to_ep_rank[expert_id] != -1:
+                raise RuntimeError(
+                    "NEP token routing expects one physical holder per expert within an "
+                    f"EP group; expert {expert_id} appears on both ep_rank "
+                    f"{expert_to_ep_rank[expert_id]} and {ep_rank}"
+                )
+            expert_to_ep_rank[expert_id] = ep_rank
+
+    missing_experts = [
+        expert_id for expert_id, ep_rank in enumerate(expert_to_ep_rank) if ep_rank == -1
+    ]
+    if missing_experts:
+        raise RuntimeError(
+            "NEP expert placement must cover every global expert for token routing; "
+            f"missing experts {missing_experts[:8]}"
+        )
+    return expert_to_ep_rank
+
+
+def get_nonuniform_ep_expert_to_ep_rank_map(num_experts: int) -> Optional[List[int]]:
+    """Return placement-aware token destination ranks, if NEP is active."""
+    runtime_config = get_nonuniform_ep_runtime_config()
+    if runtime_config is None:
+        return None
+    return build_expert_to_ep_rank_map(runtime_config.get('expert_placement'), num_experts)
+
+
+def local_expert_indices_are_contiguous(local_expert_indices: Sequence[int]) -> bool:
+    """Return whether local expert IDs form one contiguous ascending range."""
+    return list(local_expert_indices) == list(
+        range(local_expert_indices[0], local_expert_indices[0] + len(local_expert_indices))
+    )
 
 
 @dataclass
