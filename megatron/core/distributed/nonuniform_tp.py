@@ -21,6 +21,7 @@ import math
 import sys
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -36,6 +37,7 @@ from .distributed_data_parallel import DistributedDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .nonuniform_common import (
     FullParamLayout,
+    NonuniformTPTopologyRankGenerator,
     PerBufferParamLayout,
     all_to_all_with_output_views,
     configure_post_sync_handle_tracker,
@@ -71,10 +73,25 @@ def _ntp_get_non_active_ranks(
     return None
 
 
+def _ntp_get_current_topology_metadata(
+    ntp_config: "NonuniformTPConfig",
+) -> Optional[Dict[str, int]]:
+    """Return topology coordinates for the current global rank, if topology mode is active."""
+    if not ntp_config.topology_rank_metadata:
+        return None
+    rank = dist.get_rank()
+    metadata = ntp_config.topology_rank_metadata.get(rank)
+    return dict(metadata) if metadata is not None else None
+
+
 def _ntp_current_rank_is_reduced_dp(ntp_config: "NonuniformTPConfig") -> bool:
     """Return True if this rank belongs to a DP replica configured with reduced TP."""
     if ntp_config.tp_spares == 0:
         return False
+
+    metadata = _ntp_get_current_topology_metadata(ntp_config)
+    if metadata is not None:
+        return metadata['active_tp_size'] < ntp_config.tp_base
 
     dp_rank = parallel_state.get_data_parallel_rank()
     if ntp_config.non_active_ranks_per_dp:
@@ -89,11 +106,16 @@ def _ntp_current_rank_should_dp_sync(ntp_config: "NonuniformTPConfig") -> bool:
     if ntp_config.tp_spares == 0:
         return True
 
-    tp_size = parallel_state.get_tensor_model_parallel_world_size()
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
     reduced_tp_size = ntp_config.tp_base - ntp_config.tp_spares
+    metadata = _ntp_get_current_topology_metadata(ntp_config)
+    if metadata is not None:
+        if metadata['active_tp_size'] < ntp_config.tp_base:
+            return True
+        return tp_rank < reduced_tp_size
 
     # Reduced DP replicas only contain active TP ranks after NTP group reconfiguration.
+    tp_size = parallel_state.get_tensor_model_parallel_world_size()
     if tp_size != ntp_config.tp_base:
         return True
 
@@ -294,6 +316,19 @@ class NonuniformTPConfig:
        The number of non-active ranks must be consistent across CP replicas within each DP rank.
        If None, defaults to last tp_spares ranks as non-active."""
 
+    tp_domain_sizes: Optional[List[int]] = None
+    """Optional topology-aware active TP size per replica.
+
+       When set, NTP process groups are generated directly from contiguous rank
+       blocks whose sizes match this list, instead of patching standard Megatron
+       groups after init.
+       Values must currently be either tp_base or tp_base - tp_spares so the existing
+       reduced/full TP resharding semantics remain unchanged.
+    """
+
+    topology_rank_metadata: Optional[Dict[int, Dict[str, int]]] = None
+    """Runtime mapping of global rank to topology coordinates, filled during init."""
+
 
 # ======================================================================================
 # Utility Functions for NTP Configuration
@@ -380,13 +415,249 @@ def get_active_ranks_for_dp(
     return active_ranks
 
 
+def _ntp_set_parallel_state_attr(name: str, value) -> None:
+    setattr(parallel_state, name, value)
+
+
+def _ntp_get_nccl_communicator_configs(path: Optional[str]) -> dict:
+    if path is None:
+        return {}
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError(
+            "Cannot import `yaml`. Setting custom NCCL communicator configs "
+            "requires the yaml package."
+        ) from exc
+    with open(path, "r", encoding="utf-8") as stream:
+        return yaml.safe_load(stream)
+
+
+def _ntp_create_group(ranks, timeout, nccl_comm_cfgs, desc, backend=None):
+    return parallel_state.create_group(
+        ranks,
+        timeout=timeout,
+        backend=backend,
+        pg_options=(
+            None if backend == "gloo" else parallel_state.get_nccl_options(desc, nccl_comm_cfgs)
+        ),
+        group_desc=desc,
+    )
+
+
+def _initialize_nonuniform_tp_topology_process_groups(
+    ntp_config: NonuniformTPConfig,
+    exit_spares: bool = True,
+    context_parallel_size: Optional[int] = None,
+    nccl_communicator_config_path: Optional[str] = None,
+    distributed_timeout_minutes: int = 30,
+    create_gloo_process_groups: bool = True,
+    get_embedding_ranks=None,
+    get_position_embedding_ranks=None,
+) -> bool:
+    """Initialize topology-aware NTP process groups from contiguous TP domains."""
+    assert dist.is_initialized()
+    if parallel_state.get_tensor_model_parallel_group(check_initialized=False) is not None:
+        raise RuntimeError(
+            "NTP topology process groups must be initialized before standard model-parallel "
+            "groups. Use the nonuniform entrypoint topology flag instead of late patching."
+        )
+    if get_embedding_ranks is None:
+        get_embedding_ranks = parallel_state.default_embedding_ranks
+    if get_position_embedding_ranks is None:
+        get_position_embedding_ranks = parallel_state.default_position_embedding_ranks
+
+    if context_parallel_size is None:
+        if parallel_state.get_context_parallel_group(check_initialized=False) is not None:
+            context_parallel_size = parallel_state.get_context_parallel_world_size()
+        else:
+            context_parallel_size = 1
+
+    generator = NonuniformTPTopologyRankGenerator(
+        tp=ntp_config.tp_base,
+        cp=context_parallel_size,
+        tp_domain_sizes=ntp_config.tp_domain_sizes,
+    )
+    world_size = dist.get_world_size()
+    if generator.world_size != world_size:
+        raise RuntimeError(
+            f"NTP topology world_size ({generator.world_size}) != distributed world_size "
+            f"({world_size}). Expected sum(tp_domain_sizes) * CP ranks."
+        )
+
+    reduced_tp_size = ntp_config.tp_base - ntp_config.tp_spares
+    allowed_sizes = {ntp_config.tp_base}
+    if ntp_config.tp_spares > 0:
+        allowed_sizes.add(reduced_tp_size)
+    invalid_sizes = [size for size in ntp_config.tp_domain_sizes if size not in allowed_sizes]
+    if invalid_sizes:
+        raise RuntimeError(
+            "NTP topology currently supports only full TP domains and the configured "
+            f"reduced TP size ({reduced_tp_size}); got {invalid_sizes}"
+        )
+
+    ntp_config.num_reduced_tp_dp_ranks = sum(
+        1 for size in ntp_config.tp_domain_sizes if size < ntp_config.tp_base
+    )
+    ntp_config.topology_rank_metadata = dict(generator.rank_metadata)
+
+    rank = dist.get_rank()
+    timeout = timedelta(minutes=distributed_timeout_minutes)
+    nccl_comm_cfgs = _ntp_get_nccl_communicator_configs(nccl_communicator_config_path)
+
+    for ranks in generator.get_ranks('dp-cp'):
+        group = _ntp_create_group(ranks, timeout, nccl_comm_cfgs, "dp_cp")
+        group_gloo = (
+            _ntp_create_group(
+                ranks,
+                timeout,
+                nccl_comm_cfgs,
+                "DATA_PARALLEL_GROUP_WITH_CP_GLOO",
+                "gloo",
+            )
+            if create_gloo_process_groups
+            else None
+        )
+        if rank in ranks:
+            _ntp_set_parallel_state_attr("_DATA_PARALLEL_GROUP_WITH_CP", group)
+            _ntp_set_parallel_state_attr("_DATA_PARALLEL_GROUP_WITH_CP_GLOO", group_gloo)
+            _ntp_set_parallel_state_attr("_DATA_PARALLEL_GLOBAL_RANKS_WITH_CP", ranks)
+            _ntp_set_parallel_state_attr("_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP", group)
+            _ntp_set_parallel_state_attr(
+                "_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO", group_gloo
+            )
+
+    for ranks in generator.get_ranks('dp'):
+        group = _ntp_create_group(ranks, timeout, nccl_comm_cfgs, "dp")
+        group_gloo = (
+            _ntp_create_group(ranks, timeout, nccl_comm_cfgs, "DATA_PARALLEL_GROUP_GLOO", "gloo")
+            if create_gloo_process_groups
+            else None
+        )
+        if rank in ranks:
+            _ntp_set_parallel_state_attr("_DATA_PARALLEL_GROUP", group)
+            _ntp_set_parallel_state_attr("_DATA_PARALLEL_GROUP_GLOO", group_gloo)
+            _ntp_set_parallel_state_attr("_DATA_PARALLEL_GLOBAL_RANKS", ranks)
+
+    for ranks in generator.get_ranks('cp'):
+        group = _ntp_create_group(ranks, timeout, nccl_comm_cfgs, "cp")
+        if rank in ranks:
+            _ntp_set_parallel_state_attr("_CONTEXT_PARALLEL_GROUP", group)
+            _ntp_set_parallel_state_attr("_CONTEXT_PARALLEL_GLOBAL_RANKS", ranks)
+
+    for ranks in generator.get_ranks('tp'):
+        group = _ntp_create_group(ranks, timeout, nccl_comm_cfgs, "tp")
+        if rank in ranks:
+            _ntp_set_parallel_state_attr("_TENSOR_MODEL_PARALLEL_GROUP", group)
+            _ntp_set_parallel_state_attr("_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS", ranks)
+
+    for ranks in generator.get_ranks('tp'):
+        group = _ntp_create_group(ranks, timeout, nccl_comm_cfgs, "mp")
+        if rank in ranks:
+            _ntp_set_parallel_state_attr("_MODEL_PARALLEL_GROUP", group)
+            _ntp_set_parallel_state_attr("_MODEL_PARALLEL_GLOBAL_RANKS", ranks)
+
+    for ranks in [[global_rank] for global_rank in range(world_size)]:
+        group = _ntp_create_group(ranks, timeout, nccl_comm_cfgs, "pp")
+        if rank in ranks:
+            _ntp_set_parallel_state_attr("_PIPELINE_MODEL_PARALLEL_GROUP", group)
+            _ntp_set_parallel_state_attr("_PIPELINE_GLOBAL_RANKS", ranks)
+
+        embedding_ranks = get_embedding_ranks(ranks)
+        embedding_group = _ntp_create_group(embedding_ranks, timeout, nccl_comm_cfgs, "embd")
+        if rank in embedding_ranks:
+            _ntp_set_parallel_state_attr("_EMBEDDING_GROUP", embedding_group)
+            _ntp_set_parallel_state_attr("_EMBEDDING_GLOBAL_RANKS", embedding_ranks)
+
+        position_embedding_ranks = get_position_embedding_ranks(ranks)
+        position_embedding_group = _ntp_create_group(
+            position_embedding_ranks, timeout, nccl_comm_cfgs, "pos_embd"
+        )
+        if rank in position_embedding_ranks:
+            _ntp_set_parallel_state_attr("_POSITION_EMBEDDING_GROUP", position_embedding_group)
+            _ntp_set_parallel_state_attr(
+                "_POSITION_EMBEDDING_GLOBAL_RANKS", position_embedding_ranks
+            )
+
+    for ranks in generator.get_ranks('tp-dp-cp'):
+        group = _ntp_create_group(ranks, timeout, nccl_comm_cfgs, "tp_dp_cp")
+        if rank in ranks:
+            _ntp_set_parallel_state_attr("_TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP", group)
+
+    for ranks in generator.get_ranks('tp-dp'):
+        group = _ntp_create_group(ranks, timeout, nccl_comm_cfgs, "tp_dp")
+        if rank in ranks:
+            _ntp_set_parallel_state_attr("_TENSOR_AND_DATA_PARALLEL_GROUP", group)
+
+    for ranks in generator.get_ranks('tp-cp'):
+        group = _ntp_create_group(ranks, timeout, nccl_comm_cfgs, "tp_cp")
+        if rank in ranks:
+            _ntp_set_parallel_state_attr("_TENSOR_AND_CONTEXT_PARALLEL_GROUP", group)
+
+    for ranks in [[global_rank] for global_rank in range(world_size)]:
+        group = _ntp_create_group(ranks, timeout, nccl_comm_cfgs, "ep")
+        if rank in ranks:
+            _ntp_set_parallel_state_attr("_EXPERT_MODEL_PARALLEL_GROUP", group)
+            _ntp_set_parallel_state_attr("_EXPERT_MODEL_PARALLEL_RANKS", ranks)
+
+    for ranks in generator.get_ranks('tp'):
+        group = _ntp_create_group(ranks, timeout, nccl_comm_cfgs, "ep_tp")
+        if rank in ranks:
+            _ntp_set_parallel_state_attr("_EXPERT_TENSOR_PARALLEL_GROUP", group)
+
+    for ranks in generator.get_ranks('tp'):
+        group = _ntp_create_group(ranks, timeout, nccl_comm_cfgs, "tp_ep_mp")
+        if rank in ranks:
+            _ntp_set_parallel_state_attr("_EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP", group)
+
+    for ranks in generator.get_ranks('tp'):
+        group = _ntp_create_group(ranks, timeout, nccl_comm_cfgs, "tp_ep_pp")
+        if rank in ranks:
+            _ntp_set_parallel_state_attr("_EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP", group)
+
+    for ranks in generator.get_ranks('dp'):
+        group = _ntp_create_group(ranks, timeout, nccl_comm_cfgs, "ep_dp")
+        group_gloo = (
+            _ntp_create_group(
+                ranks, timeout, nccl_comm_cfgs, "EXPERT_DATA_PARALLEL_GROUP_GLOO", "gloo"
+            )
+            if create_gloo_process_groups
+            else None
+        )
+        if rank in ranks:
+            _ntp_set_parallel_state_attr("_EXPERT_DATA_PARALLEL_GROUP", group)
+            _ntp_set_parallel_state_attr("_EXPERT_DATA_PARALLEL_GROUP_GLOO", group_gloo)
+            _ntp_set_parallel_state_attr("_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP", group)
+            _ntp_set_parallel_state_attr(
+                "_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO", group_gloo
+            )
+            _ntp_set_parallel_state_attr("_INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP", None)
+
+    _ntp_set_parallel_state_attr("_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP", dist.group.WORLD)
+    parallel_state._set_global_memory_buffer()
+    rank_metadata = generator.get_rank_metadata(rank)
+    if not rank_metadata['is_active']:
+        logger.info("[NTP] Rank %s is inactive in topology mode, exiting", rank)
+        if exit_spares:
+            sys.exit(0)
+        return False
+    return True
+
+
 # ======================================================================================
 # Process Group Initialization for NTP
 # ======================================================================================
 
 
 def initialize_nonuniform_tp_process_groups(
-    ntp_config: NonuniformTPConfig, exit_spares: bool = True
+    ntp_config: NonuniformTPConfig,
+    exit_spares: bool = True,
+    context_parallel_size: Optional[int] = None,
+    nccl_communicator_config_path: Optional[str] = None,
+    distributed_timeout_minutes: int = 30,
+    create_gloo_process_groups: bool = True,
+    get_embedding_ranks=None,
+    get_position_embedding_ranks=None,
 ) -> bool:
     """
     Reconfigure TP and CP process groups for nonuniform tensor parallelism.
@@ -398,6 +669,18 @@ def initialize_nonuniform_tp_process_groups(
         ntp_config: NTP configuration containing tp_base, tp_spares, num_reduced_tp_dp_ranks,
                     and optionally non_active_ranks_per_dp
     """
+    if ntp_config.tp_domain_sizes is not None:
+        return _initialize_nonuniform_tp_topology_process_groups(
+            ntp_config,
+            exit_spares=exit_spares,
+            context_parallel_size=context_parallel_size,
+            nccl_communicator_config_path=nccl_communicator_config_path,
+            distributed_timeout_minutes=distributed_timeout_minutes,
+            create_gloo_process_groups=create_gloo_process_groups,
+            get_embedding_ranks=get_embedding_ranks,
+            get_position_embedding_ranks=get_position_embedding_ranks,
+        )
+
     if ntp_config.tp_spares == 0:
         # No nonuniform TP, nothing to reconfigure
         return True
@@ -537,9 +820,8 @@ def ntp_map(module: torch.nn.Module, ntp_config: NonuniformTPConfig, num_shards:
         f"ntp_map called with module={type(module).__name__}, num_shards={num_shards}"
     )
 
-    # Check if this (dp, cp, pp) combination has non-active ranks specified
-    # If it does, it's an unhealthy rank that uses reduced TP
-    if _ntp_get_non_active_ranks(ntp_config, dp_rank, cp_rank, pp_rank) is not None:
+    # Reduced-TP ranks synchronize directly; full-TP ranks carry the reshard metadata.
+    if _ntp_current_rank_is_reduced_dp(ntp_config):
         # This is an unhealthy rank with reduced TP - skip
         logger.debug(
             "[NTP] Rank %s [DP %s, CP %s, PP %s] Unhealthy rank, skipping",
@@ -1240,7 +1522,9 @@ class NonuniformTPDistributedDataParallel(DistributedDataParallel):
         if self.ntp_config.tp_spares > 0:
             # DDP imports _ParamAndGradBuffer into its module namespace, so patch that binding
             # while the parent constructor allocates buffers.
-            buffer_cls = functools.partial(NonuniformTPParamAndGradBuffer, ntp_config=self.ntp_config)
+            buffer_cls = functools.partial(
+                NonuniformTPParamAndGradBuffer, ntp_config=self.ntp_config
+            )
             with patch_ddp_param_and_grad_buffer(buffer_cls):
                 _call_parent_init()
             self._wrap_bucket_groups_for_ntp()

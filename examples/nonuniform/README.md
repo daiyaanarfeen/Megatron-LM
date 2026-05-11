@@ -22,6 +22,27 @@ torchrun --nproc-per-node 8 examples/nonuniform/pretrain_gpt_nonuniform.py \
   ...standard pretrain_gpt.py arguments...
 ```
 
+For topology-aware NTP, use `--nonuniform-tp-domain-sizes` to map global ranks
+into contiguous physical TP/NVL domains before Megatron model-parallel groups are
+created:
+
+```bash
+torchrun --nproc-per-node 4 --nnodes 3 examples/nonuniform/pretrain_gpt_nonuniform.py \
+  --nonuniform-mode tp \
+  --tensor-model-parallel-size 4 \
+  --context-parallel-size 1 \
+  --nonuniform-tp-base 4 \
+  --nonuniform-tp-spares 2 \
+  --nonuniform-tp-domain-sizes 2 4 4 \
+  --overlap-grad-reduce \
+  ...standard pretrain_gpt.py arguments...
+```
+
+Here the first replica uses TP2 and the next two replicas use TP4; each TP group
+is built inside its contiguous rank block. The values must currently be either
+`tp_base` or `tp_base - tp_spares`, which preserves the existing reduced/full TP
+resharding semantics.
+
 Example NEP launch:
 
 ```bash

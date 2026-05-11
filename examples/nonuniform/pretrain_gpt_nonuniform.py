@@ -38,6 +38,7 @@ import megatron.training.training as training_module
 
 
 _NTP_GROUPS_INITIALIZED = False
+_NTP_CONFIG_CACHE = {}
 _EP_CONFIG_CACHE = {}
 _ORIGINAL_INITIALIZE_MODEL_PARALLEL = parallel_state.initialize_model_parallel
 
@@ -80,6 +81,7 @@ def _build_ntp_config(args) -> NonuniformTPConfig:
         tp_spares=args.nonuniform_tp_spares,
         num_reduced_tp_dp_ranks=args.nonuniform_tp_num_reduced_dp_ranks,
         non_active_ranks_per_dp=_parse_ntp_non_active_map(args),
+        tp_domain_sizes=args.nonuniform_tp_domain_sizes,
     )
 
 
@@ -152,10 +154,47 @@ def _build_ep_runtime_config(args):
 
 
 def _initialize_model_parallel(*args, **kwargs):
-    """Runtime replacement for standard MPU init in NEP topology mode."""
+    """Runtime replacement for standard MPU init in nonuniform topology modes."""
+    global _NTP_GROUPS_INITIALIZED
     megatron_args = gpt.get_args()
-    topology = megatron_args.nonuniform_ep_num_tp_cp_per_replica
-    if megatron_args.nonuniform_mode != "ep" or topology is None:
+    ntp_topology = megatron_args.nonuniform_tp_domain_sizes
+    nep_topology = megatron_args.nonuniform_ep_num_tp_cp_per_replica
+
+    if megatron_args.nonuniform_mode == "tp" and ntp_topology is not None:
+        if megatron_args.tensor_model_parallel_size != megatron_args.nonuniform_tp_base:
+            raise RuntimeError(
+                "--tensor-model-parallel-size must match --nonuniform-tp-base "
+                "in NTP topology mode"
+            )
+        if megatron_args.pipeline_model_parallel_size != 1:
+            raise RuntimeError("Nonuniform TP topology mode currently supports PP=1 only")
+        if megatron_args.virtual_pipeline_model_parallel_size is not None:
+            raise RuntimeError("Nonuniform TP topology mode does not support virtual PP")
+        if megatron_args.use_torch_fsdp2:
+            raise RuntimeError("--use-torch-fsdp2 is not supported with nonuniform TP")
+        if megatron_args.num_distributed_optimizer_instances != 1:
+            raise RuntimeError("Nonuniform TP topology mode does not support partial DistOpt")
+        if megatron_args.expert_model_parallel_size != 1:
+            raise RuntimeError("Nonuniform TP topology mode currently requires EP=1")
+
+        ntp_config = _NTP_CONFIG_CACHE.get('config')
+        if ntp_config is None:
+            ntp_config = _build_ntp_config(megatron_args)
+            _NTP_CONFIG_CACHE['config'] = ntp_config
+        initialize_nonuniform_tp_process_groups(
+            ntp_config,
+            exit_spares=not megatron_args.nonuniform_tp_keep_inactive_ranks,
+            context_parallel_size=megatron_args.context_parallel_size,
+            nccl_communicator_config_path=megatron_args.nccl_communicator_config_path,
+            distributed_timeout_minutes=megatron_args.distributed_timeout_minutes,
+            create_gloo_process_groups=megatron_args.enable_gloo_process_groups,
+            get_embedding_ranks=kwargs.get("get_embedding_ranks"),
+            get_position_embedding_ranks=kwargs.get("get_position_embedding_ranks"),
+        )
+        _NTP_GROUPS_INITIALIZED = True
+        return None
+
+    if megatron_args.nonuniform_mode != "ep" or nep_topology is None:
         return _ORIGINAL_INITIALIZE_MODEL_PARALLEL(*args, **kwargs)
 
     if megatron_args.num_experts is None:
@@ -171,7 +210,7 @@ def _initialize_model_parallel(*args, **kwargs):
 
     etp = megatron_args.expert_tensor_parallel_size or megatron_args.tensor_model_parallel_size
     tp_cp = megatron_args.tensor_model_parallel_size * megatron_args.context_parallel_size
-    computed_min_ep_size = min(topology) * tp_cp // etp
+    computed_min_ep_size = min(nep_topology) * tp_cp // etp
     if (
         megatron_args.nonuniform_ep_min_size is not None
         and megatron_args.nonuniform_ep_min_size != computed_min_ep_size
@@ -180,7 +219,7 @@ def _initialize_model_parallel(*args, **kwargs):
             "--nonuniform-ep-min-size must match the topology-derived min EP size "
             f"({computed_min_ep_size}) when --nonuniform-ep-num-tp-cp-per-replica is set"
         )
-    for num_tp_cp in topology:
+    for num_tp_cp in nep_topology:
         if num_tp_cp * tp_cp % etp != 0:
             raise RuntimeError(
                 "Each nonuniform EP replica must produce an integer EP size: "
@@ -196,7 +235,7 @@ def _initialize_model_parallel(*args, **kwargs):
     runtime_config = initialize_nonuniform_ep_process_groups(
         tensor_model_parallel_size=megatron_args.tensor_model_parallel_size,
         context_parallel_size=megatron_args.context_parallel_size,
-        num_tp_cp_per_replica=topology,
+        num_tp_cp_per_replica=nep_topology,
         expert_tensor_parallel_size=megatron_args.expert_tensor_parallel_size,
         num_moe_experts=megatron_args.num_experts,
         nccl_communicator_config_path=megatron_args.nccl_communicator_config_path,
@@ -253,8 +292,13 @@ def _install_opt_in_ddp(args):
 
     if args.nonuniform_mode == "tp":
         set_nonuniform_ep_runtime_config(None)
-        parallel_state.initialize_model_parallel = _ORIGINAL_INITIALIZE_MODEL_PARALLEL
         ntp_config = _build_ntp_config(args)
+        _NTP_CONFIG_CACHE['config'] = ntp_config
+        parallel_state.initialize_model_parallel = (
+            _initialize_model_parallel
+            if args.nonuniform_tp_domain_sizes is not None
+            else _ORIGINAL_INITIALIZE_MODEL_PARALLEL
+        )
 
         class BenchmarkNonuniformTPDDP(NonuniformTPDistributedDataParallel):
             def __init__(self, *ddp_args, **kwargs):
@@ -295,6 +339,17 @@ def _add_nonuniform_args(parser):
     group.add_argument('--nonuniform-tp-num-reduced-dp-ranks', type=int, default=1)
     group.add_argument('--nonuniform-tp-non-active-ranks-json', default=None)
     group.add_argument('--nonuniform-tp-non-active-ranks-path', default=None)
+    group.add_argument(
+        '--nonuniform-tp-domain-sizes',
+        nargs="+",
+        type=int,
+        default=None,
+        help=(
+            "Topology-aware active TP size per replica. Each value creates one "
+            "contiguous TP domain block and must be either tp_base or "
+            "tp_base - tp_spares."
+        ),
+    )
     group.add_argument(
         '--nonuniform-tp-keep-inactive-ranks',
         action='store_true',

@@ -292,6 +292,228 @@ class NonuniformEPRankGenerator:
 
 
 @dataclass
+class NonuniformTPReplicaRanks:
+    """Contiguous physical rank block assigned to one topology-aware NTP replica."""
+
+    replica_index: int
+    active_tp_size: int
+    physical_tp_size: int
+    ranks_by_cp: List[List[int]]
+    inactive_ranks_by_cp: List[List[int]] = field(default_factory=list)
+
+    @property
+    def ranks(self) -> List[int]:
+        """Return ranks in TP-fastest, then CP order."""
+        return [rank for cp_ranks in self.ranks_by_cp for rank in cp_ranks]
+
+    def inactive_local_tp_ranks(self, tp_base: int) -> List[int]:
+        """Return local TP positions not present in this replica's active domain."""
+        return list(range(self.active_tp_size, min(tp_base, self.physical_tp_size)))
+
+    @property
+    def inactive_ranks(self) -> List[int]:
+        """Return physical ranks in this replica that do not join active NTP groups."""
+        return [rank for cp_ranks in self.inactive_ranks_by_cp for rank in cp_ranks]
+
+
+class NonuniformTPTopologyRankGenerator:
+    """Generate process groups for NTP replicas placed in explicit TP domains.
+
+    ``tp_domain_sizes`` lists the active TP size of each replica. ``physical_tp_size``
+    can reserve a larger physical block for each replica, allowing NTP to keep
+    Megatron's world-size divisibility while assigning reduced active TP groups to
+    the front of each contiguous topology domain. TP remains the fastest-changing
+    dimension inside each CP slice.
+    """
+
+    _SUPPORTED_KEYS = {'tp', 'cp', 'dp', 'dp-cp', 'tp-dp', 'tp-dp-cp', 'tp-cp'}
+
+    def __init__(
+        self,
+        tp: int,
+        cp: int,
+        tp_domain_sizes: Sequence[int],
+        rank_offset: int = 0,
+        physical_tp_size: Optional[int] = None,
+    ) -> None:
+        self.tp = int(tp)
+        self.cp = int(cp)
+        self.tp_domain_sizes = [int(size) for size in tp_domain_sizes]
+        self.rank_offset = int(rank_offset)
+        self.physical_tp_size = (
+            int(physical_tp_size) if physical_tp_size is not None else None
+        )
+
+        if self.tp < 1 or self.cp < 1:
+            raise RuntimeError(f"TP and CP sizes must be positive; got TP={tp}, CP={cp}")
+        if not self.tp_domain_sizes:
+            raise RuntimeError("NTP topology requires at least one TP domain size")
+        invalid_sizes = [
+            size for size in self.tp_domain_sizes if size < 1 or size > self.tp
+        ]
+        if invalid_sizes:
+            raise RuntimeError(
+                "NTP TP domain sizes must be in [1, tp_base]; got "
+                f"{invalid_sizes} for tp_base={self.tp}"
+            )
+        if self.physical_tp_size is not None and self.physical_tp_size < max(
+            self.tp_domain_sizes
+        ):
+            raise RuntimeError(
+                "NTP physical TP block size must be >= every active TP domain size; "
+                f"got physical_tp_size={self.physical_tp_size}, "
+                f"active sizes={self.tp_domain_sizes}"
+            )
+
+        self.num_replicas = len(self.tp_domain_sizes)
+        self._physical_tp_sizes = [
+            self.physical_tp_size if self.physical_tp_size is not None else size
+            for size in self.tp_domain_sizes
+        ]
+        self.world_size = sum(self._physical_tp_sizes) * self.cp
+        self.replica_offsets = [0]
+        for physical_tp_size in self._physical_tp_sizes:
+            self.replica_offsets.append(
+                self.replica_offsets[-1] + physical_tp_size * self.cp
+            )
+
+        self.replicas: List[NonuniformTPReplicaRanks] = []
+        self.rank_metadata: Dict[int, Dict[str, int]] = {}
+        for replica_index, active_tp_size in enumerate(self.tp_domain_sizes):
+            physical_tp_size = self._physical_tp_sizes[replica_index]
+            start = self.rank_offset + self.replica_offsets[replica_index]
+            ranks_by_cp = []
+            inactive_ranks_by_cp = []
+            for cp_rank in range(self.cp):
+                cp_start = start + cp_rank * physical_tp_size
+                cp_ranks = list(range(cp_start, cp_start + active_tp_size))
+                inactive_cp_ranks = list(
+                    range(cp_start + active_tp_size, cp_start + physical_tp_size)
+                )
+                ranks_by_cp.append(cp_ranks)
+                inactive_ranks_by_cp.append(inactive_cp_ranks)
+                for tp_rank, global_rank in enumerate(cp_ranks):
+                    self.rank_metadata[global_rank] = {
+                        'replica_index': replica_index,
+                        'active_tp_size': active_tp_size,
+                        'tp_rank': tp_rank,
+                        'cp_rank': cp_rank,
+                        'is_active': 1,
+                    }
+                for tp_rank in range(active_tp_size, physical_tp_size):
+                    self.rank_metadata[cp_start + tp_rank] = {
+                        'replica_index': replica_index,
+                        'active_tp_size': active_tp_size,
+                        'tp_rank': tp_rank,
+                        'cp_rank': cp_rank,
+                        'is_active': 0,
+                    }
+            self.replicas.append(
+                NonuniformTPReplicaRanks(
+                    replica_index=replica_index,
+                    active_tp_size=active_tp_size,
+                    physical_tp_size=physical_tp_size,
+                    ranks_by_cp=ranks_by_cp,
+                    inactive_ranks_by_cp=inactive_ranks_by_cp,
+                )
+            )
+
+    def get_ranks(self, key: str) -> List[List[int]]:
+        """Return topology-aware NTP rank groups for ``key``."""
+        if key == 'tp':
+            return self._get_tp_ranks()
+        if key == 'cp':
+            return self._get_cp_ranks()
+        if key == 'dp':
+            return self._get_dp_ranks()
+        if key == 'dp-cp':
+            return self._get_dp_cp_ranks()
+        if key == 'tp-dp':
+            return self._get_tp_dp_ranks()
+        if key == 'tp-dp-cp':
+            return self._get_tp_dp_cp_ranks()
+        if key == 'tp-cp':
+            return self._get_tp_cp_ranks()
+        raise ValueError(
+            f"Unknown nonuniform TP rank key {key}; expected {sorted(self._SUPPORTED_KEYS)}"
+        )
+
+    def get_rank_metadata(self, rank: int) -> Dict[str, int]:
+        """Return topology coordinates for a global rank."""
+        if rank not in self.rank_metadata:
+            raise RuntimeError(f"Rank {rank} is not part of the NTP topology")
+        return dict(self.rank_metadata[rank])
+
+    def get_non_active_ranks_per_replica(
+        self, pp_rank: int = 0
+    ) -> Dict[Tuple[int, int, int], List[int]]:
+        """Return legacy-shaped inactive local TP positions keyed by replica/CP/PP."""
+        result = {}
+        for replica in self.replicas:
+            inactive = replica.inactive_local_tp_ranks(self.tp)
+            if not inactive:
+                continue
+            for cp_rank in range(self.cp):
+                result[(replica.replica_index, cp_rank, pp_rank)] = list(inactive)
+        return result
+
+    def _get_tp_ranks(self) -> List[List[int]]:
+        return [
+            list(cp_ranks) for replica in self.replicas for cp_ranks in replica.ranks_by_cp
+        ]
+
+    def _get_cp_ranks(self) -> List[List[int]]:
+        groups = []
+        for replica in self.replicas:
+            for tp_rank in range(replica.active_tp_size):
+                groups.append(
+                    [replica.ranks_by_cp[cp_rank][tp_rank] for cp_rank in range(self.cp)]
+                )
+        return groups
+
+    def _get_tp_cp_ranks(self) -> List[List[int]]:
+        return [replica.ranks for replica in self.replicas]
+
+    def _get_dp_ranks(self) -> List[List[int]]:
+        groups = []
+        for cp_rank in range(self.cp):
+            for tp_rank in range(self.tp):
+                ranks = [
+                    replica.ranks_by_cp[cp_rank][tp_rank]
+                    for replica in self.replicas
+                    if tp_rank < replica.active_tp_size
+                ]
+                if ranks:
+                    groups.append(ranks)
+        return groups
+
+    def _get_dp_cp_ranks(self) -> List[List[int]]:
+        groups = []
+        for tp_rank in range(self.tp):
+            ranks = []
+            for replica in self.replicas:
+                if tp_rank >= replica.active_tp_size:
+                    continue
+                for cp_rank in range(self.cp):
+                    ranks.append(replica.ranks_by_cp[cp_rank][tp_rank])
+            if ranks:
+                groups.append(ranks)
+        return groups
+
+    def _get_tp_dp_ranks(self) -> List[List[int]]:
+        groups = []
+        for cp_rank in range(self.cp):
+            ranks = []
+            for replica in self.replicas:
+                ranks.extend(replica.ranks_by_cp[cp_rank])
+            groups.append(ranks)
+        return groups
+
+    def _get_tp_dp_cp_ranks(self) -> List[List[int]]:
+        return [[rank for replica in self.replicas for rank in replica.ranks]]
+
+
+@dataclass
 class PerBufferParamLayout:
     """Layout for parameters within one opt-in contiguous DDP buffer."""
 
