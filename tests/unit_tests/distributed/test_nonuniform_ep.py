@@ -304,6 +304,18 @@ class TestNonuniformEPTransfers:
         assert torch.equal(copy_bucket.grad_data, torch.tensor([1.0, 7.0, 8.0, 1.0]))
         assert handle.keepalive_buffers == []
 
+    def test_transfer_handle_completion_is_nonblocking(self):
+        pending = Mock()
+        pending.is_completed.return_value = False
+        complete = Mock()
+        complete.is_completed.return_value = True
+
+        handle = _P2PGradTransferHandle([pending, complete])
+        assert not handle.is_completed()
+
+        pending.is_completed.return_value = True
+        assert handle.is_completed()
+
     def test_copy_flat_into_bucket_overwrites_synced_grad_slices(self):
         bucket = Mock()
         bucket.grad_data = torch.zeros(6)
@@ -340,6 +352,57 @@ class TestNonuniformEPTransfers:
             assert group._start_owner_dp_sync_after_gather() == "started"
 
         assert bucket.params_with_extra_main_grads == [param]
+
+    def test_owner_dp_sync_waits_for_gather_completion_without_blocking(self):
+        group = object.__new__(NonuniformEPParamAndGradBucketGroup)
+        gather_handle = Mock()
+        gather_handle.is_completed.return_value = False
+        group._nep_is_owner = True
+        group._nep_started = True
+        group._nep_gather_done = False
+        group._nep_gather_handle = gather_handle
+        group._nep_owner_dp_sync_started = False
+        group._nep_owner_dp_sync_scheduler_state = None
+        group._start_owner_dp_sync_after_gather = Mock()
+
+        group._try_start_ready_owner_dp_syncs(nonblocking=True)
+
+        group._start_owner_dp_sync_after_gather.assert_not_called()
+        gather_handle.wait.assert_not_called()
+        assert not group._nep_owner_dp_sync_started
+
+        gather_handle.is_completed.return_value = True
+        group._try_start_ready_owner_dp_syncs(nonblocking=True)
+
+        gather_handle.wait.assert_called_once()
+        group._start_owner_dp_sync_after_gather.assert_called_once()
+        assert group._nep_owner_dp_sync_started
+
+    def test_scatter_wait_is_deferred_until_last_bucket_group(self):
+        first = object.__new__(NonuniformEPParamAndGradBucketGroup)
+        last = object.__new__(NonuniformEPParamAndGradBucketGroup)
+        state = {'entries': [], 'last_bucket_group': last}
+        first._nep_post_sync_state = state
+        last._nep_post_sync_state = state
+        first_handle = Mock()
+        last_handle = Mock()
+        first._nep_scatter_handle = first_handle
+        last._nep_scatter_handle = last_handle
+        first._copy_back_extra_main_grads = Mock()
+        last._copy_back_extra_main_grads = Mock()
+
+        first._record_nep_scatter_wait(copy_back_after_wait=True)
+
+        first_handle.wait.assert_not_called()
+        first._copy_back_extra_main_grads.assert_not_called()
+
+        last._record_nep_scatter_wait(copy_back_after_wait=False)
+
+        first_handle.wait.assert_called_once()
+        last_handle.wait.assert_called_once()
+        first._copy_back_extra_main_grads.assert_called_once()
+        last._copy_back_extra_main_grads.assert_not_called()
+        assert state['entries'] == []
 
     def test_owner_uses_persistent_peer_buffers_for_gather_and_scatter(self):
         group = object.__new__(NonuniformEPParamAndGradBucketGroup)

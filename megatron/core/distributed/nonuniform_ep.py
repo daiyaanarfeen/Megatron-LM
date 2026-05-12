@@ -110,6 +110,14 @@ class _P2PGradTransferHandle:
         self.recv_copies = recv_copies or []
         self.keepalive_buffers = keepalive_buffers or []
 
+    def is_completed(self):
+        """Return whether all p2p work has completed without draining buffers."""
+        for work in self.works:
+            is_completed = getattr(work, "is_completed", None)
+            if is_completed is None or not is_completed():
+                return False
+        return True
+
     def wait(self):
         for work in self.works:
             work.wait()
@@ -518,6 +526,9 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 f"got {len(self._nep_plans)} plans for {len(self.buckets)} buckets"
             )
         self._nep_started = False
+        self._nep_gather_done = False
+        self._nep_owner_dp_sync_started = False
+        self._nep_scatter_started = False
         self._nep_ready = False
         self._nep_gather_handle = None
         self._nep_scatter_handle = None
@@ -685,11 +696,51 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         )
 
     def _wait_nep_gather_to_owner(self):
+        self._complete_nep_gather_to_owner(nonblocking=False)
+
+    def _complete_nep_gather_to_owner(self, nonblocking: bool = False) -> bool:
+        if self._nep_gather_done:
+            return True
         if self._nep_gather_handle is not None:
+            if nonblocking and not self._nep_gather_handle.is_completed():
+                return False
             self._nep_gather_handle.wait()
             self._nep_gather_handle = None
+        self._nep_gather_done = True
+        return True
+
+    def _try_start_ready_owner_dp_syncs(
+        self,
+        nonblocking: bool,
+        force_all_reduce: Optional[bool] = False,
+    ) -> None:
+        state = getattr(self, '_nep_owner_dp_sync_scheduler_state', None)
+        if state is None:
+            if (
+                self._nep_is_owner
+                and self._nep_started
+                and not self._nep_owner_dp_sync_started
+                and self._complete_nep_gather_to_owner(nonblocking=nonblocking)
+            ):
+                self._start_owner_dp_sync_after_gather(force_all_reduce=force_all_reduce)
+                self._nep_owner_dp_sync_started = True
+            return
+
+        groups = state['groups']
+        while state['next_index'] < len(groups):
+            group = groups[state['next_index']]
+            if not group._nep_started:
+                break
+            if not group._complete_nep_gather_to_owner(nonblocking=nonblocking):
+                break
+            if not group._nep_owner_dp_sync_started:
+                group._start_owner_dp_sync_after_gather(force_all_reduce=force_all_reduce)
+                group._nep_owner_dp_sync_started = True
+            state['next_index'] += 1
 
     def _start_nep_scatter_from_owner(self):
+        if self._nep_scatter_started:
+            return
         works = []
         recv_copies = []
         keepalive_buffers = []
@@ -724,6 +775,29 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             recv_copies=recv_copies,
             keepalive_buffers=keepalive_buffers,
         )
+        self._nep_scatter_started = True
+
+    def _record_nep_scatter_wait(self, copy_back_after_wait: bool = False):
+        handle = self._nep_scatter_handle
+        self._nep_scatter_handle = None
+        state = getattr(self, '_nep_post_sync_state', None)
+        if state is None:
+            if handle is not None:
+                handle.wait()
+            if copy_back_after_wait:
+                self._copy_back_extra_main_grads()
+            return
+
+        state['entries'].append((self, handle, copy_back_after_wait))
+        if self is state['last_bucket_group']:
+            try:
+                for group, pending_handle, pending_copy_back in state['entries']:
+                    if pending_handle is not None:
+                        pending_handle.wait()
+                    if pending_copy_back:
+                        group._copy_back_extra_main_grads()
+            finally:
+                state['entries'] = []
 
     def _wait_nep_scatter_from_owner(self):
         if self._nep_scatter_handle is not None:
@@ -741,8 +815,10 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if not self._nep_is_owner:
             self.grad_reduce_handle = None
             return
-        self._wait_nep_gather_to_owner()
-        return self._start_owner_dp_sync_after_gather(force_all_reduce=force_all_reduce)
+        self._try_start_ready_owner_dp_syncs(
+            nonblocking=True,
+            force_all_reduce=force_all_reduce,
+        )
 
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """Finish owner DP sync and scatter synced grads back to source ranks."""
@@ -767,12 +843,15 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if not self._nep_is_owner:
             self._wait_nep_gather_to_owner()
             self._start_nep_scatter_from_owner()
-            self._wait_nep_scatter_from_owner()
-            self._copy_back_extra_main_grads()
+            self._record_nep_scatter_wait(copy_back_after_wait=True)
             return
+        self._try_start_ready_owner_dp_syncs(
+            nonblocking=False,
+            force_all_reduce=force_all_reduce,
+        )
         result = super().finish_grad_sync(force_all_reduce=force_all_reduce)
         self._start_nep_scatter_from_owner()
-        self._wait_nep_scatter_from_owner()
+        self._record_nep_scatter_wait(copy_back_after_wait=False)
         return result
 
     def register_grad_ready(
@@ -803,12 +882,18 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         """Reset per-iteration metadata."""
         super().reset()
         self._nep_started = False
+        self._nep_gather_done = False
+        self._nep_owner_dp_sync_started = False
+        self._nep_scatter_started = False
         self._nep_ready = len(self.params) == 0
         self._nep_gather_handle = None
         self._nep_scatter_handle = None
         reset_ordered_bucket_group_scheduler(
             self, '_nep_scheduler_state', '_nep_group_index'
         )
+        state = getattr(self, '_nep_owner_dp_sync_scheduler_state', None)
+        if state is not None and getattr(self, '_nep_owner_dp_sync_group_index', -1) == 0:
+            state['next_index'] = 0
 
 
 def _iter_buffer_bucket_params(buffer):
@@ -1123,6 +1208,19 @@ def build_nonuniform_ep_expert_bucket_groups(
         '_nep_group_index',
         '_nep_ready',
     )
+    owner_bucket_groups = [
+        bucket_group for bucket_group in bucket_groups if bucket_group._nep_is_owner
+    ]
+    owner_dp_sync_state = {'groups': owner_bucket_groups, 'next_index': 0}
+    for index, bucket_group in enumerate(owner_bucket_groups):
+        bucket_group._nep_owner_dp_sync_scheduler_state = owner_dp_sync_state
+        bucket_group._nep_owner_dp_sync_group_index = index
+
+    post_sync_state = (
+        {'entries': [], 'last_bucket_group': bucket_groups[-1]} if bucket_groups else None
+    )
+    for bucket_group in bucket_groups:
+        bucket_group._nep_post_sync_state = post_sync_state
     return bucket_groups
 
 
