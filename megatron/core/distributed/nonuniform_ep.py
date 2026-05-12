@@ -759,7 +759,7 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         """Reset per-iteration metadata."""
         super().reset()
         self._nep_started = False
-        self._nep_ready = False
+        self._nep_ready = len(self.params) == 0
         self._nep_gather_handle = None
         self._nep_scatter_handle = None
         reset_ordered_bucket_group_scheduler(
