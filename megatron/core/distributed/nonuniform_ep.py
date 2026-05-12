@@ -860,6 +860,26 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         self._record_nep_scatter_wait(copy_back_after_wait=False)
         return result
 
+    def finish_nep_pre_sync(self, force_all_reduce: Optional[bool] = False):
+        """Drain pre-sync p2p and start owner allreduces before generic DDP waits."""
+        if not self.ddp_config.overlap_grad_reduce:
+            return
+
+        if self.is_first_batch:
+            self.start_grad_sync(force_all_reduce=force_all_reduce)
+        elif not self._nep_started and len(self.params) == 0:
+            self.start_grad_sync(force_all_reduce=force_all_reduce)
+
+        if not self._nep_started:
+            return
+        if not self._nep_is_owner:
+            self._wait_nep_gather_to_owner()
+            return
+        self._try_start_ready_owner_dp_syncs(
+            nonblocking=False,
+            force_all_reduce=force_all_reduce,
+        )
+
     def register_grad_ready(
         self, param: torch.nn.Parameter, force_all_reduce: Optional[bool] = False
     ):
@@ -1287,3 +1307,9 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         for bucket_group in self.expert_parallel_bucket_groups:
             for bucket in bucket_group.buckets:
                 bucket.gradient_scaling_factor = expert_gradient_scaling_factor
+
+    def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
+        if self.ddp_config.overlap_grad_reduce:
+            for bucket_group in self.expert_parallel_bucket_groups:
+                bucket_group.finish_nep_pre_sync(force_all_reduce=force_all_reduce)
+        return super().finish_grad_sync(force_all_reduce=force_all_reduce)
