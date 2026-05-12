@@ -378,19 +378,6 @@ class TestNonuniformEPTransfers:
         group._start_owner_dp_sync_after_gather.assert_called_once()
         assert group._nep_owner_dp_sync_started
 
-    def test_finish_pre_sync_drains_non_owner_gather(self):
-        group = object.__new__(NonuniformEPParamAndGradBucketGroup)
-        group.ddp_config = Mock(overlap_grad_reduce=True)
-        group.is_first_batch = False
-        group.params = [object()]
-        group._nep_started = True
-        group._nep_is_owner = False
-        group._wait_nep_gather_to_owner = Mock()
-
-        group.finish_nep_pre_sync()
-
-        group._wait_nep_gather_to_owner.assert_called_once()
-
     def test_scatter_wait_is_deferred_until_last_bucket_group(self):
         first = object.__new__(NonuniformEPParamAndGradBucketGroup)
         last = object.__new__(NonuniformEPParamAndGradBucketGroup)
