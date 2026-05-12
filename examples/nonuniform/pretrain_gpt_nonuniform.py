@@ -158,6 +158,14 @@ def _build_ep_runtime_config(args):
     }
 
 
+def _create_gloo_process_groups_arg(args):
+    return getattr(
+        args,
+        "enable_gloo_process_groups",
+        getattr(args, "use_gloo_process_groups", True),
+    )
+
+
 def _initialize_model_parallel(*args, **kwargs):
     """Runtime replacement for standard MPU init in nonuniform topology modes."""
     global _NTP_GROUPS_INITIALIZED
@@ -192,7 +200,7 @@ def _initialize_model_parallel(*args, **kwargs):
             context_parallel_size=megatron_args.context_parallel_size,
             nccl_communicator_config_path=megatron_args.nccl_communicator_config_path,
             distributed_timeout_minutes=megatron_args.distributed_timeout_minutes,
-            create_gloo_process_groups=megatron_args.enable_gloo_process_groups,
+            create_gloo_process_groups=_create_gloo_process_groups_arg(megatron_args),
             get_embedding_ranks=kwargs.get("get_embedding_ranks"),
             get_position_embedding_ranks=kwargs.get("get_position_embedding_ranks"),
         )
@@ -245,7 +253,7 @@ def _initialize_model_parallel(*args, **kwargs):
         num_moe_experts=megatron_args.num_experts,
         nccl_communicator_config_path=megatron_args.nccl_communicator_config_path,
         distributed_timeout_minutes=megatron_args.distributed_timeout_minutes,
-        create_gloo_process_groups=megatron_args.enable_gloo_process_groups,
+        create_gloo_process_groups=_create_gloo_process_groups_arg(megatron_args),
         get_embedding_ranks=kwargs.get("get_embedding_ranks"),
         get_position_embedding_ranks=kwargs.get("get_position_embedding_ranks"),
     )
