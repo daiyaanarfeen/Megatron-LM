@@ -226,9 +226,11 @@ class TestNonuniformEPPlanning:
             p0: (0, 4, 0),
             p1: (4, 8, 0),
         }
-        source_bucket = Mock()
-        source_bucket.params_list = [p0, p1]
-        buffer.buckets = [source_bucket]
+        source_bucket_0 = Mock()
+        source_bucket_0.params_list = [p0]
+        source_bucket_1 = Mock()
+        source_bucket_1.params_list = [p1]
+        buffer.buckets = [source_bucket_0, source_bucket_1]
         ep_group = Mock()
         edp_group = Mock()
         edp_group.size.return_value = 2

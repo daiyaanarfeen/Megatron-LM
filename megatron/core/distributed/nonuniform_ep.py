@@ -1006,7 +1006,6 @@ def build_nonuniform_ep_expert_bucket_groups(
     all_specs.sort(
         key=lambda spec: (
             buffer_order[spec.buffer],
-            spec.source_bucket_index,
             slot_index_by_key[spec.slot_key],
             spec.expert_id,
             spec.synthetic_owner,
@@ -1021,7 +1020,7 @@ def build_nonuniform_ep_expert_bucket_groups(
             spec.expert_id, runtime_config, nonuniform_ep_config.expert_owner
         )
         owner_role = 'owner' if runtime_config['ep_rank'] == owner_ep_rank else 'source'
-        key = (spec.buffer, spec.source_bucket_index, owner_role)
+        key = (spec.buffer, slot_index_by_key[spec.slot_key], owner_role)
         if current_key is not None and key != current_key:
             grouped_specs.append(current_specs)
             current_specs = []
