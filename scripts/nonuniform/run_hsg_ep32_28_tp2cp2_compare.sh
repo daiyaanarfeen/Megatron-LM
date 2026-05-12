@@ -14,7 +14,9 @@
 # Standard GPT comparison for the shared NTP/NEP opt-in branch:
 # - uniform baseline: two uniform EP32 replicas, TP2, CP2, ETP1 on 64 ranks
 # - nonuniform NEP: EP32/EP28 replicas, TP2, CP2, ETP1 on 60 ranks
-# - proportional samples: uniform GBS=16, nonuniform GBS=15
+# - proportional samples: uniform GBS=32, nonuniform GBS=30 by default
+# - profiled defaults use longer sequence length, wider experts, recompute, and large
+#   DDP buckets to keep the run compute-heavy with <=5 expert grad buckets.
 
 set -euo pipefail
 
@@ -26,16 +28,18 @@ TRAIN_ITERS=${TRAIN_ITERS:-10}
 RUN_NONUNIFORM=${RUN_NONUNIFORM:-1}
 RUN_UNIFORM=${RUN_UNIFORM:-1}
 
-UNIFORM_GBS=${UNIFORM_GBS:-16}
-NONUNIFORM_GBS=${NONUNIFORM_GBS:-15}
-SEQ_LENGTH=${SEQ_LENGTH:-8192}
+UNIFORM_GBS=${UNIFORM_GBS:-32}
+NONUNIFORM_GBS=${NONUNIFORM_GBS:-30}
+SEQ_LENGTH=${SEQ_LENGTH:-16384}
 MAX_POSITION_EMBEDDINGS=${MAX_POSITION_EMBEDDINGS:-$SEQ_LENGTH}
 RECOMPUTE_NUM_LAYERS=${RECOMPUTE_NUM_LAYERS:-1}
 NUM_LAYERS=${NUM_LAYERS:-2}
 HIDDEN_SIZE=${HIDDEN_SIZE:-4096}
-FFN_HIDDEN_SIZE=${FFN_HIDDEN_SIZE:-16384}
+FFN_HIDDEN_SIZE=${FFN_HIDDEN_SIZE:-24576}
 NUM_ATTENTION_HEADS=${NUM_ATTENTION_HEADS:-32}
 NUM_EXPERTS=${NUM_EXPERTS:-224}
+MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
+DDP_BUCKET_SIZE=${DDP_BUCKET_SIZE:-700000000}
 PROFILE=${PROFILE:-0}
 PROFILE_STEP_START=${PROFILE_STEP_START:-5}
 PROFILE_STEP_END=${PROFILE_STEP_END:-7}
@@ -83,7 +87,7 @@ common_args=(
   --num-attention-heads "$NUM_ATTENTION_HEADS"
   --seq-length "$SEQ_LENGTH"
   --max-position-embeddings "$MAX_POSITION_EMBEDDINGS"
-  --micro-batch-size 1
+  --micro-batch-size "$MICRO_BATCH_SIZE"
   --num-experts "$NUM_EXPERTS"
   --moe-router-topk 2
   --moe-router-load-balancing-type aux_loss
@@ -97,16 +101,28 @@ common_args=(
   --lr-decay-style constant
 )
 
-if [[ "$PROFILE" == "1" ]]; then
+if [[ -n "$DDP_BUCKET_SIZE" ]]; then
   common_args+=(
-    --profile
-    --use-pytorch-profiler
-    --profile-step-start "$PROFILE_STEP_START"
-    --profile-step-end "$PROFILE_STEP_END"
-    --profile-ranks "$PROFILE_RANKS"
-    --tensorboard-dir "$LOGDIR/tensorboard"
+    --ddp-bucket-size "$DDP_BUCKET_SIZE"
   )
 fi
+
+make_profile_args() {
+  local name=$1
+  PROFILE_ARGS=()
+  if [[ "$PROFILE" == "1" ]]; then
+    local profile_ranks=()
+    read -r -a profile_ranks <<< "$PROFILE_RANKS"
+    PROFILE_ARGS=(
+      --profile
+      --use-pytorch-profiler
+      --profile-step-start "$PROFILE_STEP_START"
+      --profile-step-end "$PROFILE_STEP_END"
+      --profile-ranks "${profile_ranks[@]}"
+      --tensorboard-dir "$LOGDIR/${name}_tensorboard"
+    )
+  fi
+}
 
 run_in_allocation() {
   local nnodes=$1
@@ -142,8 +158,9 @@ run_in_allocation() {
 
 if [[ "$RUN_NONUNIFORM" == "1" ]]; then
   echo "=== nonuniform NEP EP32/EP28 TP2 CP2 ETP1 ==="
+  make_profile_args nonuniform
   if ! run_in_allocation 15 "$LOGDIR/nonuniform_ep32_ep28_tp2_cp2.log" "$MASTER_PORT" \
-    examples/nonuniform/pretrain_gpt_nonuniform.py "${common_args[@]}" \
+    examples/nonuniform/pretrain_gpt_nonuniform.py "${common_args[@]}" "${PROFILE_ARGS[@]}" \
     --global-batch-size "$NONUNIFORM_GBS" \
     --nonuniform-mode ep \
     --nonuniform-ep-num-tp-cp-per-replica 8 7; then
@@ -153,8 +170,9 @@ fi
 
 if [[ "$RUN_UNIFORM" == "1" ]]; then
   echo "=== uniform EP32 TP2 CP2 ETP1 standard ==="
+  make_profile_args uniform
   if ! run_in_allocation 16 "$LOGDIR/uniform_ep32_tp2_cp2.log" "$((MASTER_PORT + 1))" \
-    pretrain_gpt.py "${common_args[@]}" \
+    pretrain_gpt.py "${common_args[@]}" "${PROFILE_ARGS[@]}" \
     --global-batch-size "$UNIFORM_GBS" \
     --expert-model-parallel-size 32; then
     status=1

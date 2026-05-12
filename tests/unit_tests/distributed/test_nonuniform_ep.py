@@ -17,6 +17,9 @@ from megatron.core.distributed.nonuniform_common import (
     set_nonuniform_ep_runtime_config,
 )
 from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBucketGroup
+from megatron.core.distributed.distributed_data_parallel_config import (
+    DistributedDataParallelConfig,
+)
 from megatron.core.distributed.nonuniform_ep import (
     NonuniformEPConfig,
     NonuniformEPParamAndGradBucketGroup,
@@ -29,6 +32,7 @@ from megatron.core.distributed.nonuniform_ep import (
     _copy_flat_into_bucket,
     _owner_for_expert,
     _pack_bucket_slices,
+    build_nonuniform_ep_expert_bucket_groups,
 )
 
 
@@ -187,6 +191,7 @@ class TestNonuniformEPPlanning:
         local_specs = [
             _ExpertBucketSpec(
                 buffer=buffer,
+                source_bucket_index=0,
                 expert_id=0,
                 params=[],
                 start=0,
@@ -207,6 +212,58 @@ class TestNonuniformEPPlanning:
         assert specs[0].start == 0
         assert specs[0].end == 4
         assert specs[0].synthetic_owner
+
+    def test_bucket_group_builder_groups_multiple_expert_plans_per_source_bucket(self):
+        p0 = torch.nn.Parameter(torch.randn(2, 2))
+        p1 = torch.nn.Parameter(torch.randn(2, 2))
+        buffer = Mock()
+        buffer.param_data = None
+        buffer.grad_data = torch.zeros(8)
+        buffer.gradient_scaling_factor = 1.0
+        buffer.data_parallel_group = Mock()
+        buffer.data_parallel_group.size.return_value = 1
+        buffer.param_index_map = {
+            p0: (0, 4, 0),
+            p1: (4, 8, 0),
+        }
+        source_bucket = Mock()
+        source_bucket.params_list = [p0, p1]
+        buffer.buckets = [source_bucket]
+        ep_group = Mock()
+        edp_group = Mock()
+        edp_group.size.return_value = 2
+        runtime_config = {
+            'ep_group': ep_group,
+            'edp_group': edp_group,
+            'ep_rank': 0,
+            'min_ep_size': 2,
+            'expert_placement': [[0, 1], [2, 3]],
+            'local_expert_indices': [0, 1],
+        }
+        param_to_name = {
+            p0: "decoder.layers.0.mlp.experts.linear_fc1.weight0",
+            p1: "decoder.layers.0.mlp.experts.linear_fc1.weight1",
+        }
+        param_to_bucket_group = {p0: object(), p1: object()}
+
+        with patch(
+            "megatron.core.distributed.nonuniform_ep.get_global_rank",
+            side_effect=lambda group, rank: rank,
+        ):
+            bucket_groups = build_nonuniform_ep_expert_bucket_groups(
+                [buffer],
+                DistributedDataParallelConfig(overlap_grad_reduce=True),
+                runtime_config,
+                NonuniformEPConfig(),
+                param_to_bucket_group,
+                param_to_name,
+            )
+
+        assert len(bucket_groups) == 1
+        assert len(bucket_groups[0].buckets) == 2
+        assert [plan.expert_id for plan in bucket_groups[0]._nep_plans] == [0, 1]
+        assert param_to_bucket_group[p0] is bucket_groups[0]
+        assert param_to_bucket_group[p1] is bucket_groups[0]
 
 
 class TestNonuniformEPTransfers:
