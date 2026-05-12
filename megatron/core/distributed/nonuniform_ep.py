@@ -663,16 +663,18 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         works = []
         recv_accumulations = []
         keepalive_buffers = []
+        ep_group = self._nep_runtime_config['ep_group']
 
         for entry in self._nep_entries:
             plan = entry['plan']
             bucket = entry['bucket']
             if entry['is_owner']:
-                for _, source_global_rank, recv_buffer in entry['gather_recv_buffers']:
+                for source_ep_rank, _, recv_buffer in entry['gather_recv_buffers']:
                     works.append(
                         dist.irecv(
                             recv_buffer,
-                            src=source_global_rank,
+                            group=ep_group,
+                            group_src=source_ep_rank,
                             tag=self._grad_transfer_tag(plan),
                         )
                     )
@@ -684,7 +686,8 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 works.append(
                     dist.isend(
                         send_buffer,
-                        dst=plan.owner_global_rank,
+                        group=ep_group,
+                        group_dst=plan.owner_ep_rank,
                         tag=self._grad_transfer_tag(plan),
                     )
                 )
@@ -744,18 +747,20 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         works = []
         recv_copies = []
         keepalive_buffers = []
+        ep_group = self._nep_runtime_config['ep_group']
 
         for entry in self._nep_entries:
             plan = entry['plan']
             bucket = entry['bucket']
             if entry['is_owner']:
-                for _, source_global_rank, send_buffer in entry['scatter_send_buffers']:
+                for source_ep_rank, _, send_buffer in entry['scatter_send_buffers']:
                     _pack_bucket_slices_into(bucket, plan.bucket_slices, send_buffer)
                     keepalive_buffers.append(send_buffer)
                     works.append(
                         dist.isend(
                             send_buffer,
-                            dst=source_global_rank,
+                            group=ep_group,
+                            group_dst=source_ep_rank,
                             tag=self._grad_scatter_tag(plan),
                         )
                     )
@@ -764,7 +769,8 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 works.append(
                     dist.irecv(
                         recv_buffer,
-                        src=plan.owner_global_rank,
+                        group=ep_group,
+                        group_src=plan.owner_ep_rank,
                         tag=self._grad_scatter_tag(plan),
                     )
                 )

@@ -404,6 +404,43 @@ class TestNonuniformEPTransfers:
         last._copy_back_extra_main_grads.assert_not_called()
         assert state['entries'] == []
 
+    def test_nep_p2p_uses_ep_group_local_ranks(self):
+        group = object.__new__(NonuniformEPParamAndGradBucketGroup)
+        ep_group = object()
+        bucket = Mock()
+        bucket.grad_data = torch.ones(4)
+        plan = _ExpertBucketPlan(
+            expert_id=0,
+            tag_slot=0,
+            owner_ep_rank=2,
+            owner_global_rank=42,
+            source_ep_ranks=[1],
+            source_global_ranks=[41],
+            bucket_slices=[(0, 4)],
+            bucket_group_index=0,
+        )
+        group._nep_runtime_config = {'ep_group': ep_group}
+        group._nep_config = NonuniformEPConfig()
+        group._nep_entries = [
+            {
+                'bucket': bucket,
+                'plan': plan,
+                'is_owner': False,
+                'gather_recv_buffers': [],
+                'scatter_send_buffers': [],
+                'gather_send_buffer': torch.empty(4),
+                'scatter_recv_buffer': torch.empty(4),
+            }
+        ]
+
+        with patch("megatron.core.distributed.nonuniform_ep.dist.isend") as isend:
+            group._start_nep_gather_to_owner()
+
+        isend.assert_called_once()
+        assert isend.call_args.kwargs['group'] is ep_group
+        assert isend.call_args.kwargs['group_dst'] == 2
+        assert 'dst' not in isend.call_args.kwargs
+
     def test_owner_uses_persistent_peer_buffers_for_gather_and_scatter(self):
         group = object.__new__(NonuniformEPParamAndGradBucketGroup)
         bucket = Mock()
