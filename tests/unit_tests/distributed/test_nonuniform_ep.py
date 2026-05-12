@@ -22,6 +22,7 @@ from megatron.core.distributed.nonuniform_ep import (
     NonuniformEPParamAndGradBucketGroup,
     _P2PGradTransferHandle,
     _ExpertBucketPlan,
+    _ExpertBucketSpec,
     _accumulate_flat_into_bucket,
     _build_expert_bucket_specs,
     _build_synthetic_owner_bucket_specs,
@@ -138,27 +139,74 @@ class TestNonuniformEPPlanning:
             param_to_name,
         )
 
-        assert [(expert_id, start, end) for _, expert_id, _, start, end in specs] == [
+        assert [(spec.expert_id, spec.start, spec.end) for spec in specs] == [
             (4, 0, 4),
             (7, 4, 8),
         ]
         assert runtime_config['_local_expert_id_set'] == {4, 7}
 
+    def test_build_expert_bucket_specs_maps_grouped_gemm_names(self):
+        p0 = torch.nn.Parameter(torch.randn(2, 2))
+        p1 = torch.nn.Parameter(torch.randn(2, 2))
+        buffer = Mock()
+        buffer.param_index_map = {
+            p0: (0, 4, 0),
+            p1: (4, 8, 0),
+        }
+        bucket = Mock()
+        bucket.params_list = [p0, p1]
+        buffer.buckets = [bucket]
+        runtime_config = {'local_expert_indices': [8, 9]}
+        param_to_name = {
+            p0: "decoder.layers.0.mlp.experts.linear_fc1.weight0",
+            p1: "decoder.layers.0.mlp.experts.linear_fc1.weight1",
+        }
+
+        specs = _build_expert_bucket_specs(
+            [buffer],
+            runtime_config,
+            NonuniformEPConfig(),
+            param_to_name,
+        )
+
+        assert [(spec.expert_id, spec.start, spec.end) for spec in specs] == [
+            (8, 0, 4),
+            (9, 4, 8),
+        ]
+        assert specs[0].slot_key == ("decoder.layers.0.mlp.experts.linear_fc1.weight{expert}",)
+        assert runtime_config['_local_expert_id_set'] == {8, 9}
+
     def test_synthetic_owner_specs_cover_overflow_experts(self):
         buffer = Mock()
+        buffer.grad_data = torch.empty(4)
         runtime_config = {
             'ep_rank': 0,
             'min_ep_size': 2,
             'expert_placement': [[0], [2], [1], [3]],
         }
+        local_specs = [
+            _ExpertBucketSpec(
+                buffer=buffer,
+                expert_id=0,
+                params=[],
+                start=0,
+                end=4,
+                slot_key=("slot",),
+            )
+        ]
         specs = _build_synthetic_owner_bucket_specs(
             [buffer],
-            [(buffer, 0, [], 0, 4)],
+            local_specs,
             runtime_config,
             NonuniformEPConfig(),
         )
 
-        assert specs == [(buffer, 1, [], 0, 4, True)]
+        assert len(specs) == 1
+        assert specs[0].buffer is buffer
+        assert specs[0].expert_id == 1
+        assert specs[0].start == 0
+        assert specs[0].end == 4
+        assert specs[0].synthetic_owner
 
 
 class TestNonuniformEPTransfers:
@@ -242,6 +290,7 @@ class TestNonuniformEPTransfers:
         group._nep_runtime_config = {'ep_rank': 0}
         group._nep_plan = _ExpertBucketPlan(
             expert_id=0,
+            tag_slot=0,
             owner_ep_rank=0,
             owner_global_rank=10,
             source_ep_ranks=[0, 1, 2],

@@ -39,10 +39,14 @@ from .param_and_grad_buffer import _ParamAndGradBucket, _ParamAndGradBucketGroup
 
 
 logger = logging.getLogger(__name__)
+_NEP_TAG_SLOT_STRIDE = 256
 
 
 def _default_expert_name_pattern() -> re.Pattern:
-    return re.compile(r"(?:^|\.)local_experts\.(\d+)(?:\.|$)")
+    return re.compile(
+        r"(?:^|\.)local_experts\.(\d+)(?:\.|$)"
+        r"|(?:^|\.)experts\.linear_fc[12]\.(?:weight|bias)(\d+)$"
+    )
 
 
 @dataclass
@@ -65,6 +69,7 @@ class NonuniformEPConfig:
 @dataclass
 class _ExpertBucketPlan:
     expert_id: int
+    tag_slot: int
     owner_ep_rank: int
     owner_global_rank: int
     source_ep_ranks: List[int]
@@ -76,6 +81,17 @@ class _ExpertBucketPlan:
     @property
     def numel(self) -> int:
         return sum(end - start for start, end in self.bucket_slices)
+
+
+@dataclass
+class _ExpertBucketSpec:
+    buffer: object
+    expert_id: int
+    params: List[torch.nn.Parameter]
+    start: int
+    end: int
+    slot_key: Tuple[str, ...]
+    synthetic_owner: bool = False
 
 
 class _P2PGradTransferHandle:
@@ -457,12 +473,29 @@ def _local_expert_id_from_name(
     match = pattern.search(name)
     if match is None:
         return None
-    local_idx = int(match.group(1))
+    local_idx = None
+    for group_index in range(1, len(match.groups()) + 1):
+        if match.group(group_index) is not None:
+            local_idx = int(match.group(group_index))
+            break
+    if local_idx is None:
+        raise RuntimeError(f"NEP expert name pattern matched without a capture group: {name}")
     if local_expert_indices is None:
         return local_idx
     if local_idx >= len(local_expert_indices):
         raise RuntimeError(f"Local expert index {local_idx} is out of range for {name}")
     return int(local_expert_indices[local_idx])
+
+
+def _expert_slot_key_from_name(name: str, pattern: re.Pattern) -> str:
+    match = pattern.search(name)
+    if match is None:
+        return name
+    for group_index in range(1, len(match.groups()) + 1):
+        if match.group(group_index) is not None:
+            start, end = match.span(group_index)
+            return f"{name[:start]}{{expert}}{name[end:]}"
+    return name
 
 
 class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
@@ -543,10 +576,18 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             )
 
     def _grad_transfer_tag(self) -> int:
-        return self._nep_config.grad_transfer_tag_base + self._nep_plan.expert_id
+        return (
+            self._nep_config.grad_transfer_tag_base
+            + self._nep_plan.expert_id * _NEP_TAG_SLOT_STRIDE
+            + self._nep_plan.tag_slot
+        )
 
     def _grad_scatter_tag(self) -> int:
-        return self._nep_config.grad_scatter_tag_base + self._nep_plan.expert_id
+        return (
+            self._nep_config.grad_scatter_tag_base
+            + self._nep_plan.expert_id * _NEP_TAG_SLOT_STRIDE
+            + self._nep_plan.tag_slot
+        )
 
     def _copy_extra_main_grads_to_grad_buffer(self):
         for bucket in self.buckets:
@@ -726,36 +767,83 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         )
 
 
+def _iter_buffer_bucket_params(buffer):
+    source_buckets = getattr(buffer, 'buckets', None)
+    if not isinstance(source_buckets, (list, tuple)):
+        yield sorted(buffer.param_index_map, key=lambda param: buffer.param_index_map[param][0])
+        return
+
+    for bucket in source_buckets:
+        params = getattr(bucket, 'params_list', None)
+        if params is None:
+            params = list(getattr(bucket, 'params', []))
+        yield sorted(params, key=lambda param: buffer.param_index_map[param][0])
+
+
 def _build_expert_bucket_specs(buffers, runtime_config, config, param_to_name):
     local_expert_indices = runtime_config.get('local_expert_indices')
     local_expert_id_set = set(local_expert_indices) if local_expert_indices is not None else set()
     specs = []
 
     for buffer in buffers:
-        expert_to_params = {}
-        for param in buffer.param_index_map:
-            name = param_to_name.get(param, "")
-            expert_id = _local_expert_id_from_name(
-                name,
-                config.expert_name_pattern,
-                local_expert_indices,
-            )
-            if expert_id is None:
-                continue
-            local_expert_id_set.add(expert_id)
-            expert_to_params.setdefault(expert_id, []).append(param)
+        for bucket_params in _iter_buffer_bucket_params(buffer):
+            current_expert_id = None
+            current_params = []
 
-        for expert_id, params in expert_to_params.items():
-            params = sorted(params, key=lambda param: buffer.param_index_map[param][0])
-            starts_ends = [buffer.param_index_map[param][:2] for param in params]
-            start = min(start for start, _ in starts_ends)
-            end = max(end for _, end in starts_ends)
-            total = sum(param_end - param_start for param_start, param_end in starts_ends)
-            if total != end - start:
-                raise RuntimeError(
-                    f"Expert {expert_id} params are not contiguous in the grad buffer"
+            def flush_current():
+                nonlocal current_expert_id, current_params
+                if current_expert_id is None or not current_params:
+                    current_expert_id = None
+                    current_params = []
+                    return
+
+                params = current_params
+                starts_ends = [buffer.param_index_map[param][:2] for param in params]
+                start = min(start for start, _ in starts_ends)
+                end = max(end for _, end in starts_ends)
+                total = sum(param_end - param_start for param_start, param_end in starts_ends)
+                if total != end - start:
+                    raise RuntimeError(
+                        f"Expert {current_expert_id} params are not contiguous in the grad buffer"
+                    )
+                slot_key = tuple(
+                    _expert_slot_key_from_name(
+                        param_to_name.get(param, ""), config.expert_name_pattern
+                    )
+                    for param in params
                 )
-            specs.append((buffer, expert_id, params, start, end))
+                specs.append(
+                    _ExpertBucketSpec(
+                        buffer=buffer,
+                        expert_id=current_expert_id,
+                        params=params,
+                        start=start,
+                        end=end,
+                        slot_key=slot_key,
+                    )
+                )
+                current_expert_id = None
+                current_params = []
+
+            for param in bucket_params:
+                if param not in buffer.param_index_map:
+                    continue
+                name = param_to_name.get(param, "")
+                expert_id = _local_expert_id_from_name(
+                    name,
+                    config.expert_name_pattern,
+                    local_expert_indices,
+                )
+                if expert_id is None:
+                    flush_current()
+                    continue
+                local_expert_id_set.add(expert_id)
+                if current_expert_id is not None and expert_id != current_expert_id:
+                    flush_current()
+                current_expert_id = expert_id
+                current_params.append(param)
+
+            flush_current()
 
     runtime_config['_local_expert_id_set'] = local_expert_id_set
     return specs
@@ -768,18 +856,18 @@ def _build_synthetic_owner_bucket_specs(buffers, local_specs, runtime_config, co
         return []
 
     local_ep_rank = runtime_config['ep_rank']
-    local_expert_ids = {expert_id for _, expert_id, _, _, _ in local_specs}
-    template_numel_by_buffer = {}
-    for buffer, _, _, start, end in local_specs:
-        numel = end - start
-        previous_numel = template_numel_by_buffer.setdefault(buffer, numel)
-        if previous_numel != numel:
+    local_expert_ids = {spec.expert_id for spec in local_specs}
+    template_by_slot_key = {}
+    for spec in local_specs:
+        numel = spec.end - spec.start
+        previous = template_by_slot_key.setdefault(spec.slot_key, (spec.buffer, numel))
+        if previous[1] != numel:
             raise RuntimeError(
-                "NEP synthetic owner buckets assume equal per-expert grad sizes "
-                "within each expert buffer."
+                "NEP synthetic owner buckets assume equal grad sizes for matching "
+                "expert parameter slots."
             )
 
-    if not template_numel_by_buffer:
+    if not template_by_slot_key:
         return []
 
     num_experts = sum(len(experts) for experts in placement)
@@ -799,12 +887,19 @@ def _build_synthetic_owner_bucket_specs(buffers, local_specs, runtime_config, co
         synthetic_expert_ids.append(expert_id)
 
     specs = []
-    for buffer in buffers:
-        if buffer not in template_numel_by_buffer:
-            continue
-        numel = template_numel_by_buffer[buffer]
-        for expert_id in synthetic_expert_ids:
-            specs.append((buffer, expert_id, [], 0, numel, True))
+    for expert_id in synthetic_expert_ids:
+        for slot_key, (buffer, numel) in sorted(template_by_slot_key.items()):
+            specs.append(
+                _ExpertBucketSpec(
+                    buffer=buffer,
+                    expert_id=expert_id,
+                    params=[],
+                    start=0,
+                    end=numel,
+                    slot_key=slot_key,
+                    synthetic_owner=True,
+                )
+            )
     return specs
 
 
@@ -832,10 +927,7 @@ def build_nonuniform_ep_expert_bucket_groups(
             "NonuniformEPConfig.expert_name_pattern."
         )
 
-    all_specs = [
-        (buffer, expert_id, params, start, end, False)
-        for buffer, expert_id, params, start, end in specs
-    ]
+    all_specs = list(specs)
     all_specs.extend(
         _build_synthetic_owner_bucket_specs(
             buffers,
@@ -845,22 +937,40 @@ def build_nonuniform_ep_expert_bucket_groups(
         )
     )
     buffer_order = {buffer: index for index, buffer in enumerate(buffers)}
-    all_specs.sort(key=lambda spec: (buffer_order[spec[0]], spec[1], spec[5]))
+    slot_keys = sorted({spec.slot_key for spec in all_specs})
+    if len(slot_keys) > _NEP_TAG_SLOT_STRIDE:
+        raise RuntimeError(
+            f"NEP p2p tags support at most {_NEP_TAG_SLOT_STRIDE} expert parameter slots; "
+            f"got {len(slot_keys)}"
+        )
+    max_tag_offset = max((spec.expert_id for spec in all_specs), default=0) * _NEP_TAG_SLOT_STRIDE
+    max_tag_offset += max(0, len(slot_keys) - 1)
+    if (
+        nonuniform_ep_config.grad_transfer_tag_base
+        <= nonuniform_ep_config.grad_scatter_tag_base
+        <= nonuniform_ep_config.grad_transfer_tag_base + max_tag_offset
+    ):
+        raise RuntimeError(
+            "NEP grad transfer and scatter p2p tag ranges overlap; increase "
+            "grad_scatter_tag_base or decrease grad_transfer_tag_base."
+        )
+    slot_index_by_key = {slot_key: index for index, slot_key in enumerate(slot_keys)}
+    all_specs.sort(
+        key=lambda spec: (
+            buffer_order[spec.buffer],
+            slot_index_by_key[spec.slot_key],
+            spec.expert_id,
+            spec.synthetic_owner,
+        )
+    )
 
-    for group_index, (buffer, expert_id, params, start, end, is_synthetic) in enumerate(all_specs):
+    for group_index, spec in enumerate(all_specs):
         owner_ep_rank = _owner_for_expert(
-            expert_id,
+            spec.expert_id,
             runtime_config,
             nonuniform_ep_config.expert_owner,
         )
-        source_ep_ranks = _source_ep_ranks_for_expert(expert_id, runtime_config)
-        if owner_ep_rank not in source_ep_ranks and not is_synthetic:
-            raise RuntimeError(
-                "NEP owner-transfer mode requires the owner rank to physically hold "
-                f"expert {expert_id}. owner_ep_rank={owner_ep_rank}, "
-                f"source_ep_ranks={source_ep_ranks}. Use an expert placement that "
-                "duplicates owner params or choose each expert's physical holder as owner."
-            )
+        source_ep_ranks = _source_ep_ranks_for_expert(spec.expert_id, runtime_config)
         owner_global_rank = get_global_rank(ep_group, owner_ep_rank)
         source_global_ranks = [get_global_rank(ep_group, rank) for rank in source_ep_ranks]
         if edp_group is None and any(rank != owner_ep_rank for rank in source_ep_ranks):
@@ -870,43 +980,50 @@ def build_nonuniform_ep_expert_bucket_groups(
                 "a different owner rank."
             )
         plan = _ExpertBucketPlan(
-            expert_id=expert_id,
+            expert_id=spec.expert_id,
+            tag_slot=slot_index_by_key[spec.slot_key],
             owner_ep_rank=owner_ep_rank,
             owner_global_rank=owner_global_rank,
             source_ep_ranks=source_ep_ranks,
             source_global_ranks=source_global_ranks,
-            bucket_slices=[(0, end - start)],
+            bucket_slices=[(0, spec.end - spec.start)],
             bucket_group_index=group_index,
-            synthetic_owner=is_synthetic,
+            synthetic_owner=spec.synthetic_owner,
         )
 
-        if is_synthetic:
+        if spec.synthetic_owner:
             param_data = None
             grad_data = torch.empty(
-                end - start,
-                dtype=buffer.grad_data.dtype,
-                device=buffer.grad_data.device,
+                spec.end - spec.start,
+                dtype=spec.buffer.grad_data.dtype,
+                device=spec.buffer.grad_data.device,
             )
         else:
-            param_data = buffer.param_data[start:end] if buffer.param_data is not None else None
-            grad_data = buffer.grad_data[start:end]
+            param_data = (
+                spec.buffer.param_data[spec.start : spec.end]
+                if spec.buffer.param_data is not None
+                else None
+            )
+            grad_data = spec.buffer.grad_data[spec.start : spec.end]
         bucket = _ParamAndGradBucket(
-            params=params,
+            params=spec.params,
             param_data=param_data,
             grad_data=grad_data,
-            offset=start,
-            numel_unpadded=end - start,
-            gradient_scaling_factor=buffer.gradient_scaling_factor,
+            offset=spec.start,
+            numel_unpadded=spec.end - spec.start,
+            gradient_scaling_factor=spec.buffer.gradient_scaling_factor,
             bucket_id=group_index,
-            param_index_map=buffer.param_index_map,
+            param_index_map=spec.buffer.param_index_map,
             params_with_extra_main_grads=[],
         )
         is_owner_rank = runtime_config['ep_rank'] == owner_ep_rank
-        for param in params:
-            param.nonuniform_ep_expert_id = expert_id
+        for param in spec.params:
+            param.nonuniform_ep_expert_id = spec.expert_id
             param.nonuniform_ep_owner_rank = owner_ep_rank
         collective_group = (
-            edp_group if (is_owner_rank and edp_group is not None) else buffer.data_parallel_group
+            edp_group
+            if (is_owner_rank and edp_group is not None)
+            else spec.buffer.data_parallel_group
         )
         bucket_group = NonuniformEPParamAndGradBucketGroup(
             [bucket],
