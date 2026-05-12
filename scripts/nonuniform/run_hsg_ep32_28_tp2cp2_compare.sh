@@ -119,7 +119,7 @@ make_profile_args() {
       --profile-step-start "$PROFILE_STEP_START"
       --profile-step-end "$PROFILE_STEP_END"
       --profile-ranks "${profile_ranks[@]}"
-      --tensorboard-dir "$LOGDIR/${name}_tensorboard"
+      --tensorboard-dir "$LOGDIR/$name/tensorboard"
     )
   fi
 }
