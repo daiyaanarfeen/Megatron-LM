@@ -28,6 +28,15 @@ TRAIN_ITERS=${TRAIN_ITERS:-10}
 RUN_NONUNIFORM=${RUN_NONUNIFORM:-1}
 RUN_UNIFORM=${RUN_UNIFORM:-1}
 
+NONUNIFORM_NNODES=${NONUNIFORM_NNODES:-15}
+UNIFORM_NNODES=${UNIFORM_NNODES:-16}
+NONUNIFORM_TP_CP_PER_REPLICA=${NONUNIFORM_TP_CP_PER_REPLICA:-"8 7"}
+UNIFORM_EP=${UNIFORM_EP:-32}
+NONUNIFORM_LABEL=${NONUNIFORM_LABEL:-"nonuniform NEP EP32/EP28 TP2 CP2 ETP1"}
+UNIFORM_LABEL=${UNIFORM_LABEL:-"uniform EP32 TP2 CP2 ETP1 standard"}
+NONUNIFORM_LOG_NAME=${NONUNIFORM_LOG_NAME:-nonuniform_ep32_ep28_tp2_cp2.log}
+UNIFORM_LOG_NAME=${UNIFORM_LOG_NAME:-uniform_ep32_tp2_cp2.log}
+
 UNIFORM_GBS=${UNIFORM_GBS:-32}
 NONUNIFORM_GBS=${NONUNIFORM_GBS:-30}
 SEQ_LENGTH=${SEQ_LENGTH:-16384}
@@ -157,24 +166,25 @@ run_in_allocation() {
 }
 
 if [[ "$RUN_NONUNIFORM" == "1" ]]; then
-  echo "=== nonuniform NEP EP32/EP28 TP2 CP2 ETP1 ==="
+  echo "=== $NONUNIFORM_LABEL ==="
   make_profile_args nonuniform
-  if ! run_in_allocation 15 "$LOGDIR/nonuniform_ep32_ep28_tp2_cp2.log" "$MASTER_PORT" \
+  read -r -a nonuniform_topology <<< "$NONUNIFORM_TP_CP_PER_REPLICA"
+  if ! run_in_allocation "$NONUNIFORM_NNODES" "$LOGDIR/$NONUNIFORM_LOG_NAME" "$MASTER_PORT" \
     examples/nonuniform/pretrain_gpt_nonuniform.py "${common_args[@]}" "${PROFILE_ARGS[@]}" \
     --global-batch-size "$NONUNIFORM_GBS" \
     --nonuniform-mode ep \
-    --nonuniform-ep-num-tp-cp-per-replica 8 7; then
+    --nonuniform-ep-num-tp-cp-per-replica "${nonuniform_topology[@]}"; then
     status=1
   fi
 fi
 
 if [[ "$RUN_UNIFORM" == "1" ]]; then
-  echo "=== uniform EP32 TP2 CP2 ETP1 standard ==="
+  echo "=== $UNIFORM_LABEL ==="
   make_profile_args uniform
-  if ! run_in_allocation 16 "$LOGDIR/uniform_ep32_tp2_cp2.log" "$((MASTER_PORT + 1))" \
+  if ! run_in_allocation "$UNIFORM_NNODES" "$LOGDIR/$UNIFORM_LOG_NAME" "$((MASTER_PORT + 1))" \
     pretrain_gpt.py "${common_args[@]}" "${PROFILE_ARGS[@]}" \
     --global-batch-size "$UNIFORM_GBS" \
-    --expert-model-parallel-size 32; then
+    --expert-model-parallel-size "$UNIFORM_EP"; then
     status=1
   fi
 fi
