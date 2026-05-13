@@ -378,6 +378,19 @@ class TestNonuniformEPTransfers:
         group._start_owner_dp_sync_after_gather.assert_called_once()
         assert group._nep_owner_dp_sync_started
 
+    def test_finish_pre_sync_drains_non_owner_gather(self):
+        group = object.__new__(NonuniformEPParamAndGradBucketGroup)
+        group.ddp_config = Mock(overlap_grad_reduce=True)
+        group.is_first_batch = False
+        group.params = [object()]
+        group._nep_started = True
+        group._nep_is_owner = False
+        group._wait_nep_gather_to_owner = Mock()
+
+        group.finish_nep_pre_sync()
+
+        group._wait_nep_gather_to_owner.assert_called_once()
+
     def test_scatter_wait_is_deferred_until_last_bucket_group(self):
         first = object.__new__(NonuniformEPParamAndGradBucketGroup)
         last = object.__new__(NonuniformEPParamAndGradBucketGroup)
@@ -404,9 +417,10 @@ class TestNonuniformEPTransfers:
         last._copy_back_extra_main_grads.assert_not_called()
         assert state['entries'] == []
 
-    def test_nep_p2p_uses_ep_group_local_ranks(self):
+    def test_nep_p2p_uses_transfer_group_local_ranks(self):
         group = object.__new__(NonuniformEPParamAndGradBucketGroup)
         ep_group = object()
+        transfer_group = object()
         bucket = Mock()
         bucket.grad_data = torch.ones(4)
         plan = _ExpertBucketPlan(
@@ -419,7 +433,10 @@ class TestNonuniformEPTransfers:
             bucket_slices=[(0, 4)],
             bucket_group_index=0,
         )
-        group._nep_runtime_config = {'ep_group': ep_group}
+        group._nep_runtime_config = {
+            'ep_group': ep_group,
+            'nep_transfer_group': transfer_group,
+        }
         group._nep_config = NonuniformEPConfig()
         group._nep_entries = [
             {
@@ -437,7 +454,7 @@ class TestNonuniformEPTransfers:
             group._start_nep_gather_to_owner()
 
         isend.assert_called_once()
-        assert isend.call_args.kwargs['group'] is ep_group
+        assert isend.call_args.kwargs['group'] is transfer_group
         assert isend.call_args.kwargs['group_dst'] == 2
         assert 'dst' not in isend.call_args.kwargs
 

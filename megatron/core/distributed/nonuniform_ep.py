@@ -181,6 +181,7 @@ def _runtime_config_from_parallel_state() -> dict:
         'num_replicas': 1,
         'dp_size': 1,
         'ep_group': ep_group if ep_group is not None else dist.group.WORLD,
+        'nep_transfer_group': ep_group if ep_group is not None else dist.group.WORLD,
         'edp_group': None,
         'ep_rank': ep_rank,
         'local_expert_indices': None,
@@ -368,11 +369,14 @@ def initialize_nonuniform_ep_process_groups(
             _set_parallel_state_attr("_TENSOR_AND_CONTEXT_PARALLEL_GROUP", group)
 
     # Expert groups.
+    nep_transfer_group = None
     for ranks in generator.get_ranks('ep'):
         group = _create_group(ranks, timeout, nccl_comm_cfgs, "ep")
+        transfer_group = _create_group(ranks, timeout, nccl_comm_cfgs, "nep_grad_transfer")
         if rank in ranks:
             _set_parallel_state_attr("_EXPERT_MODEL_PARALLEL_GROUP", group)
             _set_parallel_state_attr("_EXPERT_MODEL_PARALLEL_RANKS", ranks)
+            nep_transfer_group = transfer_group
 
     for ranks in generator.get_ranks('etp'):
         group = _create_group(ranks, timeout, nccl_comm_cfgs, "ep_tp")
@@ -436,6 +440,7 @@ def initialize_nonuniform_ep_process_groups(
         'num_replicas': generator.num_replicas,
         'dp_size': sum(num_tp_cp_per_replica),
         'ep_group': ep_group,
+        'nep_transfer_group': nep_transfer_group,
         'edp_group': parallel_state.get_expert_data_parallel_group(),
         'ep_rank': ep_rank,
         'is_edp_eligible': ep_rank < min_ep_size,
@@ -663,7 +668,9 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         works = []
         recv_accumulations = []
         keepalive_buffers = []
-        ep_group = self._nep_runtime_config['ep_group']
+        transfer_group = self._nep_runtime_config.get(
+            'nep_transfer_group', self._nep_runtime_config['ep_group']
+        )
 
         for entry in self._nep_entries:
             plan = entry['plan']
@@ -673,7 +680,7 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     works.append(
                         dist.irecv(
                             recv_buffer,
-                            group=ep_group,
+                            group=transfer_group,
                             group_src=source_ep_rank,
                             tag=self._grad_transfer_tag(plan),
                         )
@@ -686,7 +693,7 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 works.append(
                     dist.isend(
                         send_buffer,
-                        group=ep_group,
+                        group=transfer_group,
                         group_dst=plan.owner_ep_rank,
                         tag=self._grad_transfer_tag(plan),
                     )
@@ -747,7 +754,9 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         works = []
         recv_copies = []
         keepalive_buffers = []
-        ep_group = self._nep_runtime_config['ep_group']
+        transfer_group = self._nep_runtime_config.get(
+            'nep_transfer_group', self._nep_runtime_config['ep_group']
+        )
 
         for entry in self._nep_entries:
             plan = entry['plan']
@@ -759,7 +768,7 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     works.append(
                         dist.isend(
                             send_buffer,
-                            group=ep_group,
+                            group=transfer_group,
                             group_dst=source_ep_rank,
                             tag=self._grad_scatter_tag(plan),
                         )
@@ -769,7 +778,7 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 works.append(
                     dist.irecv(
                         recv_buffer,
-                        group=ep_group,
+                        group=transfer_group,
                         group_src=plan.owner_ep_rank,
                         tag=self._grad_scatter_tag(plan),
                     )
@@ -821,10 +830,10 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if not self._nep_is_owner:
             self.grad_reduce_handle = None
             return
-        self._wait_nep_gather_to_owner()
-        result = self._start_owner_dp_sync_after_gather(force_all_reduce=force_all_reduce)
-        self._nep_owner_dp_sync_started = True
-        return result
+        self._try_start_ready_owner_dp_syncs(
+            nonblocking=True,
+            force_all_reduce=force_all_reduce,
+        )
 
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """Finish owner DP sync and scatter synced grads back to source ranks."""
@@ -859,6 +868,26 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         self._start_nep_scatter_from_owner()
         self._record_nep_scatter_wait(copy_back_after_wait=False)
         return result
+
+    def finish_nep_pre_sync(self, force_all_reduce: Optional[bool] = False):
+        """Drain pre-sync p2p and start owner allreduces before generic DDP waits."""
+        if not self.ddp_config.overlap_grad_reduce:
+            return
+
+        if self.is_first_batch:
+            self.start_grad_sync(force_all_reduce=force_all_reduce)
+        elif not self._nep_started and len(self.params) == 0:
+            self.start_grad_sync(force_all_reduce=force_all_reduce)
+
+        if not self._nep_started:
+            return
+        if not self._nep_is_owner:
+            self._wait_nep_gather_to_owner()
+            return
+        self._try_start_ready_owner_dp_syncs(
+            nonblocking=False,
+            force_all_reduce=force_all_reduce,
+        )
 
     def register_grad_ready(
         self, param: torch.nn.Parameter, force_all_reduce: Optional[bool] = False
@@ -1287,3 +1316,9 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         for bucket_group in self.expert_parallel_bucket_groups:
             for bucket in bucket_group.buckets:
                 bucket.gradient_scaling_factor = expert_gradient_scaling_factor
+
+    def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
+        if self.ddp_config.overlap_grad_reduce:
+            for bucket_group in self.expert_parallel_bucket_groups:
+                bucket_group.finish_nep_pre_sync(force_all_reduce=force_all_reduce)
+        return super().finish_grad_sync(force_all_reduce=force_all_reduce)
