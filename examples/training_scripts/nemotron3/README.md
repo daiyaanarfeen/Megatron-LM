@@ -1,4 +1,4 @@
-# Nemotron 3 recipes (Nano / Super / Ultra)
+# Nemotron-3 recipes (Nano / Super / Ultra)
 
 Hybrid Mamba + attention + MoE pretraining recipes for the Nano, Super, and
 Ultra models, each trained on 25 T tokens (`--train-samples 3 051 757 813`
