@@ -12,7 +12,7 @@
 #SBATCH --error=%x_%j.err
 
 # Standard Megatron GPT stress comparison:
-# - heterogeneous EP16/EP12, TP2, CP2, ETP1 on 28 ranks, NVSHMEM approach
+# - heterogeneous EP16/EP12, TP2, CP2, ETP1 on 28 ranks
 # - uniform EP16, TP2, CP2, ETP1 on 32 ranks, standard pretrain_gpt.py
 # - proportional per-replica samples: uniform 16-GPU replicas get 8 samples,
 #   hetero 16-GPU replica gets 8 and 12-GPU replica gets 6.
@@ -24,17 +24,23 @@ LOGDIR=${LOGDIR:-$WORKDIR/heterogeneous_ep_training_logs_ep16_12_stress}
 MASTER_PORT=${MASTER_PORT:-29520}
 GPUS_PER_NODE=${GPUS_PER_NODE:-4}
 TRAIN_ITERS=${TRAIN_ITERS:-20}
+HETERO_APPROACHES=${HETERO_APPROACHES:-"nvshmem"}
 HETERO_GBS=${HETERO_GBS:-14}
 UNIFORM_GBS=${UNIFORM_GBS:-16}
 SEQ_LENGTH=${SEQ_LENGTH:-8192}
 MAX_POSITION_EMBEDDINGS=${MAX_POSITION_EMBEDDINGS:-$SEQ_LENGTH}
 RECOMPUTE_NUM_LAYERS=${RECOMPUTE_NUM_LAYERS:-1}
+NUM_LAYERS=${NUM_LAYERS:-4}
+HIDDEN_SIZE=${HIDDEN_SIZE:-4096}
+FFN_HIDDEN_SIZE=${FFN_HIDDEN_SIZE:-16384}
+NUM_ATTENTION_HEADS=${NUM_ATTENTION_HEADS:-32}
+NUM_EXPERTS=${NUM_EXPERTS:-96}
 # The opt-in NVSHMEM path rebuilds expert buckets on layer boundaries. For this
 # model each layer/expert BF16 grad payload is 256 MiB, so 320 MiB leaves margin.
 NVSHMEM_SLOT_MB=${MEGATRON_NVSHMEM_SLOT_MB:-320}
 RUN_HETERO=${RUN_HETERO:-1}
 RUN_UNIFORM=${RUN_UNIFORM:-1}
-HSG_CACHED_IMAGE=${HSG_CACHED_IMAGE:-/lustre/fsw/portfolios/coreai/users/darfeen/pyt25.08-nvshmem-megatron-het-ep.sqsh}
+HSG_CACHED_IMAGE=${HSG_CACHED_IMAGE:-/lustre/fsw/portfolios/coreai/users/darfeen/pyt25.10-nvshmem-megatron-het-ep.sqsh}
 
 export NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE:-0}
 export NVSHMEM_MAX_TEAMS=${NVSHMEM_MAX_TEAMS:-512}
@@ -71,14 +77,14 @@ common_args=(
   --context-parallel-size 2
   --expert-tensor-parallel-size 1
   --sequence-parallel
-  --num-layers 4
-  --hidden-size 4096
-  --ffn-hidden-size 16384
-  --num-attention-heads 32
+  --num-layers "$NUM_LAYERS"
+  --hidden-size "$HIDDEN_SIZE"
+  --ffn-hidden-size "$FFN_HIDDEN_SIZE"
+  --num-attention-heads "$NUM_ATTENTION_HEADS"
   --seq-length "$SEQ_LENGTH"
   --max-position-embeddings "$MAX_POSITION_EMBEDDINGS"
   --micro-batch-size 1
-  --num-experts 96
+  --num-experts "$NUM_EXPERTS"
   --moe-router-topk 2
   --moe-router-load-balancing-type aux_loss
   --moe-aux-loss-coeff 0.01
@@ -125,19 +131,25 @@ run_in_allocation() {
 }
 
 if [[ "$RUN_HETERO" == "1" ]]; then
-  echo "=== hetero EP16/EP12 TP2 CP2 ETP1 approach=nvshmem ==="
-  if ! run_in_allocation 7 "$LOGDIR/hetero_ep16_ep12_tp2_cp2_nvshmem.log" "$MASTER_PORT" \
-    pretrain_gpt_heterogeneous_ep.py "${common_args[@]}" \
-    --global-batch-size "$HETERO_GBS" \
-    --heterogeneous-ep-ddp-approach nvshmem \
-    --heterogeneous-ep-num-tp-cp-per-replica 4 3; then
-    status=1
-  fi
+  approach_index=0
+  for approach in $HETERO_APPROACHES; do
+    echo "=== hetero EP16/EP12 TP2 CP2 ETP1 approach=$approach ==="
+    if ! run_in_allocation 7 "$LOGDIR/hetero_ep16_ep12_tp2_cp2_${approach}.log" "$((MASTER_PORT + approach_index))" \
+      pretrain_gpt_heterogeneous_ep.py "${common_args[@]}" \
+      --global-batch-size "$HETERO_GBS" \
+      --heterogeneous-ep-ddp-approach "$approach" \
+      --heterogeneous-ep-num-tp-cp-per-replica 4 3; then
+      status=1
+    fi
+    approach_index=$((approach_index + 1))
+  done
+else
+  approach_index=0
 fi
 
 if [[ "$RUN_UNIFORM" == "1" ]]; then
   echo "=== uniform EP16 TP2 CP2 ETP1 standard ==="
-  if ! run_in_allocation 8 "$LOGDIR/uniform_ep16_tp2_cp2_standard.log" "$((MASTER_PORT + 1))" \
+  if ! run_in_allocation 8 "$LOGDIR/uniform_ep16_tp2_cp2_standard.log" "$((MASTER_PORT + approach_index))" \
     pretrain_gpt.py "${common_args[@]}" \
     --global-batch-size "$UNIFORM_GBS" \
     --expert-model-parallel-size 16; then

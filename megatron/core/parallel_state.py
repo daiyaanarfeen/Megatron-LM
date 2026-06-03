@@ -1582,6 +1582,7 @@ def initialize_heterogeneous_model_parallel(
     num_moe_experts: Optional[int] = None,
     hidden_size: Optional[int] = None,
     ffn_hidden_size: Optional[int] = None,
+    heterogeneous_ep_approach: Optional[str] = None,
     nccl_communicator_config_path: Optional[str] = None,
     distributed_timeout_minutes: int = 30,
     create_gloo_process_groups: bool = True,
@@ -1604,6 +1605,10 @@ def initialize_heterogeneous_model_parallel(
             <= tp and divide tp. Defaults to tp.
         num_moe_experts: If provided, validates num_experts % ep_i == 0
             for every replica.
+        heterogeneous_ep_approach: Optional gradient sync approach. When set to
+            ``"nccl"`` or ``"phased"``, skip NVSHMEM initialization and symmetric
+            buffer allocation. ``None`` preserves the previous compatibility
+            behavior and initializes NVSHMEM when it is available.
         nccl_communicator_config_path: Path to NCCL communicator config yaml.
         distributed_timeout_minutes: Timeout for distributed operations.
         create_gloo_process_groups: Whether to create Gloo process groups.
@@ -1625,49 +1630,65 @@ def initialize_heterogeneous_model_parallel(
         f"sum(num_tp_cp_per_replica) * tp * cp must equal world_size."
     )
 
+    normalized_het_ep_approach = None
+    if heterogeneous_ep_approach is not None:
+        normalized_het_ep_approach = heterogeneous_ep_approach.lower()
+        assert normalized_het_ep_approach in {"nccl", "nvshmem", "phased"}, (
+            f"Unsupported heterogeneous EP approach: {heterogeneous_ep_approach}"
+        )
+    enable_nvshmem = (
+        normalized_het_ep_approach is None or normalized_het_ep_approach == "nvshmem"
+    )
+
     # ── Initialize NVSHMEM early, BEFORE creating NCCL groups ──
     # NVSHMEM + NCCL coexist better when NVSHMEM inits first (fewer resource conflicts).
     _nvshmem_ok = False
     _nvshmem_stream = None
     _nvshmem_dev = None
-    try:
-        import nvshmem.core as _nvshmem_core
-        from megatron.core.resharding.nvshmem_copy_service.compat import (
-            ensure_nvshmem_compat,
-            get_cuda_core_device_class,
-        )
-        ensure_nvshmem_compat()
-
-        _init_st = _nvshmem_core.init_status()
-        if _init_st != _nvshmem_core.InitStatus.STATUS_IS_INITIALIZED:
-            _nvshmem_uid = _nvshmem_core.get_unique_id(empty=True)
-            if rank == 0:
-                _nvshmem_uid = _nvshmem_core.get_unique_id()
-            _uid_list = [_nvshmem_uid]
-            torch.distributed.broadcast_object_list(_uid_list, src=0)
-
-            _Device = get_cuda_core_device_class()
-            _nvshmem_dev = _Device(rank % torch.cuda.device_count())
-            _nvshmem_dev.set_current()
-            _nvshmem_core.init(
-                device=_nvshmem_dev, uid=_uid_list[0],
-                rank=rank, nranks=world_size, initializer_method="uid",
+    if enable_nvshmem:
+        try:
+            import nvshmem.core as _nvshmem_core
+            from megatron.core.resharding.nvshmem_copy_service.compat import (
+                ensure_nvshmem_compat,
+                get_cuda_core_device_class,
             )
-        else:
-            _Device = get_cuda_core_device_class()
-            _nvshmem_dev = _Device(rank % torch.cuda.device_count())
-            _nvshmem_dev.set_current()
+            ensure_nvshmem_compat()
 
-        _nvshmem_stream = _nvshmem_dev.create_stream()
-        _nvshmem_ok = True
-        logger.info(f"NVSHMEM initialized early (PE={rank}, nPEs={world_size})")
-    except ImportError:
-        pass  # nvshmem4py not installed
-    except Exception as e:
-        import traceback
-        logger.warning(f"NVSHMEM early init failed: {e}")
-        logger.warning(traceback.format_exc())
-        _nvshmem_ok = False
+            _init_st = _nvshmem_core.init_status()
+            if _init_st != _nvshmem_core.InitStatus.STATUS_IS_INITIALIZED:
+                _nvshmem_uid = _nvshmem_core.get_unique_id(empty=True)
+                if rank == 0:
+                    _nvshmem_uid = _nvshmem_core.get_unique_id()
+                _uid_list = [_nvshmem_uid]
+                torch.distributed.broadcast_object_list(_uid_list, src=0)
+
+                _Device = get_cuda_core_device_class()
+                _nvshmem_dev = _Device(rank % torch.cuda.device_count())
+                _nvshmem_dev.set_current()
+                _nvshmem_core.init(
+                    device=_nvshmem_dev, uid=_uid_list[0],
+                    rank=rank, nranks=world_size, initializer_method="uid",
+                )
+            else:
+                _Device = get_cuda_core_device_class()
+                _nvshmem_dev = _Device(rank % torch.cuda.device_count())
+                _nvshmem_dev.set_current()
+
+            _nvshmem_stream = _nvshmem_dev.create_stream()
+            _nvshmem_ok = True
+            logger.info(f"NVSHMEM initialized early (PE={rank}, nPEs={world_size})")
+        except ImportError:
+            pass  # nvshmem4py not installed
+        except Exception as e:
+            import traceback
+            logger.warning(f"NVSHMEM early init failed: {e}")
+            logger.warning(traceback.format_exc())
+            _nvshmem_ok = False
+    else:
+        logger.info(
+            "Skipping NVSHMEM initialization for heterogeneous EP approach %s",
+            normalized_het_ep_approach,
+        )
 
     # Validate that num_moe_experts is divisible by every replica's ep_i.
     if num_moe_experts is not None:
@@ -2037,10 +2058,11 @@ def initialize_heterogeneous_model_parallel(
         'expert_placement': expert_placement,
         'local_expert_indices': local_expert_indices,
         'expert_gather_map': expert_gather_map,
+        'heterogeneous_ep_approach': normalized_het_ep_approach,
     }
 
     # ── Allocate NVSHMEM symmetric buffers + Approach B edp groups ──
-    if _nvshmem_ok:
+    if enable_nvshmem and _nvshmem_ok:
         import nvshmem.core as _nvshmem_core
         _ep_peer_pes = [
             torch.distributed.get_global_rank(_EXPERT_MODEL_PARALLEL_GROUP, i)

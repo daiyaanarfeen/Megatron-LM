@@ -1,0 +1,43 @@
+qkv_fprop:
+  method: ring_exchange
+  aggregate: 1
+
+proj_fprop:
+  method: ring_exchange
+  aggregate: 1
+
+fc1_fprop:
+  method: ring_exchange
+  aggregate: 1
+
+fc2_fprop:
+  method: ring_exchange
+  aggregate: 1
+
+fc2_dgrad:
+  method: ring_exchange
+  aggregate: 1
+
+fc1_dgrad:
+  method: bulk
+  num_sm: 1
+  set_sm_margin: 0
+
+fc1_wgrad:
+  method: bulk
+  num_sm: 1
+  set_sm_margin: 0
+
+proj_dgrad:
+  method: ring_exchange
+  aggregate: 1
+
+qkv_dgrad:
+  method: bulk
+  num_sm: 1
+  set_sm_margin: 0
+
+qkv_wgrad:
+  method: bulk
+  num_sm: 1
+  set_sm_margin: 0

@@ -14,6 +14,7 @@ onelogger.log
 onelogger.err
 .venv
 runs/
+hsg_profile_traces/
 /test_cases/
 **/dist/
 

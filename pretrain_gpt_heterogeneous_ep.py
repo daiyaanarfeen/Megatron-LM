@@ -106,6 +106,7 @@ def _initialize_model_parallel(*args, **kwargs):
         num_moe_experts=megatron_args.num_experts,
         hidden_size=megatron_args.hidden_size,
         ffn_hidden_size=megatron_args.ffn_hidden_size,
+        heterogeneous_ep_approach=megatron_args.heterogeneous_ep_ddp_approach,
         nccl_communicator_config_path=megatron_args.nccl_communicator_config_path,
         distributed_timeout_minutes=megatron_args.distributed_timeout_minutes,
         create_gloo_process_groups=megatron_args.enable_gloo_process_groups,

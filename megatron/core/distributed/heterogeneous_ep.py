@@ -451,6 +451,16 @@ class HeterogeneousEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             else self.ddp_config.num_ep_reshard_pipeline_chunks
         )
 
+        if use_pipelined and not runtime_config.get('nvshmem_initialized', False):
+            raise RuntimeError(
+                "Heterogeneous EP NVSHMEM approach requires NVSHMEM parallel-state "
+                "initialization. Pass heterogeneous_ep_approach='nvshmem' to "
+                "initialize_heterogeneous_model_parallel()."
+            )
+
+        if use_phased and runtime_config['local_ep_size'] > 1:
+            self._setup_phased_splits(runtime_config)
+
         # Approach A: is_edp_eligible gathers from all ep peers.
         # Approach B: is_b_leader gathers from its subgroup.
         # Approach C: is_b_leader receives via all_to_all.
@@ -459,17 +469,22 @@ class HeterogeneousEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             if (use_pipelined or use_phased)
             else runtime_config['is_edp_eligible']
         )
-        if runtime_config['local_ep_size'] > 1 and should_alloc_gather:
+        # NCCL Approach A uses synchronous per-bucket scratch in the collective
+        # itself. Persisting one local_ep-sized gather buffer per bucket is
+        # prohibitively expensive on the large-expert benchmark.
+        if runtime_config['local_ep_size'] > 1 and should_alloc_gather and (
+            use_pipelined or use_phased
+        ):
             self._gather_buffers = []
-            for bucket in self.buckets:
+            for bucket_idx, bucket in enumerate(self.buckets):
                 if use_pipelined:
                     gather_numel = self._pipelined_gather_buffer_numel(
                         bucket.grad_data.numel(),
                         bucket.grad_data.element_size(),
                         runtime_config,
                     )
-                else:
-                    gather_numel = bucket.grad_data.numel() * runtime_config['local_ep_size']
+                elif use_phased:
+                    gather_numel = sum(self._phased_gather_recv[bucket_idx])
 
                 if gather_numel > 0:
                     gather_buf = torch.zeros(
@@ -480,9 +495,6 @@ class HeterogeneousEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 else:
                     gather_buf = None
                 self._gather_buffers.append(gather_buf)
-
-        if use_phased and runtime_config['local_ep_size'] > 1:
-            self._setup_phased_splits(runtime_config)
 
         if use_pipelined and runtime_config.get('expert_gather_map') is not None:
             self._expert_grad_slices = self._build_expert_grad_slices(runtime_config)
@@ -771,17 +783,15 @@ class HeterogeneousEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             if local_ep_size == 1:
                 torch.distributed.all_reduce(grad_data, op=reduce_op, group=edp_group)
             else:
-                if is_edp_eligible:
-                    gather_buf = self._gather_buffers[idx]
-                    gather_list = [
-                        gather_buf[i * chunk_size : (i + 1) * chunk_size]
-                        for i in range(local_ep_size)
-                    ]
-                else:
-                    gather_list = [
-                        torch.empty(chunk_size, dtype=grad_data.dtype, device=grad_data.device)
-                        for _ in range(local_ep_size)
-                    ]
+                gather_buf = torch.empty(
+                    chunk_size * local_ep_size,
+                    dtype=grad_data.dtype,
+                    device=grad_data.device,
+                )
+                gather_list = [
+                    gather_buf[i * chunk_size : (i + 1) * chunk_size]
+                    for i in range(local_ep_size)
+                ]
                 torch.distributed.all_gather(gather_list, grad_data, group=ep_group)
 
                 if is_edp_eligible:
@@ -791,14 +801,7 @@ class HeterogeneousEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
 
                 ep_rank = cfg['ep_rank']
                 if ep_rank != 0:
-                    if is_edp_eligible:
-                        gather_buf.zero_()
-                    else:
-                        gather_buf = torch.zeros(
-                            chunk_size * local_ep_size,
-                            dtype=grad_data.dtype,
-                            device=grad_data.device,
-                        )
+                    gather_buf.zero_()
                 torch.distributed.all_reduce(
                     gather_buf,
                     op=torch.distributed.ReduceOp.SUM,
@@ -1019,14 +1022,14 @@ def build_heterogeneous_ep_layer_bucket_groups(
         if missing_names:
             examples = ", ".join(missing_names[:3])
             raise RuntimeError(
-                "Cannot build optimized heterogeneous EP NVSHMEM layer buckets because "
+                "Cannot build layer-aligned heterogeneous EP expert buckets because "
                 f"{len(missing_names)} expert params do not match the expected layer naming "
                 f"pattern. Examples: {examples}"
             )
 
         if not layer_to_params:
             raise RuntimeError(
-                "Cannot build optimized heterogeneous EP NVSHMEM layer buckets: "
+                "Cannot build layer-aligned heterogeneous EP expert buckets: "
                 "no expert-layer parameters were found."
             )
 
@@ -1078,13 +1081,15 @@ def build_heterogeneous_ep_layer_bucket_groups(
     _configure_heterogeneous_ep_scheduler(bucket_groups)
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         if torch.distributed.get_rank() == 0:
+            approach = heterogeneous_ep_config.approach.value
             logger.info(
-                "Built %d layer-aligned heterogeneous EP NVSHMEM expert bucket groups",
+                "Built %d layer-aligned heterogeneous EP %s expert bucket groups",
                 len(bucket_groups),
+                approach,
             )
             print(
                 "[heterogeneous_ep] built "
-                f"{len(bucket_groups)} layer-aligned NVSHMEM expert bucket groups",
+                f"{len(bucket_groups)} layer-aligned {approach} expert bucket groups",
                 flush=True,
             )
     return bucket_groups
@@ -1174,7 +1179,10 @@ class HeterogeneousEPDistributedDataParallel(DistributedDataParallel):
             self.expert_parallel_bucket_groups,
             expert_gradient_scaling_factor,
         )
-        if self.heterogeneous_ep_config.approach == HeterogeneousEPApproach.NVSHMEM:
+        if self.heterogeneous_ep_config.approach in {
+            HeterogeneousEPApproach.NVSHMEM,
+            HeterogeneousEPApproach.PHASED,
+        }:
             layer_bucket_groups = build_heterogeneous_ep_layer_bucket_groups(
                 self.expert_parallel_buffers,
                 self.ddp_config,
@@ -1188,9 +1196,13 @@ class HeterogeneousEPDistributedDataParallel(DistributedDataParallel):
 
         if layer_bucket_groups:
             self.expert_parallel_bucket_groups = layer_bucket_groups
-        elif self.heterogeneous_ep_config.approach == HeterogeneousEPApproach.NVSHMEM:
+        elif self.heterogeneous_ep_config.approach in {
+            HeterogeneousEPApproach.NVSHMEM,
+            HeterogeneousEPApproach.PHASED,
+        }:
             raise RuntimeError(
-                "Optimized heterogeneous EP NVSHMEM path requires layer-aligned expert buckets, "
+                f"Heterogeneous EP {self.heterogeneous_ep_config.approach.value} path "
+                "requires layer-aligned expert buckets, "
                 "but none were constructed."
             )
         else:
