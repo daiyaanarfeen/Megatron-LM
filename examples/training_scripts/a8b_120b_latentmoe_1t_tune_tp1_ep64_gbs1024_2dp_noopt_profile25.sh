@@ -2,7 +2,7 @@
 
 #SBATCH -p batch
 #SBATCH --account=coreai_comparch_sysarch
-#SBATCH --nodes=2
+#SBATCH --nodes=32
 #SBATCH --exclusive
 #SBATCH -t 1:00:00
 #SBATCH --mem=0
@@ -10,8 +10,9 @@
 # add --segment=4 (or --segment=16 for 16-node segments) on those platforms.
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
+#SBATCH --segment=16
 #SBATCH --dependency=singleton
-#SBATCH --job-name=a315m_1b_moe_88b_dp1_dummy
+#SBATCH --job-name=a8b_120b_latentmoe_1t_baseline_profile25
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_FWD_LAYERNORM_SM_MARGIN=16
@@ -24,11 +25,12 @@ export TRITON_CACHE_DIR="/tmp/triton_cache/"
 ASSET_ROOT="${ASSET_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report}"
 ROOT_DIR="${ROOT_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs}"
 REPO_DIR="${REPO_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/Megatron-LM-EP}"
-TRAIN_ITERS="${TRAIN_ITERS:-50}"
+TRAIN_ITERS="${TRAIN_ITERS:-25}"
 LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-10}"
 # Run name; change this per experiment.
-NAME="a315m_1b_moe_88b_dp1_dummy"
+NAME="${NAME:-a8b_120b_latentmoe_1t_tune_tp1_ep64_gbs1024_2dp_noopt_profile25}"
 IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
+CONTAINER_NAME="${CONTAINER_NAME:-nvidia-pytorch-25-06-deps-mamba}"
 
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 
@@ -45,27 +47,28 @@ mkdir -p ${TENSORBOARD_DIR}
 
 options=" \
     --use-mcore-models \
-    --hybrid-layer-pattern MEMEM*EMEME*EMEM*EMEME \
+    --hybrid-layer-pattern MEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEME/*E/*E \
     --spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec \
-    --hidden-size 768 \
-    --num-attention-heads 6 \
+    --hidden-size 4608 \
+    --num-attention-heads 40 \
     --group-query-attention \
-    --num-query-groups 2 \
-    --mamba-num-heads 24 \
-    --ffn-hidden-size 512 \
+    --num-query-groups 8 \
+    --mamba-num-heads 128 \
+    --ffn-hidden-size 3072 \
     --kv-channels 128 \
     --squared-relu \
     --untie-embeddings-and-output-weights \
-    --init-method-std 0.0325 \
+    --init-method-std 0.0132 \
     --position-embedding-type none \
     --attention-dropout 0.0 \
     --hidden-dropout 0.0 \
     --disable-bias-linear \
     --normalization RMSNorm \
     \
-    --num-experts 128 \
+    --num-experts 512 \
     --moe-router-topk 6 \
-    --moe-shared-expert-intermediate-size 960 \
+    --moe-shared-expert-intermediate-size 6144 \
+    --moe-latent-size 1152 \
     --moe-token-dispatcher-type alltoall \
     --moe-router-score-function sigmoid \
     --moe-grouped-gemm \
@@ -78,6 +81,9 @@ options=" \
     --moe-permute-fusion \
     --use-fused-weighted-squared-relu \
     \
+    --mtp-loss-scaling-factor 0.3 \
+    --calculate-per-token-loss \
+    \
     --bf16 \
     --seq-length 8192 \
     --max-position-embeddings 8192 \
@@ -87,10 +93,10 @@ options=" \
     --lr-warmup-iters 1 \
     --lr-wsd-decay-style minus_sqrt \
     --lr-wsd-decay-iters ${LR_WSD_DECAY_ITERS} \
-    --micro-batch-size 4 \
-    --global-batch-size 96 \
-    --lr 2.2e-3 \
-    --min-lr 2.2e-5 \
+    --micro-batch-size 1 \
+    --global-batch-size 1024 \
+    --lr 8e-4 \
+    --min-lr 8e-6 \
     --weight-decay 0.1 \
     --clip-grad 1.0 \
     --adam-beta1 0.9 \
@@ -104,22 +110,24 @@ options=" \
     --no-load-rng \
     \
     --mock-data \
+    --no-check-for-nan-in-loss-and-grad \
     --tokenizer-type NullTokenizer \
     --vocab-size 131072 \
     --num-workers 1 \
     --no-create-attention-mask-in-dataloader \
     \
-    --use-distributed-optimizer \
     --overlap-grad-reduce \
-    --overlap-param-gather \
+    --nonuniform-skip-optimizer-step \
     --tensor-model-parallel-size 1 \
     --sequence-parallel \
-    --expert-model-parallel-size 8 \
+    --expert-model-parallel-size 64 \
     --expert-tensor-parallel-size 1 \
     --pipeline-model-parallel-size 1 \
     --high-priority-stream-groups ep \
     --ddp-num-buckets 8 \
     --attention-backend flash \
+    --recompute-granularity selective \
+    --recompute-modules moe \
     \
     --log-interval 1 \
     --log-memory-interval 50 \
@@ -131,6 +139,11 @@ options=" \
     --logging-level 20 \
     --timing-log-option minmax \
     --tensorboard-dir ${TENSORBOARD_DIR} \
+    --profile \
+    --use-pytorch-profiler \
+    --profile-step-start 10 \
+    --profile-step-end 12 \
+    --profile-ranks 0 31 63 64 95 127 \
     --check-weight-hash-across-dp-replicas-interval 20000 \
     \
     --manual-gc \
@@ -147,6 +160,7 @@ run_cmd="python -u ${REPO_DIR}/pretrain_hybrid.py ${options}"
 # (e.g. "/scratch:/scratch" on clusters where assets live under /scratch).
 srun -l \
     --container-image "${IMAGE_PATH}" \
+    --container-name "${CONTAINER_NAME}" \
     --container-mounts "/lustre:/lustre" \
     --no-container-mount-home \
     --output="${LOGS_DIR}/%x_%j_${DATETIME}.log" \

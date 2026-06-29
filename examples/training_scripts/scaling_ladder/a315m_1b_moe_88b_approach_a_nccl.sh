@@ -11,7 +11,7 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
 #SBATCH --dependency=singleton
-#SBATCH --job-name=a315m_1b_moe_88b_dp1_dummy
+#SBATCH --job-name=a315m_1b_moe_88b_dp1_dummy_approach_a_nccl
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_FWD_LAYERNORM_SM_MARGIN=16
@@ -19,16 +19,19 @@ export NVTE_BWD_LAYERNORM_SM_MARGIN=16
 export NVTE_FUSED_ATTN=0  # Disable cuDNN fused attention.
 export TORCHINDUCTOR_WORKER_START=fork
 export TRITON_CACHE_DIR="/tmp/triton_cache/"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export MEGATRON_NONUNIFORM_EP_NCCL_MAX_GATHER_BYTES="${MEGATRON_NONUNIFORM_EP_NCCL_MAX_GATHER_BYTES:-1073741824}"
 
 # Short DP1 dummy-data benchmark defaults for this cluster.
 ASSET_ROOT="${ASSET_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report}"
 ROOT_DIR="${ROOT_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs}"
 REPO_DIR="${REPO_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/Megatron-LM-EP}"
-TRAIN_ITERS="${TRAIN_ITERS:-50}"
+TRAIN_ITERS="${TRAIN_ITERS:-10}"
 LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-10}"
 # Run name; change this per experiment.
-NAME="a315m_1b_moe_88b_dp1_dummy"
+NAME="a315m_1b_moe_88b_dp1_dummy_approach_a_nccl"
 IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
+CONTAINER_NAME="${CONTAINER_NAME:-nvidia-pytorch-25-06-deps-mamba}"
 
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 
@@ -88,7 +91,7 @@ options=" \
     --lr-wsd-decay-style minus_sqrt \
     --lr-wsd-decay-iters ${LR_WSD_DECAY_ITERS} \
     --micro-batch-size 4 \
-    --global-batch-size 96 \
+    --global-batch-size 32 \
     --lr 2.2e-3 \
     --min-lr 2.2e-5 \
     --weight-decay 0.1 \
@@ -98,8 +101,7 @@ options=" \
     --eval-interval 1000 \
     --eval-iters 0 \
     \
-    --cuda-graph-impl local \
-    --cuda-graph-modules mamba attn moe_router \
+    --cuda-graph-impl none \
     --te-rng-tracker \
     --no-load-rng \
     \
@@ -109,9 +111,7 @@ options=" \
     --num-workers 1 \
     --no-create-attention-mask-in-dataloader \
     \
-    --use-distributed-optimizer \
     --overlap-grad-reduce \
-    --overlap-param-gather \
     --tensor-model-parallel-size 1 \
     --sequence-parallel \
     --expert-model-parallel-size 8 \
@@ -120,6 +120,11 @@ options=" \
     --high-priority-stream-groups ep \
     --ddp-num-buckets 8 \
     --attention-backend flash \
+    \
+    --nonuniform-mode ep \
+    --nonuniform-ep-ddp-approach nccl \
+    --nonuniform-skip-optimizer-step \
+    --nonuniform-ep-num-tp-cp-per-replica 8 \
     \
     --log-interval 1 \
     --log-memory-interval 50 \
@@ -147,6 +152,7 @@ run_cmd="python -u ${REPO_DIR}/pretrain_hybrid.py ${options}"
 # (e.g. "/scratch:/scratch" on clusters where assets live under /scratch).
 srun -l \
     --container-image "${IMAGE_PATH}" \
+    --container-name "${CONTAINER_NAME}" \
     --container-mounts "/lustre:/lustre" \
     --no-container-mount-home \
     --output="${LOGS_DIR}/%x_%j_${DATETIME}.log" \

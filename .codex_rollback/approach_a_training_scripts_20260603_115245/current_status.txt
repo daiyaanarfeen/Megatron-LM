@@ -1,0 +1,37 @@
+## dnarayanan/training_scripts...origin/dnarayanan/training_scripts
+ M examples/training_scripts/8b_1t.sh
+ M examples/training_scripts/a3b_30b_moe_1t.sh
+ M examples/training_scripts/a3b_30b_transformer_moe_1t.sh
+ M examples/training_scripts/a8b_120b_latentmoe_1t.sh
+ M examples/training_scripts/nemotron3/nano.sh
+ M examples/training_scripts/nemotron3/super.sh
+ M examples/training_scripts/nemotron3/ultra.sh
+ M examples/training_scripts/scaling_ladder/README.md
+ M examples/training_scripts/scaling_ladder/a1b_7b_moe_310b.sh
+ M examples/training_scripts/scaling_ladder/a2b_14b_moe_560b.sh
+ M examples/training_scripts/scaling_ladder/a315m_1b_moe_88b.sh
+ M examples/training_scripts/scaling_ladder/a3b_30b_moe_1t.sh
+ M examples/training_scripts/scaling_ladder/a500m_2b_moe_140b.sh
+ M examples/training_scripts/scaling_ladder/a770m_4b_moe_215b.sh
+ M megatron/core/dist_checkpointing/strategies/nvrx.py
+ M megatron/training/training.py
+ M pretrain_gpt.py
+ M pretrain_hybrid.py
+?? .codex_rollback/
+?? NONUNIFORM_PARALLELISM_BRANCHES.md
+?? examples/training_scripts/8b_1t_tune_tp2_mbs2_gbs16.sh
+?? examples/training_scripts/a3b_30b_moe_1t_tune_tp1_ep64_gbs128.sh
+?? examples/training_scripts/a3b_30b_transformer_moe_1t_tune_tp1_ep64_gbs128.sh
+?? examples/training_scripts/a8b_120b_latentmoe_1t_tune_tp1_ep32_gbs256.sh
+?? examples/training_scripts/a8b_120b_latentmoe_1t_tune_tp1_ep64_gbs512_cache.sh
+?? examples/training_scripts/a8b_120b_latentmoe_1t_tune_tp2_ep32_gbs256_cache.sh
+?? examples/training_scripts/a8b_120b_latentmoe_1t_tune_tp2_ep64_gbs512_cache.sh
+?? examples/training_scripts/a8b_120b_latentmoe_1t_tune_tp2_gbs256_cache.sh
+?? examples/training_scripts/nemotron3/nano_tune_tp1_ep64_gbs128.sh
+?? examples/training_scripts/nemotron3/nano_tune_tp2_gbs128_cache.sh
+?? examples/training_scripts/nemotron3/nano_tune_tp2_mbs2_gbs128.sh
+?? examples/training_scripts/nemotron3/super_tune_tp1_ep128_gbs256.sh
+?? examples/training_scripts/nemotron3/super_tune_tp2_gbs256_cache.sh
+?? examples/training_scripts/nemotron3/ultra_tune_tp4_ep128_gbs512.sh
+?? examples/training_scripts/nemotron3/ultra_tune_tp8_gbs512_cache.sh
+?? examples/training_scripts/nonuniform_ep_approach_a_smoke.sh

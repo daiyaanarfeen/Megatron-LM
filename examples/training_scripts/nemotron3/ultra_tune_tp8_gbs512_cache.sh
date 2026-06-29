@@ -2,16 +2,16 @@
 
 #SBATCH -p batch
 #SBATCH --account=coreai_comparch_sysarch
-#SBATCH --nodes=2
+#SBATCH --nodes=128
 #SBATCH --exclusive
 #SBATCH -t 1:00:00
 #SBATCH --mem=0
-# GB200/GB300 have 4 GPUs/node; set --ntasks-per-node=4, --gpus-per-node=4, and
-# add --segment=4 (or --segment=16 for 16-node segments) on those platforms.
+# Targets GB200/GB300 (4 GPUs/node); H100 is impractical at this scale.
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
+#SBATCH --segment=16
 #SBATCH --dependency=singleton
-#SBATCH --job-name=a315m_1b_moe_88b_dp1_dummy
+#SBATCH --job-name=nemotron3_ultra_tune_tp8_gbs512_cache
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_FWD_LAYERNORM_SM_MARGIN=16
@@ -24,11 +24,16 @@ export TRITON_CACHE_DIR="/tmp/triton_cache/"
 ASSET_ROOT="${ASSET_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report}"
 ROOT_DIR="${ROOT_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs}"
 REPO_DIR="${REPO_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/Megatron-LM-EP}"
-TRAIN_ITERS="${TRAIN_ITERS:-50}"
+TRAIN_ITERS="${TRAIN_ITERS:-10}"
 LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-10}"
+MBS="${MBS:-1}"
+GBS="${GBS:-512}"
+TP="${TP:-8}"
+EP="${EP:-64}"
 # Run name; change this per experiment.
-NAME="a315m_1b_moe_88b_dp1_dummy"
+NAME="${NAME:-nemotron3_ultra_tune_tp8_gbs512_cache}"
 IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
+CONTAINER_NAME="${CONTAINER_NAME:-nvidia-pytorch-25-06-deps-mamba}"
 
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 
@@ -43,40 +48,70 @@ mkdir -p ${CHECKPOINT_DIR}
 mkdir -p ${DATACACHE_DIR}
 mkdir -p ${TENSORBOARD_DIR}
 
+
+# Tokenizer model.
+TOKENIZER_MODEL="${ROOT_DIR}/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
+
+# Data blend (Ultra, phase 1, 25T tokens). On OCI-HSG, this lives at
+# /lustre/fs1/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6/blend_files/ultra/25t_phase1.json;
+# adjust path on other clusters.
+BLEND_PATH="/lustre/fs1/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6/blend_files/ultra/25t_phase1.json"
+
+# TransformerEngine precision config for FP4 quantization. On OCI-HSG, this
+# lives at
+# /lustre/fs1/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6/code_ultra/te_quant.cfg;
+# adjust path on other clusters.
+TE_PRECISION_CONFIG="/lustre/fs1/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6/code_ultra/te_quant.cfg"
+
+
 options=" \
     --use-mcore-models \
-    --hybrid-layer-pattern MEMEM*EMEME*EMEM*EMEME \
+    --hybrid-layer-pattern MEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME/*E/*E \
     --spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec \
-    --hidden-size 768 \
-    --num-attention-heads 6 \
+    --hidden-size 8192 \
+    --num-attention-heads 64 \
     --group-query-attention \
     --num-query-groups 2 \
-    --mamba-num-heads 24 \
-    --ffn-hidden-size 512 \
+    --mamba-num-heads 256 \
+    --ffn-hidden-size 5120 \
     --kv-channels 128 \
     --squared-relu \
     --untie-embeddings-and-output-weights \
-    --init-method-std 0.0325 \
+    --init-method-std 0.0099 \
     --position-embedding-type none \
     --attention-dropout 0.0 \
     --hidden-dropout 0.0 \
     --disable-bias-linear \
     --normalization RMSNorm \
     \
-    --num-experts 128 \
-    --moe-router-topk 6 \
-    --moe-shared-expert-intermediate-size 960 \
+    --num-experts 512 \
+    --moe-router-topk 22 \
+    --moe-shared-expert-intermediate-size 10240 \
+    --moe-latent-size 2048 \
     --moe-token-dispatcher-type alltoall \
     --moe-router-score-function sigmoid \
     --moe-grouped-gemm \
     --moe-aux-loss-coeff 1e-4 \
-    --moe-router-topk-scaling-factor 2.5 \
+    --moe-router-topk-scaling-factor 5.0 \
     --moe-router-enable-expert-bias \
     --moe-router-dtype fp32 \
     --moe-router-load-balancing-type seq_aux_loss \
     --moe-router-force-load-balancing \
     --moe-permute-fusion \
     --use-fused-weighted-squared-relu \
+    --cross-entropy-loss-fusion \
+    --cross-entropy-fusion-impl native \
+    \
+    --mtp-use-repeated-layer \
+    --mtp-loss-scaling-factor 0.1 \
+    --calculate-per-token-loss \
+    \
+    --first-last-layers-bf16 \
+    --num-layers-at-start-in-bf16 0 \
+    --num-layers-at-end-in-bf16 16 \
+    --fp4-format e2m1 \
+    --fp4-recipe nvfp4 \
+    --te-precision-config-file ${TE_PRECISION_CONFIG} \
     \
     --bf16 \
     --seq-length 8192 \
@@ -87,10 +122,10 @@ options=" \
     --lr-warmup-iters 1 \
     --lr-wsd-decay-style minus_sqrt \
     --lr-wsd-decay-iters ${LR_WSD_DECAY_ITERS} \
-    --micro-batch-size 4 \
-    --global-batch-size 96 \
-    --lr 2.2e-3 \
-    --min-lr 2.2e-5 \
+    --micro-batch-size ${MBS} \
+    --global-batch-size ${GBS} \
+    --lr 2.5e-4 \
+    --min-lr 2.5e-6 \
     --weight-decay 0.1 \
     --clip-grad 1.0 \
     --adam-beta1 0.9 \
@@ -98,10 +133,7 @@ options=" \
     --eval-interval 1000 \
     --eval-iters 0 \
     \
-    --cuda-graph-impl local \
-    --cuda-graph-modules mamba attn moe_router \
-    --te-rng-tracker \
-    --no-load-rng \
+    --cuda-graph-impl none \
     \
     --mock-data \
     --tokenizer-type NullTokenizer \
@@ -112,13 +144,14 @@ options=" \
     --use-distributed-optimizer \
     --overlap-grad-reduce \
     --overlap-param-gather \
-    --tensor-model-parallel-size 1 \
+    --tensor-model-parallel-size ${TP} \
     --sequence-parallel \
-    --expert-model-parallel-size 8 \
+    --expert-model-parallel-size ${EP} \
     --expert-tensor-parallel-size 1 \
     --pipeline-model-parallel-size 1 \
     --high-priority-stream-groups ep \
-    --ddp-num-buckets 8 \
+    --ddp-num-buckets 10 \
+    --ddp-pad-buckets-for-high-nccl-busbw \
     --attention-backend flash \
     \
     --log-interval 1 \
@@ -146,7 +179,9 @@ run_cmd="python -u ${REPO_DIR}/pretrain_hybrid.py ${options}"
 # Adjust --container-mounts below if ROOT_DIR lives on a different filesystem
 # (e.g. "/scratch:/scratch" on clusters where assets live under /scratch).
 srun -l \
+    --mpi=none \
     --container-image "${IMAGE_PATH}" \
+    --container-name "${CONTAINER_NAME}" \
     --container-mounts "/lustre:/lustre" \
     --no-container-mount-home \
     --output="${LOGS_DIR}/%x_%j_${DATETIME}.log" \

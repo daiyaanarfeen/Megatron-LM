@@ -1,0 +1,2039 @@
+diff --git a/examples/training_scripts/8b_1t.sh b/examples/training_scripts/8b_1t.sh
+index 621a6a7dd..bc06ec008 100755
+--- a/examples/training_scripts/8b_1t.sh
++++ b/examples/training_scripts/8b_1t.sh
+@@ -1,32 +1,32 @@
+ #!/bin/bash
+ 
+ #SBATCH -p batch
+-#SBATCH --account=nemotron_sw_pre
+-#SBATCH --nodes=96
++#SBATCH --account=coreai_comparch_sysarch
++#SBATCH --nodes=1
+ #SBATCH --exclusive
+-#SBATCH -t 4:00:00
++#SBATCH -t 1:00:00
+ #SBATCH --mem=0
+ # GB200/GB300 have 4 GPUs/node; set --ntasks-per-node=4, --gpus-per-node=4, and
+ # add --segment=4 (or --segment=16 for 16-node segments) on those platforms.
+-#SBATCH --ntasks-per-node=8
+-#SBATCH --gpus-per-node=8
++#SBATCH --ntasks-per-node=4
++#SBATCH --gpus-per-node=4
+ #SBATCH --dependency=singleton
+-#SBATCH --job-name=8b_1t
++#SBATCH --job-name=8b_1t_dp1_dummy
+ 
+ export CUDA_DEVICE_MAX_CONNECTIONS=1
+ export NVTE_FWD_LAYERNORM_SM_MARGIN=16
+ export NVTE_BWD_LAYERNORM_SM_MARGIN=16
+ export NVTE_FUSED_ATTN=0  # Disable cuDNN fused attention.
+ 
+-# Set this to a path you have write permission on; it must already contain all
+-# required assets (code, image, tokenizer, blend files, etc.). On OCI-HSG,
+-# "/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report"
+-# is one such path.
+-ROOT_DIR=""
+-REPO_DIR="${ROOT_DIR}/code"
++# Short DP1 dummy-data benchmark defaults for this cluster.
++ASSET_ROOT="${ASSET_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report}"
++ROOT_DIR="${ROOT_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs}"
++REPO_DIR="${REPO_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/Megatron-LM-EP}"
++TRAIN_ITERS="${TRAIN_ITERS:-50}"
++LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-10}"
+ # Run name; change this per experiment.
+-NAME="8b_1t"
+-IMAGE_PATH="${ROOT_DIR}/images/nvidia+pytorch+25.06-py3+dependencies.sqsh"
++NAME="8b_1t_dp1_dummy"
++IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
+ 
+ DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
+ 
+@@ -41,14 +41,6 @@ mkdir -p ${CHECKPOINT_DIR}
+ mkdir -p ${DATACACHE_DIR}
+ mkdir -p ${TENSORBOARD_DIR}
+ 
+-
+-# Tokenizer model.
+-TOKENIZER_MODEL="${ROOT_DIR}/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
+-
+-# Data blend.
+-BLEND_PATH="${ROOT_DIR}/blend_files/1t_singlephase.json"
+-
+-
+ options=" \
+     --use-mcore-models \
+     --num-layers 32 \
+@@ -72,14 +64,14 @@ options=" \
+     --bf16 \
+     --seq-length 8192 \
+     --max-position-embeddings 8192 \
+-    --train-samples 122070313 \
++    --train-iters ${TRAIN_ITERS} \
+     --lr-decay-style WSD \
+-    --lr-decay-samples 122070313 \
+-    --lr-warmup-samples 3051758 \
++    --lr-decay-iters ${TRAIN_ITERS} \
++    --lr-warmup-iters 1 \
+     --lr-wsd-decay-style minus_sqrt \
+-    --lr-wsd-decay-samples 24414063 \
++    --lr-wsd-decay-iters ${LR_WSD_DECAY_ITERS} \
+     --micro-batch-size 1 \
+-    --global-batch-size 1536 \
++    --global-batch-size 8 \
+     --lr 8e-4 \
+     --min-lr 8e-6 \
+     --weight-decay 0.1 \
+@@ -87,14 +79,11 @@ options=" \
+     --adam-beta1 0.9 \
+     --adam-beta2 0.95 \
+     --eval-interval 1000 \
+-    --eval-iters 14 \
++    --eval-iters 0 \
+     \
+-    --per-split-data-args-path ${BLEND_PATH} \
+-    --data-cache-path ${DATACACHE_DIR} \
+-    --tokenizer-type TikTokenizer \
+-    --tokenizer-model ${TOKENIZER_MODEL} \
+-    --tiktoken-pattern v2 \
+-    --no-mmap-bin-files \
++    --mock-data \
++    --tokenizer-type NullTokenizer \
++    --vocab-size 131072 \
+     --num-workers 1 \
+     --no-create-attention-mask-in-dataloader \
+     \
+@@ -107,19 +96,8 @@ options=" \
+     --ddp-num-buckets 8 \
+     --attention-backend flash \
+     \
+-    --ckpt-format torch_dist \
+-    --load ${CHECKPOINT_DIR} \
+-    --save ${CHECKPOINT_DIR} \
+-    --save-interval 500 \
+-    --save-retain-interval 2000 \
+-    --ckpt-fully-parallel-save \
+-    --ckpt-fully-parallel-load \
+-    --async-save \
+-    --use-persistent-ckpt-worker \
+-    --ckpt-assume-constant-structure \
+-    \
+-    --log-interval 100 \
+-    --log-memory-interval 1000 \
++    --log-interval 1 \
++    --log-memory-interval 50 \
+     --log-params-norm \
+     --log-num-zeros-in-grad \
+     --log-throughput \
+@@ -133,7 +111,7 @@ options=" \
+     --manual-gc \
+     --manual-gc-interval 10 \
+     --distributed-timeout-minutes 10 \
+-    --exit-duration-in-mins 235 \
++    --exit-duration-in-mins 55 \
+     --disable-gloo-process-groups \
+     --disable-straggler-on-startup \
+     --straggler-minmax-count 16 "
+diff --git a/examples/training_scripts/a3b_30b_moe_1t.sh b/examples/training_scripts/a3b_30b_moe_1t.sh
+index ef580c1e0..fe7f4b688 100755
+--- a/examples/training_scripts/a3b_30b_moe_1t.sh
++++ b/examples/training_scripts/a3b_30b_moe_1t.sh
+@@ -1,17 +1,17 @@
+ #!/bin/bash
+ 
+ #SBATCH -p batch
+-#SBATCH --account=nemotron_sw_pre
+-#SBATCH --nodes=96
++#SBATCH --account=coreai_comparch_sysarch
++#SBATCH --nodes=16
+ #SBATCH --exclusive
+-#SBATCH -t 4:00:00
++#SBATCH -t 1:00:00
+ #SBATCH --mem=0
+ # GB200/GB300 have 4 GPUs/node; set --ntasks-per-node=4, --gpus-per-node=4, and
+ # add --segment=4 (or --segment=16 for 16-node segments) on those platforms.
+-#SBATCH --ntasks-per-node=8
+-#SBATCH --gpus-per-node=8
++#SBATCH --ntasks-per-node=4
++#SBATCH --gpus-per-node=4
+ #SBATCH --dependency=singleton
+-#SBATCH --job-name=a3b_30b_moe_1t
++#SBATCH --job-name=a3b_30b_moe_1t_dp1_dummy
+ 
+ export CUDA_DEVICE_MAX_CONNECTIONS=1
+ export NVTE_FWD_LAYERNORM_SM_MARGIN=16
+@@ -20,15 +20,15 @@ export NVTE_FUSED_ATTN=0  # Disable cuDNN fused attention.
+ export TORCHINDUCTOR_WORKER_START=fork
+ export TRITON_CACHE_DIR="/tmp/triton_cache/"
+ 
+-# Set this to a path you have write permission on; it must already contain all
+-# required assets (code, image, tokenizer, blend files, etc.). On OCI-HSG,
+-# "/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report"
+-# is one such path.
+-ROOT_DIR=""
+-REPO_DIR="${ROOT_DIR}/code"
++# Short DP1 dummy-data benchmark defaults for this cluster.
++ASSET_ROOT="${ASSET_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report}"
++ROOT_DIR="${ROOT_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs}"
++REPO_DIR="${REPO_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/Megatron-LM-EP}"
++TRAIN_ITERS="${TRAIN_ITERS:-50}"
++LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-10}"
+ # Run name; change this per experiment.
+-NAME="a3b_30b_moe_1t"
+-IMAGE_PATH="${ROOT_DIR}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh"
++NAME="a3b_30b_moe_1t_dp1_dummy"
++IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
+ 
+ DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
+ 
+@@ -43,14 +43,6 @@ mkdir -p ${CHECKPOINT_DIR}
+ mkdir -p ${DATACACHE_DIR}
+ mkdir -p ${TENSORBOARD_DIR}
+ 
+-
+-# Tokenizer model.
+-TOKENIZER_MODEL="${ROOT_DIR}/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
+-
+-# Data blend.
+-BLEND_PATH="${ROOT_DIR}/blend_files/1t_singlephase.json"
+-
+-
+ options=" \
+     --use-mcore-models \
+     --hybrid-layer-pattern MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME \
+@@ -82,20 +74,21 @@ options=" \
+     --moe-router-enable-expert-bias \
+     --moe-router-dtype fp32 \
+     --moe-router-load-balancing-type seq_aux_loss \
++    --moe-router-force-load-balancing \
+     --moe-permute-fusion \
+     --use-fused-weighted-squared-relu \
+     \
+     --bf16 \
+     --seq-length 8192 \
+     --max-position-embeddings 8192 \
+-    --train-samples 122070313 \
++    --train-iters ${TRAIN_ITERS} \
+     --lr-decay-style WSD \
+-    --lr-decay-samples 122070313 \
+-    --lr-warmup-samples 1024000 \
++    --lr-decay-iters ${TRAIN_ITERS} \
++    --lr-warmup-iters 1 \
+     --lr-wsd-decay-style minus_sqrt \
+-    --lr-wsd-decay-samples 18310547 \
++    --lr-wsd-decay-iters ${LR_WSD_DECAY_ITERS} \
+     --micro-batch-size 1 \
+-    --global-batch-size 768 \
++    --global-batch-size 64 \
+     --lr 1.2e-3 \
+     --min-lr 1.2e-5 \
+     --weight-decay 0.1 \
+@@ -103,19 +96,16 @@ options=" \
+     --adam-beta1 0.9 \
+     --adam-beta2 0.95 \
+     --eval-interval 1000 \
+-    --eval-iters 14 \
++    --eval-iters 0 \
+     \
+     --cuda-graph-impl local \
+     --cuda-graph-modules mamba attn moe_router \
+     --te-rng-tracker \
+     --no-load-rng \
+     \
+-    --per-split-data-args-path ${BLEND_PATH} \
+-    --data-cache-path ${DATACACHE_DIR} \
+-    --tokenizer-type TikTokenizer \
+-    --tokenizer-model ${TOKENIZER_MODEL} \
+-    --tiktoken-pattern v2 \
+-    --no-mmap-bin-files \
++    --mock-data \
++    --tokenizer-type NullTokenizer \
++    --vocab-size 131072 \
+     --num-workers 1 \
+     --no-create-attention-mask-in-dataloader \
+     \
+@@ -131,19 +121,8 @@ options=" \
+     --ddp-num-buckets 8 \
+     --attention-backend flash \
+     \
+-    --ckpt-format torch_dist \
+-    --load ${CHECKPOINT_DIR} \
+-    --save ${CHECKPOINT_DIR} \
+-    --save-interval 500 \
+-    --save-retain-interval 2000 \
+-    --ckpt-fully-parallel-save \
+-    --ckpt-fully-parallel-load \
+-    --async-save \
+-    --use-persistent-ckpt-worker \
+-    --ckpt-assume-constant-structure \
+-    \
+-    --log-interval 100 \
+-    --log-memory-interval 1000 \
++    --log-interval 1 \
++    --log-memory-interval 50 \
+     --log-params-norm \
+     --log-num-zeros-in-grad \
+     --log-throughput \
+@@ -157,7 +136,7 @@ options=" \
+     --manual-gc \
+     --manual-gc-interval 10 \
+     --distributed-timeout-minutes 10 \
+-    --exit-duration-in-mins 235 \
++    --exit-duration-in-mins 55 \
+     --disable-gloo-process-groups \
+     --disable-straggler-on-startup \
+     --straggler-minmax-count 16 "
+diff --git a/examples/training_scripts/a3b_30b_transformer_moe_1t.sh b/examples/training_scripts/a3b_30b_transformer_moe_1t.sh
+index 89fd50703..fd93643d9 100755
+--- a/examples/training_scripts/a3b_30b_transformer_moe_1t.sh
++++ b/examples/training_scripts/a3b_30b_transformer_moe_1t.sh
+@@ -1,17 +1,17 @@
+ #!/bin/bash
+ 
+ #SBATCH -p batch
+-#SBATCH --account=nemotron_sw_pre
+-#SBATCH --nodes=96
++#SBATCH --account=coreai_comparch_sysarch
++#SBATCH --nodes=16
+ #SBATCH --exclusive
+-#SBATCH -t 4:00:00
++#SBATCH -t 1:00:00
+ #SBATCH --mem=0
+ # GB200/GB300 have 4 GPUs/node; set --ntasks-per-node=4, --gpus-per-node=4, and
+ # add --segment=4 (or --segment=16 for 16-node segments) on those platforms.
+-#SBATCH --ntasks-per-node=8
+-#SBATCH --gpus-per-node=8
++#SBATCH --ntasks-per-node=4
++#SBATCH --gpus-per-node=4
+ #SBATCH --dependency=singleton
+-#SBATCH --job-name=a3b_30b_transformer_moe_1t
++#SBATCH --job-name=a3b_30b_transformer_moe_1t_dp1_dummy
+ 
+ export CUDA_DEVICE_MAX_CONNECTIONS=1
+ export NVTE_FWD_LAYERNORM_SM_MARGIN=16
+@@ -20,15 +20,15 @@ export NVTE_FUSED_ATTN=0  # Disable cuDNN fused attention.
+ export TORCHINDUCTOR_WORKER_START=fork
+ export TRITON_CACHE_DIR="/tmp/triton_cache/"
+ 
+-# Set this to a path you have write permission on; it must already contain all
+-# required assets (code, image, tokenizer, blend files, etc.). On OCI-HSG,
+-# "/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report"
+-# is one such path.
+-ROOT_DIR=""
+-REPO_DIR="${ROOT_DIR}/code"
++# Short DP1 dummy-data benchmark defaults for this cluster.
++ASSET_ROOT="${ASSET_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report}"
++ROOT_DIR="${ROOT_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs}"
++REPO_DIR="${REPO_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/Megatron-LM-EP}"
++TRAIN_ITERS="${TRAIN_ITERS:-50}"
++LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-10}"
+ # Run name; change this per experiment.
+-NAME="a3b_30b_transformer_moe_1t"
+-IMAGE_PATH="${ROOT_DIR}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh"
++NAME="a3b_30b_transformer_moe_1t_dp1_dummy"
++IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
+ 
+ DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
+ 
+@@ -43,14 +43,6 @@ mkdir -p ${CHECKPOINT_DIR}
+ mkdir -p ${DATACACHE_DIR}
+ mkdir -p ${TENSORBOARD_DIR}
+ 
+-
+-# Tokenizer model.
+-TOKENIZER_MODEL="${ROOT_DIR}/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
+-
+-# Data blend.
+-BLEND_PATH="${ROOT_DIR}/blend_files/1t_singlephase.json"
+-
+-
+ options=" \
+     --use-mcore-models \
+     --hybrid-layer-pattern *E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E \
+@@ -81,20 +73,21 @@ options=" \
+     --moe-router-enable-expert-bias \
+     --moe-router-dtype fp32 \
+     --moe-router-load-balancing-type seq_aux_loss \
++    --moe-router-force-load-balancing \
+     --moe-permute-fusion \
+     --use-fused-weighted-squared-relu \
+     \
+     --bf16 \
+     --seq-length 8192 \
+     --max-position-embeddings 8192 \
+-    --train-samples 122070313 \
++    --train-iters ${TRAIN_ITERS} \
+     --lr-decay-style WSD \
+-    --lr-decay-samples 122070313 \
+-    --lr-warmup-samples 1024000 \
++    --lr-decay-iters ${TRAIN_ITERS} \
++    --lr-warmup-iters 1 \
+     --lr-wsd-decay-style minus_sqrt \
+-    --lr-wsd-decay-samples 18310547 \
++    --lr-wsd-decay-iters ${LR_WSD_DECAY_ITERS} \
+     --micro-batch-size 1 \
+-    --global-batch-size 768 \
++    --global-batch-size 64 \
+     --lr 1.2e-3 \
+     --min-lr 1.2e-5 \
+     --weight-decay 0.1 \
+@@ -102,19 +95,16 @@ options=" \
+     --adam-beta1 0.9 \
+     --adam-beta2 0.95 \
+     --eval-interval 1000 \
+-    --eval-iters 14 \
++    --eval-iters 0 \
+     \
+     --cuda-graph-impl local \
+     --cuda-graph-modules mamba attn moe_router \
+     --te-rng-tracker \
+     --no-load-rng \
+     \
+-    --per-split-data-args-path ${BLEND_PATH} \
+-    --data-cache-path ${DATACACHE_DIR} \
+-    --tokenizer-type TikTokenizer \
+-    --tokenizer-model ${TOKENIZER_MODEL} \
+-    --tiktoken-pattern v2 \
+-    --no-mmap-bin-files \
++    --mock-data \
++    --tokenizer-type NullTokenizer \
++    --vocab-size 131072 \
+     --num-workers 1 \
+     --no-create-attention-mask-in-dataloader \
+     \
+@@ -130,19 +120,8 @@ options=" \
+     --ddp-num-buckets 8 \
+     --attention-backend flash \
+     \
+-    --ckpt-format torch_dist \
+-    --load ${CHECKPOINT_DIR} \
+-    --save ${CHECKPOINT_DIR} \
+-    --save-interval 500 \
+-    --save-retain-interval 2000 \
+-    --ckpt-fully-parallel-save \
+-    --ckpt-fully-parallel-load \
+-    --async-save \
+-    --use-persistent-ckpt-worker \
+-    --ckpt-assume-constant-structure \
+-    \
+-    --log-interval 100 \
+-    --log-memory-interval 1000 \
++    --log-interval 1 \
++    --log-memory-interval 50 \
+     --log-params-norm \
+     --log-num-zeros-in-grad \
+     --log-throughput \
+@@ -156,7 +135,7 @@ options=" \
+     --manual-gc \
+     --manual-gc-interval 10 \
+     --distributed-timeout-minutes 10 \
+-    --exit-duration-in-mins 235 \
++    --exit-duration-in-mins 55 \
+     --disable-gloo-process-groups \
+     --disable-straggler-on-startup \
+     --straggler-minmax-count 16 "
+diff --git a/examples/training_scripts/a8b_120b_latentmoe_1t.sh b/examples/training_scripts/a8b_120b_latentmoe_1t.sh
+index 06d9c16c0..aad6517e0 100755
+--- a/examples/training_scripts/a8b_120b_latentmoe_1t.sh
++++ b/examples/training_scripts/a8b_120b_latentmoe_1t.sh
+@@ -1,17 +1,17 @@
+ #!/bin/bash
+ 
+ #SBATCH -p batch
+-#SBATCH --account=nemotron_sw_pre
+-#SBATCH --nodes=96
++#SBATCH --account=coreai_comparch_sysarch
++#SBATCH --nodes=8
+ #SBATCH --exclusive
+-#SBATCH -t 4:00:00
++#SBATCH -t 1:00:00
+ #SBATCH --mem=0
+ # GB200/GB300 have 4 GPUs/node; set --ntasks-per-node=4, --gpus-per-node=4, and
+ # add --segment=4 (or --segment=16 for 16-node segments) on those platforms.
+-#SBATCH --ntasks-per-node=8
+-#SBATCH --gpus-per-node=8
++#SBATCH --ntasks-per-node=4
++#SBATCH --gpus-per-node=4
+ #SBATCH --dependency=singleton
+-#SBATCH --job-name=a8b_120b_latentmoe_1t
++#SBATCH --job-name=a8b_120b_latentmoe_1t_dp1_dummy
+ 
+ export CUDA_DEVICE_MAX_CONNECTIONS=1
+ export NVTE_FWD_LAYERNORM_SM_MARGIN=16
+@@ -20,15 +20,15 @@ export NVTE_FUSED_ATTN=0  # Disable cuDNN fused attention.
+ export TORCHINDUCTOR_WORKER_START=fork
+ export TRITON_CACHE_DIR="/tmp/triton_cache/"
+ 
+-# Set this to a path you have write permission on; it must already contain all
+-# required assets (code, image, tokenizer, blend files, etc.). On OCI-HSG,
+-# "/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report"
+-# is one such path.
+-ROOT_DIR=""
+-REPO_DIR="${ROOT_DIR}/code"
++# Short DP1 dummy-data benchmark defaults for this cluster.
++ASSET_ROOT="${ASSET_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report}"
++ROOT_DIR="${ROOT_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs}"
++REPO_DIR="${REPO_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/Megatron-LM-EP}"
++TRAIN_ITERS="${TRAIN_ITERS:-50}"
++LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-10}"
+ # Run name; change this per experiment.
+-NAME="a8b_120b_latentmoe_1t"
+-IMAGE_PATH="${ROOT_DIR}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh"
++NAME="a8b_120b_latentmoe_1t_dp1_dummy"
++IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
+ 
+ DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
+ 
+@@ -43,14 +43,6 @@ mkdir -p ${CHECKPOINT_DIR}
+ mkdir -p ${DATACACHE_DIR}
+ mkdir -p ${TENSORBOARD_DIR}
+ 
+-
+-# Tokenizer model.
+-TOKENIZER_MODEL="${ROOT_DIR}/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
+-
+-# Data blend.
+-BLEND_PATH="${ROOT_DIR}/blend_files/1t_singlephase.json"
+-
+-
+ options=" \
+     --use-mcore-models \
+     --hybrid-layer-pattern MEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEME/*E/*E \
+@@ -83,24 +75,24 @@ options=" \
+     --moe-router-enable-expert-bias \
+     --moe-router-dtype fp32 \
+     --moe-router-load-balancing-type seq_aux_loss \
++    --moe-router-force-load-balancing \
+     --moe-permute-fusion \
+     --use-fused-weighted-squared-relu \
+     \
+-    --mtp-spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec \
+     --mtp-loss-scaling-factor 0.3 \
+     --calculate-per-token-loss \
+     \
+     --bf16 \
+     --seq-length 8192 \
+     --max-position-embeddings 8192 \
+-    --train-samples 122070313 \
++    --train-iters ${TRAIN_ITERS} \
+     --lr-decay-style WSD \
+-    --lr-decay-samples 122070313 \
+-    --lr-warmup-samples 3051758 \
++    --lr-decay-iters ${TRAIN_ITERS} \
++    --lr-warmup-iters 1 \
+     --lr-wsd-decay-style minus_sqrt \
+-    --lr-wsd-decay-samples 24414063 \
++    --lr-wsd-decay-iters ${LR_WSD_DECAY_ITERS} \
+     --micro-batch-size 1 \
+-    --global-batch-size 3072 \
++    --global-batch-size 128 \
+     --lr 8e-4 \
+     --min-lr 8e-6 \
+     --weight-decay 0.1 \
+@@ -108,19 +100,16 @@ options=" \
+     --adam-beta1 0.9 \
+     --adam-beta2 0.95 \
+     --eval-interval 1000 \
+-    --eval-iters 14 \
++    --eval-iters 0 \
+     \
+     --cuda-graph-impl local \
+     --cuda-graph-modules mamba attn moe_router \
+     --te-rng-tracker \
+     --no-load-rng \
+     \
+-    --per-split-data-args-path ${BLEND_PATH} \
+-    --data-cache-path ${DATACACHE_DIR} \
+-    --tokenizer-type TikTokenizer \
+-    --tokenizer-model ${TOKENIZER_MODEL} \
+-    --tiktoken-pattern v2 \
+-    --no-mmap-bin-files \
++    --mock-data \
++    --tokenizer-type NullTokenizer \
++    --vocab-size 131072 \
+     --num-workers 1 \
+     --no-create-attention-mask-in-dataloader \
+     \
+@@ -138,19 +127,8 @@ options=" \
+     --recompute-granularity selective \
+     --recompute-modules moe \
+     \
+-    --ckpt-format torch_dist \
+-    --load ${CHECKPOINT_DIR} \
+-    --save ${CHECKPOINT_DIR} \
+-    --save-interval 500 \
+-    --save-retain-interval 2000 \
+-    --ckpt-fully-parallel-save \
+-    --ckpt-fully-parallel-load \
+-    --async-save \
+-    --use-persistent-ckpt-worker \
+-    --ckpt-assume-constant-structure \
+-    \
+-    --log-interval 100 \
+-    --log-memory-interval 1000 \
++    --log-interval 1 \
++    --log-memory-interval 50 \
+     --log-params-norm \
+     --log-num-zeros-in-grad \
+     --log-throughput \
+@@ -164,7 +142,7 @@ options=" \
+     --manual-gc \
+     --manual-gc-interval 10 \
+     --distributed-timeout-minutes 10 \
+-    --exit-duration-in-mins 235 \
++    --exit-duration-in-mins 55 \
+     --disable-gloo-process-groups \
+     --disable-straggler-on-startup \
+     --straggler-minmax-count 16 "
+diff --git a/examples/training_scripts/nemotron3/nano.sh b/examples/training_scripts/nemotron3/nano.sh
+index da3b1f36e..f3eea26ba 100755
+--- a/examples/training_scripts/nemotron3/nano.sh
++++ b/examples/training_scripts/nemotron3/nano.sh
+@@ -1,17 +1,17 @@
+ #!/bin/bash
+ 
+ #SBATCH -p batch
+-#SBATCH --account=nemotron_sw_pre
+-#SBATCH --nodes=384
++#SBATCH --account=coreai_comparch_sysarch
++#SBATCH --nodes=16
+ #SBATCH --exclusive
+-#SBATCH -t 4:00:00
++#SBATCH -t 1:00:00
+ #SBATCH --mem=0
+ # GB200/GB300 have 4 GPUs/node; set --ntasks-per-node=4, --gpus-per-node=4, and
+ # add --segment=4 (or --segment=16 for 16-node segments) on those platforms.
+-#SBATCH --ntasks-per-node=8
+-#SBATCH --gpus-per-node=8
++#SBATCH --ntasks-per-node=4
++#SBATCH --gpus-per-node=4
+ #SBATCH --dependency=singleton
+-#SBATCH --job-name=nano
++#SBATCH --job-name=nemotron3_nano_dp1_dummy
+ 
+ export CUDA_DEVICE_MAX_CONNECTIONS=1
+ export NVTE_FWD_LAYERNORM_SM_MARGIN=16
+@@ -20,15 +20,15 @@ export NVTE_FUSED_ATTN=0  # Disable cuDNN fused attention.
+ export TORCHINDUCTOR_WORKER_START=fork
+ export TRITON_CACHE_DIR="/tmp/triton_cache/"
+ 
+-# Set this to a path you have write permission on; it must already contain all
+-# required assets (code, image, tokenizer, blend files, etc.). On OCI-HSG,
+-# "/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report"
+-# is one such path.
+-ROOT_DIR=""
+-REPO_DIR="${ROOT_DIR}/code"
++# Short DP1 dummy-data benchmark defaults for this cluster.
++ASSET_ROOT="${ASSET_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report}"
++ROOT_DIR="${ROOT_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs}"
++REPO_DIR="${REPO_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/Megatron-LM-EP}"
++TRAIN_ITERS="${TRAIN_ITERS:-50}"
++LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-10}"
+ # Run name; change this per experiment.
+-NAME="nano"
+-IMAGE_PATH="${ROOT_DIR}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh"
++NAME="nemotron3_nano_dp1_dummy"
++IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
+ 
+ DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
+ 
+@@ -85,6 +85,7 @@ options=" \
+     --moe-router-enable-expert-bias \
+     --moe-router-dtype fp32 \
+     --moe-router-load-balancing-type seq_aux_loss \
++    --moe-router-force-load-balancing \
+     --moe-permute-fusion \
+     --use-fused-weighted-squared-relu \
+     --cross-entropy-loss-fusion \
+@@ -93,30 +94,26 @@ options=" \
+     --bf16 \
+     --seq-length 8192 \
+     --max-position-embeddings 8192 \
+-    --train-samples 3051757813 \
++    --train-iters ${TRAIN_ITERS} \
+     --lr-decay-style WSD \
+-    --lr-decay-samples 3050733813 \
+-    --lr-warmup-samples 1024000 \
++    --lr-decay-iters ${TRAIN_ITERS} \
++    --lr-warmup-iters 1 \
+     --lr-wsd-decay-style minus_sqrt \
+-    --lr-wsd-decay-samples 610351563 \
++    --lr-wsd-decay-iters ${LR_WSD_DECAY_ITERS} \
+     --micro-batch-size 1 \
+-    --global-batch-size 3072 \
++    --global-batch-size 64 \
+     --lr 1e-3 \
+     --min-lr 1e-5 \
+     --weight-decay 0.1 \
+     --clip-grad 1.0 \
+     --adam-beta1 0.9 \
+     --adam-beta2 0.95 \
+-    --eval-interval 2000 \
+-    --eval-iters 14 \
+-    --override-opt_param-scheduler \
++    --eval-interval 1000 \
++    --eval-iters 0 \
+     \
+-    --per-split-data-args-path ${BLEND_PATH} \
+-    --data-cache-path ${DATACACHE_DIR} \
+-    --tokenizer-type TikTokenizer \
+-    --tokenizer-model ${TOKENIZER_MODEL} \
+-    --tiktoken-pattern v2 \
+-    --no-mmap-bin-files \
++    --mock-data \
++    --tokenizer-type NullTokenizer \
++    --vocab-size 131072 \
+     --num-workers 1 \
+     --no-create-attention-mask-in-dataloader \
+     \
+@@ -133,19 +130,8 @@ options=" \
+     --ddp-pad-buckets-for-high-nccl-busbw \
+     --attention-backend flash \
+     \
+-    --ckpt-format torch_dist \
+-    --load ${CHECKPOINT_DIR} \
+-    --save ${CHECKPOINT_DIR} \
+-    --save-interval 1000 \
+-    --save-retain-interval 10000 \
+-    --ckpt-fully-parallel-save \
+-    --ckpt-fully-parallel-load \
+-    --async-save \
+-    --use-persistent-ckpt-worker \
+-    --ckpt-assume-constant-structure \
+-    \
+-    --log-interval 100 \
+-    --log-memory-interval 500 \
++    --log-interval 1 \
++    --log-memory-interval 50 \
+     --log-params-norm \
+     --log-num-zeros-in-grad \
+     --log-throughput \
+@@ -157,8 +143,9 @@ options=" \
+     --check-weight-hash-across-dp-replicas-interval 20000 \
+     \
+     --manual-gc \
++    --manual-gc-interval 10 \
+     --distributed-timeout-minutes 10 \
+-    --exit-duration-in-mins 5750 \
++    --exit-duration-in-mins 55 \
+     --disable-gloo-process-groups \
+     --disable-straggler-on-startup \
+     --straggler-minmax-count 16 "
+diff --git a/examples/training_scripts/nemotron3/super.sh b/examples/training_scripts/nemotron3/super.sh
+index 7aa7d1b19..11b956688 100755
+--- a/examples/training_scripts/nemotron3/super.sh
++++ b/examples/training_scripts/nemotron3/super.sh
+@@ -1,17 +1,17 @@
+ #!/bin/bash
+ 
+ #SBATCH -p batch
+-#SBATCH --account=nemotron_sw_pre
+-#SBATCH --nodes=768
++#SBATCH --account=coreai_comparch_sysarch
++#SBATCH --nodes=32
+ #SBATCH --exclusive
+-#SBATCH -t 4:00:00
++#SBATCH -t 1:00:00
+ #SBATCH --mem=0
+ # Targets GB200/GB300 (4 GPUs/node); H100 is impractical at this scale.
+ #SBATCH --ntasks-per-node=4
+ #SBATCH --gpus-per-node=4
+ #SBATCH --segment=16
+ #SBATCH --dependency=singleton
+-#SBATCH --job-name=super
++#SBATCH --job-name=nemotron3_super_dp1_dummy
+ 
+ export CUDA_DEVICE_MAX_CONNECTIONS=1
+ export NVTE_FWD_LAYERNORM_SM_MARGIN=16
+@@ -19,16 +19,17 @@ export NVTE_BWD_LAYERNORM_SM_MARGIN=16
+ export NVTE_FUSED_ATTN=0  # Disable cuDNN fused attention.
+ export TORCHINDUCTOR_WORKER_START=fork
+ export TRITON_CACHE_DIR="/tmp/triton_cache/"
++export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+ 
+-# Set this to a path you have write permission on; it must already contain all
+-# required assets (code, image, tokenizer, blend files, etc.). On OCI-HSG,
+-# "/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report"
+-# is one such path.
+-ROOT_DIR=""
+-REPO_DIR="${ROOT_DIR}/code"
++# Short DP1 dummy-data benchmark defaults for this cluster.
++ASSET_ROOT="${ASSET_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report}"
++ROOT_DIR="${ROOT_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs}"
++REPO_DIR="${REPO_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/Megatron-LM-EP}"
++TRAIN_ITERS="${TRAIN_ITERS:-50}"
++LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-10}"
+ # Run name; change this per experiment.
+-NAME="super"
+-IMAGE_PATH="${ROOT_DIR}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh"
++NAME="nemotron3_super_dp1_dummy"
++IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
+ 
+ DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
+ 
+@@ -84,7 +85,6 @@ options=" \
+     --moe-shared-expert-intermediate-size 5376 \
+     --moe-latent-size 1024 \
+     --moe-token-dispatcher-type alltoall \
+-    --moe-shared-expert-compute-before-router \
+     --moe-router-score-function sigmoid \
+     --moe-grouped-gemm \
+     --moe-aux-loss-coeff 1e-4 \
+@@ -92,12 +92,12 @@ options=" \
+     --moe-router-enable-expert-bias \
+     --moe-router-dtype fp32 \
+     --moe-router-load-balancing-type seq_aux_loss \
++    --moe-router-force-load-balancing \
+     --moe-permute-fusion \
+     --use-fused-weighted-squared-relu \
+     --cross-entropy-loss-fusion \
+     --cross-entropy-fusion-impl native \
+     \
+-    --mtp-spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec \
+     --mtp-loss-scaling-factor 0.3 \
+     --calculate-per-token-loss \
+     \
+@@ -111,14 +111,14 @@ options=" \
+     --bf16 \
+     --seq-length 8192 \
+     --max-position-embeddings 8192 \
+-    --train-samples 3051757813 \
++    --train-iters ${TRAIN_ITERS} \
+     --lr-decay-style WSD \
+-    --lr-decay-samples 3048706055 \
+-    --lr-warmup-samples 24414063 \
++    --lr-decay-iters ${TRAIN_ITERS} \
++    --lr-warmup-iters 1 \
+     --lr-wsd-decay-style minus_sqrt \
+-    --lr-wsd-decay-samples 610351563 \
++    --lr-wsd-decay-iters ${LR_WSD_DECAY_ITERS} \
+     --micro-batch-size 1 \
+-    --global-batch-size 3072 \
++    --global-batch-size 128 \
+     --lr 4.5e-4 \
+     --min-lr 4.5e-6 \
+     --weight-decay 0.1 \
+@@ -126,19 +126,16 @@ options=" \
+     --adam-beta1 0.9 \
+     --adam-beta2 0.95 \
+     --eval-interval 1000 \
+-    --eval-iters 14 \
+-    --override-opt_param-scheduler \
++    --eval-iters 0 \
+     \
+     --cuda-graph-impl local \
+     --cuda-graph-modules mamba attn moe_router \
+     --te-rng-tracker \
++    --no-load-rng \
+     \
+-    --per-split-data-args-path ${BLEND_PATH} \
+-    --data-cache-path ${DATACACHE_DIR} \
+-    --tokenizer-type TikTokenizer \
+-    --tokenizer-model ${TOKENIZER_MODEL} \
+-    --tiktoken-pattern v2 \
+-    --no-mmap-bin-files \
++    --mock-data \
++    --tokenizer-type NullTokenizer \
++    --vocab-size 131072 \
+     --num-workers 1 \
+     --no-create-attention-mask-in-dataloader \
+     \
+@@ -155,20 +152,8 @@ options=" \
+     --ddp-pad-buckets-for-high-nccl-busbw \
+     --attention-backend flash \
+     \
+-    --ckpt-format torch_dist \
+-    --load ${CHECKPOINT_DIR} \
+-    --save ${CHECKPOINT_DIR} \
+-    --save-interval 250 \
+-    --save-retain-interval 1000 \
+-    --ckpt-fully-parallel-save \
+-    --ckpt-fully-parallel-load \
+-    --async-save \
+-    --use-persistent-ckpt-worker \
+-    --ckpt-assume-constant-structure \
+-    --result-rejected-tracker-filename ${CHECKPOINT_DIR}/result_rejected_tracker.txt \
+-    \
+-    --log-interval 100 \
+-    --log-memory-interval 500 \
++    --log-interval 1 \
++    --log-memory-interval 50 \
+     --log-params-norm \
+     --log-num-zeros-in-grad \
+     --log-throughput \
+@@ -180,8 +165,9 @@ options=" \
+     --check-weight-hash-across-dp-replicas-interval 20000 \
+     \
+     --manual-gc \
++    --manual-gc-interval 10 \
+     --distributed-timeout-minutes 10 \
+-    --exit-duration-in-mins 5750 \
++    --exit-duration-in-mins 55 \
+     --disable-gloo-process-groups \
+     --disable-straggler-on-startup \
+     --straggler-minmax-count 16 "
+diff --git a/examples/training_scripts/nemotron3/ultra.sh b/examples/training_scripts/nemotron3/ultra.sh
+index 535a5c688..83e084c70 100755
+--- a/examples/training_scripts/nemotron3/ultra.sh
++++ b/examples/training_scripts/nemotron3/ultra.sh
+@@ -1,17 +1,17 @@
+ #!/bin/bash
+ 
+ #SBATCH -p batch
+-#SBATCH --account=nemotron_sw_pre
+-#SBATCH --nodes=1536
++#SBATCH --account=coreai_comparch_sysarch
++#SBATCH --nodes=128
+ #SBATCH --exclusive
+-#SBATCH -t 4:00:00
++#SBATCH -t 1:00:00
+ #SBATCH --mem=0
+ # Targets GB200/GB300 (4 GPUs/node); H100 is impractical at this scale.
+ #SBATCH --ntasks-per-node=4
+ #SBATCH --gpus-per-node=4
+ #SBATCH --segment=16
+ #SBATCH --dependency=singleton
+-#SBATCH --job-name=ultra
++#SBATCH --job-name=nemotron3_ultra_dp1_dummy
+ 
+ export CUDA_DEVICE_MAX_CONNECTIONS=1
+ export NVTE_FWD_LAYERNORM_SM_MARGIN=16
+@@ -19,23 +19,16 @@ export NVTE_BWD_LAYERNORM_SM_MARGIN=16
+ export NVTE_FUSED_ATTN=0  # Disable cuDNN fused attention.
+ export TORCHINDUCTOR_WORKER_START=fork
+ export TRITON_CACHE_DIR="/tmp/triton_cache/"
+-# HybridEP token dispatcher (flex backend = hybridep).
+-export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=64
+-export USE_MNNVL=1
+-# Activation offloading (used with --fine-grained-activation-offloading).
+-export NVTE_CPU_OFFLOAD_V1=1
+ 
+-# Set this to a path you have write permission on; it must already contain all
+-# required assets (code, image, tokenizer, blend files, etc.). On OCI-HSG,
+-# "/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report"
+-# is one such path.
+-ROOT_DIR=""
+-REPO_DIR="${ROOT_DIR}/code"
++# Short DP1 dummy-data benchmark defaults for this cluster.
++ASSET_ROOT="${ASSET_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report}"
++ROOT_DIR="${ROOT_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs}"
++REPO_DIR="${REPO_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/Megatron-LM-EP}"
++TRAIN_ITERS="${TRAIN_ITERS:-10}"
++LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-10}"
+ # Run name; change this per experiment.
+-NAME="ultra"
+-# This recipe uses HybridEP (--moe-flex-dispatcher-backend hybridep); the
+-# container image must include the HybridEP runtime.
+-IMAGE_PATH="${ROOT_DIR}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh"
++NAME="nemotron3_ultra_dp1_dummy"
++IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
+ 
+ DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
+ 
+@@ -90,9 +83,7 @@ options=" \
+     --moe-router-topk 22 \
+     --moe-shared-expert-intermediate-size 10240 \
+     --moe-latent-size 2048 \
+-    --moe-token-dispatcher-type flex \
+-    --moe-flex-dispatcher-backend hybridep \
+-    --moe-hybridep-num-sms 32 \
++    --moe-token-dispatcher-type alltoall \
+     --moe-router-score-function sigmoid \
+     --moe-grouped-gemm \
+     --moe-aux-loss-coeff 1e-4 \
+@@ -100,12 +91,12 @@ options=" \
+     --moe-router-enable-expert-bias \
+     --moe-router-dtype fp32 \
+     --moe-router-load-balancing-type seq_aux_loss \
++    --moe-router-force-load-balancing \
+     --moe-permute-fusion \
+     --use-fused-weighted-squared-relu \
+     --cross-entropy-loss-fusion \
+     --cross-entropy-fusion-impl native \
+     \
+-    --mtp-spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec \
+     --mtp-use-repeated-layer \
+     --mtp-loss-scaling-factor 0.1 \
+     --calculate-per-token-loss \
+@@ -117,21 +108,17 @@ options=" \
+     --fp4-recipe nvfp4 \
+     --te-precision-config-file ${TE_PRECISION_CONFIG} \
+     \
+-    --fine-grained-activation-offloading \
+-    --offload-modules moe_act \
+-    \
+     --bf16 \
+     --seq-length 8192 \
+     --max-position-embeddings 8192 \
+-    --train-samples 3051757813 \
++    --train-iters ${TRAIN_ITERS} \
+     --lr-decay-style WSD \
+-    --lr-decay-samples 3048706055 \
+-    --lr-warmup-samples 24414063 \
++    --lr-decay-iters ${TRAIN_ITERS} \
++    --lr-warmup-iters 1 \
+     --lr-wsd-decay-style minus_sqrt \
+-    --lr-wsd-decay-samples 610351563 \
+-    --phase-transition-iterations 800000 \
+-    --micro-batch-size 2 \
+-    --global-batch-size 3072 \
++    --lr-wsd-decay-iters ${LR_WSD_DECAY_ITERS} \
++    --micro-batch-size 1 \
++    --global-batch-size 256 \
+     --lr 2.5e-4 \
+     --min-lr 2.5e-6 \
+     --weight-decay 0.1 \
+@@ -139,19 +126,13 @@ options=" \
+     --adam-beta1 0.9 \
+     --adam-beta2 0.95 \
+     --eval-interval 1000 \
+-    --eval-iters 14 \
+-    --override-opt_param-scheduler \
++    --eval-iters 0 \
+     \
+-    --cuda-graph-impl local \
+-    --cuda-graph-modules mamba attn moe_router \
+-    --te-rng-tracker \
++    --cuda-graph-impl none \
+     \
+-    --per-split-data-args-path ${BLEND_PATH} \
+-    --data-cache-path ${DATACACHE_DIR} \
+-    --tokenizer-type TikTokenizer \
+-    --tokenizer-model ${TOKENIZER_MODEL} \
+-    --tiktoken-pattern v2 \
+-    --no-mmap-bin-files \
++    --mock-data \
++    --tokenizer-type NullTokenizer \
++    --vocab-size 131072 \
+     --num-workers 1 \
+     --no-create-attention-mask-in-dataloader \
+     \
+@@ -168,21 +149,8 @@ options=" \
+     --ddp-pad-buckets-for-high-nccl-busbw \
+     --attention-backend flash \
+     \
+-    --ckpt-format torch_dist \
+-    --load ${CHECKPOINT_DIR} \
+-    --save ${CHECKPOINT_DIR} \
+-    --save-interval 125 \
+-    --save-retain-interval 1000 \
+-    --ckpt-fully-parallel-save \
+-    --ckpt-fully-parallel-load \
+-    --async-save \
+-    --use-persistent-ckpt-worker \
+-    --ckpt-assume-constant-structure \
+-    --result-rejected-tracker-filename ${CHECKPOINT_DIR}/result_rejected_tracker.txt \
+-    --rerun-mode disabled \
+-    \
+-    --log-interval 10 \
+-    --log-memory-interval 1000 \
++    --log-interval 1 \
++    --log-memory-interval 50 \
+     --log-params-norm \
+     --log-num-zeros-in-grad \
+     --log-throughput \
+@@ -194,8 +162,9 @@ options=" \
+     --check-weight-hash-across-dp-replicas-interval 20000 \
+     \
+     --manual-gc \
++    --manual-gc-interval 10 \
+     --distributed-timeout-minutes 10 \
+-    --exit-duration-in-mins 5750 \
++    --exit-duration-in-mins 55 \
+     --disable-gloo-process-groups \
+     --disable-straggler-on-startup \
+     --straggler-minmax-count 16 "
+diff --git a/examples/training_scripts/scaling_ladder/README.md b/examples/training_scripts/scaling_ladder/README.md
+index a361d60e7..1cbc65b29 100644
+--- a/examples/training_scripts/scaling_ladder/README.md
++++ b/examples/training_scripts/scaling_ladder/README.md
+@@ -38,6 +38,5 @@ Notes:
+ - `--lr-decay-samples` equals `--train-samples` (full WSD decay); the
+   `lr-wsd-decay` tail is 15% of train samples in each case.
+ - Only `a3b_30b_moe_1t.sh` enables MTP: pattern gets a `/*E/*E` suffix
+-  (two depths, identical `*E` pattern per depth), plus `--mtp-spec`,
+-  `--mtp-use-repeated-layer` (shared weights across depths),
+-  `--mtp-loss-scaling-factor 0.1`, `--calculate-per-token-loss`.
++  (two depths, identical `*E` pattern per depth), plus
++  `--mtp-loss-scaling-factor 0.1` and `--calculate-per-token-loss`.
+diff --git a/examples/training_scripts/scaling_ladder/a1b_7b_moe_310b.sh b/examples/training_scripts/scaling_ladder/a1b_7b_moe_310b.sh
+index 51183eb61..6bf46a121 100755
+--- a/examples/training_scripts/scaling_ladder/a1b_7b_moe_310b.sh
++++ b/examples/training_scripts/scaling_ladder/a1b_7b_moe_310b.sh
+@@ -1,17 +1,17 @@
+ #!/bin/bash
+ 
+ #SBATCH -p batch
+-#SBATCH --account=nemotron_sw_pre
+-#SBATCH --nodes=32
++#SBATCH --account=coreai_comparch_sysarch
++#SBATCH --nodes=2
+ #SBATCH --exclusive
+-#SBATCH -t 4:00:00
++#SBATCH -t 1:00:00
+ #SBATCH --mem=0
+ # GB200/GB300 have 4 GPUs/node; set --ntasks-per-node=4, --gpus-per-node=4, and
+ # add --segment=4 (or --segment=16 for 16-node segments) on those platforms.
+-#SBATCH --ntasks-per-node=8
+-#SBATCH --gpus-per-node=8
++#SBATCH --ntasks-per-node=4
++#SBATCH --gpus-per-node=4
+ #SBATCH --dependency=singleton
+-#SBATCH --job-name=a1b_7b_moe_310b
++#SBATCH --job-name=a1b_7b_moe_310b_dp1_dummy
+ 
+ export CUDA_DEVICE_MAX_CONNECTIONS=1
+ export NVTE_FWD_LAYERNORM_SM_MARGIN=16
+@@ -20,15 +20,15 @@ export NVTE_FUSED_ATTN=0  # Disable cuDNN fused attention.
+ export TORCHINDUCTOR_WORKER_START=fork
+ export TRITON_CACHE_DIR="/tmp/triton_cache/"
+ 
+-# Set this to a path you have write permission on; it must already contain all
+-# required assets (code, image, tokenizer, blend files, etc.). On OCI-HSG,
+-# "/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report"
+-# is one such path.
+-ROOT_DIR=""
+-REPO_DIR="${ROOT_DIR}/code"
++# Short DP1 dummy-data benchmark defaults for this cluster.
++ASSET_ROOT="${ASSET_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report}"
++ROOT_DIR="${ROOT_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs}"
++REPO_DIR="${REPO_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/Megatron-LM-EP}"
++TRAIN_ITERS="${TRAIN_ITERS:-50}"
++LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-10}"
+ # Run name; change this per experiment.
+-NAME="a1b_7b_moe_310b"
+-IMAGE_PATH="${ROOT_DIR}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh"
++NAME="a1b_7b_moe_310b_dp1_dummy"
++IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
+ 
+ DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
+ 
+@@ -43,14 +43,6 @@ mkdir -p ${CHECKPOINT_DIR}
+ mkdir -p ${DATACACHE_DIR}
+ mkdir -p ${TENSORBOARD_DIR}
+ 
+-
+-# Tokenizer model.
+-TOKENIZER_MODEL="${ROOT_DIR}/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
+-
+-# Data blend.
+-BLEND_PATH="${ROOT_DIR}/blend_files/1t_singlephase.json"
+-
+-
+ options=" \
+     --use-mcore-models \
+     --hybrid-layer-pattern MEMEM*EMEMEM*EMEMEMEM*EMEMEM*EMEMEME \
+@@ -82,20 +74,21 @@ options=" \
+     --moe-router-enable-expert-bias \
+     --moe-router-dtype fp32 \
+     --moe-router-load-balancing-type seq_aux_loss \
++    --moe-router-force-load-balancing \
+     --moe-permute-fusion \
+     --use-fused-weighted-squared-relu \
+     \
+     --bf16 \
+     --seq-length 8192 \
+     --max-position-embeddings 8192 \
+-    --train-samples 37841797 \
++    --train-iters ${TRAIN_ITERS} \
+     --lr-decay-style WSD \
+-    --lr-decay-samples 37841797 \
+-    --lr-warmup-samples 1024000 \
++    --lr-decay-iters ${TRAIN_ITERS} \
++    --lr-warmup-iters 1 \
+     --lr-wsd-decay-style minus_sqrt \
+-    --lr-wsd-decay-samples 5676270 \
++    --lr-wsd-decay-iters ${LR_WSD_DECAY_ITERS} \
+     --micro-batch-size 1 \
+-    --global-batch-size 768 \
++    --global-batch-size 24 \
+     --lr 1.6e-3 \
+     --min-lr 1.6e-5 \
+     --weight-decay 0.1 \
+@@ -103,19 +96,16 @@ options=" \
+     --adam-beta1 0.9 \
+     --adam-beta2 0.95 \
+     --eval-interval 1000 \
+-    --eval-iters 14 \
++    --eval-iters 0 \
+     \
+     --cuda-graph-impl local \
+     --cuda-graph-modules mamba attn moe_router \
+     --te-rng-tracker \
+     --no-load-rng \
+     \
+-    --per-split-data-args-path ${BLEND_PATH} \
+-    --data-cache-path ${DATACACHE_DIR} \
+-    --tokenizer-type TikTokenizer \
+-    --tokenizer-model ${TOKENIZER_MODEL} \
+-    --tiktoken-pattern v2 \
+-    --no-mmap-bin-files \
++    --mock-data \
++    --tokenizer-type NullTokenizer \
++    --vocab-size 131072 \
+     --num-workers 1 \
+     --no-create-attention-mask-in-dataloader \
+     \
+@@ -131,19 +121,8 @@ options=" \
+     --ddp-num-buckets 8 \
+     --attention-backend flash \
+     \
+-    --ckpt-format torch_dist \
+-    --load ${CHECKPOINT_DIR} \
+-    --save ${CHECKPOINT_DIR} \
+-    --save-interval 500 \
+-    --save-retain-interval 2000 \
+-    --ckpt-fully-parallel-save \
+-    --ckpt-fully-parallel-load \
+-    --async-save \
+-    --use-persistent-ckpt-worker \
+-    --ckpt-assume-constant-structure \
+-    \
+-    --log-interval 100 \
+-    --log-memory-interval 1000 \
++    --log-interval 1 \
++    --log-memory-interval 50 \
+     --log-params-norm \
+     --log-num-zeros-in-grad \
+     --log-throughput \
+@@ -157,7 +136,7 @@ options=" \
+     --manual-gc \
+     --manual-gc-interval 10 \
+     --distributed-timeout-minutes 10 \
+-    --exit-duration-in-mins 235 \
++    --exit-duration-in-mins 55 \
+     --disable-gloo-process-groups \
+     --disable-straggler-on-startup \
+     --straggler-minmax-count 16 "
+diff --git a/examples/training_scripts/scaling_ladder/a2b_14b_moe_560b.sh b/examples/training_scripts/scaling_ladder/a2b_14b_moe_560b.sh
+index 9f8ff032e..487de9aad 100755
+--- a/examples/training_scripts/scaling_ladder/a2b_14b_moe_560b.sh
++++ b/examples/training_scripts/scaling_ladder/a2b_14b_moe_560b.sh
+@@ -1,17 +1,17 @@
+ #!/bin/bash
+ 
+ #SBATCH -p batch
+-#SBATCH --account=nemotron_sw_pre
+-#SBATCH --nodes=32
++#SBATCH --account=coreai_comparch_sysarch
++#SBATCH --nodes=4
+ #SBATCH --exclusive
+-#SBATCH -t 4:00:00
++#SBATCH -t 1:00:00
+ #SBATCH --mem=0
+ # GB200/GB300 have 4 GPUs/node; set --ntasks-per-node=4, --gpus-per-node=4, and
+ # add --segment=4 (or --segment=16 for 16-node segments) on those platforms.
+-#SBATCH --ntasks-per-node=8
+-#SBATCH --gpus-per-node=8
++#SBATCH --ntasks-per-node=4
++#SBATCH --gpus-per-node=4
+ #SBATCH --dependency=singleton
+-#SBATCH --job-name=a2b_14b_moe_560b
++#SBATCH --job-name=a2b_14b_moe_560b_dp1_dummy
+ 
+ export CUDA_DEVICE_MAX_CONNECTIONS=1
+ export NVTE_FWD_LAYERNORM_SM_MARGIN=16
+@@ -20,15 +20,15 @@ export NVTE_FUSED_ATTN=0  # Disable cuDNN fused attention.
+ export TORCHINDUCTOR_WORKER_START=fork
+ export TRITON_CACHE_DIR="/tmp/triton_cache/"
+ 
+-# Set this to a path you have write permission on; it must already contain all
+-# required assets (code, image, tokenizer, blend files, etc.). On OCI-HSG,
+-# "/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report"
+-# is one such path.
+-ROOT_DIR=""
+-REPO_DIR="${ROOT_DIR}/code"
++# Short DP1 dummy-data benchmark defaults for this cluster.
++ASSET_ROOT="${ASSET_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report}"
++ROOT_DIR="${ROOT_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs}"
++REPO_DIR="${REPO_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/Megatron-LM-EP}"
++TRAIN_ITERS="${TRAIN_ITERS:-50}"
++LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-10}"
+ # Run name; change this per experiment.
+-NAME="a2b_14b_moe_560b"
+-IMAGE_PATH="${ROOT_DIR}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh"
++NAME="a2b_14b_moe_560b_dp1_dummy"
++IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
+ 
+ DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
+ 
+@@ -43,14 +43,6 @@ mkdir -p ${CHECKPOINT_DIR}
+ mkdir -p ${DATACACHE_DIR}
+ mkdir -p ${TENSORBOARD_DIR}
+ 
+-
+-# Tokenizer model.
+-TOKENIZER_MODEL="${ROOT_DIR}/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
+-
+-# Data blend.
+-BLEND_PATH="${ROOT_DIR}/blend_files/1t_singlephase.json"
+-
+-
+ options=" \
+     --use-mcore-models \
+     --hybrid-layer-pattern MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEME \
+@@ -82,20 +74,21 @@ options=" \
+     --moe-router-enable-expert-bias \
+     --moe-router-dtype fp32 \
+     --moe-router-load-balancing-type seq_aux_loss \
++    --moe-router-force-load-balancing \
+     --moe-permute-fusion \
+     --use-fused-weighted-squared-relu \
+     \
+     --bf16 \
+     --seq-length 8192 \
+     --max-position-embeddings 8192 \
+-    --train-samples 68359375 \
++    --train-iters ${TRAIN_ITERS} \
+     --lr-decay-style WSD \
+-    --lr-decay-samples 68359375 \
+-    --lr-warmup-samples 1024000 \
++    --lr-decay-iters ${TRAIN_ITERS} \
++    --lr-warmup-iters 1 \
+     --lr-wsd-decay-style minus_sqrt \
+-    --lr-wsd-decay-samples 10253907 \
++    --lr-wsd-decay-iters ${LR_WSD_DECAY_ITERS} \
+     --micro-batch-size 1 \
+-    --global-batch-size 768 \
++    --global-batch-size 48 \
+     --lr 1.4e-3 \
+     --min-lr 1.4e-5 \
+     --weight-decay 0.1 \
+@@ -103,19 +96,16 @@ options=" \
+     --adam-beta1 0.9 \
+     --adam-beta2 0.95 \
+     --eval-interval 1000 \
+-    --eval-iters 14 \
++    --eval-iters 0 \
+     \
+     --cuda-graph-impl local \
+     --cuda-graph-modules mamba attn moe_router \
+     --te-rng-tracker \
+     --no-load-rng \
+     \
+-    --per-split-data-args-path ${BLEND_PATH} \
+-    --data-cache-path ${DATACACHE_DIR} \
+-    --tokenizer-type TikTokenizer \
+-    --tokenizer-model ${TOKENIZER_MODEL} \
+-    --tiktoken-pattern v2 \
+-    --no-mmap-bin-files \
++    --mock-data \
++    --tokenizer-type NullTokenizer \
++    --vocab-size 131072 \
+     --num-workers 1 \
+     --no-create-attention-mask-in-dataloader \
+     \
+@@ -131,19 +121,8 @@ options=" \
+     --ddp-num-buckets 8 \
+     --attention-backend flash \
+     \
+-    --ckpt-format torch_dist \
+-    --load ${CHECKPOINT_DIR} \
+-    --save ${CHECKPOINT_DIR} \
+-    --save-interval 500 \
+-    --save-retain-interval 2000 \
+-    --ckpt-fully-parallel-save \
+-    --ckpt-fully-parallel-load \
+-    --async-save \
+-    --use-persistent-ckpt-worker \
+-    --ckpt-assume-constant-structure \
+-    \
+-    --log-interval 100 \
+-    --log-memory-interval 1000 \
++    --log-interval 1 \
++    --log-memory-interval 50 \
+     --log-params-norm \
+     --log-num-zeros-in-grad \
+     --log-throughput \
+@@ -157,7 +136,7 @@ options=" \
+     --manual-gc \
+     --manual-gc-interval 10 \
+     --distributed-timeout-minutes 10 \
+-    --exit-duration-in-mins 235 \
++    --exit-duration-in-mins 55 \
+     --disable-gloo-process-groups \
+     --disable-straggler-on-startup \
+     --straggler-minmax-count 16 "
+diff --git a/examples/training_scripts/scaling_ladder/a315m_1b_moe_88b.sh b/examples/training_scripts/scaling_ladder/a315m_1b_moe_88b.sh
+index 7c329ac17..0913d5ade 100755
+--- a/examples/training_scripts/scaling_ladder/a315m_1b_moe_88b.sh
++++ b/examples/training_scripts/scaling_ladder/a315m_1b_moe_88b.sh
+@@ -1,17 +1,17 @@
+ #!/bin/bash
+ 
+ #SBATCH -p batch
+-#SBATCH --account=nemotron_sw_pre
+-#SBATCH --nodes=8
++#SBATCH --account=coreai_comparch_sysarch
++#SBATCH --nodes=2
+ #SBATCH --exclusive
+-#SBATCH -t 4:00:00
++#SBATCH -t 1:00:00
+ #SBATCH --mem=0
+ # GB200/GB300 have 4 GPUs/node; set --ntasks-per-node=4, --gpus-per-node=4, and
+ # add --segment=4 (or --segment=16 for 16-node segments) on those platforms.
+-#SBATCH --ntasks-per-node=8
+-#SBATCH --gpus-per-node=8
++#SBATCH --ntasks-per-node=4
++#SBATCH --gpus-per-node=4
+ #SBATCH --dependency=singleton
+-#SBATCH --job-name=a315m_1b_moe_88b
++#SBATCH --job-name=a315m_1b_moe_88b_dp1_dummy
+ 
+ export CUDA_DEVICE_MAX_CONNECTIONS=1
+ export NVTE_FWD_LAYERNORM_SM_MARGIN=16
+@@ -20,15 +20,15 @@ export NVTE_FUSED_ATTN=0  # Disable cuDNN fused attention.
+ export TORCHINDUCTOR_WORKER_START=fork
+ export TRITON_CACHE_DIR="/tmp/triton_cache/"
+ 
+-# Set this to a path you have write permission on; it must already contain all
+-# required assets (code, image, tokenizer, blend files, etc.). On OCI-HSG,
+-# "/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report"
+-# is one such path.
+-ROOT_DIR=""
+-REPO_DIR="${ROOT_DIR}/code"
++# Short DP1 dummy-data benchmark defaults for this cluster.
++ASSET_ROOT="${ASSET_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report}"
++ROOT_DIR="${ROOT_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs}"
++REPO_DIR="${REPO_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/Megatron-LM-EP}"
++TRAIN_ITERS="${TRAIN_ITERS:-50}"
++LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-10}"
+ # Run name; change this per experiment.
+-NAME="a315m_1b_moe_88b"
+-IMAGE_PATH="${ROOT_DIR}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh"
++NAME="a315m_1b_moe_88b_dp1_dummy"
++IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
+ 
+ DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
+ 
+@@ -43,14 +43,6 @@ mkdir -p ${CHECKPOINT_DIR}
+ mkdir -p ${DATACACHE_DIR}
+ mkdir -p ${TENSORBOARD_DIR}
+ 
+-
+-# Tokenizer model.
+-TOKENIZER_MODEL="${ROOT_DIR}/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
+-
+-# Data blend.
+-BLEND_PATH="${ROOT_DIR}/blend_files/1t_singlephase.json"
+-
+-
+ options=" \
+     --use-mcore-models \
+     --hybrid-layer-pattern MEMEM*EMEME*EMEM*EMEME \
+@@ -82,20 +74,21 @@ options=" \
+     --moe-router-enable-expert-bias \
+     --moe-router-dtype fp32 \
+     --moe-router-load-balancing-type seq_aux_loss \
++    --moe-router-force-load-balancing \
+     --moe-permute-fusion \
+     --use-fused-weighted-squared-relu \
+     \
+     --bf16 \
+     --seq-length 8192 \
+     --max-position-embeddings 8192 \
+-    --train-samples 10766602 \
++    --train-iters ${TRAIN_ITERS} \
+     --lr-decay-style WSD \
+-    --lr-decay-samples 10766602 \
+-    --lr-warmup-samples 1024000 \
++    --lr-decay-iters ${TRAIN_ITERS} \
++    --lr-warmup-iters 1 \
+     --lr-wsd-decay-style minus_sqrt \
+-    --lr-wsd-decay-samples 1614990 \
++    --lr-wsd-decay-iters ${LR_WSD_DECAY_ITERS} \
+     --micro-batch-size 4 \
+-    --global-batch-size 768 \
++    --global-batch-size 96 \
+     --lr 2.2e-3 \
+     --min-lr 2.2e-5 \
+     --weight-decay 0.1 \
+@@ -103,19 +96,16 @@ options=" \
+     --adam-beta1 0.9 \
+     --adam-beta2 0.95 \
+     --eval-interval 1000 \
+-    --eval-iters 14 \
++    --eval-iters 0 \
+     \
+     --cuda-graph-impl local \
+     --cuda-graph-modules mamba attn moe_router \
+     --te-rng-tracker \
+     --no-load-rng \
+     \
+-    --per-split-data-args-path ${BLEND_PATH} \
+-    --data-cache-path ${DATACACHE_DIR} \
+-    --tokenizer-type TikTokenizer \
+-    --tokenizer-model ${TOKENIZER_MODEL} \
+-    --tiktoken-pattern v2 \
+-    --no-mmap-bin-files \
++    --mock-data \
++    --tokenizer-type NullTokenizer \
++    --vocab-size 131072 \
+     --num-workers 1 \
+     --no-create-attention-mask-in-dataloader \
+     \
+@@ -131,19 +121,8 @@ options=" \
+     --ddp-num-buckets 8 \
+     --attention-backend flash \
+     \
+-    --ckpt-format torch_dist \
+-    --load ${CHECKPOINT_DIR} \
+-    --save ${CHECKPOINT_DIR} \
+-    --save-interval 500 \
+-    --save-retain-interval 2000 \
+-    --ckpt-fully-parallel-save \
+-    --ckpt-fully-parallel-load \
+-    --async-save \
+-    --use-persistent-ckpt-worker \
+-    --ckpt-assume-constant-structure \
+-    \
+-    --log-interval 100 \
+-    --log-memory-interval 1000 \
++    --log-interval 1 \
++    --log-memory-interval 50 \
+     --log-params-norm \
+     --log-num-zeros-in-grad \
+     --log-throughput \
+@@ -157,7 +136,7 @@ options=" \
+     --manual-gc \
+     --manual-gc-interval 10 \
+     --distributed-timeout-minutes 10 \
+-    --exit-duration-in-mins 235 \
++    --exit-duration-in-mins 55 \
+     --disable-gloo-process-groups \
+     --disable-straggler-on-startup \
+     --straggler-minmax-count 16 "
+diff --git a/examples/training_scripts/scaling_ladder/a3b_30b_moe_1t.sh b/examples/training_scripts/scaling_ladder/a3b_30b_moe_1t.sh
+index 581c33348..93417ff31 100755
+--- a/examples/training_scripts/scaling_ladder/a3b_30b_moe_1t.sh
++++ b/examples/training_scripts/scaling_ladder/a3b_30b_moe_1t.sh
+@@ -1,17 +1,17 @@
+ #!/bin/bash
+ 
+ #SBATCH -p batch
+-#SBATCH --account=nemotron_sw_pre
+-#SBATCH --nodes=32
++#SBATCH --account=coreai_comparch_sysarch
++#SBATCH --nodes=16
+ #SBATCH --exclusive
+-#SBATCH -t 4:00:00
++#SBATCH -t 1:00:00
+ #SBATCH --mem=0
+ # GB200/GB300 have 4 GPUs/node; set --ntasks-per-node=4, --gpus-per-node=4, and
+ # add --segment=4 (or --segment=16 for 16-node segments) on those platforms.
+-#SBATCH --ntasks-per-node=8
+-#SBATCH --gpus-per-node=8
++#SBATCH --ntasks-per-node=4
++#SBATCH --gpus-per-node=4
+ #SBATCH --dependency=singleton
+-#SBATCH --job-name=a3b_30b_moe_1t
++#SBATCH --job-name=a3b_30b_moe_1t_ladder_dp1_dummy
+ 
+ export CUDA_DEVICE_MAX_CONNECTIONS=1
+ export NVTE_FWD_LAYERNORM_SM_MARGIN=16
+@@ -20,15 +20,15 @@ export NVTE_FUSED_ATTN=0  # Disable cuDNN fused attention.
+ export TORCHINDUCTOR_WORKER_START=fork
+ export TRITON_CACHE_DIR="/tmp/triton_cache/"
+ 
+-# Set this to a path you have write permission on; it must already contain all
+-# required assets (code, image, tokenizer, blend files, etc.). On OCI-HSG,
+-# "/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report"
+-# is one such path.
+-ROOT_DIR=""
+-REPO_DIR="${ROOT_DIR}/code"
++# Short DP1 dummy-data benchmark defaults for this cluster.
++ASSET_ROOT="${ASSET_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report}"
++ROOT_DIR="${ROOT_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs}"
++REPO_DIR="${REPO_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/Megatron-LM-EP}"
++TRAIN_ITERS="${TRAIN_ITERS:-50}"
++LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-10}"
+ # Run name; change this per experiment.
+-NAME="a3b_30b_moe_1t"
+-IMAGE_PATH="${ROOT_DIR}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh"
++NAME="a3b_30b_moe_1t_ladder_dp1_dummy"
++IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
+ 
+ DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
+ 
+@@ -43,14 +43,6 @@ mkdir -p ${CHECKPOINT_DIR}
+ mkdir -p ${DATACACHE_DIR}
+ mkdir -p ${TENSORBOARD_DIR}
+ 
+-
+-# Tokenizer model.
+-TOKENIZER_MODEL="${ROOT_DIR}/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
+-
+-# Data blend.
+-BLEND_PATH="${ROOT_DIR}/blend_files/1t_singlephase.json"
+-
+-
+ options=" \
+     --use-mcore-models \
+     --hybrid-layer-pattern MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME/*E/*E \
+@@ -82,25 +74,23 @@ options=" \
+     --moe-router-enable-expert-bias \
+     --moe-router-dtype fp32 \
+     --moe-router-load-balancing-type seq_aux_loss \
+-    --moe-permute-fusion \
++    --moe-router-force-load-balancing \
+     --use-fused-weighted-squared-relu \
+     \
+-    --mtp-spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec \
+-    --mtp-use-repeated-layer \
+     --mtp-loss-scaling-factor 0.1 \
+     --calculate-per-token-loss \
+     \
+     --bf16 \
+     --seq-length 8192 \
+     --max-position-embeddings 8192 \
+-    --train-samples 122070313 \
++    --train-iters ${TRAIN_ITERS} \
+     --lr-decay-style WSD \
+-    --lr-decay-samples 122070313 \
+-    --lr-warmup-samples 1024000 \
++    --lr-decay-iters ${TRAIN_ITERS} \
++    --lr-warmup-iters 1 \
+     --lr-wsd-decay-style minus_sqrt \
+-    --lr-wsd-decay-samples 18310547 \
++    --lr-wsd-decay-iters ${LR_WSD_DECAY_ITERS} \
+     --micro-batch-size 1 \
+-    --global-batch-size 768 \
++    --global-batch-size 192 \
+     --lr 1.2e-3 \
+     --min-lr 1.2e-5 \
+     --weight-decay 0.1 \
+@@ -108,19 +98,16 @@ options=" \
+     --adam-beta1 0.9 \
+     --adam-beta2 0.95 \
+     --eval-interval 1000 \
+-    --eval-iters 14 \
++    --eval-iters 0 \
+     \
+     --cuda-graph-impl local \
+     --cuda-graph-modules mamba attn moe_router \
+     --te-rng-tracker \
+     --no-load-rng \
+     \
+-    --per-split-data-args-path ${BLEND_PATH} \
+-    --data-cache-path ${DATACACHE_DIR} \
+-    --tokenizer-type TikTokenizer \
+-    --tokenizer-model ${TOKENIZER_MODEL} \
+-    --tiktoken-pattern v2 \
+-    --no-mmap-bin-files \
++    --mock-data \
++    --tokenizer-type NullTokenizer \
++    --vocab-size 131072 \
+     --num-workers 1 \
+     --no-create-attention-mask-in-dataloader \
+     \
+@@ -136,19 +123,8 @@ options=" \
+     --ddp-num-buckets 8 \
+     --attention-backend flash \
+     \
+-    --ckpt-format torch_dist \
+-    --load ${CHECKPOINT_DIR} \
+-    --save ${CHECKPOINT_DIR} \
+-    --save-interval 500 \
+-    --save-retain-interval 2000 \
+-    --ckpt-fully-parallel-save \
+-    --ckpt-fully-parallel-load \
+-    --async-save \
+-    --use-persistent-ckpt-worker \
+-    --ckpt-assume-constant-structure \
+-    \
+-    --log-interval 100 \
+-    --log-memory-interval 1000 \
++    --log-interval 1 \
++    --log-memory-interval 50 \
+     --log-params-norm \
+     --log-num-zeros-in-grad \
+     --log-throughput \
+@@ -162,7 +138,7 @@ options=" \
+     --manual-gc \
+     --manual-gc-interval 10 \
+     --distributed-timeout-minutes 10 \
+-    --exit-duration-in-mins 235 \
++    --exit-duration-in-mins 55 \
+     --disable-gloo-process-groups \
+     --disable-straggler-on-startup \
+     --straggler-minmax-count 16 "
+diff --git a/examples/training_scripts/scaling_ladder/a500m_2b_moe_140b.sh b/examples/training_scripts/scaling_ladder/a500m_2b_moe_140b.sh
+index 305f1a2f8..b238fb2d4 100755
+--- a/examples/training_scripts/scaling_ladder/a500m_2b_moe_140b.sh
++++ b/examples/training_scripts/scaling_ladder/a500m_2b_moe_140b.sh
+@@ -1,17 +1,17 @@
+ #!/bin/bash
+ 
+ #SBATCH -p batch
+-#SBATCH --account=nemotron_sw_pre
+-#SBATCH --nodes=32
++#SBATCH --account=coreai_comparch_sysarch
++#SBATCH --nodes=2
+ #SBATCH --exclusive
+-#SBATCH -t 4:00:00
++#SBATCH -t 1:00:00
+ #SBATCH --mem=0
+ # GB200/GB300 have 4 GPUs/node; set --ntasks-per-node=4, --gpus-per-node=4, and
+ # add --segment=4 (or --segment=16 for 16-node segments) on those platforms.
+-#SBATCH --ntasks-per-node=8
+-#SBATCH --gpus-per-node=8
++#SBATCH --ntasks-per-node=4
++#SBATCH --gpus-per-node=4
+ #SBATCH --dependency=singleton
+-#SBATCH --job-name=a500m_2b_moe_140b
++#SBATCH --job-name=a500m_2b_moe_140b_dp1_dummy
+ 
+ export CUDA_DEVICE_MAX_CONNECTIONS=1
+ export NVTE_FWD_LAYERNORM_SM_MARGIN=16
+@@ -20,15 +20,15 @@ export NVTE_FUSED_ATTN=0  # Disable cuDNN fused attention.
+ export TORCHINDUCTOR_WORKER_START=fork
+ export TRITON_CACHE_DIR="/tmp/triton_cache/"
+ 
+-# Set this to a path you have write permission on; it must already contain all
+-# required assets (code, image, tokenizer, blend files, etc.). On OCI-HSG,
+-# "/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report"
+-# is one such path.
+-ROOT_DIR=""
+-REPO_DIR="${ROOT_DIR}/code"
++# Short DP1 dummy-data benchmark defaults for this cluster.
++ASSET_ROOT="${ASSET_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report}"
++ROOT_DIR="${ROOT_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs}"
++REPO_DIR="${REPO_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/Megatron-LM-EP}"
++TRAIN_ITERS="${TRAIN_ITERS:-50}"
++LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-10}"
+ # Run name; change this per experiment.
+-NAME="a500m_2b_moe_140b"
+-IMAGE_PATH="${ROOT_DIR}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh"
++NAME="a500m_2b_moe_140b_dp1_dummy"
++IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
+ 
+ DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
+ 
+@@ -43,14 +43,6 @@ mkdir -p ${CHECKPOINT_DIR}
+ mkdir -p ${DATACACHE_DIR}
+ mkdir -p ${TENSORBOARD_DIR}
+ 
+-
+-# Tokenizer model.
+-TOKENIZER_MODEL="${ROOT_DIR}/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
+-
+-# Data blend.
+-BLEND_PATH="${ROOT_DIR}/blend_files/1t_singlephase.json"
+-
+-
+ options=" \
+     --use-mcore-models \
+     --hybrid-layer-pattern MEMEM*EMEMEM*EMEMEM*EMEMEME \
+@@ -82,20 +74,21 @@ options=" \
+     --moe-router-enable-expert-bias \
+     --moe-router-dtype fp32 \
+     --moe-router-load-balancing-type seq_aux_loss \
++    --moe-router-force-load-balancing \
+     --moe-permute-fusion \
+     --use-fused-weighted-squared-relu \
+     \
+     --bf16 \
+     --seq-length 8192 \
+     --max-position-embeddings 8192 \
+-    --train-samples 17089844 \
++    --train-iters ${TRAIN_ITERS} \
+     --lr-decay-style WSD \
+-    --lr-decay-samples 17089844 \
+-    --lr-warmup-samples 1024000 \
++    --lr-decay-iters ${TRAIN_ITERS} \
++    --lr-warmup-iters 1 \
+     --lr-wsd-decay-style minus_sqrt \
+-    --lr-wsd-decay-samples 2563477 \
++    --lr-wsd-decay-iters ${LR_WSD_DECAY_ITERS} \
+     --micro-batch-size 1 \
+-    --global-batch-size 768 \
++    --global-batch-size 24 \
+     --lr 2.0e-3 \
+     --min-lr 2.0e-5 \
+     --weight-decay 0.1 \
+@@ -103,19 +96,16 @@ options=" \
+     --adam-beta1 0.9 \
+     --adam-beta2 0.95 \
+     --eval-interval 1000 \
+-    --eval-iters 14 \
++    --eval-iters 0 \
+     \
+     --cuda-graph-impl local \
+     --cuda-graph-modules mamba attn moe_router \
+     --te-rng-tracker \
+     --no-load-rng \
+     \
+-    --per-split-data-args-path ${BLEND_PATH} \
+-    --data-cache-path ${DATACACHE_DIR} \
+-    --tokenizer-type TikTokenizer \
+-    --tokenizer-model ${TOKENIZER_MODEL} \
+-    --tiktoken-pattern v2 \
+-    --no-mmap-bin-files \
++    --mock-data \
++    --tokenizer-type NullTokenizer \
++    --vocab-size 131072 \
+     --num-workers 1 \
+     --no-create-attention-mask-in-dataloader \
+     \
+@@ -131,19 +121,8 @@ options=" \
+     --ddp-num-buckets 8 \
+     --attention-backend flash \
+     \
+-    --ckpt-format torch_dist \
+-    --load ${CHECKPOINT_DIR} \
+-    --save ${CHECKPOINT_DIR} \
+-    --save-interval 500 \
+-    --save-retain-interval 2000 \
+-    --ckpt-fully-parallel-save \
+-    --ckpt-fully-parallel-load \
+-    --async-save \
+-    --use-persistent-ckpt-worker \
+-    --ckpt-assume-constant-structure \
+-    \
+-    --log-interval 100 \
+-    --log-memory-interval 1000 \
++    --log-interval 1 \
++    --log-memory-interval 50 \
+     --log-params-norm \
+     --log-num-zeros-in-grad \
+     --log-throughput \
+@@ -157,7 +136,7 @@ options=" \
+     --manual-gc \
+     --manual-gc-interval 10 \
+     --distributed-timeout-minutes 10 \
+-    --exit-duration-in-mins 235 \
++    --exit-duration-in-mins 55 \
+     --disable-gloo-process-groups \
+     --disable-straggler-on-startup \
+     --straggler-minmax-count 16 "
+diff --git a/examples/training_scripts/scaling_ladder/a770m_4b_moe_215b.sh b/examples/training_scripts/scaling_ladder/a770m_4b_moe_215b.sh
+index 2e52c2e45..c3531bfa8 100755
+--- a/examples/training_scripts/scaling_ladder/a770m_4b_moe_215b.sh
++++ b/examples/training_scripts/scaling_ladder/a770m_4b_moe_215b.sh
+@@ -1,17 +1,17 @@
+ #!/bin/bash
+ 
+ #SBATCH -p batch
+-#SBATCH --account=nemotron_sw_pre
+-#SBATCH --nodes=32
++#SBATCH --account=coreai_comparch_sysarch
++#SBATCH --nodes=2
+ #SBATCH --exclusive
+-#SBATCH -t 4:00:00
++#SBATCH -t 1:00:00
+ #SBATCH --mem=0
+ # GB200/GB300 have 4 GPUs/node; set --ntasks-per-node=4, --gpus-per-node=4, and
+ # add --segment=4 (or --segment=16 for 16-node segments) on those platforms.
+-#SBATCH --ntasks-per-node=8
+-#SBATCH --gpus-per-node=8
++#SBATCH --ntasks-per-node=4
++#SBATCH --gpus-per-node=4
+ #SBATCH --dependency=singleton
+-#SBATCH --job-name=a770m_4b_moe_215b
++#SBATCH --job-name=a770m_4b_moe_215b_dp1_dummy
+ 
+ export CUDA_DEVICE_MAX_CONNECTIONS=1
+ export NVTE_FWD_LAYERNORM_SM_MARGIN=16
+@@ -20,15 +20,15 @@ export NVTE_FUSED_ATTN=0  # Disable cuDNN fused attention.
+ export TORCHINDUCTOR_WORKER_START=fork
+ export TRITON_CACHE_DIR="/tmp/triton_cache/"
+ 
+-# Set this to a path you have write permission on; it must already contain all
+-# required assets (code, image, tokenizer, blend files, etc.). On OCI-HSG,
+-# "/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report"
+-# is one such path.
+-ROOT_DIR=""
+-REPO_DIR="${ROOT_DIR}/code"
++# Short DP1 dummy-data benchmark defaults for this cluster.
++ASSET_ROOT="${ASSET_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report}"
++ROOT_DIR="${ROOT_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs}"
++REPO_DIR="${REPO_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/Megatron-LM-EP}"
++TRAIN_ITERS="${TRAIN_ITERS:-50}"
++LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-10}"
+ # Run name; change this per experiment.
+-NAME="a770m_4b_moe_215b"
+-IMAGE_PATH="${ROOT_DIR}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh"
++NAME="a770m_4b_moe_215b_dp1_dummy"
++IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
+ 
+ DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
+ 
+@@ -43,14 +43,6 @@ mkdir -p ${CHECKPOINT_DIR}
+ mkdir -p ${DATACACHE_DIR}
+ mkdir -p ${TENSORBOARD_DIR}
+ 
+-
+-# Tokenizer model.
+-TOKENIZER_MODEL="${ROOT_DIR}/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
+-
+-# Data blend.
+-BLEND_PATH="${ROOT_DIR}/blend_files/1t_singlephase.json"
+-
+-
+ options=" \
+     --use-mcore-models \
+     --hybrid-layer-pattern MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEME \
+@@ -82,20 +74,21 @@ options=" \
+     --moe-router-enable-expert-bias \
+     --moe-router-dtype fp32 \
+     --moe-router-load-balancing-type seq_aux_loss \
++    --moe-router-force-load-balancing \
+     --moe-permute-fusion \
+     --use-fused-weighted-squared-relu \
+     \
+     --bf16 \
+     --seq-length 8192 \
+     --max-position-embeddings 8192 \
+-    --train-samples 26245118 \
++    --train-iters ${TRAIN_ITERS} \
+     --lr-decay-style WSD \
+-    --lr-decay-samples 26245118 \
+-    --lr-warmup-samples 1024000 \
++    --lr-decay-iters ${TRAIN_ITERS} \
++    --lr-warmup-iters 1 \
+     --lr-wsd-decay-style minus_sqrt \
+-    --lr-wsd-decay-samples 3936768 \
++    --lr-wsd-decay-iters ${LR_WSD_DECAY_ITERS} \
+     --micro-batch-size 1 \
+-    --global-batch-size 768 \
++    --global-batch-size 24 \
+     --lr 1.8e-3 \
+     --min-lr 1.8e-5 \
+     --weight-decay 0.1 \
+@@ -103,19 +96,16 @@ options=" \
+     --adam-beta1 0.9 \
+     --adam-beta2 0.95 \
+     --eval-interval 1000 \
+-    --eval-iters 14 \
++    --eval-iters 0 \
+     \
+     --cuda-graph-impl local \
+     --cuda-graph-modules mamba attn moe_router \
+     --te-rng-tracker \
+     --no-load-rng \
+     \
+-    --per-split-data-args-path ${BLEND_PATH} \
+-    --data-cache-path ${DATACACHE_DIR} \
+-    --tokenizer-type TikTokenizer \
+-    --tokenizer-model ${TOKENIZER_MODEL} \
+-    --tiktoken-pattern v2 \
+-    --no-mmap-bin-files \
++    --mock-data \
++    --tokenizer-type NullTokenizer \
++    --vocab-size 131072 \
+     --num-workers 1 \
+     --no-create-attention-mask-in-dataloader \
+     \
+@@ -131,19 +121,8 @@ options=" \
+     --ddp-num-buckets 8 \
+     --attention-backend flash \
+     \
+-    --ckpt-format torch_dist \
+-    --load ${CHECKPOINT_DIR} \
+-    --save ${CHECKPOINT_DIR} \
+-    --save-interval 500 \
+-    --save-retain-interval 2000 \
+-    --ckpt-fully-parallel-save \
+-    --ckpt-fully-parallel-load \
+-    --async-save \
+-    --use-persistent-ckpt-worker \
+-    --ckpt-assume-constant-structure \
+-    \
+-    --log-interval 100 \
+-    --log-memory-interval 1000 \
++    --log-interval 1 \
++    --log-memory-interval 50 \
+     --log-params-norm \
+     --log-num-zeros-in-grad \
+     --log-throughput \
+@@ -157,7 +136,7 @@ options=" \
+     --manual-gc \
+     --manual-gc-interval 10 \
+     --distributed-timeout-minutes 10 \
+-    --exit-duration-in-mins 235 \
++    --exit-duration-in-mins 55 \
+     --disable-gloo-process-groups \
+     --disable-straggler-on-startup \
+     --straggler-minmax-count 16 "
+diff --git a/megatron/core/dist_checkpointing/strategies/nvrx.py b/megatron/core/dist_checkpointing/strategies/nvrx.py
+index e4b1c1a9a..8986fb611 100644
+--- a/megatron/core/dist_checkpointing/strategies/nvrx.py
++++ b/megatron/core/dist_checkpointing/strategies/nvrx.py
+@@ -41,9 +41,8 @@ def has_nvrx_async_support() -> bool:
+         getattr(state_dict_saver, "save_state_dict_async_finalize", None),
+         getattr(state_dict_saver, "save_state_dict_async_plan", None),
+     )
+-    assert (
+-        is_nvrx_min_version()
+-    ), f"Minimum required nvidia-resiliency-ext package version is {NVRX_MIN_VERSION}."
++    if not is_nvrx_min_version():
++        return False
+ 
+     return all(symbol is not None for symbol in required_symbols) and hasattr(
+         filesystem_async, "_results_queue"
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+index 642e471a4..0acba76f1 100644
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -129,7 +129,7 @@ try:
+     from modelopt.torch.distill.plugins.megatron import get_tensor_shapes_adjust_fn_for_distillation
+ 
+     has_nvidia_modelopt = True
+-except ImportError:
++except Exception:
+     has_nvidia_modelopt = False
+ 
+ from megatron.core import mpu, nccl_allocator, tensor_parallel
+@@ -3282,7 +3282,7 @@ def train(
+         forward_backward_func = FullCudaGraphWrapper(
+             forward_backward_func,
+             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+-            use_single_mempool=args.cuda_graph_use_single_mempool,
++            use_single_mempool=getattr(args, "cuda_graph_use_single_mempool", False),
+         )
+     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
+     if args.moe_expert_rank_capacity_factor is not None:
+@@ -3298,7 +3298,7 @@ def train(
+         optimizer.step = OptimizerCudaGraphWrapper(
+             optimizer.step,
+             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+-            use_single_mempool=args.cuda_graph_use_single_mempool,
++            use_single_mempool=getattr(args, "cuda_graph_use_single_mempool", False),
+         )
+ 
+     def get_e2e_base_metrics():
+@@ -3847,7 +3847,7 @@ def evaluate(
+         forward_backward_func = FullCudaGraphWrapper(
+             forward_backward_func,
+             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+-            use_single_mempool=args.cuda_graph_use_single_mempool,
++            use_single_mempool=getattr(args, "cuda_graph_use_single_mempool", False),
+         )
+     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
+     if args.moe_expert_rank_capacity_factor is not None:
+diff --git a/pretrain_gpt.py b/pretrain_gpt.py
+index 1c2ede9fa..e72a8a96d 100644
+--- a/pretrain_gpt.py
++++ b/pretrain_gpt.py
+@@ -67,7 +67,7 @@ try:
+     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
+ 
+     has_nvidia_modelopt = True
+-except ImportError:
++except Exception:
+     has_nvidia_modelopt = False
+ 
+ stimer = StragglerDetector()
+diff --git a/pretrain_hybrid.py b/pretrain_hybrid.py
+index fe4df14cd..ce303349c 100644
+--- a/pretrain_hybrid.py
++++ b/pretrain_hybrid.py
+@@ -66,7 +66,7 @@ try:
+     from megatron.post_training.arguments import add_modelopt_args
+     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
+     has_nvidia_modelopt = True
+-except ImportError:
++except Exception:
+     has_nvidia_modelopt = False
+ 
+ stimer = StragglerDetector()

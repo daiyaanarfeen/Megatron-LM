@@ -1,17 +1,17 @@
 #!/bin/bash
 
 #SBATCH -p batch
-#SBATCH --account=nemotron_sw_pre
-#SBATCH --nodes=768
+#SBATCH --account=coreai_comparch_sysarch
+#SBATCH --nodes=32
 #SBATCH --exclusive
-#SBATCH -t 4:00:00
+#SBATCH -t 1:00:00
 #SBATCH --mem=0
 # Targets GB200/GB300 (4 GPUs/node); H100 is impractical at this scale.
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
 #SBATCH --segment=16
 #SBATCH --dependency=singleton
-#SBATCH --job-name=super
+#SBATCH --job-name=nemotron3_super_dp1_dummy
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_FWD_LAYERNORM_SM_MARGIN=16
@@ -19,16 +19,17 @@ export NVTE_BWD_LAYERNORM_SM_MARGIN=16
 export NVTE_FUSED_ATTN=0  # Disable cuDNN fused attention.
 export TORCHINDUCTOR_WORKER_START=fork
 export TRITON_CACHE_DIR="/tmp/triton_cache/"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Set this to a path you have write permission on; it must already contain all
-# required assets (code, image, tokenizer, blend files, etc.). On OCI-HSG,
-# "/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report"
-# is one such path.
-ROOT_DIR=""
-REPO_DIR="${ROOT_DIR}/code"
+# Short DP1 dummy-data benchmark defaults for this cluster.
+ASSET_ROOT="${ASSET_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report}"
+ROOT_DIR="${ROOT_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs}"
+REPO_DIR="${REPO_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/Megatron-LM-EP}"
+TRAIN_ITERS="${TRAIN_ITERS:-50}"
+LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-10}"
 # Run name; change this per experiment.
-NAME="super"
-IMAGE_PATH="${ROOT_DIR}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh"
+NAME="nemotron3_super_dp1_dummy"
+IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
 
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 
@@ -84,7 +85,6 @@ options=" \
     --moe-shared-expert-intermediate-size 5376 \
     --moe-latent-size 1024 \
     --moe-token-dispatcher-type alltoall \
-    --moe-shared-expert-compute-before-router \
     --moe-router-score-function sigmoid \
     --moe-grouped-gemm \
     --moe-aux-loss-coeff 1e-4 \
@@ -92,12 +92,12 @@ options=" \
     --moe-router-enable-expert-bias \
     --moe-router-dtype fp32 \
     --moe-router-load-balancing-type seq_aux_loss \
+    --moe-router-force-load-balancing \
     --moe-permute-fusion \
     --use-fused-weighted-squared-relu \
     --cross-entropy-loss-fusion \
     --cross-entropy-fusion-impl native \
     \
-    --mtp-spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec \
     --mtp-loss-scaling-factor 0.3 \
     --calculate-per-token-loss \
     \
@@ -111,14 +111,14 @@ options=" \
     --bf16 \
     --seq-length 8192 \
     --max-position-embeddings 8192 \
-    --train-samples 3051757813 \
+    --train-iters ${TRAIN_ITERS} \
     --lr-decay-style WSD \
-    --lr-decay-samples 3048706055 \
-    --lr-warmup-samples 24414063 \
+    --lr-decay-iters ${TRAIN_ITERS} \
+    --lr-warmup-iters 1 \
     --lr-wsd-decay-style minus_sqrt \
-    --lr-wsd-decay-samples 610351563 \
+    --lr-wsd-decay-iters ${LR_WSD_DECAY_ITERS} \
     --micro-batch-size 1 \
-    --global-batch-size 3072 \
+    --global-batch-size 128 \
     --lr 4.5e-4 \
     --min-lr 4.5e-6 \
     --weight-decay 0.1 \
@@ -126,19 +126,16 @@ options=" \
     --adam-beta1 0.9 \
     --adam-beta2 0.95 \
     --eval-interval 1000 \
-    --eval-iters 14 \
-    --override-opt_param-scheduler \
+    --eval-iters 0 \
     \
     --cuda-graph-impl local \
     --cuda-graph-modules mamba attn moe_router \
     --te-rng-tracker \
+    --no-load-rng \
     \
-    --per-split-data-args-path ${BLEND_PATH} \
-    --data-cache-path ${DATACACHE_DIR} \
-    --tokenizer-type TikTokenizer \
-    --tokenizer-model ${TOKENIZER_MODEL} \
-    --tiktoken-pattern v2 \
-    --no-mmap-bin-files \
+    --mock-data \
+    --tokenizer-type NullTokenizer \
+    --vocab-size 131072 \
     --num-workers 1 \
     --no-create-attention-mask-in-dataloader \
     \
@@ -155,20 +152,8 @@ options=" \
     --ddp-pad-buckets-for-high-nccl-busbw \
     --attention-backend flash \
     \
-    --ckpt-format torch_dist \
-    --load ${CHECKPOINT_DIR} \
-    --save ${CHECKPOINT_DIR} \
-    --save-interval 250 \
-    --save-retain-interval 1000 \
-    --ckpt-fully-parallel-save \
-    --ckpt-fully-parallel-load \
-    --async-save \
-    --use-persistent-ckpt-worker \
-    --ckpt-assume-constant-structure \
-    --result-rejected-tracker-filename ${CHECKPOINT_DIR}/result_rejected_tracker.txt \
-    \
-    --log-interval 100 \
-    --log-memory-interval 500 \
+    --log-interval 1 \
+    --log-memory-interval 50 \
     --log-params-norm \
     --log-num-zeros-in-grad \
     --log-throughput \
@@ -180,8 +165,9 @@ options=" \
     --check-weight-hash-across-dp-replicas-interval 20000 \
     \
     --manual-gc \
+    --manual-gc-interval 10 \
     --distributed-timeout-minutes 10 \
-    --exit-duration-in-mins 5750 \
+    --exit-duration-in-mins 55 \
     --disable-gloo-process-groups \
     --disable-straggler-on-startup \
     --straggler-minmax-count 16 "

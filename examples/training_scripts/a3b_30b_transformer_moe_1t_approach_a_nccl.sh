@@ -2,7 +2,7 @@
 
 #SBATCH -p batch
 #SBATCH --account=coreai_comparch_sysarch
-#SBATCH --nodes=2
+#SBATCH --nodes=16
 #SBATCH --exclusive
 #SBATCH -t 1:00:00
 #SBATCH --mem=0
@@ -11,7 +11,7 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
 #SBATCH --dependency=singleton
-#SBATCH --job-name=a315m_1b_moe_88b_dp1_dummy
+#SBATCH --job-name=a3b_30b_transformer_moe_1t_dp1_dummy_approach_a_nccl
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_FWD_LAYERNORM_SM_MARGIN=16
@@ -19,16 +19,19 @@ export NVTE_BWD_LAYERNORM_SM_MARGIN=16
 export NVTE_FUSED_ATTN=0  # Disable cuDNN fused attention.
 export TORCHINDUCTOR_WORKER_START=fork
 export TRITON_CACHE_DIR="/tmp/triton_cache/"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export MEGATRON_NONUNIFORM_EP_NCCL_MAX_GATHER_BYTES="${MEGATRON_NONUNIFORM_EP_NCCL_MAX_GATHER_BYTES:-1073741824}"
 
 # Short DP1 dummy-data benchmark defaults for this cluster.
 ASSET_ROOT="${ASSET_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report}"
 ROOT_DIR="${ROOT_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs}"
 REPO_DIR="${REPO_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/Megatron-LM-EP}"
-TRAIN_ITERS="${TRAIN_ITERS:-50}"
+TRAIN_ITERS="${TRAIN_ITERS:-10}"
 LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-10}"
 # Run name; change this per experiment.
-NAME="a315m_1b_moe_88b_dp1_dummy"
+NAME="a3b_30b_transformer_moe_1t_dp1_dummy_approach_a_nccl"
 IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
+CONTAINER_NAME="${CONTAINER_NAME:-nvidia-pytorch-25-06-deps-mamba}"
 
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 
@@ -45,18 +48,17 @@ mkdir -p ${TENSORBOARD_DIR}
 
 options=" \
     --use-mcore-models \
-    --hybrid-layer-pattern MEMEM*EMEME*EMEM*EMEME \
+    --hybrid-layer-pattern *E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E*E \
     --spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec \
-    --hidden-size 768 \
-    --num-attention-heads 6 \
+    --hidden-size 2688 \
+    --num-attention-heads 32 \
     --group-query-attention \
     --num-query-groups 2 \
-    --mamba-num-heads 24 \
-    --ffn-hidden-size 512 \
+    --ffn-hidden-size 1856 \
     --kv-channels 128 \
     --squared-relu \
     --untie-embeddings-and-output-weights \
-    --init-method-std 0.0325 \
+    --init-method-std 0.0173 \
     --position-embedding-type none \
     --attention-dropout 0.0 \
     --hidden-dropout 0.0 \
@@ -65,7 +67,7 @@ options=" \
     \
     --num-experts 128 \
     --moe-router-topk 6 \
-    --moe-shared-expert-intermediate-size 960 \
+    --moe-shared-expert-intermediate-size 3712 \
     --moe-token-dispatcher-type alltoall \
     --moe-router-score-function sigmoid \
     --moe-grouped-gemm \
@@ -87,10 +89,10 @@ options=" \
     --lr-warmup-iters 1 \
     --lr-wsd-decay-style minus_sqrt \
     --lr-wsd-decay-iters ${LR_WSD_DECAY_ITERS} \
-    --micro-batch-size 4 \
-    --global-batch-size 96 \
-    --lr 2.2e-3 \
-    --min-lr 2.2e-5 \
+    --micro-batch-size 1 \
+    --global-batch-size 32 \
+    --lr 1.2e-3 \
+    --min-lr 1.2e-5 \
     --weight-decay 0.1 \
     --clip-grad 1.0 \
     --adam-beta1 0.9 \
@@ -98,8 +100,7 @@ options=" \
     --eval-interval 1000 \
     --eval-iters 0 \
     \
-    --cuda-graph-impl local \
-    --cuda-graph-modules mamba attn moe_router \
+    --cuda-graph-impl none \
     --te-rng-tracker \
     --no-load-rng \
     \
@@ -109,17 +110,20 @@ options=" \
     --num-workers 1 \
     --no-create-attention-mask-in-dataloader \
     \
-    --use-distributed-optimizer \
     --overlap-grad-reduce \
-    --overlap-param-gather \
-    --tensor-model-parallel-size 1 \
+    --tensor-model-parallel-size 2 \
     --sequence-parallel \
-    --expert-model-parallel-size 8 \
+    --expert-model-parallel-size 32 \
     --expert-tensor-parallel-size 1 \
     --pipeline-model-parallel-size 1 \
     --high-priority-stream-groups ep \
     --ddp-num-buckets 8 \
     --attention-backend flash \
+    \
+    --nonuniform-mode ep \
+    --nonuniform-ep-ddp-approach nccl \
+    --nonuniform-skip-optimizer-step \
+    --nonuniform-ep-num-tp-cp-per-replica 16 16 \
     \
     --log-interval 1 \
     --log-memory-interval 50 \
@@ -147,6 +151,7 @@ run_cmd="python -u ${REPO_DIR}/pretrain_hybrid.py ${options}"
 # (e.g. "/scratch:/scratch" on clusters where assets live under /scratch).
 srun -l \
     --container-image "${IMAGE_PATH}" \
+    --container-name "${CONTAINER_NAME}" \
     --container-mounts "/lustre:/lustre" \
     --no-container-mount-home \
     --output="${LOGS_DIR}/%x_%j_${DATETIME}.log" \
