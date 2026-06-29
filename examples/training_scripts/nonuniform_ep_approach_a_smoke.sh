@@ -31,7 +31,7 @@ SEQ_LENGTH="${SEQ_LENGTH:-128}"
 NUM_EXPERTS="${NUM_EXPERTS:-6}"
 NAME="${NAME:-nonuniform_ep_approach_a_smoke}"
 IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
-CONTAINER_NAME="${CONTAINER_NAME:-nvidia-pytorch-25-06-deps-mamba}"
+CONTAINER_NAME="${CONTAINER_NAME-nvidia-pytorch-25-06-deps-mamba}"
 MASTER_PORT="${MASTER_PORT:-29640}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 NNODES="${NNODES:-${SLURM_NNODES:-1}}"
@@ -130,6 +130,11 @@ if [[ "${RUN_DIRECT}" == "1" ]]; then
     exit 0
 fi
 
+container_name_options=()
+if [[ -n "${CONTAINER_NAME}" ]]; then
+    container_name_options=(--container-name "${CONTAINER_NAME}")
+fi
+
 srun -l \
     --nodes="${NNODES}" \
     --ntasks="${NNODES}" \
@@ -137,7 +142,7 @@ srun -l \
     --gpus-per-node="${GPUS_PER_NODE}" \
     --mpi=none \
     --container-image "${IMAGE_PATH}" \
-    --container-name "${CONTAINER_NAME}" \
+    "${container_name_options[@]}" \
     --container-mounts "/lustre:/lustre" \
     --no-container-mount-home \
     --output="${LOGS_DIR}/%x_%j_${DATETIME}.log" \

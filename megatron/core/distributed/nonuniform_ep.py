@@ -238,6 +238,23 @@ def _copy_flat_into_bucket(bucket, slices: List[Tuple[int, int]], flat: torch.Te
         offset = next_offset
 
 
+def _source_ep_ranks_for_owner(
+    expert_placement: List[List[int]],
+    owner_ep_rank: int,
+    num_experts: int,
+    min_ep_size: int,
+) -> List[int]:
+    """Return EP ranks that physically hold an owner's expert range."""
+    experts_per_owner = num_experts // min_ep_size
+    owner_first_expert = owner_ep_rank * experts_per_owner
+    owner_last_expert = owner_first_expert + experts_per_owner
+    return [
+        source_ep_rank
+        for source_ep_rank, expert_ids in enumerate(expert_placement)
+        if any(owner_first_expert <= expert_id < owner_last_expert for expert_id in expert_ids)
+    ]
+
+
 def _runtime_config_from_parallel_state() -> dict:
     runtime_config = get_nonuniform_ep_runtime_config()
     if runtime_config is not None:
@@ -258,6 +275,8 @@ def _runtime_config_from_parallel_state() -> dict:
         'dp_size': 1,
         'ep_group': ep_group if ep_group is not None else dist.group.WORLD,
         'nep_transfer_group': ep_group if ep_group is not None else dist.group.WORLD,
+        'nep_owner_transfer_groups': {},
+        'nep_owner_transfer_group_ranks': {},
         'edp_group': None,
         'ep_rank': ep_rank,
         'local_expert_indices': None,
@@ -453,10 +472,38 @@ def initialize_nonuniform_ep_process_groups(
             _set_parallel_state_attr("_TENSOR_AND_CONTEXT_PARALLEL_GROUP", group)
 
     # Expert groups.
+    min_ep_size = generator.min_k * tp * cp // etp
     nep_transfer_group = None
+    nep_owner_transfer_groups = {}
+    nep_owner_transfer_group_ranks = {}
     for ranks in generator.get_ranks('ep'):
         group = _create_group(ranks, timeout, nccl_comm_cfgs, "ep")
         transfer_group = _create_group(ranks, timeout, nccl_comm_cfgs, "nep_grad_transfer")
+        group_expert_placement, _ = compute_nonuniform_ep_expert_placement(
+            num_moe_experts,
+            len(ranks),
+            min_ep_size,
+        )
+        for owner_ep_rank in range(min_ep_size):
+            source_ep_ranks = _source_ep_ranks_for_owner(
+                group_expert_placement,
+                owner_ep_rank,
+                num_moe_experts,
+                min_ep_size,
+            )
+            source_global_ranks = [ranks[source_ep_rank] for source_ep_rank in source_ep_ranks]
+            owner_transfer_group = None
+            if len(source_global_ranks) > 1:
+                owner_transfer_group = _create_group(
+                    source_global_ranks,
+                    timeout,
+                    nccl_comm_cfgs,
+                    "nep_owner_transfer",
+                )
+            if rank in ranks:
+                nep_owner_transfer_group_ranks[owner_ep_rank] = source_ep_ranks
+                if rank in source_global_ranks:
+                    nep_owner_transfer_groups[owner_ep_rank] = owner_transfer_group
         if rank in ranks:
             _set_parallel_state_attr("_EXPERT_MODEL_PARALLEL_GROUP", group)
             _set_parallel_state_attr("_EXPERT_MODEL_PARALLEL_RANKS", ranks)
@@ -509,7 +556,6 @@ def initialize_nonuniform_ep_process_groups(
     if local_ep_size is None:
         raise RuntimeError(f"Rank {rank} is not in any nonuniform EP replica")
 
-    min_ep_size = generator.min_k * tp * cp // etp
     ep_group = parallel_state.get_expert_model_parallel_group()
     ep_rank = ep_group.rank()
     expert_placement, expert_gather_map = compute_nonuniform_ep_expert_placement(
@@ -525,6 +571,8 @@ def initialize_nonuniform_ep_process_groups(
         'dp_size': sum(num_tp_cp_per_replica),
         'ep_group': ep_group,
         'nep_transfer_group': nep_transfer_group,
+        'nep_owner_transfer_groups': nep_owner_transfer_groups,
+        'nep_owner_transfer_group_ranks': nep_owner_transfer_group_ranks,
         'edp_group': parallel_state.get_expert_data_parallel_group(),
         'ep_rank': ep_rank,
         'is_edp_eligible': ep_rank < min_ep_size,
@@ -1176,19 +1224,30 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         }
         return self._nep_nccl_owner_layout
 
-    def _get_nep_nccl_transfer_group_info(self) -> tuple:
-        """Return the communicator used for NEP reshard all-to-alls."""
+    def _get_nep_nccl_transfer_group_info(self, owner_ep_rank: int) -> tuple:
+        """Return the owner-source communicator used for NEP reshard all-to-alls."""
         cfg = self._nep_runtime_config
-        transfer_group = cfg.get('nep_transfer_group') or cfg['ep_group']
+        source_ranks = self._nep_nccl_owner_source_ranks(owner_ep_rank)
+        ep_rank = cfg['ep_rank']
+        if ep_rank not in source_ranks:
+            return None, -1, len(source_ranks), source_ranks
+        if len(source_ranks) <= 1:
+            return None, 0, len(source_ranks), source_ranks
+
+        transfer_group = cfg.get('nep_owner_transfer_groups', {}).get(owner_ep_rank)
+        if transfer_group is None:
+            raise RuntimeError(
+                "Missing NEP owner transfer group for owner "
+                f"{owner_ep_rank} with source EP ranks {source_ranks}"
+            )
         transfer_rank = dist.get_rank(group=transfer_group)
         transfer_size = dist.get_world_size(group=transfer_group)
-        local_ep_size = cfg['local_ep_size']
-        if transfer_size != local_ep_size:
+        if transfer_size != len(source_ranks):
             raise RuntimeError(
-                "NEP transfer group size must match local EP size; got "
-                f"transfer_size={transfer_size}, local_ep_size={local_ep_size}"
+                "NEP owner transfer group size must match owner source count; got "
+                f"transfer_size={transfer_size}, source_ranks={source_ranks}"
             )
-        return transfer_group, transfer_rank, transfer_size
+        return transfer_group, transfer_rank, transfer_size, source_ranks
 
     def _nep_nccl_owner_entries(self, owner_ep_rank: int) -> List[dict]:
         """Return local expert-slot entries that contribute to an owner-layout chunk."""
@@ -1295,6 +1354,10 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
 
     def _nep_nccl_owner_source_ranks(self, owner_ep_rank: int) -> List[int]:
         """Return EP ranks that physically hold experts for an owner-layout chunk."""
+        source_ranks_by_owner = self._nep_runtime_config.get('nep_owner_transfer_group_ranks')
+        if source_ranks_by_owner is not None and owner_ep_rank in source_ranks_by_owner:
+            return list(source_ranks_by_owner[owner_ep_rank])
+
         placement = self._nep_runtime_config.get('expert_placement')
         if placement is None:
             return [owner_ep_rank]
@@ -1320,16 +1383,27 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
     ) -> None:
         """Reshard source-rank expert grads into one owner-layout chunk."""
         cfg = self._nep_runtime_config
-        transfer_group, ep_rank, local_ep_size = self._get_nep_nccl_transfer_group_info()
+        ep_rank = cfg['ep_rank']
         group_index = getattr(self, '_nep_nccl_group_index', -1)
         chunk_size = chunk_end - chunk_start
         source_ranks = self._nep_nccl_owner_source_ranks(owner_ep_rank)
-        remote_source_ranks = [rank for rank in source_ranks if rank != owner_ep_rank]
+        if owner_ep_rank not in source_ranks:
+            raise RuntimeError(
+                f"NEP owner {owner_ep_rank} is not in its source ranks {source_ranks}"
+            )
+        if ep_rank not in source_ranks:
+            return
 
-        if ep_rank in source_ranks:
-            self._pack_nep_nccl_owner_chunk(owner_ep_rank, chunk_start, chunk_end, chunk)
-        elif ep_rank == owner_ep_rank:
-            chunk.zero_()
+        remote_source_ranks = [rank for rank in source_ranks if rank != owner_ep_rank]
+        transfer_group, _, transfer_size, transfer_source_ranks = (
+            self._get_nep_nccl_transfer_group_info(owner_ep_rank)
+        )
+        owner_transfer_rank = transfer_source_ranks.index(owner_ep_rank)
+        remote_transfer_ranks = [
+            transfer_source_ranks.index(rank) for rank in remote_source_ranks
+        ]
+
+        self._pack_nep_nccl_owner_chunk(owner_ep_rank, chunk_start, chunk_end, chunk)
 
         if not remote_source_ranks:
             return
@@ -1343,17 +1417,17 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             chunk.device,
         )
 
-        input_split_sizes = [0] * local_ep_size
+        input_split_sizes = [0] * transfer_size
         if ep_rank in remote_source_ranks:
-            input_split_sizes[owner_ep_rank] = chunk_size
+            input_split_sizes[owner_transfer_rank] = chunk_size
             gather_input = chunk
         else:
             gather_input = empty
 
-        output_split_sizes = [0] * local_ep_size
+        output_split_sizes = [0] * transfer_size
         if ep_rank == owner_ep_rank:
-            for source_ep_rank in remote_source_ranks:
-                output_split_sizes[source_ep_rank] = chunk_size
+            for source_transfer_rank in remote_transfer_ranks:
+                output_split_sizes[source_transfer_rank] = chunk_size
             gather_output_numel = len(remote_source_ranks) * chunk_size
             gather_output = self._get_nep_nccl_cached_tensor(
                 cache,
@@ -1374,7 +1448,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         _nep_debug_print(
             "before ep_all_to_all_owner_gather "
             f"group={group_index} owner={owner_ep_rank} chunk={chunk_index} "
-            f"chunk_size={chunk_size} ep_rank={ep_rank} sources={source_ranks}"
+            f"chunk_size={chunk_size} ep_rank={ep_rank} sources={source_ranks} "
+            f"transfer_sources={transfer_source_ranks}"
         )
         work = dist.all_to_all_single(
             gather_output,
@@ -1412,14 +1487,28 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
     ) -> None:
         """Reshard one reduced owner-layout chunk back to physical source ranks."""
         cfg = self._nep_runtime_config
-        transfer_group, ep_rank, local_ep_size = self._get_nep_nccl_transfer_group_info()
+        ep_rank = cfg['ep_rank']
         group_index = getattr(self, '_nep_nccl_group_index', -1)
         chunk_size = chunk_end - chunk_start
         source_ranks = self._nep_nccl_owner_source_ranks(owner_ep_rank)
+        if owner_ep_rank not in source_ranks:
+            raise RuntimeError(
+                f"NEP owner {owner_ep_rank} is not in its source ranks {source_ranks}"
+            )
+        if ep_rank not in source_ranks:
+            return
+
         remote_source_ranks = [rank for rank in source_ranks if rank != owner_ep_rank]
+        transfer_group, _, transfer_size, transfer_source_ranks = (
+            self._get_nep_nccl_transfer_group_info(owner_ep_rank)
+        )
+        owner_transfer_rank = transfer_source_ranks.index(owner_ep_rank)
+        remote_transfer_ranks = [
+            transfer_source_ranks.index(rank) for rank in remote_source_ranks
+        ]
 
         if not remote_source_ranks:
-            if ep_rank == owner_ep_rank and ep_rank in source_ranks:
+            if ep_rank == owner_ep_rank:
                 self._copy_nep_nccl_owner_chunk_to_local_grads(
                     owner_ep_rank, chunk_start, chunk_end, chunk
                 )
@@ -1434,10 +1523,10 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             chunk.device,
         )
 
-        input_split_sizes = [0] * local_ep_size
+        input_split_sizes = [0] * transfer_size
         if ep_rank == owner_ep_rank:
-            for destination_ep_rank in remote_source_ranks:
-                input_split_sizes[destination_ep_rank] = chunk_size
+            for destination_transfer_rank in remote_transfer_ranks:
+                input_split_sizes[destination_transfer_rank] = chunk_size
             if len(remote_source_ranks) == 1:
                 scatter_input = chunk
             else:
@@ -1461,9 +1550,9 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         else:
             scatter_input = empty
 
-        output_split_sizes = [0] * local_ep_size
+        output_split_sizes = [0] * transfer_size
         if ep_rank in remote_source_ranks:
-            output_split_sizes[owner_ep_rank] = chunk_size
+            output_split_sizes[owner_transfer_rank] = chunk_size
             scatter_output = self._get_nep_nccl_cached_tensor(
                 cache,
                 (
@@ -1483,7 +1572,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         _nep_debug_print(
             "before ep_all_to_all_owner_scatter "
             f"group={group_index} owner={owner_ep_rank} chunk={chunk_index} "
-            f"chunk_size={chunk_size} ep_rank={ep_rank} destinations={source_ranks}"
+            f"chunk_size={chunk_size} ep_rank={ep_rank} destinations={source_ranks} "
+            f"transfer_sources={transfer_source_ranks}"
         )
         work = dist.all_to_all_single(
             scatter_output,
@@ -1500,7 +1590,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             if scatter_output.numel() > 0:
                 self._nep_nccl_async_tensors.append(scatter_output)
 
-        if ep_rank == owner_ep_rank and ep_rank in source_ranks:
+        if ep_rank == owner_ep_rank:
             self._copy_nep_nccl_owner_chunk_to_local_grads(
                 owner_ep_rank, chunk_start, chunk_end, chunk
             )
@@ -2003,6 +2093,49 @@ def _build_expert_bucket_specs(buffers, runtime_config, config, param_to_name):
     return specs
 
 
+def _build_expert_param_bucket_specs(buffers, runtime_config, config, param_to_name):
+    """Build one NCCL bucket spec per logical expert parameter slot."""
+    local_expert_indices = runtime_config.get('local_expert_indices')
+    local_expert_id_set = set(local_expert_indices) if local_expert_indices is not None else set()
+    specs = []
+
+    for buffer in buffers:
+        for source_bucket_index, bucket_params in _iter_buffer_bucket_params(buffer):
+            for param in bucket_params:
+                if param not in buffer.param_index_map:
+                    continue
+                name = param_to_name.get(param, "")
+                expert_id = _local_expert_id_from_name(
+                    name,
+                    config.expert_name_pattern,
+                    local_expert_indices,
+                )
+                if expert_id is None:
+                    continue
+
+                local_expert_id_set.add(expert_id)
+                start, end = buffer.param_index_map[param][:2]
+                specs.append(
+                    _ExpertBucketSpec(
+                        buffer=buffer,
+                        source_bucket_index=source_bucket_index,
+                        expert_id=expert_id,
+                        params=[param],
+                        start=start,
+                        end=end,
+                        slot_key=(
+                            _expert_slot_key_from_name(
+                                name,
+                                config.expert_name_pattern,
+                            ),
+                        ),
+                    )
+                )
+
+    runtime_config['_local_expert_id_set'] = local_expert_id_set
+    return specs
+
+
 def _build_synthetic_owner_bucket_specs(buffers, local_specs, runtime_config, config):
     """Build owner-side buckets for experts physically held by extra EP ranks."""
     placement = runtime_config.get('expert_placement')
@@ -2159,7 +2292,7 @@ def build_nonuniform_ep_nccl_bucket_groups(
 ) -> List[NonuniformEPNCCLParamAndGradBucketGroup]:
     """Build common-layout NCCL Approach-A bucket groups by expert parameter slot."""
     ep_group = runtime_config['ep_group']
-    specs = _build_expert_bucket_specs(
+    specs = _build_expert_param_bucket_specs(
         buffers,
         runtime_config,
         nonuniform_ep_config,
@@ -2175,23 +2308,8 @@ def build_nonuniform_ep_nccl_bucket_groups(
     for spec in specs:
         grouped_specs.setdefault(spec.slot_key, []).append(spec)
 
-    buffer_order = {buffer: index for index, buffer in enumerate(buffers)}
-
-    def backward_slot_order(item):
-        slot_key, slot_specs = item
-        return (
-            max(buffer_order.get(spec.buffer, 0) for spec in slot_specs),
-            max(spec.source_bucket_index for spec in slot_specs),
-            max(spec.end for spec in slot_specs),
-            slot_key,
-        )
-
     bucket_groups = []
-    # Backward produces gradients in reverse buffer/source-bucket order.  The
-    # ordered scheduler launches list entries monotonically, so put the
-    # backward-ready buckets first to allow overlap instead of waiting for the
-    # earliest-forward bucket.
-    ordered_grouped_specs = sorted(grouped_specs.items(), key=backward_slot_order, reverse=True)
+    ordered_grouped_specs = sorted(grouped_specs.items(), key=lambda item: item[0], reverse=True)
     for group_index, (slot_key, unordered_group_specs) in enumerate(ordered_grouped_specs):
         group_specs = sorted(unordered_group_specs, key=lambda spec: spec.expert_id)
         slot_numels = {spec.end - spec.start for spec in group_specs}
