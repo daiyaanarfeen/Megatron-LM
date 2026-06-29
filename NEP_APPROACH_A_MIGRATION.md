@@ -42,11 +42,11 @@
   - Run dir: `/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs/nonuniform_ep_smoke_nep_ep8_ep4_paramslots_h512_l2_s512_debug`
   - Result: completed 4/4 iterations. Debug lines showed matching `chunk_size=2097152` on healthy owner rank 0 and reduced owner rank 8.
 
-- Pending/running validation at the time of this note:
+- Passed 4-layer validation after per-parameter slot fix:
   - Job: `3645970` / `nep_ep8ep4_paramslots_l4`
   - Topology: `8 4`
   - Run dir: `/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs/nonuniform_ep_smoke_nep_ep8_ep4_paramslots_h512_l4_s512`
-  - Purpose: same 4-layer / 8-iteration shape as the previously failing smoke, without debug logging.
+  - Result: completed 8/8 iterations with exit code `0:0`. Steady-state iterations 3-8 averaged about `66.3 ms`.
 
 ## Benchmarks submitted
 
