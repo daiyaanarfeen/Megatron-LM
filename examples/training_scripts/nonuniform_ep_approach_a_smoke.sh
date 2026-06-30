@@ -11,7 +11,7 @@
 #SBATCH --dependency=singleton
 #SBATCH --job-name=nonuniform_ep_approach_a_smoke
 
-export CUDA_DEVICE_MAX_CONNECTIONS=1
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 export NVTE_FUSED_ATTN=0
 export TORCHINDUCTOR_WORKER_START=fork
 export TRITON_CACHE_DIR="/tmp/triton_cache/"
