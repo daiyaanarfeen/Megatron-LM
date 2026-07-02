@@ -8,12 +8,13 @@ benchmark modes.  With the non-distributed optimizer, synced gradients are prese
 that own the local parameters before the normal optimizer step runs.
 """
 
-from functools import partial
 import json
-from pathlib import Path
 import sys
+from functools import partial
+from pathlib import Path
 from typing import Dict, Optional
 
+import torch
 import torch.distributed as dist
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -46,6 +47,10 @@ _NTP_GROUPS_INITIALIZED = False
 _NTP_CONFIG_CACHE = {}
 _EP_CONFIG_CACHE = {}
 _ORIGINAL_INITIALIZE_MODEL_PARALLEL = parallel_state.initialize_model_parallel
+_ORIGINAL_DDP = training_module.DDP
+_ORIGINAL_GET_MEGATRON_OPTIMIZER = training_module.get_megatron_optimizer
+_ORIGINAL_GET_OPTIMIZER_PARAM_SCHEDULER = training_module.get_optimizer_param_scheduler
+_ORIGINAL_TRAIN_STEP = training_module.train_step
 
 
 def _load_json_arg(value: Optional[str], path: Optional[str], default=None):
@@ -293,7 +298,88 @@ def _ep_model_provider(builder, args, *provider_args, **kwargs):
     return gpt.model_provider(builder, *provider_args, **kwargs)
 
 
+def _no_op_optimizer_step_for_nonuniform_benchmark():
+    return True, None, None
+
+
+class _NonuniformBenchmarkNoOpOptimizer:
+    is_stub_optimizer = True
+    chained_optimizers = []
+
+    def __init__(self, args):
+        self.param_groups = [{'default_config': True, 'lr': args.lr}]
+
+    def zero_grad(self):
+        return None
+
+    def step(self):
+        return _no_op_optimizer_step_for_nonuniform_benchmark()
+
+    def scale_loss(self, loss):
+        return loss
+
+    def get_loss_scale(self):
+        device = (
+            torch.device('cuda', torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device('cpu')
+        )
+        return torch.tensor(1.0, device=device)
+
+    def reload_model_params(self):
+        return None
+
+    def state_dict(self):
+        return {}
+
+    def load_state_dict(self, state_dict):
+        return None
+
+
+class _NonuniformBenchmarkNoOpParamScheduler:
+    def step(self, increment):
+        return None
+
+    def state_dict(self):
+        return {}
+
+    def load_state_dict(self, state_dict):
+        return None
+
+
+def _get_no_op_optimizer_for_nonuniform_benchmark(*args, **kwargs):
+    return _NonuniformBenchmarkNoOpOptimizer(gpt.get_args())
+
+
+def _get_no_op_param_scheduler_for_nonuniform_benchmark(*args, **kwargs):
+    return _NonuniformBenchmarkNoOpParamScheduler()
+
+
+def _train_step_without_optimizer_step(*args, **kwargs):
+    optimizer = args[3] if len(args) > 3 else kwargs.get('optimizer')
+    if optimizer is None:
+        return _ORIGINAL_TRAIN_STEP(*args, **kwargs)
+
+    original_step = optimizer.step
+    optimizer.step = _no_op_optimizer_step_for_nonuniform_benchmark
+    try:
+        return _ORIGINAL_TRAIN_STEP(*args, **kwargs)
+    finally:
+        optimizer.step = original_step
+
+
 def _install_opt_in_ddp(args):
+    training_module.DDP = _ORIGINAL_DDP
+    training_module.train_step = _ORIGINAL_TRAIN_STEP
+    training_module.get_megatron_optimizer = _ORIGINAL_GET_MEGATRON_OPTIMIZER
+    training_module.get_optimizer_param_scheduler = _ORIGINAL_GET_OPTIMIZER_PARAM_SCHEDULER
+    if args.nonuniform_skip_optimizer_step:
+        training_module.get_megatron_optimizer = _get_no_op_optimizer_for_nonuniform_benchmark
+        training_module.get_optimizer_param_scheduler = (
+            _get_no_op_param_scheduler_for_nonuniform_benchmark
+        )
+        training_module.train_step = _train_step_without_optimizer_step
+
     if args.nonuniform_mode == "none":
         set_nonuniform_ep_runtime_config(None)
         parallel_state.initialize_model_parallel = _ORIGINAL_INITIALIZE_MODEL_PARALLEL
@@ -387,6 +473,14 @@ def _add_nonuniform_args(parser):
         choices=['p2p', 'nccl'],
         default='p2p',
         help='Nonuniform EP expert-gradient sync approach. `nccl` is Approach A.',
+    )
+    group.add_argument(
+        '--nonuniform-skip-optimizer-step',
+        action='store_true',
+        help=(
+            'Run forward/backward and nonuniform EP grad sync with a no-op '
+            'optimizer for performance-only validation.'
+        ),
     )
     return parser
 

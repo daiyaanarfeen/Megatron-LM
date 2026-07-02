@@ -11,15 +11,17 @@
 #SBATCH --dependency=singleton
 #SBATCH --job-name=nonuniform_ep_approach_a_smoke
 
+set -euo pipefail
+
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 export NVTE_FUSED_ATTN=0
 export TORCHINDUCTOR_WORKER_START=fork
 export TRITON_CACHE_DIR="/tmp/triton_cache/"
 export MEGATRON_NONUNIFORM_EP_DEBUG="${MEGATRON_NONUNIFORM_EP_DEBUG:-0}"
 
-ASSET_ROOT="${ASSET_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report}"
-ROOT_DIR="${ROOT_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs}"
-REPO_DIR="${REPO_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/Megatron-LM-nonuniform-approach-a}"
+ASSET_ROOT="${ASSET_ROOT:-/home/scratch.darfeen_gpu}"
+ROOT_DIR="${ROOT_DIR:-/home/scratch.darfeen_gpu/training_scripts_dp1_dummy_runs}"
+REPO_DIR="${REPO_DIR:-/home/scratch.darfeen_gpu/Megatron-LM-EP}"
 TRAIN_ITERS="${TRAIN_ITERS:-10}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-4}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
@@ -31,25 +33,39 @@ SEQ_LENGTH="${SEQ_LENGTH:-128}"
 NUM_EXPERTS="${NUM_EXPERTS:-6}"
 NAME="${NAME:-nonuniform_ep_approach_a_smoke}"
 IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
-CONTAINER_NAME="${CONTAINER_NAME-nvidia-pytorch-25-06-deps-mamba}"
+CONTAINER_NAME="${CONTAINER_NAME:-nvidia-pytorch-25-06-deps-mamba}"
+CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-/home/scratch.darfeen_gpu:/home/scratch.darfeen_gpu}"
 MASTER_PORT="${MASTER_PORT:-29640}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 NNODES="${NNODES:-${SLURM_NNODES:-1}}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-${GPUS_PER_NODE}}"
 TORCH_CUDA_VISIBLE_DEVICES="${TORCH_CUDA_VISIBLE_DEVICES:-}"
 NONUNIFORM_EP_DDP_APPROACH="${NONUNIFORM_EP_DDP_APPROACH:-nccl}"
-NONUNIFORM_EP_TOPOLOGY="${NONUNIFORM_EP_TOPOLOGY:-3 1}"
+NONUNIFORM_EP_TOPOLOGY="${NONUNIFORM_EP_TOPOLOGY:-2 2}"
 MOE_TOKEN_DISPATCHER_TYPE="${MOE_TOKEN_DISPATCHER_TYPE:-alltoall}"
 MASTER_ADDR="${MASTER_ADDR:-$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n1)}"
 ENABLE_PYTORCH_PROFILER="${ENABLE_PYTORCH_PROFILER:-0}"
+ENABLE_NSYS_PROFILE="${ENABLE_NSYS_PROFILE:-0}"
 PROFILE_STEP_START="${PROFILE_STEP_START:-1}"
 PROFILE_STEP_END="${PROFILE_STEP_END:-3}"
 PROFILE_RANKS="${PROFILE_RANKS:-0 1 2 3 4 5}"
+NSYS_TRACE="${NSYS_TRACE:-cuda,nvtx,cublas,cudnn}"
+NSYS_CAPTURE_RANGE="${NSYS_CAPTURE_RANGE:-cudaProfilerApi}"
+NSYS_EXTRA_ARGS="${NSYS_EXTRA_ARGS:-}"
 DDP_BUCKET_SIZE="${DDP_BUCKET_SIZE:-}"
 RUN_DIRECT="${RUN_DIRECT:-0}"
+LAUNCHER_MODE="${LAUNCHER_MODE:-torchrun}"
+EXTRA_MEGATRON_ARGS="${EXTRA_MEGATRON_ARGS:-}"
 
 PROFILE_OPTIONS=""
-if [[ "${ENABLE_PYTORCH_PROFILER}" == "1" ]]; then
+if [[ "${ENABLE_NSYS_PROFILE}" == "1" ]]; then
+    PROFILE_OPTIONS=" \
+    --profile \
+    --profile-step-start ${PROFILE_STEP_START} \
+    --profile-step-end ${PROFILE_STEP_END} \
+    --profile-ranks ${PROFILE_RANKS} \
+    --nvtx-ranges "
+elif [[ "${ENABLE_PYTORCH_PROFILER}" == "1" ]]; then
     PROFILE_OPTIONS=" \
     --profile \
     --use-pytorch-profiler \
@@ -68,6 +84,16 @@ RUN_DIR="${ROOT_DIR}/${NAME}"
 LOGS_DIR="${RUN_DIR}/logs"
 TENSORBOARD_DIR="${RUN_DIR}/tensorboard"
 mkdir -p "${LOGS_DIR}" "${TENSORBOARD_DIR}"
+
+if [[ ! -d "${REPO_DIR}" ]]; then
+    echo "REPO_DIR does not exist: ${REPO_DIR}" >&2
+    exit 2
+fi
+
+if [[ ! -f "${IMAGE_PATH}" && "${IMAGE_PATH}" != *"#"* ]]; then
+    echo "IMAGE_PATH does not exist: ${IMAGE_PATH}" >&2
+    exit 2
+fi
 
 options=" \
     --use-mcore-models \
@@ -112,9 +138,10 @@ options=" \
     ${PROFILE_OPTIONS} \
     --nonuniform-mode ep \
     --nonuniform-ep-num-tp-cp-per-replica ${NONUNIFORM_EP_TOPOLOGY} \
-    --nonuniform-ep-ddp-approach ${NONUNIFORM_EP_DDP_APPROACH} "
+    --nonuniform-ep-ddp-approach ${NONUNIFORM_EP_DDP_APPROACH} \
+    ${EXTRA_MEGATRON_ARGS} "
 
-if [[ -z "${TORCH_CUDA_VISIBLE_DEVICES}" && "${NPROC_PER_NODE}" != "${GPUS_PER_NODE}" ]]; then
+if [[ "${LAUNCHER_MODE}" != "direct" && -z "${TORCH_CUDA_VISIBLE_DEVICES}" && "${NPROC_PER_NODE}" != "${GPUS_PER_NODE}" ]]; then
     TORCH_CUDA_VISIBLE_DEVICES="$(seq -s, 0 "$((NPROC_PER_NODE - 1))")"
 fi
 
@@ -123,7 +150,25 @@ if [[ -n "${TORCH_CUDA_VISIBLE_DEVICES}" ]]; then
     cuda_visible_prefix="CUDA_VISIBLE_DEVICES=${TORCH_CUDA_VISIBLE_DEVICES} "
 fi
 
-run_cmd="cd ${REPO_DIR} && ${cuda_visible_prefix}python -u -m torch.distributed.run --nproc_per_node=${NPROC_PER_NODE} --nnodes=${NNODES} --node_rank=\${SLURM_NODEID} --master_addr=${MASTER_ADDR} --master_port=${MASTER_PORT} examples/nonuniform/pretrain_gpt_nonuniform.py ${options}"
+nsys_prefix=""
+if [[ "${ENABLE_NSYS_PROFILE}" == "1" ]]; then
+    NSYS_OUTPUT_DIR="${NSYS_OUTPUT_DIR:-${RUN_DIR}/nsys}"
+    NSYS_OUTPUT_NAME="${NSYS_OUTPUT_NAME:-node_\${SLURM_NODEID}}"
+    mkdir -p "${NSYS_OUTPUT_DIR}"
+    nsys_range_args=""
+    if [[ "${NSYS_CAPTURE_RANGE}" != "none" ]]; then
+        nsys_range_args="--capture-range=${NSYS_CAPTURE_RANGE} --capture-range-end=stop"
+    fi
+    nsys_prefix="nsys profile --sample=none --cpuctxsw=none --trace=${NSYS_TRACE} --wait all ${nsys_range_args} --cuda-graph-trace=node --force-overwrite=true --export=sqlite ${NSYS_EXTRA_ARGS} --output=${NSYS_OUTPUT_DIR}/${NSYS_OUTPUT_NAME} "
+fi
+
+if [[ "${LAUNCHER_MODE}" == "direct" ]]; then
+    run_cmd="cd ${REPO_DIR} && ${cuda_visible_prefix}${nsys_prefix}python -u examples/nonuniform/pretrain_gpt_nonuniform.py ${options}"
+else
+    run_cmd="cd ${REPO_DIR} && ${cuda_visible_prefix}${nsys_prefix}python -u -m torch.distributed.run --nproc_per_node=${NPROC_PER_NODE} --nnodes=${NNODES} --node_rank=\${SLURM_NODEID} --master_addr=${MASTER_ADDR} --master_port=${MASTER_PORT} examples/nonuniform/pretrain_gpt_nonuniform.py ${options}"
+fi
+
+echo "[nonuniform_ep_smoke] run_cmd=${run_cmd}"
 
 if [[ "${RUN_DIRECT}" == "1" ]]; then
     sh -c "${run_cmd}"
@@ -143,7 +188,7 @@ srun -l \
     --mpi=none \
     --container-image "${IMAGE_PATH}" \
     "${container_name_options[@]}" \
-    --container-mounts "/lustre:/lustre" \
+    --container-mounts "${CONTAINER_MOUNTS}" \
     --no-container-mount-home \
     --output="${LOGS_DIR}/%x_%j_${DATETIME}.log" \
     sh -c "${run_cmd}"

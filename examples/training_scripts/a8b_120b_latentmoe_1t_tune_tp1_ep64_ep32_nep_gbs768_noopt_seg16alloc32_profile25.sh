@@ -38,6 +38,7 @@ RUN_GPUS_PER_NODE=4
 NAME="${NAME:-a8b_120b_latentmoe_1t_tune_tp1_ep64_ep32_nep_gbs768_noopt_seg16alloc32_profile25}"
 IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
 CONTAINER_NAME="${CONTAINER_NAME:-nvidia-pytorch-25-06-deps-mamba}"
+CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-/lustre:/lustre}"
 
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 
@@ -174,7 +175,7 @@ srun -l \
     --gpus-per-node="${RUN_GPUS_PER_NODE}" \
     --container-image "${IMAGE_PATH}" \
     --container-name "${CONTAINER_NAME}" \
-    --container-mounts "/lustre:/lustre" \
+    --container-mounts "${CONTAINER_MOUNTS}" \
     --no-container-mount-home \
     --output="${LOGS_DIR}/%x_%j_${DATETIME}.log" \
     sh -c "${run_cmd}"

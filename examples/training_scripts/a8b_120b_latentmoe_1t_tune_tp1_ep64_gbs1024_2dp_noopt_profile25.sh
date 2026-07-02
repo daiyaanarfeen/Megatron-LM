@@ -31,6 +31,7 @@ LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-10}"
 NAME="${NAME:-a8b_120b_latentmoe_1t_tune_tp1_ep64_gbs1024_2dp_noopt_profile25}"
 IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
 CONTAINER_NAME="${CONTAINER_NAME:-nvidia-pytorch-25-06-deps-mamba}"
+CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-/lustre:/lustre}"
 
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 
@@ -161,7 +162,7 @@ run_cmd="python -u ${REPO_DIR}/pretrain_hybrid.py ${options}"
 srun -l \
     --container-image "${IMAGE_PATH}" \
     --container-name "${CONTAINER_NAME}" \
-    --container-mounts "/lustre:/lustre" \
+    --container-mounts "${CONTAINER_MOUNTS}" \
     --no-container-mount-home \
     --output="${LOGS_DIR}/%x_%j_${DATETIME}.log" \
     sh -c "${run_cmd}"

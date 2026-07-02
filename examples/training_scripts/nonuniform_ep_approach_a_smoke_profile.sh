@@ -18,19 +18,20 @@ export NVTE_FUSED_ATTN=0
 export TORCHINDUCTOR_WORKER_START=fork
 export TRITON_CACHE_DIR="/tmp/triton_cache/"
 
-ASSET_ROOT="${ASSET_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report}"
-ROOT_DIR="${ROOT_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs}"
-REPO_DIR="${REPO_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/Megatron-LM-EP}"
+ASSET_ROOT="${ASSET_ROOT:-/home/scratch.darfeen_gpu}"
+ROOT_DIR="${ROOT_DIR:-/home/scratch.darfeen_gpu/training_scripts_dp1_dummy_runs}"
+REPO_DIR="${REPO_DIR:-/home/scratch.darfeen_gpu/Megatron-LM-EP}"
 TRAIN_ITERS="${TRAIN_ITERS:-8}"
 PROFILE_STEP_START="${PROFILE_STEP_START:-0}"
 PROFILE_STEP_END="${PROFILE_STEP_END:-2}"
 NAME="${NAME:-nonuniform_ep_approach_a_smoke_profile}"
 IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
 CONTAINER_NAME="${CONTAINER_NAME:-nvidia-pytorch-25-06-deps-mamba}"
+CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-/home/scratch.darfeen_gpu:/home/scratch.darfeen_gpu}"
 MASTER_PORT="${MASTER_PORT:-29641}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 NONUNIFORM_EP_DDP_APPROACH="${NONUNIFORM_EP_DDP_APPROACH:-nccl}"
-NONUNIFORM_EP_TOPOLOGY="${NONUNIFORM_EP_TOPOLOGY:-3 1}"
+NONUNIFORM_EP_TOPOLOGY="${NONUNIFORM_EP_TOPOLOGY:-2 2}"
 MOE_TOKEN_DISPATCHER_TYPE="${MOE_TOKEN_DISPATCHER_TYPE:-alltoall}"
 
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
@@ -38,6 +39,16 @@ RUN_DIR="${ROOT_DIR}/${NAME}"
 LOGS_DIR="${RUN_DIR}/logs"
 TENSORBOARD_DIR="${RUN_DIR}/tensorboard"
 mkdir -p "${LOGS_DIR}" "${TENSORBOARD_DIR}"
+
+if [[ ! -d "${REPO_DIR}" ]]; then
+    echo "REPO_DIR does not exist: ${REPO_DIR}" >&2
+    exit 2
+fi
+
+if [[ ! -f "${IMAGE_PATH}" ]]; then
+    echo "IMAGE_PATH does not exist: ${IMAGE_PATH}" >&2
+    exit 2
+fi
 
 options=" \
     --use-mcore-models \
@@ -93,7 +104,7 @@ srun -l \
     --mpi=none \
     --container-image "${IMAGE_PATH}" \
     --container-name "${CONTAINER_NAME}" \
-    --container-mounts "/lustre:/lustre" \
+    --container-mounts "${CONTAINER_MOUNTS}" \
     --no-container-mount-home \
     --output="${LOGS_DIR}/%x_%j_${DATETIME}.log" \
     sh -c "${run_cmd}"
