@@ -2,6 +2,34 @@
 
 Append a dated entry whenever we do something new: code changes, job submissions, benchmark results, trace analysis, or decisions that change the next step. Keep entries factual and include job IDs, run dirs, and commits when available.
 
+## 2026-07-02 - Lyris NEP overlap investigation
+
+- Completed corrected eight-bucket Lyris comparisons using nvcr.io/nvidia/nemo:25.09: healthy MBS2 job 2261389, NEP MBS2 job 2261369, healthy MBS4 job 2261390, and NEP MBS4 job 2261391.
+- Clean iterations 8-10:
+  - MBS2 healthy 242.03 TFLOP/s/GPU versus NEP 66.00 (27.3% of healthy).
+  - MBS4 healthy 440.60 TFLOP/s/GPU versus NEP 128.73 (29.2% of healthy).
+- Process-group-specific rank-0 trace analysis showed exactly 0 ms overlap between non-NCCL kernels and all 184 nep_owner_transfer kernels at both MBS2 and MBS4. MBS4 contained about 3513 ms of owner-transfer NCCL and 104 ms of owner ep_dp all-reduce NCCL.
+- NEP debug events showed owner-transfer launches beginning roughly two seconds before backward completed. Therefore late launch was not the primary problem.
+- One serialization source identified in NonuniformEPNCCLParamAndGradBucketGroup: every bounded buffer-slot reuse called Work.wait() from the autograd hook. With 184 tasks and 16 slots, these host waits repeatedly stopped submission of later backward kernels.
+- Replaced slot-reuse host waits with Work.block_current_stream() ordering on the dedicated NEP communication stream. This preserves buffer safety and gather/all-reduce/scatter ordering while allowing the autograd thread to keep submitting later compute.
+- Added focused coverage in tests/unit_tests/distributed/test_nonuniform_ep.py and a Lyris profiled smoke wrapper at scripts/nonuniform/run_lyris_nonuniform_ep_overlap_smoke.sh.
+- Container-side focused checks passed in jobs 2261947 and 2261949; their distributed steps did not start because an initial wrapper version contained a malformed srun continuation. The wrapper was corrected.
+- Corrected EP4/2 smoke job 2262080 completed 10/10 iterations with finite losses. Its owner-transfer kernels were too short to provide a meaningful large-workload overlap test.
+- MBS4 jobs 2262099 (healthy) and 2262100 (NEP after nonblocking slot reuse) completed:
+  - Healthy: 806.00 ms and 452.90 TFLOP/s/GPU.
+  - NEP: 2833.53 ms and 128.83 TFLOP/s/GPU, effectively unchanged from the original full-layout path.
+  - Owner-transfer overlap increased only from 0% to 2.16%, so host slot waits were not the dominant large-workload cost.
+- CTA-8, CTA-4, CGA-disabled, and high-priority CTA-8 owner-transfer communicator experiments did not improve overlap or throughput. Reducing CTAs increased communication duration enough to make end-to-end performance worse.
+- The dominant algorithmic issue was zero-padded transfer volume. For EP8/4, each of four follower ranks sent a full 32-expert owner-layout chunk while holding only four useful expert slices, and the owner sent the same full chunk back to every follower.
+- Reimplemented owner gather/scatter with dense variable-split all-to-all payloads. Owners still reconstruct the same full layout before the EDP all-reduce, but followers send and receive only their actual expert slices.
+- Dense correctness smoke job 2262211 completed 10/10 iterations and halved EP4/2 owner-transfer message size and kernel time.
+- Dense MBS4 NEP job 2262239 completed successfully:
+  - 1219.03 ms and 299.43 TFLOP/s/GPU.
+  - NEP improved from 28.4% to 66.1% of the 452.90 TFLOP/s/GPU healthy result.
+  - Owner-transfer NCCL union fell from 3738.88 ms to 776.91 ms; overlap rose from 2.16% to 10.00%.
+  - The dense trace reduced the rank-0 owner-transfer message from 638,582,784 to 79,822,848 elements, an 8x reduction.
+- Container job 2262356 ran required isort and the focused tests; both nonblocking slot reuse and dense gather/scatter round-trip tests passed.
+
 ## 2026-07-01
 
 ### a3b training-script Approach-A baseline versus NEP submission
