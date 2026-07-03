@@ -1099,7 +1099,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         self._nep_nccl_bucket_numels_cache = {}
         self._nep_nccl_async_handles = []
         self._nep_nccl_async_tensors = []
-        self._nep_nccl_stream = None
+        self._nep_nccl_streams = {}
         self._nep_nccl_logical_grad_data_cache = {}
         self._nep_nccl_send_chunk_cache = {}
         self._nep_nccl_gather_buf_cache = {}
@@ -1171,19 +1171,29 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             cache[key] = tensor
         return tensor
 
-    def _get_nep_nccl_comm_stream(self) -> torch.cuda.Stream:
+    def _get_nep_nccl_comm_stream(self, stream_slot: int) -> torch.cuda.Stream:
         state = getattr(self, '_nep_nccl_scheduler_state', None)
         if state is not None:
-            stream = state.get('comm_stream')
+            streams = state.setdefault('comm_streams', {})
+            stream = streams.get(stream_slot)
             if stream is None:
                 stream = torch.cuda.Stream(device=torch.cuda.current_device())
-                state['comm_stream'] = stream
-            self._nep_nccl_stream = stream
+                streams[stream_slot] = stream
+            self._nep_nccl_streams[stream_slot] = stream
             return stream
 
-        if self._nep_nccl_stream is None:
-            self._nep_nccl_stream = torch.cuda.Stream(device=torch.cuda.current_device())
-        return self._nep_nccl_stream
+        stream = self._nep_nccl_streams.get(stream_slot)
+        if stream is None:
+            stream = torch.cuda.Stream(device=torch.cuda.current_device())
+            self._nep_nccl_streams[stream_slot] = stream
+        return stream
+
+    def _get_nep_nccl_task_buffer_slot(self, owner_ep_rank: int, chunk_index: int) -> int:
+        layout = self._get_nep_nccl_owner_layout()
+        buffer_slots = _get_nep_nccl_async_chunk_window()
+        return (
+            owner_ep_rank * max(1, layout['num_chunks']) + chunk_index
+        ) % buffer_slots
 
     def _get_nep_nccl_owner_layout(self) -> dict:
         """Return cached owner-layout metadata for this expert slot bucket group."""
@@ -1836,10 +1846,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             self._mark_nep_nccl_task_started(owner_ep_rank, chunk_index)
             return
 
-        buffer_slots = _get_nep_nccl_async_chunk_window()
-        buffer_slot = (
-            owner_ep_rank * max(1, layout['num_chunks']) + chunk_index
-        ) % buffer_slots
+        buffer_slot = self._get_nep_nccl_task_buffer_slot(owner_ep_rank, chunk_index)
         chunk_dtype = self.buckets[0].grad_data.dtype
         chunk_device = self.buckets[0].grad_data.device
         buffer_slot_key = (
@@ -1943,51 +1950,62 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             else async_op_override
         )
 
-        def launch_ready_tasks_on_current_stream() -> None:
+        def next_task_is_ready() -> bool:
             tasks = state['task_sequence']
-            while state['task_next_index'] < len(tasks):
-                task = tasks[state['task_next_index']]
-                group = task['group']
-                owner_ep_rank = task['owner_ep_rank']
-                if not force_ready and not group._nep_nccl_owner_task_ready(owner_ep_rank):
-                    break
-                group._start_nep_nccl_owner_task(
-                    owner_ep_rank,
-                    task['chunk_index'],
-                    task['chunk_start'],
-                    task['chunk_end'],
-                    async_op=async_op,
-                )
-                state['task_next_index'] += 1
+            if state['task_next_index'] >= len(tasks):
+                return False
+            task = tasks[state['task_next_index']]
+            return force_ready or task['group']._nep_nccl_owner_task_ready(
+                task['owner_ep_rank']
+            )
+
+        def launch_next_task() -> None:
+            task = state['task_sequence'][state['task_next_index']]
+            group = task['group']
+            group._start_nep_nccl_owner_task(
+                task['owner_ep_rank'],
+                task['chunk_index'],
+                task['chunk_start'],
+                task['chunk_end'],
+                async_op=async_op,
+            )
+            state['task_next_index'] += 1
+
+        def launch_ready_tasks_on_current_stream() -> None:
+            while next_task_is_ready():
+                launch_next_task()
 
         if async_op:
-            nccl_stream = self._get_nep_nccl_comm_stream()
-            before_task_index = state['task_next_index']
-            nccl_stream.wait_stream(torch.cuda.current_stream())
-            debug_start_event = None
-            debug_done_event = None
-            with torch.cuda.stream(nccl_stream):
-                if _nep_overlap_debug_enabled():
-                    debug_start_event = torch.cuda.Event(enable_timing=True)
-                    debug_start_event.record(nccl_stream)
-                launch_ready_tasks_on_current_stream()
-                if _nep_overlap_debug_enabled():
-                    debug_done_event = torch.cuda.Event(enable_timing=True)
-                    debug_done_event.record(nccl_stream)
-            if (
-                _nep_overlap_debug_enabled()
-                and state['task_next_index'] > before_task_index
-                and debug_start_event is not None
-                and debug_done_event is not None
-            ):
-                self._nep_nccl_overlap_debug_events.append(
-                    (
-                        before_task_index,
-                        state['task_next_index'],
-                        debug_start_event,
-                        debug_done_event,
-                    )
+            compute_stream = torch.cuda.current_stream()
+            while next_task_is_ready():
+                task_index = state['task_next_index']
+                task = state['task_sequence'][task_index]
+                group = task['group']
+                owner_ep_rank = task['owner_ep_rank']
+                stream_slot = group._get_nep_nccl_task_buffer_slot(
+                    owner_ep_rank, task['chunk_index']
                 )
+                nccl_stream = group._get_nep_nccl_comm_stream(stream_slot)
+                nccl_stream.wait_stream(compute_stream)
+                debug_start_event = None
+                debug_done_event = None
+                with torch.cuda.stream(nccl_stream):
+                    if _nep_overlap_debug_enabled():
+                        debug_start_event = torch.cuda.Event(enable_timing=True)
+                        debug_start_event.record(nccl_stream)
+                    launch_next_task()
+                    if _nep_overlap_debug_enabled():
+                        debug_done_event = torch.cuda.Event(enable_timing=True)
+                        debug_done_event.record(nccl_stream)
+                if debug_start_event is not None and debug_done_event is not None:
+                    group._nep_nccl_overlap_debug_events.append(
+                        (
+                            task_index,
+                            task_index + 1,
+                            debug_start_event,
+                            debug_done_event,
+                        )
+                    )
         else:
             launch_ready_tasks_on_current_stream()
 
@@ -2067,14 +2085,14 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
     def _finish_nonuniform_ep_nccl_grad_sync(self):
         overlap_debug = _nep_overlap_debug_enabled()
         compute_ready_event = None
-        if overlap_debug and self._nep_nccl_stream is not None:
+        if overlap_debug and self._nep_nccl_streams:
             compute_ready_event = torch.cuda.Event(enable_timing=True)
             compute_ready_event.record(torch.cuda.current_stream())
         drain_start = time.perf_counter() if overlap_debug else None
         self._drain_nep_nccl_async_window(force_all=True)
         drain_ms = (time.perf_counter() - drain_start) * 1000.0 if overlap_debug else None
-        if self._nep_nccl_stream is not None:
-            torch.cuda.current_stream().wait_stream(self._nep_nccl_stream)
+        for nccl_stream in self._nep_nccl_streams.values():
+            torch.cuda.current_stream().wait_stream(nccl_stream)
         if overlap_debug and self._nep_nccl_overlap_debug_events:
             after_wait_event = torch.cuda.Event(enable_timing=True)
             after_wait_event.record(torch.cuda.current_stream())

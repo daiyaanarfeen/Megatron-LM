@@ -51,6 +51,7 @@ PROFILE_STEP_START="${PROFILE_STEP_START:-5}"
 PROFILE_STEP_END="${PROFILE_STEP_END:-7}"
 PROFILE_RANKS="${PROFILE_RANKS:-0}"
 EXTRA_MEGATRON_ARGS="${EXTRA_MEGATRON_ARGS:-}"
+HIGH_PRIORITY_STREAM_GROUPS="${HIGH_PRIORITY_STREAM_GROUPS-ep}"
 
 RUN_DIR="${ROOT_DIR}/${NAME}/${SLURM_JOB_ID}"
 LOGS_DIR="${RUN_DIR}/logs"
@@ -89,6 +90,11 @@ srun --nodes=1 --ntasks=1 --mpi=none "${container_args[@]}" \
 profile_args=""
 if [[ "${PROFILE}" == "1" ]]; then
     profile_args=" --profile --use-pytorch-profiler --profile-step-start ${PROFILE_STEP_START} --profile-step-end ${PROFILE_STEP_END} --profile-ranks ${PROFILE_RANKS} "
+fi
+
+high_priority_stream_args=""
+if [[ -n "${HIGH_PRIORITY_STREAM_GROUPS}" ]]; then
+    high_priority_stream_args=" --high-priority-stream-groups ${HIGH_PRIORITY_STREAM_GROUPS} "
 fi
 
 options=" \
@@ -161,7 +167,7 @@ options=" \
     --expert-model-parallel-size ${EXPERT_MODEL_PARALLEL_SIZE} \
     --expert-tensor-parallel-size ${EXPERT_TENSOR_PARALLEL_SIZE} \
     --pipeline-model-parallel-size 1 \
-    --high-priority-stream-groups ep \
+    ${high_priority_stream_args} \
     --ddp-num-buckets ${DDP_NUM_BUCKETS} \
     --attention-backend flash \
     --log-interval 1 \

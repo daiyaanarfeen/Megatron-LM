@@ -29,6 +29,18 @@ Append a dated entry whenever we do something new: code changes, job submissions
   - Owner-transfer NCCL union fell from 3738.88 ms to 776.91 ms; overlap rose from 2.16% to 10.00%.
   - The dense trace reduced the rank-0 owner-transfer message from 638,582,784 to 79,822,848 elements, an 8x reduction.
 - Container job 2262356 ran required isort and the focused tests; both nonblocking slot reuse and dense gather/scatter round-trip tests passed.
+- Chunk-size sweep jobs 2262739 (256 MiB), 2262740 (128 MiB), and 2262741 (64 MiB) showed that splitting the dense owner payload further does not improve overlap. Clean iteration averages were about 1214, 1320, and 1345 ms respectively, versus 1219 ms for the single-chunk dense run.
+- Trace/code correlation identified an additional scheduler serialization: all owner tasks shared one auxiliary CUDA stream, so gather, owner EDP all-reduce, scatter, and the next independent owner task were chained on that stream despite the bounded buffer window.
+- Replaced the single auxiliary stream with a bounded per-buffer-slot stream pool. Dependencies and buffer reuse remain ordered within a slot, while independent owner tasks can progress concurrently.
+- Focused test job 2262843 passed 3/3 tests, including new stream-slot coverage. Its batch status was nonzero only because whole-file `black --check` requested formatting of the modified implementation file.
+- Multi-stream EP8/4 smoke job 2262844 completed 10/10 finite iterations with zero skipped/nan iterations.
+- Multi-stream a3b NEP job 2262845 completed successfully:
+  - Clean iterations 8-10 averaged about 914 ms and 399 TFLOP/s/GPU.
+  - Throughput improved from 66% to about 88% of the existing healthy MBS4 result.
+  - Rank-0 owner-transfer GPU time fell from about 777 ms to 81 ms over the two profiled iterations because independent owner collectives no longer suffered cross-rank launch skew.
+  - Direct owner-transfer/non-NCCL kernel overlap remained low at about 5%; the improvement primarily came from shortening owner-transfer completion time, not hiding it behind compute.
+- Disabling high-priority EP/EDP communicators in job 2262893 improved clean iterations 8-10 to about 886 ms and 412 TFLOP/s/GPU, about 91% of the existing healthy result. Direct communication/non-NCCL overlap remained low, so a matching healthy control was submitted as job 2262899.
+- MBS8 NEP job 2262892 OOMed at roughly 182 GiB used during the vocabulary cross-entropy allocation. MBS6 job 2262901 fit at roughly 142 GiB and completed at about 1151 ms and 476 TFLOP/s/GPU; direct owner-transfer plus EDP overlap increased to about 24%. Matching healthy MBS6 job 2262900 remains queued.
 
 ## 2026-07-01
 
