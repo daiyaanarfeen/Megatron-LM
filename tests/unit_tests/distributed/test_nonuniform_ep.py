@@ -40,7 +40,7 @@ def test_nep_nccl_owner_tasks_use_bounded_distinct_stream_slots(monkeypatch):
     bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
         NonuniformEPNCCLParamAndGradBucketGroup
     )
-    bucket_group._nep_nccl_owner_layout = {'num_chunks': 2}
+    bucket_group._nep_nccl_owner_layout = {'min_ep_size': 3, 'num_chunks': 2}
 
     slots = [
         bucket_group._get_nep_nccl_task_buffer_slot(owner_ep_rank, chunk_index)
@@ -49,6 +49,14 @@ def test_nep_nccl_owner_tasks_use_bounded_distinct_stream_slots(monkeypatch):
     ]
 
     assert slots == [0, 1, 2, 3, 0, 1]
+
+    bucket_group._nep_nccl_group_index = 1
+    next_group_slots = [
+        bucket_group._get_nep_nccl_task_buffer_slot(owner_ep_rank, chunk_index)
+        for owner_ep_rank in range(3)
+        for chunk_index in range(2)
+    ]
+    assert next_group_slots == [2, 3, 0, 1, 2, 3]
 
 
 def test_nep_nccl_dense_source_payload_round_trip():

@@ -40,7 +40,24 @@ Append a dated entry whenever we do something new: code changes, job submissions
   - Rank-0 owner-transfer GPU time fell from about 777 ms to 81 ms over the two profiled iterations because independent owner collectives no longer suffered cross-rank launch skew.
   - Direct owner-transfer/non-NCCL kernel overlap remained low at about 5%; the improvement primarily came from shortening owner-transfer completion time, not hiding it behind compute.
 - Disabling high-priority EP/EDP communicators in job 2262893 improved clean iterations 8-10 to about 886 ms and 412 TFLOP/s/GPU, about 91% of the existing healthy result. Direct communication/non-NCCL overlap remained low, so a matching healthy control was submitted as job 2262899.
-- MBS8 NEP job 2262892 OOMed at roughly 182 GiB used during the vocabulary cross-entropy allocation. MBS6 job 2262901 fit at roughly 142 GiB and completed at about 1151 ms and 476 TFLOP/s/GPU; direct owner-transfer plus EDP overlap increased to about 24%. Matching healthy MBS6 job 2262900 remains queued.
+- MBS8 NEP job 2262892 OOMed at roughly 182 GiB used during the vocabulary cross-entropy allocation. MBS6 job 2262901 fit at roughly 142 GiB and completed at about 1151 ms and 476 TFLOP/s/GPU; direct owner-transfer plus EDP overlap increased to about 24%. The matching 45-minute healthy request was canceled when essential controls were resubmitted with accurate 15-minute limits.
+- Exact low-priority MBS4 healthy control job 2263540 completed at 769.1 ms and 474.6 TFLOP/s/GPU over clean iterations 8-10. The pre-phase-pipeline NEP result was therefore 86.8% of exact healthy throughput, with a 117 ms step gap.
+- Exact two-microbatch controls completed:
+  - Healthy job 2263541: 1433.8 ms and 509.2 TFLOP/s/GPU.
+  - Pre-phase-pipeline NEP job 2263542: 1577.0 ms and 462.9 TFLOP/s/GPU, or 90.9% of healthy throughput.
+  - Trace overlap remained about 1.7%, confirming that accumulation amortized exposed synchronization rather than hiding it.
+- Added bounded cross-layer phase pipelining. Each slot now keeps gather and owner EDP reduce in flight; scatter is deferred until slot reuse or the final drain. Deferred scatters are enqueued on their original slot streams, and reset asserts that no deferred scatter survived the iteration.
+- Phase-pipeline validation:
+  - Focused test job 2263584 passed 3/3 tests.
+  - EP8/4 smoke job 2263573 completed 10/10 iterations with finite losses and zero skipped/nan iterations.
+  - Full one-microbatch NEP job 2263585 completed at 858.7 ms and 425.1 TFLOP/s/GPU, improving exact parity from 86.8% to 89.6%.
+  - Phase pipelining reduced profiled owner-transfer plus EDP union from about 225 ms to 189 ms; literal non-NCCL overlap remained low.
+- MBS7 healthy job 2263610 completed at 1173.5 ms and 544.3 TFLOP/s/GPU. Phase-pipeline NEP job 2263611 OOMed because the bounded pipeline staging buffers pushed memory above the GB200 limit; MBS7 is not a viable NEP setting with a 16-slot window.
+- Final near-parity result uses two MBS4 microbatches:
+  - Phase-pipeline NEP job 2263612: 1517.1 ms and 481.2 TFLOP/s/GPU over iterations 8-10.
+  - Exact healthy job 2263541: 1433.8 ms and 509.2 TFLOP/s/GPU.
+  - NEP reaches 94.5% of healthy per-GPU throughput with an 83.3 ms step gap; all measured iterations had finite losses and zero skipped/nan iterations.
+  - Rank-0 trace still shows only 3.7% combined owner-transfer/EDP overlap with non-NCCL kernels. Near parity comes from reduced communication span plus amortizing the remaining fixed cost over two microbatches, not from mostly hiding reshard behind backward compute.
 
 ## 2026-07-01
 

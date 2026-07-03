@@ -10,13 +10,13 @@ then scattered back to every source rank so non-distributed optimizers can step
 the local expert params on every rank.
 """
 
-from dataclasses import dataclass, field
-from datetime import timedelta
-from enum import Enum
 import logging
 import os
 import re
 import time
+from dataclasses import dataclass, field
+from datetime import timedelta
+from enum import Enum
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -41,7 +41,6 @@ from .nonuniform_common import (
 )
 from .param_and_grad_buffer import _ParamAndGradBucket, _ParamAndGradBucketGroup
 
-
 logger = logging.getLogger(__name__)
 _NEP_TAG_SLOT_STRIDE = 256
 _NEP_NCCL_DEFAULT_MAX_GATHER_BYTES = 8 * 1024 * 1024 * 1024
@@ -50,12 +49,7 @@ _NEP_NCCL_DEFAULT_ASYNC_CHUNK_WINDOW = 2
 
 def _nep_debug_print(message: str) -> None:
     """Print NEP debug messages when explicitly enabled."""
-    if os.getenv("MEGATRON_NONUNIFORM_EP_DEBUG", "0").lower() not in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    ):
+    if os.getenv("MEGATRON_NONUNIFORM_EP_DEBUG", "0").lower() not in ("1", "true", "yes", "on"):
         return
     try:
         rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
@@ -64,9 +58,7 @@ def _nep_debug_print(message: str) -> None:
     rank_filter = os.getenv("MEGATRON_NONUNIFORM_EP_DEBUG_RANKS")
     if rank_filter:
         selected_ranks = {
-            int(part)
-            for part in rank_filter.replace(",", " ").split()
-            if part.strip()
+            int(part) for part in rank_filter.replace(",", " ").split() if part.strip()
         }
         if rank not in selected_ranks:
             return
@@ -102,9 +94,7 @@ def _get_nep_nccl_max_gather_bytes() -> int:
         return _NEP_NCCL_DEFAULT_MAX_GATHER_BYTES
     max_gather_bytes = int(value)
     if max_gather_bytes <= 0:
-        raise RuntimeError(
-            "MEGATRON_NONUNIFORM_EP_NCCL_MAX_GATHER_BYTES must be positive"
-        )
+        raise RuntimeError("MEGATRON_NONUNIFORM_EP_NCCL_MAX_GATHER_BYTES must be positive")
     return max_gather_bytes
 
 
@@ -114,9 +104,7 @@ def _get_nep_nccl_async_chunk_window() -> int:
         return _NEP_NCCL_DEFAULT_ASYNC_CHUNK_WINDOW
     chunk_window = int(value)
     if chunk_window <= 0:
-        raise RuntimeError(
-            "MEGATRON_NONUNIFORM_EP_NCCL_ASYNC_CHUNK_WINDOW must be positive"
-        )
+        raise RuntimeError("MEGATRON_NONUNIFORM_EP_NCCL_ASYNC_CHUNK_WINDOW must be positive")
     return chunk_window
 
 
@@ -152,6 +140,7 @@ class NonuniformEPConfig:
         if isinstance(self.expert_name_pattern, str):
             self.expert_name_pattern = re.compile(self.expert_name_pattern)
 
+
 @dataclass
 class _ExpertBucketPlan:
     expert_id: int
@@ -184,13 +173,7 @@ class _ExpertBucketSpec:
 class _P2PGradTransferHandle:
     """Wait handle that drains p2p works and applies grad receive buffers."""
 
-    def __init__(
-        self,
-        works,
-        recv_accumulations=None,
-        recv_copies=None,
-        keepalive_buffers=None,
-    ):
+    def __init__(self, works, recv_accumulations=None, recv_copies=None, keepalive_buffers=None):
         self.works = works
         self.recv_accumulations = recv_accumulations or []
         self.recv_copies = recv_copies or []
@@ -249,10 +232,7 @@ def _copy_flat_into_bucket(bucket, slices: List[Tuple[int, int]], flat: torch.Te
 
 
 def _source_ep_ranks_for_owner(
-    expert_placement: List[List[int]],
-    owner_ep_rank: int,
-    num_experts: int,
-    min_ep_size: int,
+    expert_placement: List[List[int]], owner_ep_rank: int, num_experts: int, min_ep_size: int
 ) -> List[int]:
     """Return EP ranks that physically hold an owner's expert range."""
     experts_per_owner = num_experts // min_ep_size
@@ -372,10 +352,7 @@ def initialize_nonuniform_ep_process_groups(
     )
 
     generator = NonuniformEPRankGenerator(
-        tp=tp,
-        cp=cp,
-        num_tp_cp_per_replica=num_tp_cp_per_replica,
-        etp=etp,
+        tp=tp, cp=cp, num_tp_cp_per_replica=num_tp_cp_per_replica, etp=etp
     )
     if generator.world_size != world_size:
         raise RuntimeError(
@@ -400,11 +377,7 @@ def initialize_nonuniform_ep_process_groups(
         group = _create_group(ranks, timeout, nccl_comm_cfgs, "dp_cp")
         group_gloo = (
             _create_group(
-                ranks,
-                timeout,
-                nccl_comm_cfgs,
-                "DATA_PARALLEL_GROUP_WITH_CP_GLOO",
-                "gloo",
+                ranks, timeout, nccl_comm_cfgs, "DATA_PARALLEL_GROUP_WITH_CP_GLOO", "gloo"
             )
             if create_gloo_process_groups
             else None
@@ -490,25 +463,17 @@ def initialize_nonuniform_ep_process_groups(
         group = _create_group(ranks, timeout, nccl_comm_cfgs, "ep")
         transfer_group = _create_group(ranks, timeout, nccl_comm_cfgs, "nep_grad_transfer")
         group_expert_placement, _ = compute_nonuniform_ep_expert_placement(
-            num_moe_experts,
-            len(ranks),
-            min_ep_size,
+            num_moe_experts, len(ranks), min_ep_size
         )
         for owner_ep_rank in range(min_ep_size):
             source_ep_ranks = _source_ep_ranks_for_owner(
-                group_expert_placement,
-                owner_ep_rank,
-                num_moe_experts,
-                min_ep_size,
+                group_expert_placement, owner_ep_rank, num_moe_experts, min_ep_size
             )
             source_global_ranks = [ranks[source_ep_rank] for source_ep_rank in source_ep_ranks]
             owner_transfer_group = None
             if len(source_global_ranks) > 1:
                 owner_transfer_group = _create_group(
-                    source_global_ranks,
-                    timeout,
-                    nccl_comm_cfgs,
-                    "nep_owner_transfer",
+                    source_global_ranks, timeout, nccl_comm_cfgs, "nep_owner_transfer"
                 )
             if rank in ranks:
                 nep_owner_transfer_group_ranks[owner_ep_rank] = source_ep_ranks
@@ -569,9 +534,7 @@ def initialize_nonuniform_ep_process_groups(
     ep_group = parallel_state.get_expert_model_parallel_group()
     ep_rank = ep_group.rank()
     expert_placement, expert_gather_map = compute_nonuniform_ep_expert_placement(
-        num_moe_experts,
-        local_ep_size,
-        min_ep_size,
+        num_moe_experts, local_ep_size, min_ep_size
     )
     runtime_config = {
         'needs_reshard': local_ep_size > min_ep_size,
@@ -601,9 +564,7 @@ def initialize_nonuniform_ep_process_groups(
 
 
 def _owner_for_expert(
-    expert_id: int,
-    runtime_config: dict,
-    explicit_owner: Optional[Dict[int, int]],
+    expert_id: int, runtime_config: dict, explicit_owner: Optional[Dict[int, int]]
 ) -> int:
     if explicit_owner is not None and expert_id in explicit_owner:
         return explicit_owner[expert_id]
@@ -627,9 +588,7 @@ def _source_ep_ranks_for_expert(expert_id: int, runtime_config: dict) -> List[in
 
 
 def _local_expert_id_from_name(
-    name: str,
-    pattern: re.Pattern,
-    local_expert_indices: Optional[List[int]],
+    name: str, pattern: re.Pattern, local_expert_indices: Optional[List[int]]
 ) -> Optional[int]:
     match = pattern.search(name)
     if match is None:
@@ -766,14 +725,10 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 self._nep_scatter_send_buffers = self._nep_gather_recv_buffers
             else:
                 entry['gather_send_buffer'] = torch.empty(
-                    plan.numel,
-                    dtype=bucket.grad_data.dtype,
-                    device=bucket.grad_data.device,
+                    plan.numel, dtype=bucket.grad_data.dtype, device=bucket.grad_data.device
                 )
                 entry['scatter_recv_buffer'] = torch.empty(
-                    plan.numel,
-                    dtype=bucket.grad_data.dtype,
-                    device=bucket.grad_data.device,
+                    plan.numel, dtype=bucket.grad_data.dtype, device=bucket.grad_data.device
                 )
                 self._nep_gather_send_buffer = entry['gather_send_buffer']
                 self._nep_scatter_recv_buffer = entry['scatter_recv_buffer']
@@ -847,9 +802,7 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 )
 
         self._nep_gather_handle = _P2PGradTransferHandle(
-            works,
-            recv_accumulations=recv_accumulations,
-            keepalive_buffers=keepalive_buffers,
+            works, recv_accumulations=recv_accumulations, keepalive_buffers=keepalive_buffers
         )
 
     def _wait_nep_gather_to_owner(self):
@@ -867,9 +820,7 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         return True
 
     def _try_start_ready_owner_dp_syncs(
-        self,
-        nonblocking: bool,
-        force_all_reduce: Optional[bool] = False,
+        self, nonblocking: bool, force_all_reduce: Optional[bool] = False
     ) -> None:
         state = getattr(self, '_nep_owner_dp_sync_scheduler_state', None)
         if state is None:
@@ -933,9 +884,7 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 recv_copies.append((bucket, plan.bucket_slices, recv_buffer))
 
         self._nep_scatter_handle = _P2PGradTransferHandle(
-            works,
-            recv_copies=recv_copies,
-            keepalive_buffers=keepalive_buffers,
+            works, recv_copies=recv_copies, keepalive_buffers=keepalive_buffers
         )
         self._nep_scatter_started = True
 
@@ -977,10 +926,7 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if not self._nep_is_owner:
             self.grad_reduce_handle = None
             return
-        self._try_start_ready_owner_dp_syncs(
-            nonblocking=True,
-            force_all_reduce=force_all_reduce,
-        )
+        self._try_start_ready_owner_dp_syncs(nonblocking=True, force_all_reduce=force_all_reduce)
 
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """Finish owner DP sync and scatter synced grads back to source ranks."""
@@ -1007,10 +953,7 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             self._start_nep_scatter_from_owner()
             self._record_nep_scatter_wait(copy_back_after_wait=True)
             return
-        self._try_start_ready_owner_dp_syncs(
-            nonblocking=False,
-            force_all_reduce=force_all_reduce,
-        )
+        self._try_start_ready_owner_dp_syncs(nonblocking=False, force_all_reduce=force_all_reduce)
         result = super().finish_grad_sync(force_all_reduce=force_all_reduce)
         self._start_nep_scatter_from_owner()
         self._record_nep_scatter_wait(copy_back_after_wait=False)
@@ -1031,10 +974,7 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if not self._nep_is_owner:
             self._wait_nep_gather_to_owner()
             return
-        self._try_start_ready_owner_dp_syncs(
-            nonblocking=False,
-            force_all_reduce=force_all_reduce,
-        )
+        self._try_start_ready_owner_dp_syncs(nonblocking=False, force_all_reduce=force_all_reduce)
 
     def register_grad_ready(
         self, param: torch.nn.Parameter, force_all_reduce: Optional[bool] = False
@@ -1070,9 +1010,7 @@ class NonuniformEPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         self._nep_ready = len(self.params) == 0
         self._nep_gather_handle = None
         self._nep_scatter_handle = None
-        reset_ordered_bucket_group_scheduler(
-            self, '_nep_scheduler_state', '_nep_group_index'
-        )
+        reset_ordered_bucket_group_scheduler(self, '_nep_scheduler_state', '_nep_group_index')
         state = getattr(self, '_nep_owner_dp_sync_scheduler_state', None)
         if state is not None and getattr(self, '_nep_owner_dp_sync_group_index', -1) == 0:
             state['next_index'] = 0
@@ -1153,12 +1091,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         del self._nep_nccl_async_handles[:drain_count]
 
     def _get_nep_nccl_cached_tensor(
-        self,
-        cache: dict,
-        key: tuple,
-        numel: int,
-        dtype: torch.dtype,
-        device: torch.device,
+        self, cache: dict, key: tuple, numel: int, dtype: torch.dtype, device: torch.device
     ) -> torch.Tensor:
         tensor = cache.get(key)
         if (
@@ -1191,9 +1124,31 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
     def _get_nep_nccl_task_buffer_slot(self, owner_ep_rank: int, chunk_index: int) -> int:
         layout = self._get_nep_nccl_owner_layout()
         buffer_slots = _get_nep_nccl_async_chunk_window()
-        return (
-            owner_ep_rank * max(1, layout['num_chunks']) + chunk_index
-        ) % buffer_slots
+        group_index = max(0, getattr(self, '_nep_nccl_group_index', 0))
+        task_ordinal = (
+            group_index * layout['min_ep_size'] * max(1, layout['num_chunks'])
+            + owner_ep_rank * max(1, layout['num_chunks'])
+            + chunk_index
+        )
+        return task_ordinal % buffer_slots
+
+    def _flush_nep_nccl_pending_scatters(
+        self, buffer_slot: Optional[int] = None, force_all: bool = False
+    ) -> None:
+        state = getattr(self, '_nep_nccl_scheduler_state', None)
+        if state is None:
+            return
+        pending_scatters = state.setdefault('pending_scatters', [])
+        remaining_scatters = []
+        for context in pending_scatters:
+            if not force_all and context['buffer_slot'] != buffer_slot:
+                remaining_scatters.append(context)
+                continue
+            group = context['group']
+            nccl_stream = group._get_nep_nccl_comm_stream(context['buffer_slot'])
+            with torch.cuda.stream(nccl_stream):
+                group._start_nep_nccl_owner_task_scatter(context)
+        state['pending_scatters'] = remaining_scatters
 
     def _get_nep_nccl_owner_layout(self) -> dict:
         """Return cached owner-layout metadata for this expert slot bucket group."""
@@ -1310,11 +1265,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             self._nep_nccl_prepped_experts.add(expert_id)
 
     def _pack_nep_nccl_owner_chunk(
-        self,
-        owner_ep_rank: int,
-        chunk_start: int,
-        chunk_end: int,
-        chunk: torch.Tensor,
+        self, owner_ep_rank: int, chunk_start: int, chunk_end: int, chunk: torch.Tensor
     ) -> None:
         """Pack local source grads into a common owner-rank layout chunk."""
         slot_numel = self._nep_nccl_slot_numel
@@ -1343,11 +1294,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             )
 
     def _nep_nccl_owner_source_segments(
-        self,
-        owner_ep_rank: int,
-        source_ep_rank: int,
-        chunk_start: int,
-        chunk_end: int,
+        self, owner_ep_rank: int, source_ep_rank: int, chunk_start: int, chunk_end: int
     ) -> List[Tuple[int, int, int, int]]:
         """Map one source rank's dense payload to offsets in an owner-layout chunk."""
         placement = self._nep_runtime_config.get('expert_placement')
@@ -1384,11 +1331,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         return segments
 
     def _nep_nccl_owner_source_payload_numel(
-        self,
-        owner_ep_rank: int,
-        source_ep_rank: int,
-        chunk_start: int,
-        chunk_end: int,
+        self, owner_ep_rank: int, source_ep_rank: int, chunk_start: int, chunk_end: int
     ) -> int:
         return sum(
             numel
@@ -1484,11 +1427,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             payload_offset += numel
 
     def _copy_nep_nccl_owner_chunk_to_local_grads(
-        self,
-        owner_ep_rank: int,
-        chunk_start: int,
-        chunk_end: int,
-        chunk: torch.Tensor,
+        self, owner_ep_rank: int, chunk_start: int, chunk_end: int, chunk: torch.Tensor
     ) -> None:
         """Copy a reduced common owner-rank layout chunk back to local source grads."""
         slot_numel = self._nep_nccl_slot_numel
@@ -1562,9 +1501,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             self._get_nep_nccl_transfer_group_info(owner_ep_rank)
         )
         owner_transfer_rank = transfer_source_ranks.index(owner_ep_rank)
-        remote_transfer_ranks = [
-            transfer_source_ranks.index(rank) for rank in remote_source_ranks
-        ]
+        remote_transfer_ranks = [transfer_source_ranks.index(rank) for rank in remote_source_ranks]
 
         if ep_rank == owner_ep_rank:
             self._pack_nep_nccl_owner_chunk(owner_ep_rank, chunk_start, chunk_end, chunk)
@@ -1574,11 +1511,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
 
         cache = self._get_nep_nccl_shared_buffer_state()['gather_buf_cache']
         empty = self._get_nep_nccl_cached_tensor(
-            cache,
-            ("empty", chunk.dtype, chunk.device),
-            0,
-            chunk.dtype,
-            chunk.device,
+            cache, ("empty", chunk.dtype, chunk.device), 0, chunk.dtype, chunk.device
         )
 
         input_split_sizes = [0] * transfer_size
@@ -1601,11 +1534,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 chunk.device,
             )
             self._pack_nep_nccl_source_payload(
-                owner_ep_rank,
-                ep_rank,
-                chunk_start,
-                chunk_end,
-                gather_input,
+                owner_ep_rank, ep_rank, chunk_start, chunk_end, gather_input
             )
         else:
             gather_input = empty
@@ -1705,9 +1634,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             self._get_nep_nccl_transfer_group_info(owner_ep_rank)
         )
         owner_transfer_rank = transfer_source_ranks.index(owner_ep_rank)
-        remote_transfer_ranks = [
-            transfer_source_ranks.index(rank) for rank in remote_source_ranks
-        ]
+        remote_transfer_ranks = [transfer_source_ranks.index(rank) for rank in remote_source_ranks]
 
         if not remote_source_ranks:
             if ep_rank == owner_ep_rank:
@@ -1718,11 +1645,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
 
         cache = self._get_nep_nccl_shared_buffer_state()['gather_buf_cache']
         empty = self._get_nep_nccl_cached_tensor(
-            cache,
-            ("empty", chunk.dtype, chunk.device),
-            0,
-            chunk.dtype,
-            chunk.device,
+            cache, ("empty", chunk.dtype, chunk.device), 0, chunk.dtype, chunk.device
         )
 
         input_split_sizes = [0] * transfer_size
@@ -1814,11 +1737,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             )
         elif ep_rank in remote_source_ranks:
             self._copy_nep_nccl_scatter_payload_to_local_grads(
-                owner_ep_rank,
-                ep_rank,
-                chunk_start,
-                chunk_end,
-                scatter_output,
+                owner_ep_rank, ep_rank, chunk_start, chunk_end, scatter_output
             )
         _nep_debug_print(
             "after ep_all_to_all_owner_scatter "
@@ -1838,6 +1757,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         chunk_start: int,
         chunk_end: int,
         async_op: bool,
+        defer_scatter: bool = False,
     ) -> None:
         """Launch one ordered owner-layout gather/allreduce/scatter task."""
         layout = self._get_nep_nccl_owner_layout()
@@ -1849,24 +1769,13 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         buffer_slot = self._get_nep_nccl_task_buffer_slot(owner_ep_rank, chunk_index)
         chunk_dtype = self.buckets[0].grad_data.dtype
         chunk_device = self.buckets[0].grad_data.device
-        buffer_slot_key = (
-            buffer_slot,
-            chunk_size,
-            chunk_dtype,
-            chunk_device,
-        )
+        buffer_slot_key = (buffer_slot, chunk_size, chunk_dtype, chunk_device)
         self._order_nep_nccl_buffer_slot(buffer_slot_key)
 
         gather_buf_cache = self._get_nep_nccl_shared_buffer_state()['gather_buf_cache']
         chunk = self._get_nep_nccl_cached_tensor(
             gather_buf_cache,
-            (
-                "owner_layout_gather",
-                buffer_slot,
-                chunk_size,
-                chunk_dtype,
-                chunk_device,
-            ),
+            ("owner_layout_gather", buffer_slot, chunk_size, chunk_dtype, chunk_device),
             chunk_size,
             chunk_dtype,
             chunk_device,
@@ -1903,41 +1812,53 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 f"group={group_index} owner={owner_ep_rank} chunk={chunk_index} "
                 f"chunk_size={chunk_size} edp_rank={edp_group.rank()}"
             )
-            work = dist.all_reduce(
-                chunk,
-                op=reduce_op,
-                group=edp_group,
-                async_op=async_op,
-            )
+            work = dist.all_reduce(chunk, op=reduce_op, group=edp_group, async_op=async_op)
             self._record_nep_nccl_work(work, buffer_slot_key)
             _nep_debug_print(
                 "after edp_all_reduce_owner_chunk "
                 f"group={group_index} owner={owner_ep_rank} chunk={chunk_index}"
             )
 
+        context = {
+            'group': self,
+            'owner_ep_rank': owner_ep_rank,
+            'chunk_index': chunk_index,
+            'chunk_start': chunk_start,
+            'chunk_end': chunk_end,
+            'chunk': chunk,
+            'buffer_slot': buffer_slot,
+            'buffer_slot_key': buffer_slot_key,
+            'async_op': async_op,
+        }
+        if defer_scatter:
+            state = getattr(self, '_nep_nccl_scheduler_state', None)
+            if state is None:
+                raise RuntimeError("Deferred NEP scatter requires a shared task scheduler")
+            state.setdefault('pending_scatters', []).append(context)
+        else:
+            self._start_nep_nccl_owner_task_scatter(context)
+
+    def _start_nep_nccl_owner_task_scatter(self, context: dict) -> None:
         self._start_nep_nccl_owner_all_to_all_scatter(
-            owner_ep_rank,
-            chunk_index,
-            chunk_start,
-            chunk_end,
-            chunk,
-            buffer_slot_key,
-            async_op=async_op,
+            context['owner_ep_rank'],
+            context['chunk_index'],
+            context['chunk_start'],
+            context['chunk_end'],
+            context['chunk'],
+            context['buffer_slot_key'],
+            async_op=context['async_op'],
         )
-        self._mark_nep_nccl_task_started(owner_ep_rank, chunk_index)
+        self._mark_nep_nccl_task_started(context['owner_ep_rank'], context['chunk_index'])
 
     def _try_start_nep_nccl_ready_tasks(
-        self,
-        force_ready: bool = False,
-        async_op_override: Optional[bool] = None,
+        self, force_ready: bool = False, async_op_override: Optional[bool] = None
     ) -> None:
         """Launch globally ordered owner tasks while local dependencies are ready."""
         state = getattr(self, '_nep_nccl_scheduler_state', None)
         if state is None or 'task_sequence' not in state:
             self._start_nonuniform_ep_nccl_grad_sync(
                 async_op=(
-                    self.ddp_config.overlap_grad_reduce
-                    and not self.is_first_batch
+                    self.ddp_config.overlap_grad_reduce and not self.is_first_batch
                     if async_op_override is None
                     else async_op_override
                 )
@@ -1955,9 +1876,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             if state['task_next_index'] >= len(tasks):
                 return False
             task = tasks[state['task_next_index']]
-            return force_ready or task['group']._nep_nccl_owner_task_ready(
-                task['owner_ep_rank']
-            )
+            return force_ready or task['group']._nep_nccl_owner_task_ready(task['owner_ep_rank'])
 
         def launch_next_task() -> None:
             task = state['task_sequence'][state['task_next_index']]
@@ -1968,6 +1887,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 task['chunk_start'],
                 task['chunk_end'],
                 async_op=async_op,
+                defer_scatter=async_op,
             )
             state['task_next_index'] += 1
 
@@ -1993,19 +1913,17 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     if _nep_overlap_debug_enabled():
                         debug_start_event = torch.cuda.Event(enable_timing=True)
                         debug_start_event.record(nccl_stream)
+                    group._flush_nep_nccl_pending_scatters(buffer_slot=stream_slot)
                     launch_next_task()
                     if _nep_overlap_debug_enabled():
                         debug_done_event = torch.cuda.Event(enable_timing=True)
                         debug_done_event.record(nccl_stream)
                 if debug_start_event is not None and debug_done_event is not None:
                     group._nep_nccl_overlap_debug_events.append(
-                        (
-                            task_index,
-                            task_index + 1,
-                            debug_start_event,
-                            debug_done_event,
-                        )
+                        (task_index, task_index + 1, debug_start_event, debug_done_event)
                     )
+            if force_ready:
+                self._flush_nep_nccl_pending_scatters(force_all=True)
         else:
             launch_ready_tasks_on_current_stream()
 
@@ -2031,16 +1949,10 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             f"max_chunk_numel={layout['max_chunk_numel']} slot_key={self._nep_nccl_slot_key}"
         )
         for owner_ep_rank in range(min_ep_size):
-            for chunk_index, start in enumerate(
-                range(0, owner_numel, layout['max_chunk_numel'])
-            ):
+            for chunk_index, start in enumerate(range(0, owner_numel, layout['max_chunk_numel'])):
                 end = min(start + layout['max_chunk_numel'], owner_numel)
                 self._start_nep_nccl_owner_task(
-                    owner_ep_rank,
-                    chunk_index,
-                    start,
-                    end,
-                    async_op=async_op,
+                    owner_ep_rank, chunk_index, start, end, async_op=async_op
                 )
         _nep_debug_print(f"nccl_sync exit group={group_index}")
 
@@ -2075,10 +1987,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         _nep_debug_print(
             f"start_grad_sync before_nccl_task_scheduler group={group_index} async_op={async_op}"
         )
-        self._try_start_nep_nccl_ready_tasks(
-            force_ready=True,
-            async_op_override=async_op,
-        )
+        self._try_start_nep_nccl_ready_tasks(force_ready=True, async_op_override=async_op)
         self.grad_reduce_handle = None
         _nep_debug_print(f"start_grad_sync exit group={group_index}")
 
@@ -2204,10 +2113,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 self.per_param_grad_ready_counts[param] = 0
             self.per_param_grad_ready_counts[param] += 1
             if not self.is_first_batch:
-                self._try_start_nep_nccl_ready_tasks(
-                    force_ready=False,
-                    async_op_override=True,
-                )
+                self._try_start_nep_nccl_ready_tasks(force_ready=False, async_op_override=True)
                 if self.per_param_grad_ready_counts == self.golden_per_param_grad_ready_counts:
                     assert len(self.per_param_grad_ready_counts) == len(self.params)
                     _nep_debug_print(
@@ -2230,7 +2136,10 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         )
         state = getattr(self, '_nep_nccl_scheduler_state', None)
         if state is not None and getattr(self, '_nep_nccl_group_index', -1) == 0:
+            if state.get('pending_scatters'):
+                raise RuntimeError("NEP reset found deferred scatters that were not flushed")
             state['task_next_index'] = 0
+            state['pending_scatters'] = []
 
 
 def _coalesce_nep_nccl_bucket_groups_for_edp_order(
@@ -2247,9 +2156,7 @@ def _coalesce_nep_nccl_bucket_groups_for_edp_order(
         return bucket_groups
 
     local_count = torch.tensor(
-        [len(bucket_groups)],
-        dtype=torch.int32,
-        device=torch.cuda.current_device(),
+        [len(bucket_groups)], dtype=torch.int32, device=torch.cuda.current_device()
     )
     dist.all_reduce(local_count, op=dist.ReduceOp.MIN, group=edp_group)
     target_count = int(local_count.item())
@@ -2360,9 +2267,7 @@ def _build_expert_bucket_specs(buffers, runtime_config, config, param_to_name):
                     continue
                 name = param_to_name.get(param, "")
                 expert_id = _local_expert_id_from_name(
-                    name,
-                    config.expert_name_pattern,
-                    local_expert_indices,
+                    name, config.expert_name_pattern, local_expert_indices
                 )
                 if expert_id is None:
                     flush_current()
@@ -2392,9 +2297,7 @@ def _build_expert_param_bucket_specs(buffers, runtime_config, config, param_to_n
                     continue
                 name = param_to_name.get(param, "")
                 expert_id = _local_expert_id_from_name(
-                    name,
-                    config.expert_name_pattern,
-                    local_expert_indices,
+                    name, config.expert_name_pattern, local_expert_indices
                 )
                 if expert_id is None:
                     continue
@@ -2409,12 +2312,7 @@ def _build_expert_param_bucket_specs(buffers, runtime_config, config, param_to_n
                         params=[param],
                         start=start,
                         end=end,
-                        slot_key=(
-                            _expert_slot_key_from_name(
-                                name,
-                                config.expert_name_pattern,
-                            ),
-                        ),
+                        slot_key=(_expert_slot_key_from_name(name, config.expert_name_pattern),),
                     )
                 )
 
@@ -2450,11 +2348,7 @@ def _build_synthetic_owner_bucket_specs(buffers, local_specs, runtime_config, co
     for expert_id in range(num_experts):
         if expert_id in local_expert_ids:
             continue
-        owner_ep_rank = _owner_for_expert(
-            expert_id,
-            runtime_config,
-            config.expert_owner,
-        )
+        owner_ep_rank = _owner_for_expert(expert_id, runtime_config, config.expert_owner)
         if owner_ep_rank != local_ep_rank:
             continue
         if local_ep_rank in _source_ep_ranks_for_expert(expert_id, runtime_config):
@@ -2483,9 +2377,7 @@ def wrap_nonuniform_ep_nccl_bucket_groups(
     bucket_groups: List[_ParamAndGradBucketGroup],
     runtime_config: dict,
     nonuniform_ep_config: NonuniformEPConfig,
-    param_to_bucket_group: Optional[
-        Dict[torch.nn.Parameter, _ParamAndGradBucketGroup]
-    ] = None,
+    param_to_bucket_group: Optional[Dict[torch.nn.Parameter, _ParamAndGradBucketGroup]] = None,
 ) -> List[NonuniformEPNCCLParamAndGradBucketGroup]:
     """Replace generic expert bucket groups with Approach-A NCCL bucket groups."""
     wrapped_bucket_groups = []
@@ -2500,17 +2392,12 @@ def wrap_nonuniform_ep_nccl_bucket_groups(
             )
             wrapped_bucket_group.__dict__ = bucket_group.__dict__.copy()
 
-        wrapped_bucket_group.configure_nonuniform_ep_nccl(
-            runtime_config,
-            nonuniform_ep_config,
-        )
+        wrapped_bucket_group.configure_nonuniform_ep_nccl(runtime_config, nonuniform_ep_config)
         old_to_new[bucket_group] = wrapped_bucket_group
         wrapped_bucket_groups.append(wrapped_bucket_group)
 
     wrapped_bucket_groups = _coalesce_nep_nccl_bucket_groups_for_edp_order(
-        wrapped_bucket_groups,
-        runtime_config,
-        nonuniform_ep_config,
+        wrapped_bucket_groups, runtime_config, nonuniform_ep_config
     )
     for wrapped_bucket_group in wrapped_bucket_groups:
         wrapped_bucket_group.next_param_gather_bucket_group = None
@@ -2566,6 +2453,7 @@ def _configure_nep_nccl_task_scheduler(
 
     state['task_sequence'] = task_sequence
     state['task_next_index'] = 0
+    state['pending_scatters'] = []
 
 
 def build_nonuniform_ep_nccl_bucket_groups(
@@ -2579,10 +2467,7 @@ def build_nonuniform_ep_nccl_bucket_groups(
     """Build common-layout NCCL Approach-A bucket groups by expert parameter slot."""
     ep_group = runtime_config['ep_group']
     specs = _build_expert_param_bucket_specs(
-        buffers,
-        runtime_config,
-        nonuniform_ep_config,
-        param_to_name,
+        buffers, runtime_config, nonuniform_ep_config, param_to_name
     )
     if buffers and not specs:
         raise RuntimeError(
@@ -2633,18 +2518,11 @@ def build_nonuniform_ep_nccl_bucket_groups(
             )
             buckets.append(bucket)
             entries.append(
-                {
-                    'expert_id': spec.expert_id,
-                    'bucket': bucket,
-                    'numel': spec.end - spec.start,
-                }
+                {'expert_id': spec.expert_id, 'bucket': bucket, 'numel': spec.end - spec.start}
             )
 
         bucket_group = NonuniformEPNCCLParamAndGradBucketGroup(
-            buckets,
-            ddp_config,
-            ep_group,
-            dist.get_world_size(group=ep_group),
+            buckets, ddp_config, ep_group, dist.get_world_size(group=ep_group)
         )
         bucket_group.configure_nonuniform_ep_nccl(
             runtime_config,
@@ -2664,10 +2542,7 @@ def build_nonuniform_ep_nccl_bucket_groups(
                 param_to_bucket_group[param] = bucket_group
 
     configure_ordered_bucket_group_scheduler(
-        bucket_groups,
-        '_nep_nccl_scheduler_state',
-        '_nep_nccl_group_index',
-        '_nep_nccl_ready',
+        bucket_groups, '_nep_nccl_scheduler_state', '_nep_nccl_group_index', '_nep_nccl_ready'
     )
     _configure_nep_nccl_task_scheduler(bucket_groups)
     return bucket_groups
@@ -2685,12 +2560,7 @@ def build_nonuniform_ep_expert_bucket_groups(
     ep_group = runtime_config['ep_group']
     edp_group = runtime_config.get('edp_group')
     bucket_groups = []
-    specs = _build_expert_bucket_specs(
-        buffers,
-        runtime_config,
-        nonuniform_ep_config,
-        param_to_name,
-    )
+    specs = _build_expert_bucket_specs(buffers, runtime_config, nonuniform_ep_config, param_to_name)
     if buffers and not specs:
         raise RuntimeError(
             "Cannot configure NEP: expert buffers exist, but no params matched "
@@ -2699,12 +2569,7 @@ def build_nonuniform_ep_expert_bucket_groups(
 
     all_specs = list(specs)
     all_specs.extend(
-        _build_synthetic_owner_bucket_specs(
-            buffers,
-            specs,
-            runtime_config,
-            nonuniform_ep_config,
-        )
+        _build_synthetic_owner_bucket_specs(buffers, specs, runtime_config, nonuniform_ep_config)
     )
     buffer_order = {buffer: index for index, buffer in enumerate(buffers)}
     slot_keys = sorted({spec.slot_key for spec in all_specs})
@@ -2757,9 +2622,7 @@ def build_nonuniform_ep_expert_bucket_groups(
         is_owner_rank = False
         for spec in group_specs:
             owner_ep_rank = _owner_for_expert(
-                spec.expert_id,
-                runtime_config,
-                nonuniform_ep_config.expert_owner,
+                spec.expert_id, runtime_config, nonuniform_ep_config.expert_owner
             )
             source_ep_ranks = _source_ep_ranks_for_expert(spec.expert_id, runtime_config)
             owner_global_rank = get_global_rank(ep_group, owner_ep_rank)
@@ -2819,16 +2682,9 @@ def build_nonuniform_ep_expert_bucket_groups(
             edp_group if (is_owner_rank and edp_group is not None) else buffer.data_parallel_group
         )
         bucket_group = NonuniformEPParamAndGradBucketGroup(
-            buckets,
-            ddp_config,
-            collective_group,
-            collective_group.size(),
+            buckets, ddp_config, collective_group, collective_group.size()
         )
-        bucket_group.configure_nonuniform_ep(
-            runtime_config,
-            nonuniform_ep_config,
-            plans,
-        )
+        bucket_group.configure_nonuniform_ep(runtime_config, nonuniform_ep_config, plans)
         bucket_groups.append(bucket_group)
 
     for buffer in buffers:
@@ -2840,10 +2696,7 @@ def build_nonuniform_ep_expert_bucket_groups(
                 param_to_bucket_group[param] = bucket_group
 
     configure_ordered_bucket_group_scheduler(
-        bucket_groups,
-        '_nep_scheduler_state',
-        '_nep_group_index',
-        '_nep_ready',
+        bucket_groups, '_nep_scheduler_state', '_nep_group_index', '_nep_ready'
     )
     owner_bucket_groups = [
         bucket_group for bucket_group in bucket_groups if bucket_group._nep_is_owner
@@ -2936,9 +2789,7 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         )
 
     def _register_delayed_dense_grad_ready(
-        self,
-        bucket_group: _ParamAndGradBucketGroup,
-        param: torch.nn.Parameter,
+        self, bucket_group: _ParamAndGradBucketGroup, param: torch.nn.Parameter
     ) -> None:
         """Track dense bucket readiness without launching dense DP collectives."""
         assert bucket_group.ddp_config.overlap_grad_reduce
@@ -2948,9 +2799,7 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 bucket_group.per_param_grad_ready_counts[param] = 0
             bucket_group.per_param_grad_ready_counts[param] += 1
 
-    def _start_delayed_dense_grad_syncs(
-        self, force_all_reduce: Optional[bool] = False
-    ) -> None:
+    def _start_delayed_dense_grad_syncs(self, force_all_reduce: Optional[bool] = False) -> None:
         if not self._delay_dense_grad_sync_for_nep():
             return
 
