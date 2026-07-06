@@ -2,6 +2,130 @@
 
 Append a dated entry whenever we do something new: code changes, job submissions, benchmark results, trace analysis, or decisions that change the next step. Keep entries factual and include job IDs, run dirs, and commits when available.
 
+## 2026-07-06 - NCCL CTA and copy-engine overlap investigation
+
+- Focused the next optimization cycle on physical reshard overlap. The final phase-pipeline trace from job `2263612` still used 32-CTA `ncclDevKernel_SendRecv` kernels for all 184 `nep_owner_transfer` operations and 32-CTA all-reduce kernels for all 92 owner `ep_dp` operations.
+- Checked NVIDIA's NCCL zero-CTA requirements. Copy-engine zero-CTA requires NCCL 2.28 or newer, a zero-CTA communicator, symmetrically registered NCCL-window buffers, and a native supported collective. NCCL 2.29 supports AlltoAll, AllGather, Gather, and Scatter within one NVL/MNNVL domain; variable-split SendRecv is not supported.
+- Probed public 26.04 containers on Lyris GB200:
+  - PyTorch job `2291298`: NCCL `2.29.7`; `ProcessGroupNCCL.Options.config.cta_policy` is exposed.
+  - NeMo job `2291299`: NCCL `2.29.2`; CTA policy is exposed.
+  - Corrected NeMo dependency job `2291325`: Mamba `2.3.1`, causal-conv `1.6.1`, and Transformer Engine `2.14.1` import successfully; standalone `grouped_gemm` is missing. The image reports `NCCL_CTA_POLICY_ZERO=2`.
+- Added `scripts/nonuniform/probe_nccl_zero_cta.py` to profile registered-buffer default, efficiency-policy, one-CTA, and zero-CTA collective variants on four GPUs.
+- First collective probe job `2291355` established two constraints before failing on the intentionally tested zero-policy AlltoAll:
+  - PyTorch's equal-split `all_to_all_single` maps to `ncclDevKernel_SendRecv`, not native `ncclAlltoAll`.
+  - `NCCL_CTA_POLICY_EFFICIENCY` did not reduce that SendRecv launch; both default and efficiency traces used a 32-CTA grid. Efficiency was slower in this short sample.
+  - Forcing zero policy on that unsupported SendRecv path raised an NCCL unhandled-CUDA error. This confirms that the current variable-split NEP path cannot become copy-engine-only by changing the communicator policy alone.
+- Revised the probe to isolate risky cases, added a `max_ctas=min_ctas=1` communicator control, and moved known-supported zero-CTA AllGather ahead of unsupported SendRecv tests.
+- One-node rerun `2291380` completed the default, efficiency, and one-CTA controls before failing in the 26.04/NCCL 2.29.3 copy-engine AllGather path:
+  - Default and efficiency variable SendRecv used 11 CTAs in this one-peer pattern and took about `0.104 ms` and `0.054 ms` of sampled GPU time respectively.
+  - The one-CTA variable path used one CTA but took about `1.662 ms`, roughly 16x the default sampled duration. This agrees with the earlier CTA-4/8 model runs: reducing CTA count stretches communication enough to hurt throughput.
+  - The zero-policy AllGather reached NCCL's `Init CE` path, then failed in `ce_coll.cc:411` with `Cuda failure 'invalid argument'`. The node had driver `13.1`, NCCL detected the four GPUs in one node, and symmetric-window setup completed, so the next check targets a newer NCCL CE implementation rather than another CTA limit.
+- Submitted isolated zero-AllGather job `2291407` with public `nvcr.io/nvidia/nemo:26.06`, which carries NCCL 2.30.4 and the 2.30 CE-collective fixes. The job was pending on priority at submission.
+- Job `2291407` completed successfully on one GB200 node. The container's PyTorch build reports NCCL `2.29.7`; registered-buffer zero-CTA AllGather passed on four ranks, and NCCL logged `Init CE` without the `ce_coll.cc` failure seen in the 26.04 image.
+- The rank-0 trace for `2291407` contains `Memcpy DtoD` and `Memcpy PtoP` GPU activity and no `ncclDevKernel`, confirming that the collective ran on copy engines rather than consuming SMs.
+- Submitted two-rank job `2291447` on the same public NeMo 26.06 image to test zero-CTA equal-split AlltoAll. Current PyTorch can call native `ncclAllToAll` without a custom C++ binding, but code inspection corrected an important topology assumption: round-robin follower placement makes a3b EP8/4 owner groups size 5 and a8b EP64/32 groups size 9, so fixed AlltoAll would multiply traffic by the group size and is only a control, not the preferred integration.
+- The better-fit operation is native zero-CTA Gather/Scatter. Each follower in an owner group contributes the same dense payload while the owner can retain its larger local contribution directly; only the owner's dummy follower-sized slice is padding. Submitted job `2291453` to check whether NVIDIA's PyTorch 26.06 build already maps `dist.gather` to native `ncclGather` before implementing a small direct binding.
+- Jobs `2291447` and `2291453` both completed on two GB200 GPUs. Equal-split `all_to_all_single` used only copy-engine `Memcpy DtoD/PtoP` events with no NCCL kernel, while `dist.gather` still emitted `ncclDevKernel_SendRecv`; PyTorch therefore exposes native `ncclAllToAll` but not native `ncclGather` in this image.
+- Added `scripts/nonuniform/probe_nccl_native_gather.py`, a small experimental binding that calls the stable `ncclGather`/`ncclScatter` C API through `ctypes` using `ProcessGroupNCCL._comm_ptr()`. This avoids a compiled extension and keeps the experiment isolated from NEP until validated.
+- Submitted native Gather/Scatter correctness and trace job `2291467` on two GB200 GPUs with symmetrically registered NCCL-window buffers and a zero-CTA communicator.
+- Job `2291467` completed successfully. Native Gather and Scatter both passed BF16 correctness using the raw communicator pointer; each rank-0 trace contains only `Memcpy DtoD/PtoP` copy-engine activity and no `ncclDevKernel` event. The measured two-active-step GPU copy-event sums were about `0.112 ms` for each direction at 2 MiB per rank.
+- Decided to integrate this path behind an explicit opt-in. The existing ordered backward-hook task scheduler and slot CUDA streams remain unchanged; the integration only replaces variable SendRecv AlltoAll with native Gather/Scatter and preallocates symmetrically registered staging buffers.
+- PyTorch's ProcessGroupNCCL exposes its `ncclMemAlloc` allocator directly as `backend.mem_allocator`. Updated the probe to use that allocator with `torch.cuda.MemPool`, eliminating Megatron's inline allocator compilation from this path, and submitted validation job `2291478`.
+- Job `2291478` completed successfully with the built-in ProcessGroup allocator. Native zero-CTA Gather/Scatter again passed and entered NCCL's CE path, now without compiling the Megatron NCCL allocator extension.
+- Added an opt-in core implementation selected by `MEGATRON_NONUNIFORM_EP_ZERO_SM_RESHARD=1`:
+  - Only `nep_owner_transfer` communicators receive `NCCL_CTA_POLICY_ZERO`.
+  - Persistent small/large staging buffers are allocated from `ProcessGroupNCCL.mem_allocator`, registered symmetrically with each local owner group, and shared by the existing bounded slot scheduler.
+  - The owner-transfer phases call native `ncclGather`/`ncclScatter` through a lazy `ctypes` helper. The existing variable-split AlltoAll path remains the default fallback.
+- Submitted two-node EP4/2 smoke job `2291495` with 16 layers, four staging slots, ten iterations, and a rank-0 PyTorch profile on NeMo 26.06. It was pending on priority at submission.
+- Job `2291495` completed successfully on two nodes. All ten iterations had finite losses and zero skipped/nan iterations; clean iterations 7-10 were `178-185 ms`. NCCL logged `Init CE` for both owner communicators, confirming the integrated path was active. The wrapper had overwritten the requested four-slot setting with 16, which was corrected after the run.
+- Exact trace correlation found 64 Gather and 64 Scatter calls over two profiled iterations. Their 448 correlated GPU copy events moved about 4.29 GB, had an 8.03 ms union, and contained no owner-transfer NCCL kernel. Physical overlap with non-NCCL kernels on other streams was 0% in this small workload.
+- The no-overlap explanation is launch granularity, not SM contention: native NCCL CPU markers averaged about `99 us` for Gather and `105 us` for Scatter, while their GPU annotations averaged `73 us` and `84 us`. Each short copy finishes before autograd has submitted the next backward kernel. The exposed transfer span is nevertheless only about `4 ms/iteration` here.
+- Removed whole-buffer memsets from the native path. Only unequal-payload padding is now zeroed, and zero-payload chunk collectives are skipped. The smoke wrapper now respects an explicitly configured async window.
+- Submitted an exact NeMo 26.06 comparison after that optimization:
+  - Zero-SM job `2291559`, EP4/2, 12 iterations, rank-0 profile.
+  - Existing variable-AlltoAll control `2291561`, with identical model, topology, profiler, and 16-slot window.
+  - Both jobs were pending on priority at submission.
+- The exact small comparison completed with finite losses and zero skipped/nan iterations:
+  - Fallback `2291561`: clean iterations 7-10 averaged `191.2 ms`; 128 owner-transfer SendRecv kernels totaled `8.10 ms` over two profiled iterations.
+  - Memset-removal zero-SM `2291559`: clean iterations averaged `230.7 ms`, a regression. Its native host markers rose to roughly `133/139 us` for Gather/Scatter from `99/105 us` in the original integrated run, while GPU annotations rose to `79/91 us` from `73/84 us`.
+  - The original zero-SM smoke `2291495` averaged `181.3 ms`, about 5.2% faster than the exact fallback on its node pair. Because the memset-removal variant worsened launch latency, the whole-buffer staging writes were restored; only the zero-payload guard remains.
+- Updated the real a3b wrapper to support a named enroot container on NeMo 26.06 and to rely on Transformer Engine's grouped-GEMM implementation instead of requiring the absent standalone `grouped_gemm` package during preflight.
+- Submitted a real a3b EP8/4 MBS4/GBS48 pair, 12 iterations with rank-0 profiles and low-priority communicators:
+  - Zero-SM job `2291612` on `lyris[0073-0075]`.
+  - Variable-AlltoAll control `2291617` on `lyris[0076-0078]`.
+  - Both jobs entered RUNNING immediately.
+- Both real a3b jobs stalled in the first backward pass before iteration 1. Every sampled GPU remained at 100% utilization with no memory-controller activity, consistent with NCCL kernels spinning rather than useful model compute. Zero-SM job `2291612` eventually failed with exit code 143 after `28:26`; fallback job `2291617` was canceled after reproducing the same state.
+- NCCL RAS queries identified the same mismatch in both jobs: a six-rank communicator spanning three nodes had four ranks at AllReduce operation 4 while communicator ranks 4 and 5, both on the reduced-replica node, remained at operation 2. All other queried communicator groups were healthy.
+- The affected size-six group is a dense data-parallel communicator, not an owner-transfer communicator. The identical zero-SM and fallback failure therefore isolates a shared cross-communicator launch-order problem in this NeMo 26.06/NCCL 2.30 real-workload configuration rather than a native Gather/Scatter correctness failure.
+- Next diagnostic: run the smallest a3b EP8/4 first-backward case with `CUDA_DEVICE_MAX_CONNECTIONS=1` and `NCCL_LAUNCH_ORDER_IMPLICIT=1`. This restores Megatron's sequence-parallel launch-order requirement and asks NCCL 2.30 to impose host launch order across communicators before resuming the full zero-SM/fallback profile comparison.
+- Submitted that diagnostic as job `2291773`: a3b EP8/4 topology `4 2`, TP2, MBS1/GBS12, two iterations, no profiler, fallback owner transfers, and a 20-minute limit on three GB200 nodes.
+- Job `2291773` reproduced the same first-backward stall even with `CUDA_DEVICE_MAX_CONNECTIONS=1` and `NCCL_LAUNCH_ORDER_IMPLICIT=1`. NCCL RAS again reported both six-rank dense-DP communicators at operation counts `4` on four healthy-replica ranks versus `2` on the two reduced-replica ranks. The job was canceled after the live diagnosis.
+- Code inspection found the first-batch ordering bug: `_start_delayed_dense_grad_syncs()` skipped every first-batch dense bucket group, leaving `DistributedDataParallel.finish_grad_sync()` to start and wait groups sequentially. Rank-dependent bucket grouping can then leave reduced ranks waiting after two dense AllReduces while healthy ranks attempt to launch four.
+- Removed the first-batch skip. The NEP wrapper now submits every ready dense bucket group before the parent finish loop waits; Megatron's existing first-batch `grad_reduce_handle` guard makes the parent start calls no-ops. Added opt-in per-bucket launch markers under `MEGATRON_NONUNIFORM_EP_DEBUG`.
+- Submitted fixed fallback validation job `2291798`: a3b EP8/4, MBS1/GBS12, two iterations, original `CUDA_DEVICE_MAX_CONNECTIONS=32`/implicit-order disabled settings, with debug output restricted to representative healthy and reduced ranks.
+- Job `2291798` reached the new dense prelaunch markers and exposed the underlying invalid layout. Healthy ranks had four dense groups with `299,945,984`, `302,388,192`, `302,388,192`, and `200,870,240` elements; reduced ranks had two with `531,236,512` and `574,356,096` elements. Both layouts total exactly `1,105,592,608` elements, but collective counts and boundaries differ. The job was canceled after this proof.
+- Root cause is `--ddp-num-buckets 16`: training derives `bucket_size` from each rank's total local parameter count. Reduced-EP ranks hold more local expert parameters, so they derive a larger bucket size even though the dense parameter sequence is identical across replicas.
+- Added a pre-DDP synchronization for NEP runs when `num_buckets` is configured. Each dense DP group takes the maximum locally derived bucket size before constructing buffers, producing identical dense bucket boundaries while retaining bucketing. Corrected first-batch readiness validation to use complete local parameter coverage because golden ready-count maps are populated only after the first reset.
+- Submitted job `2291821` with the same minimal a3b EP8/4 MBS1/GBS12 fallback configuration to validate synchronized bucket construction and two complete iterations.
+- Job `2291821` completed both iterations with finite loss and zero skipped/nan iterations. The local bucket-size derivations were `298,590,226` elements on healthy ranks and `528,080,914` on reduced ranks; synchronization selected `528,080,914` everywhere, and all sampled ranks built the identical two dense buckets of `531,236,512` and `574,356,096` elements. This removed the NCCL operation-count mismatch.
+- The validation's `91.7 s` first and `46.5 s` second iteration times are not performance data: rank-filtered debug still emitted thousands of per-group lines. The full comparison disables all NEP debug output.
+- Submitted the full corrected a3b EP8/4 TP2 MBS4/GBS48, 12-iteration profiled pair on NeMo 26.06:
+  - Native zero-SM Gather/Scatter job `2291854`.
+  - Variable-AlltoAll fallback job `2291856`.
+  - Both use 16 scheduler slots, rank-0 profiler steps 5-7, low-priority communication groups, `CUDA_DEVICE_MAX_CONNECTIONS=32`, and implicit NCCL launch ordering disabled.
+- Both jobs completed with finite losses and zero skipped/nan iterations. Excluding warmup, profiled iterations, and the manual-GC outlier, iterations 8-10 and 12 averaged:
+  - Zero-SM `2291854`: `1514.7 ms`, `482.0 TFLOP/s/GPU`.
+  - Fallback `2291856`: `1582.6 ms`, `461.3 TFLOP/s/GPU`.
+  - Native Gather/Scatter improved iteration time and throughput by about `4.5%`.
+- Rank-0 trace analysis over profiler steps 5-6:
+  - Zero-SM contained 92 Gather and 92 Scatter GPU annotations, 644 correlated copy-engine events, about 44.06 GB moved, 77.07 ms copy-event union, and no `nep_owner_transfer` NCCL kernel.
+  - Fallback contained 184 `nep_owner_transfer` SendRecv kernels with 115.05 ms union.
+  - Literal copy-engine/non-NCCL-kernel overlap in zero-SM remained only 0.82 ms, or `1.1%`; fallback owner-transfer overlap was `0.35%`.
+  - Zero-SM EDP all-reduce union was 131.91 ms with 10.5% compute overlap; fallback EDP was 114.43 ms with 4.9% overlap. Dense-DP all-reduce was about 23.35 ms in both.
+- Host trace analysis explained the remaining lack of overlap. Two late AccumulateGrad hooks per profiled iteration each batched 38-41 native calls and occupied the autograd thread for 85-98 ms. Each such hook contained roughly 2,700 tensor-slice dispatches, 900 copies, 300 adds, and 300 scales, so copy-engine operations usually finished before autograd could submit the next compute kernel.
+- Implemented a bounded-complexity host-path optimization: cache stable source-segment metadata and tensor views, then use PyTorch foreach copy/add/multiply operations for owner packing, source packing, gather accumulation, scatter packing, and local unpacking. The loop fallback remains for PyTorch builds without the foreach APIs.
+- Submitted two-node EP4/2 zero-SM job `2291922` to run the focused unit tests and validate the fused-view path for ten finite profiled iterations before repeating the a3b measurement.
+- Job `2291922` completed successfully: all four focused unit tests passed, all ten iterations had finite losses with zero skips/nans, and clean iterations 8-10 averaged `183.4 ms` versus `181.3 ms` in the original zero-SM smoke on a different node pair.
+- Exact smoke trace comparison showed the host-path optimization worked as intended:
+  - Reshard-hook slice operations fell from 1,344 to 448.
+  - Individual `copy_`, `add_`, and `mul_` calls fell from 320/128/128 to zero and were replaced by 208/128/64 foreach calls.
+  - Total CPU time in hooks containing native reshard calls fell from 73.61 to 63.48 ms (`13.8%`).
+  - Copy-engine union remained about 8.05 ms and had zero useful-compute overlap in both toy traces because each transfer is too short.
+- Submitted the full fused-view a3b MBS4/GBS48 profiled pair:
+  - Zero-SM job `2291941`.
+  - Variable-AlltoAll fallback job `2291942`.
+- Zero-SM fused-view job `2291941` completed successfully. Clean iterations 8-10 and 12 averaged `1517.1 ms` and `481.2 TFLOP/s/GPU`, statistically unchanged from the pre-fusion zero-SM run (`1514.7 ms`, `482.0 TFLOP/s/GPU`).
+- Its trace nevertheless confirms substantially better physical overlap:
+  - Native copy-engine/non-NCCL-kernel overlap increased from `1.1%` to `31.2%` (`40.12 ms` overlapped out of `128.54 ms` copy union).
+  - CPU time in reshard-containing AccumulateGrad hooks fell from `366.50 ms` to `162.34 ms` over two profiled iterations; the two largest hooks per iteration fell from roughly 85-98 ms to 34-38 ms.
+  - Native copy union stretched from `77.07 ms` to `128.54 ms` while overlapping compute, showing memory/fabric contention offsets the reduced host exposure in steady-state throughput.
+- Submitted zero-SM window sweep jobs to reduce concurrent copy-engine pressure while retaining fused host dispatch:
+  - Eight slots: `2291974`.
+  - Four slots: `2291975`.
+  - Both were pending on priority with no start estimate at submission.
+- Fused-view fallback job `2291942` also completed with finite losses and no skips/nans. Clean iterations 8-10 and 12 averaged `1611.5 ms` and `453.1 TFLOP/s/GPU`, about 1.8% slower than the pre-fusion fallback result on a different node set.
+- Its trace shows the same tradeoff as zero-SM: long reshard-hook CPU time fell from `385.54 ms` to `160.20 ms`, but the 184 owner-transfer SendRecv kernels stretched to `152.45 ms` summed duration under increased concurrent memory traffic. The foreach optimization should therefore remain scoped to the zero-SM opt-in path rather than changing default fallback behavior.
+- Scoped foreach copy/add/multiply launches to `zero_sm_reshard=True`; fallback keeps its original per-segment CUDA operations while retaining cached metadata/views.
+- Window jobs `2291974` and `2291975` completed with finite losses and no skips/nans. Clean iterations 8-10 and 12:
+  - 16 slots (`2291941`): `1517.1 ms`, `481.2 TFLOP/s/GPU`.
+  - 8 slots (`2291974`): `1523.9 ms`, `479.0 TFLOP/s/GPU`.
+  - 4 slots (`2291975`): `1527.8 ms`, `477.9 TFLOP/s/GPU`.
+- Trace tradeoff across 16/8/4 slots:
+  - Copy-engine overlap: `31.2%` / `27.7%` / `11.5%`.
+  - Copy union: `128.54` / `129.89` / `83.14 ms`.
+  - EDP all-reduce overlap: `44.1%` / `42.5%` / `19.1%`.
+  - Four slots shorten individual communication but serialize the cross-task pipeline enough to make profiled iterations about 67 ms slower. Sixteen slots remains the selected setting.
+- Submitted current same-code/container healthy control `2292010`: topology `4 4`, TP2/EP8, 16 GPUs, MBS4/GBS64, 12 iterations with profiler steps 5-7 on NeMo 26.06. It started immediately on four GB200 nodes.
+- Healthy control `2292010` completed with finite losses and no skipped/nan iterations. Clean iterations 8-10 and 12 averaged `1484.8 ms` and `491.7 TFLOP/s/GPU`.
+- Final current comparison:
+  - Healthy `4 4`: `1484.8 ms`, `491.7 TFLOP/s/GPU`.
+  - Zero-SM NEP `4 2`: `1517.1 ms`, `481.2 TFLOP/s/GPU`.
+  - NEP is 2.2% slower by step time and reaches `97.9%` of healthy per-GPU throughput, with a `32.3 ms` step gap.
+- Healthy versus NEP rank-0 traces show the remaining cost is dominated by owner-layout EDP reduction. Over two profiled iterations, healthy `ep_dp` union was `56.47 ms` with effectively no compute overlap; NEP was `192.36 ms` but overlapped `44.1%`. NEP's zero-SM owner copies additionally overlapped `31.2%` of their `128.54 ms` copy union.
+- Submitted final containerized lint/test job `2292060` to run required `uv run isort`, targeted `black --check`, and the focused NEP unit suite on the edited Python files.
+- Job `2292060` completed required `uv run isort` but stopped at `black --check`, which identified four files needing formatting; pytest did not run in that job.
+- Follow-up job `2292099` applied targeted Black formatting, reran required `uv run isort`, passed Black check on all five edited Python files, and passed all four focused tests in `tests/unit_tests/distributed/test_nonuniform_ep.py`.
+
 ## 2026-07-02 - Lyris NEP overlap investigation
 
 - Completed corrected eight-bucket Lyris comparisons using nvcr.io/nvidia/nemo:25.09: healthy MBS2 job 2261389, NEP MBS2 job 2261369, healthy MBS4 job 2261390, and NEP MBS4 job 2261391.
