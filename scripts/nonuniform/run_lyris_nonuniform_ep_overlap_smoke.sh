@@ -19,6 +19,7 @@ set -euo pipefail
 REPO_DIR="${REPO_DIR:-/home/darfeen/Megatron-LM}"
 ROOT_DIR="${ROOT_DIR:-${REPO_DIR}/slurm_runs/lyris_nep_smoke}"
 IMAGE="${IMAGE:-nvcr.io#nvidia/nemo:25.09}"
+CONTAINER_NAME="${CONTAINER_NAME:-}"
 NAME="${NAME:-ep8_4_l16_h1024_s1024_nonblocking_slots_${SLURM_JOB_ID}}"
 RUN_DIR="${ROOT_DIR}/${NAME}"
 DRIVER_LOG="${RUN_DIR}/driver_${SLURM_JOB_ID}.log"
@@ -47,12 +48,18 @@ container_args=(
     --container-workdir="${REPO_DIR}"
     --no-container-mount-home
 )
+if [[ -n "${CONTAINER_NAME}" ]]; then
+    container_args+=(--container-name="${CONTAINER_NAME}")
+fi
 
 echo "[lyris-nep-smoke] job=${SLURM_JOB_ID} nodes=${SLURM_JOB_NODELIST} image=${IMAGE}"
 
 srun --nodes=1 --ntasks=1 --mpi=none "${container_args[@]}" bash -lc '
 cd /home/darfeen/Megatron-LM
-python -m compileall -q megatron/core/distributed/nonuniform_ep.py
+python -m compileall -q \
+    megatron/core/distributed/_native_nccl.py \
+    megatron/core/distributed/nonuniform_ep.py
+python -m pytest -q tests/unit_tests/distributed/test_nonuniform_ep.py
 python - <<'"'"'PY'"'"'
 from megatron.core.distributed.nonuniform_ep import NonuniformEPNCCLParamAndGradBucketGroup
 
@@ -88,8 +95,8 @@ export CUDA_DEVICE_MAX_CONNECTIONS=32
 export NVTE_FUSED_ATTN=0
 export TORCHINDUCTOR_WORKER_START=fork
 export TRITON_CACHE_DIR=/tmp/triton_cache
-export MEGATRON_NONUNIFORM_EP_NCCL_ASYNC_CHUNK_WINDOW=16
-export MEGATRON_NONUNIFORM_EP_OVERLAP_DEBUG=1
+export MEGATRON_NONUNIFORM_EP_NCCL_ASYNC_CHUNK_WINDOW="${MEGATRON_NONUNIFORM_EP_NCCL_ASYNC_CHUNK_WINDOW:-16}"
+export MEGATRON_NONUNIFORM_EP_OVERLAP_DEBUG="${MEGATRON_NONUNIFORM_EP_OVERLAP_DEBUG:-1}"
 
 export RUN_DIRECT=1
 export IMAGE_PATH="${IMAGE}"

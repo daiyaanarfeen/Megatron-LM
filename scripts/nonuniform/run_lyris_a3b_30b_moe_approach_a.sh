@@ -19,6 +19,7 @@
 set -euo pipefail
 
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-32}"
+export NCCL_LAUNCH_ORDER_IMPLICIT="${NCCL_LAUNCH_ORDER_IMPLICIT:-0}"
 export NVTE_FWD_LAYERNORM_SM_MARGIN="${NVTE_FWD_LAYERNORM_SM_MARGIN:-16}"
 export NVTE_BWD_LAYERNORM_SM_MARGIN="${NVTE_BWD_LAYERNORM_SM_MARGIN:-16}"
 export NVTE_FUSED_ATTN="${NVTE_FUSED_ATTN:-0}"
@@ -28,10 +29,12 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export MEGATRON_NONUNIFORM_EP_NCCL_MAX_GATHER_BYTES="${MEGATRON_NONUNIFORM_EP_NCCL_MAX_GATHER_BYTES:-1073741824}"
 export MEGATRON_NONUNIFORM_EP_NCCL_ASYNC_CHUNK_WINDOW="${MEGATRON_NONUNIFORM_EP_NCCL_ASYNC_CHUNK_WINDOW:-16}"
 export MEGATRON_NONUNIFORM_EP_OVERLAP_DEBUG="${MEGATRON_NONUNIFORM_EP_OVERLAP_DEBUG:-0}"
+export MEGATRON_NONUNIFORM_EP_ZERO_SM_RESHARD="${MEGATRON_NONUNIFORM_EP_ZERO_SM_RESHARD:-0}"
 
 REPO_DIR="${REPO_DIR:-/home/darfeen/Megatron-LM}"
 ROOT_DIR="${ROOT_DIR:-${REPO_DIR}/slurm_runs/lyris_a3b}"
 IMAGE="${IMAGE:-nvcr.io#nvidia/nemo:25.09}"
+CONTAINER_NAME="${CONTAINER_NAME:-}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 RUN_NNODES="${RUN_NNODES:-${SLURM_NNODES}}"
 TRAIN_ITERS="${TRAIN_ITERS:-12}"
@@ -74,6 +77,7 @@ trap finish EXIT
 
 echo "[lyris-a3b] job=${SLURM_JOB_ID} nodes=${SLURM_JOB_NODELIST} image=${IMAGE}"
 echo "[lyris-a3b] topology=${NONUNIFORM_EP_TOPOLOGY} mbs=${MICRO_BATCH_SIZE} gbs=${GLOBAL_BATCH_SIZE} buckets=${DDP_NUM_BUCKETS}"
+echo "[lyris-a3b] zero_sm=${MEGATRON_NONUNIFORM_EP_ZERO_SM_RESHARD} cuda_connections=${CUDA_DEVICE_MAX_CONNECTIONS} nccl_implicit_order=${NCCL_LAUNCH_ORDER_IMPLICIT}"
 
 container_args=(
     --container-image="${IMAGE}"
@@ -81,11 +85,14 @@ container_args=(
     --container-workdir="${REPO_DIR}"
     --no-container-mount-home
 )
+if [[ -n "${CONTAINER_NAME}" ]]; then
+    container_args+=(--container-name="${CONTAINER_NAME}")
+fi
 
 # Compile the dataset helper once into the shared checkout and validate the
 # Mamba-specific runtime before starting the distributed workers.
 srun --nodes=1 --ntasks=1 --mpi=none "${container_args[@]}" \
-    bash -lc "cd '${REPO_DIR}' && python -c 'import mamba_ssm, causal_conv1d, grouped_gemm; from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec; from megatron.core.datasets.utils import compile_helpers; compile_helpers(); print(\"[lyris-a3b] runtime preflight: ok\")'"
+    bash -lc "cd '${REPO_DIR}' && python -c 'import mamba_ssm, causal_conv1d; from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec; from megatron.core.datasets.utils import compile_helpers; compile_helpers(); print(\"[lyris-a3b] runtime preflight: ok\")'"
 
 profile_args=""
 if [[ "${PROFILE}" == "1" ]]; then

@@ -2,7 +2,11 @@
 
 import torch
 
-from megatron.core.distributed.nonuniform_ep import NonuniformEPNCCLParamAndGradBucketGroup
+from megatron.core.distributed.nonuniform_ep import (
+    NonuniformEPApproach,
+    NonuniformEPDistributedDataParallel,
+    NonuniformEPNCCLParamAndGradBucketGroup,
+)
 
 
 class _FakeWork:
@@ -15,6 +19,21 @@ class _FakeWork:
 
     def wait(self):
         self.wait_calls += 1
+
+
+class _FakeDenseBucketGroup:
+    def __init__(self, numel):
+        self.is_first_batch = True
+        self.grad_reduce_handle = None
+        self.params = [object()]
+        self.per_param_grad_ready_counts = {self.params[0]: 1}
+        self.golden_per_param_grad_ready_counts = {}
+        self.buckets = [type('Bucket', (), {'grad_data': torch.empty(numel)})()]
+        self.start_calls = []
+
+    def start_grad_sync(self, force_all_reduce=False):
+        self.start_calls.append(force_all_reduce)
+        self.grad_reduce_handle = object()
 
 
 def test_nep_nccl_buffer_slot_reuse_does_not_block_host():
@@ -33,6 +52,20 @@ def test_nep_nccl_buffer_slot_reuse_does_not_block_host():
     assert all(work.block_calls == 1 for work in works)
     assert all(work.wait_calls == 0 for work in works)
     assert slot_key not in bucket_group._nep_nccl_scheduler_state['buffer_slot_handles']
+
+
+def test_nep_nccl_starts_first_batch_dense_groups_before_waiting():
+    ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
+    ddp.ddp_config = type('DDPConfig', (), {'overlap_grad_reduce': True})()
+    ddp.nonuniform_ep_config = type(
+        'NonuniformEPConfig', (), {'approach': NonuniformEPApproach.NCCL}
+    )()
+    ddp.bucket_groups = [_FakeDenseBucketGroup(4), _FakeDenseBucketGroup(8)]
+
+    ddp._start_delayed_dense_grad_syncs(force_all_reduce=True)
+
+    assert [group.start_calls for group in ddp.bucket_groups] == [[True], [True]]
+    assert all(group.grad_reduce_handle is not None for group in ddp.bucket_groups)
 
 
 def test_nep_nccl_owner_tasks_use_bounded_distinct_stream_slots(monkeypatch):

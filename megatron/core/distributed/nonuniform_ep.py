@@ -26,6 +26,7 @@ from .. import parallel_state
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
+from ._native_nccl import get_native_nccl
 from .distributed_data_parallel import DistributedDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .nonuniform_common import (
@@ -45,6 +46,7 @@ logger = logging.getLogger(__name__)
 _NEP_TAG_SLOT_STRIDE = 256
 _NEP_NCCL_DEFAULT_MAX_GATHER_BYTES = 8 * 1024 * 1024 * 1024
 _NEP_NCCL_DEFAULT_ASYNC_CHUNK_WINDOW = 2
+_NCCL_CTA_POLICY_ZERO = 2
 
 
 def _nep_debug_print(message: str) -> None:
@@ -67,6 +69,15 @@ def _nep_debug_print(message: str) -> None:
 
 def _nep_overlap_debug_enabled() -> bool:
     return os.getenv("MEGATRON_NONUNIFORM_EP_OVERLAP_DEBUG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _nep_zero_sm_reshard_enabled() -> bool:
+    return os.getenv("MEGATRON_NONUNIFORM_EP_ZERO_SM_RESHARD", "0").lower() in (
         "1",
         "true",
         "yes",
@@ -298,16 +309,22 @@ def _get_nccl_communicator_configs(path: Optional[str]) -> dict:
         return yaml.safe_load(stream)
 
 
-def _create_group(ranks, timeout, nccl_comm_cfgs, desc, backend=None):
+def _create_group(ranks, timeout, nccl_comm_cfgs, desc, backend=None, cta_policy=None):
     _nep_debug_print(f"before_create_group desc={desc} backend={backend} ranks={ranks}")
+    pg_options = (
+        None if backend == "gloo" else parallel_state.get_nccl_options(desc, nccl_comm_cfgs)
+    )
+    if cta_policy is not None:
+        if pg_options is None:
+            pg_options = dist.ProcessGroupNCCL.Options()
+        if not hasattr(pg_options.config, "cta_policy"):
+            raise RuntimeError(
+                "MEGATRON_NONUNIFORM_EP_ZERO_SM_RESHARD requires a PyTorch build "
+                "that exposes ProcessGroupNCCL.Options.config.cta_policy"
+            )
+        pg_options.config.cta_policy = cta_policy
     group = parallel_state.create_group(
-        ranks,
-        timeout=timeout,
-        backend=backend,
-        pg_options=(
-            None if backend == "gloo" else parallel_state.get_nccl_options(desc, nccl_comm_cfgs)
-        ),
-        group_desc=desc,
+        ranks, timeout=timeout, backend=backend, pg_options=pg_options, group_desc=desc
     )
     _nep_debug_print(f"after_create_group desc={desc} backend={backend} ranks={ranks}")
     return group
@@ -371,6 +388,7 @@ def initialize_nonuniform_ep_process_groups(
 
     timeout = timedelta(minutes=distributed_timeout_minutes)
     nccl_comm_cfgs = _get_nccl_communicator_configs(nccl_communicator_config_path)
+    zero_sm_reshard = _nep_zero_sm_reshard_enabled()
 
     # Attention/data groups.
     for ranks in generator.get_ranks('dp-cp'):
@@ -473,7 +491,11 @@ def initialize_nonuniform_ep_process_groups(
             owner_transfer_group = None
             if len(source_global_ranks) > 1:
                 owner_transfer_group = _create_group(
-                    source_global_ranks, timeout, nccl_comm_cfgs, "nep_owner_transfer"
+                    source_global_ranks,
+                    timeout,
+                    nccl_comm_cfgs,
+                    "nep_owner_transfer",
+                    cta_policy=_NCCL_CTA_POLICY_ZERO if zero_sm_reshard else None,
                 )
             if rank in ranks:
                 nep_owner_transfer_group_ranks[owner_ep_rank] = source_ep_ranks
@@ -553,6 +575,7 @@ def initialize_nonuniform_ep_process_groups(
         'local_expert_indices': expert_placement[ep_rank],
         'expert_placement': expert_placement,
         'expert_gather_map': expert_gather_map,
+        'zero_sm_reshard': zero_sm_reshard,
     }
     set_nonuniform_ep_runtime_config(runtime_config)
     _nep_debug_print(
@@ -1043,6 +1066,11 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         self._nep_nccl_gather_buf_cache = {}
         self._nep_nccl_gather_list_cache = {}
         self._nep_nccl_buffer_state = {}
+        self._nep_nccl_segment_cache = {}
+        self._nep_nccl_tensor_view_cache = {}
+        self._nep_nccl_entry_by_expert = {
+            entry['expert_id']: entry for entry in self._nep_nccl_entries
+        }
         self._nep_nccl_owner_layout = None
         self._nep_nccl_started_tasks = set()
         self._nep_nccl_prepped_experts = set()
@@ -1252,6 +1280,9 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
 
     def _prep_nep_nccl_owner_entries_for_sync(self, owner_ep_rank: int) -> None:
         """Apply one-time local grad prep for entries used by one owner task."""
+        copy_destinations = []
+        copy_sources = []
+        scale_tensors_by_factor = {}
         for entry in self._nep_nccl_owner_entries(owner_ep_rank):
             expert_id = entry['expert_id']
             if expert_id in self._nep_nccl_prepped_experts:
@@ -1259,10 +1290,26 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             bucket = entry['bucket']
             for param in bucket.params_with_extra_main_grads:
                 if getattr(param, 'main_grad_copy_in_grad_buffer', None) is not None:
-                    param.main_grad_copy_in_grad_buffer.copy_(param.main_grad)
+                    copy_destinations.append(param.main_grad_copy_in_grad_buffer)
+                    copy_sources.append(param.main_grad)
             if bucket.gradient_scaling_factor != 1.0:
-                bucket.grad_data *= bucket.gradient_scaling_factor
+                scale_tensors_by_factor.setdefault(bucket.gradient_scaling_factor, []).append(
+                    bucket.grad_data
+                )
             self._nep_nccl_prepped_experts.add(expert_id)
+
+        self._foreach_copy_(copy_destinations, copy_sources)
+        foreach_mul = (
+            getattr(torch, '_foreach_mul_', None)
+            if self._nep_runtime_config.get('zero_sm_reshard', False)
+            else None
+        )
+        for scaling_factor, tensors in scale_tensors_by_factor.items():
+            if foreach_mul is None:
+                for tensor in tensors:
+                    tensor.mul_(scaling_factor)
+            else:
+                foreach_mul(tensors, scaling_factor)
 
     def _pack_nep_nccl_owner_chunk(
         self, owner_ep_rank: int, chunk_start: int, chunk_end: int, chunk: torch.Tensor
@@ -1272,31 +1319,47 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         experts_per_owner = self._nep_nccl_experts_per_owner
         owner_first_expert = owner_ep_rank * experts_per_owner
 
+        def build_views():
+            destinations = []
+            sources = []
+            for entry in self._nep_nccl_entries:
+                expert_id = entry['expert_id']
+                owner_local_expert_index = expert_id - owner_first_expert
+                if owner_local_expert_index < 0 or owner_local_expert_index >= experts_per_owner:
+                    continue
+
+                expert_start = owner_local_expert_index * slot_numel
+                expert_end = expert_start + entry['numel']
+                overlap_start = max(chunk_start, expert_start)
+                overlap_end = min(chunk_end, expert_end)
+                if overlap_start >= overlap_end:
+                    continue
+
+                chunk_offset = overlap_start - chunk_start
+                entry_offset = overlap_start - expert_start
+                numel = overlap_end - overlap_start
+                destinations.append(chunk[chunk_offset : chunk_offset + numel])
+                sources.append(entry['bucket'].grad_data[entry_offset : entry_offset + numel])
+            return destinations, sources
+
         chunk.zero_()
-        for entry in self._nep_nccl_entries:
-            expert_id = entry['expert_id']
-            owner_local_expert_index = expert_id - owner_first_expert
-            if owner_local_expert_index < 0 or owner_local_expert_index >= experts_per_owner:
-                continue
-
-            expert_start = owner_local_expert_index * slot_numel
-            expert_end = expert_start + entry['numel']
-            overlap_start = max(chunk_start, expert_start)
-            overlap_end = min(chunk_end, expert_end)
-            if overlap_start >= overlap_end:
-                continue
-
-            chunk_offset = overlap_start - chunk_start
-            entry_offset = overlap_start - expert_start
-            numel = overlap_end - overlap_start
-            chunk[chunk_offset : chunk_offset + numel].copy_(
-                entry['bucket'].grad_data[entry_offset : entry_offset + numel]
-            )
+        destinations, sources = self._get_nep_nccl_cached_tensor_views(
+            ('pack_owner', owner_ep_rank, chunk_start, chunk_end, chunk.data_ptr()), build_views
+        )
+        self._foreach_copy_(destinations, sources)
 
     def _nep_nccl_owner_source_segments(
         self, owner_ep_rank: int, source_ep_rank: int, chunk_start: int, chunk_end: int
     ) -> List[Tuple[int, int, int, int]]:
         """Map one source rank's dense payload to offsets in an owner-layout chunk."""
+        cache = getattr(self, '_nep_nccl_segment_cache', None)
+        if cache is None:
+            cache = self._nep_nccl_segment_cache = {}
+        cache_key = (owner_ep_rank, source_ep_rank, chunk_start, chunk_end)
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         placement = self._nep_runtime_config.get('expert_placement')
         if placement is None:
             source_expert_ids = [
@@ -1328,7 +1391,46 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     overlap_end - overlap_start,
                 )
             )
+        cache[cache_key] = segments
         return segments
+
+    def _get_nep_nccl_cached_tensor_views(self, key: tuple, build_views) -> tuple:
+        cache = getattr(self, '_nep_nccl_tensor_view_cache', None)
+        if cache is None:
+            cache = self._nep_nccl_tensor_view_cache = {}
+        views = cache.get(key)
+        if views is None:
+            views = build_views()
+            cache[key] = views
+        return views
+
+    def _foreach_copy_(self, destinations: List[torch.Tensor], sources: List[torch.Tensor]) -> None:
+        if not destinations:
+            return
+        foreach_copy = (
+            getattr(torch, '_foreach_copy_', None)
+            if self._nep_runtime_config.get('zero_sm_reshard', False)
+            else None
+        )
+        if foreach_copy is None:
+            for destination, source in zip(destinations, sources):
+                destination.copy_(source)
+            return
+        foreach_copy(destinations, sources)
+
+    def _foreach_add_(self, destinations: List[torch.Tensor], sources: List[torch.Tensor]) -> None:
+        if not destinations:
+            return
+        foreach_add = (
+            getattr(torch, '_foreach_add_', None)
+            if self._nep_runtime_config.get('zero_sm_reshard', False)
+            else None
+        )
+        if foreach_add is None:
+            for destination, source in zip(destinations, sources):
+                destination.add_(source)
+            return
+        foreach_add(destinations, sources)
 
     def _nep_nccl_owner_source_payload_numel(
         self, owner_ep_rank: int, source_ep_rank: int, chunk_start: int, chunk_end: int
@@ -1348,24 +1450,46 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         chunk_end: int,
         payload: torch.Tensor,
     ) -> None:
-        entry_by_expert = {entry['expert_id']: entry for entry in self._nep_nccl_entries}
-        payload_offset = 0
-        for expert_id, _, entry_offset, numel in self._nep_nccl_owner_source_segments(
-            owner_ep_rank, source_ep_rank, chunk_start, chunk_end
-        ):
-            entry = entry_by_expert.get(expert_id)
-            if entry is None:
+        entry_by_expert = getattr(self, '_nep_nccl_entry_by_expert', None)
+        if entry_by_expert is None:
+            entry_by_expert = self._nep_nccl_entry_by_expert = {
+                entry['expert_id']: entry for entry in self._nep_nccl_entries
+            }
+
+        def build_views():
+            destinations = []
+            sources = []
+            payload_offset = 0
+            for expert_id, _, entry_offset, numel in self._nep_nccl_owner_source_segments(
+                owner_ep_rank, source_ep_rank, chunk_start, chunk_end
+            ):
+                entry = entry_by_expert.get(expert_id)
+                if entry is None:
+                    raise RuntimeError(
+                        f"NEP source rank {source_ep_rank} is missing expert {expert_id}"
+                    )
+                destinations.append(payload[payload_offset : payload_offset + numel])
+                sources.append(entry['bucket'].grad_data[entry_offset : entry_offset + numel])
+                payload_offset += numel
+            if payload_offset != payload.numel():
                 raise RuntimeError(
-                    f"NEP source rank {source_ep_rank} is missing expert {expert_id}"
+                    f"NEP packed {payload_offset} elements into a "
+                    f"{payload.numel()}-element payload"
                 )
-            payload[payload_offset : payload_offset + numel].copy_(
-                entry['bucket'].grad_data[entry_offset : entry_offset + numel]
-            )
-            payload_offset += numel
-        if payload_offset != payload.numel():
-            raise RuntimeError(
-                f"NEP packed {payload_offset} elements into a {payload.numel()}-element payload"
-            )
+            return destinations, sources
+
+        destinations, sources = self._get_nep_nccl_cached_tensor_views(
+            (
+                'pack_source',
+                owner_ep_rank,
+                source_ep_rank,
+                chunk_start,
+                chunk_end,
+                payload.data_ptr(),
+            ),
+            build_views,
+        )
+        self._foreach_copy_(destinations, sources)
 
     def _accumulate_nep_nccl_source_payload(
         self,
@@ -1376,14 +1500,31 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         payload: torch.Tensor,
         chunk: torch.Tensor,
     ) -> None:
-        payload_offset = 0
-        for _, chunk_offset, _, numel in self._nep_nccl_owner_source_segments(
-            owner_ep_rank, source_ep_rank, chunk_start, chunk_end
-        ):
-            chunk[chunk_offset : chunk_offset + numel].add_(
-                payload[payload_offset : payload_offset + numel]
-            )
-            payload_offset += numel
+        def build_views():
+            destinations = []
+            sources = []
+            payload_offset = 0
+            for _, chunk_offset, _, numel in self._nep_nccl_owner_source_segments(
+                owner_ep_rank, source_ep_rank, chunk_start, chunk_end
+            ):
+                destinations.append(chunk[chunk_offset : chunk_offset + numel])
+                sources.append(payload[payload_offset : payload_offset + numel])
+                payload_offset += numel
+            return destinations, sources
+
+        destinations, sources = self._get_nep_nccl_cached_tensor_views(
+            (
+                'accumulate_source',
+                owner_ep_rank,
+                source_ep_rank,
+                chunk_start,
+                chunk_end,
+                payload.data_ptr(),
+                chunk.data_ptr(),
+            ),
+            build_views,
+        )
+        self._foreach_add_(destinations, sources)
 
     def _pack_nep_nccl_scatter_payload(
         self,
@@ -1394,14 +1535,31 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         chunk: torch.Tensor,
         payload: torch.Tensor,
     ) -> None:
-        payload_offset = 0
-        for _, chunk_offset, _, numel in self._nep_nccl_owner_source_segments(
-            owner_ep_rank, destination_ep_rank, chunk_start, chunk_end
-        ):
-            payload[payload_offset : payload_offset + numel].copy_(
-                chunk[chunk_offset : chunk_offset + numel]
-            )
-            payload_offset += numel
+        def build_views():
+            destinations = []
+            sources = []
+            payload_offset = 0
+            for _, chunk_offset, _, numel in self._nep_nccl_owner_source_segments(
+                owner_ep_rank, destination_ep_rank, chunk_start, chunk_end
+            ):
+                destinations.append(payload[payload_offset : payload_offset + numel])
+                sources.append(chunk[chunk_offset : chunk_offset + numel])
+                payload_offset += numel
+            return destinations, sources
+
+        destinations, sources = self._get_nep_nccl_cached_tensor_views(
+            (
+                'pack_scatter',
+                owner_ep_rank,
+                destination_ep_rank,
+                chunk_start,
+                chunk_end,
+                chunk.data_ptr(),
+                payload.data_ptr(),
+            ),
+            build_views,
+        )
+        self._foreach_copy_(destinations, sources)
 
     def _copy_nep_nccl_scatter_payload_to_local_grads(
         self,
@@ -1411,20 +1569,41 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         chunk_end: int,
         payload: torch.Tensor,
     ) -> None:
-        entry_by_expert = {entry['expert_id']: entry for entry in self._nep_nccl_entries}
-        payload_offset = 0
-        for expert_id, _, entry_offset, numel in self._nep_nccl_owner_source_segments(
-            owner_ep_rank, source_ep_rank, chunk_start, chunk_end
-        ):
-            entry = entry_by_expert.get(expert_id)
-            if entry is None:
-                raise RuntimeError(
-                    f"NEP source rank {source_ep_rank} is missing expert {expert_id}"
-                )
-            entry['bucket'].grad_data[entry_offset : entry_offset + numel].copy_(
-                payload[payload_offset : payload_offset + numel]
-            )
-            payload_offset += numel
+        entry_by_expert = getattr(self, '_nep_nccl_entry_by_expert', None)
+        if entry_by_expert is None:
+            entry_by_expert = self._nep_nccl_entry_by_expert = {
+                entry['expert_id']: entry for entry in self._nep_nccl_entries
+            }
+
+        def build_views():
+            destinations = []
+            sources = []
+            payload_offset = 0
+            for expert_id, _, entry_offset, numel in self._nep_nccl_owner_source_segments(
+                owner_ep_rank, source_ep_rank, chunk_start, chunk_end
+            ):
+                entry = entry_by_expert.get(expert_id)
+                if entry is None:
+                    raise RuntimeError(
+                        f"NEP source rank {source_ep_rank} is missing expert {expert_id}"
+                    )
+                destinations.append(entry['bucket'].grad_data[entry_offset : entry_offset + numel])
+                sources.append(payload[payload_offset : payload_offset + numel])
+                payload_offset += numel
+            return destinations, sources
+
+        destinations, sources = self._get_nep_nccl_cached_tensor_views(
+            (
+                'copy_scatter',
+                owner_ep_rank,
+                source_ep_rank,
+                chunk_start,
+                chunk_end,
+                payload.data_ptr(),
+            ),
+            build_views,
+        )
+        self._foreach_copy_(destinations, sources)
 
     def _copy_nep_nccl_owner_chunk_to_local_grads(
         self, owner_ep_rank: int, chunk_start: int, chunk_end: int, chunk: torch.Tensor
@@ -1434,25 +1613,33 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         experts_per_owner = self._nep_nccl_experts_per_owner
         owner_first_expert = owner_ep_rank * experts_per_owner
 
-        for entry in self._nep_nccl_entries:
-            expert_id = entry['expert_id']
-            owner_local_expert_index = expert_id - owner_first_expert
-            if owner_local_expert_index < 0 or owner_local_expert_index >= experts_per_owner:
-                continue
+        def build_views():
+            destinations = []
+            sources = []
+            for entry in self._nep_nccl_entries:
+                expert_id = entry['expert_id']
+                owner_local_expert_index = expert_id - owner_first_expert
+                if owner_local_expert_index < 0 or owner_local_expert_index >= experts_per_owner:
+                    continue
 
-            expert_start = owner_local_expert_index * slot_numel
-            expert_end = expert_start + entry['numel']
-            overlap_start = max(chunk_start, expert_start)
-            overlap_end = min(chunk_end, expert_end)
-            if overlap_start >= overlap_end:
-                continue
+                expert_start = owner_local_expert_index * slot_numel
+                expert_end = expert_start + entry['numel']
+                overlap_start = max(chunk_start, expert_start)
+                overlap_end = min(chunk_end, expert_end)
+                if overlap_start >= overlap_end:
+                    continue
 
-            chunk_offset = overlap_start - chunk_start
-            entry_offset = overlap_start - expert_start
-            numel = overlap_end - overlap_start
-            entry['bucket'].grad_data[entry_offset : entry_offset + numel].copy_(
-                chunk[chunk_offset : chunk_offset + numel]
-            )
+                chunk_offset = overlap_start - chunk_start
+                entry_offset = overlap_start - expert_start
+                numel = overlap_end - overlap_start
+                destinations.append(entry['bucket'].grad_data[entry_offset : entry_offset + numel])
+                sources.append(chunk[chunk_offset : chunk_offset + numel])
+            return destinations, sources
+
+        destinations, sources = self._get_nep_nccl_cached_tensor_views(
+            ('copy_owner', owner_ep_rank, chunk_start, chunk_end, chunk.data_ptr()), build_views
+        )
+        self._foreach_copy_(destinations, sources)
 
     def _nep_nccl_owner_source_ranks(self, owner_ep_rank: int) -> List[int]:
         """Return EP ranks that physically hold experts for an owner-layout chunk."""
@@ -1472,6 +1659,179 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             if any(owner_first_expert <= expert_id < owner_last_expert for expert_id in expert_ids):
                 source_ranks.append(source_ep_rank)
         return source_ranks
+
+    def _get_nep_zero_sm_buffers(
+        self, buffer_slot: int, dtype: torch.dtype, transfer_size: int, payload_numel: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        state = self._get_nep_nccl_shared_buffer_state()
+        small_buffers = state.get('zero_sm_small_buffers')
+        large_buffers = state.get('zero_sm_large_buffers')
+        if small_buffers is None or large_buffers is None:
+            raise RuntimeError("NEP zero-SM staging buffers were not initialized")
+        small = small_buffers[(buffer_slot, dtype)]
+        large = large_buffers[(buffer_slot, dtype)]
+        large_numel = transfer_size * payload_numel
+        if small.numel() < payload_numel or large.numel() < large_numel:
+            raise RuntimeError(
+                "NEP zero-SM staging buffer is too small: "
+                f"small={small.numel()}/{payload_numel}, "
+                f"large={large.numel()}/{large_numel}"
+            )
+        return small[:payload_numel], large[:large_numel]
+
+    def _get_nep_zero_sm_comm_ptr(self, transfer_group) -> int:
+        state = self._get_nep_nccl_shared_buffer_state()
+        comm_ptr = state.get('zero_sm_comm_ptrs', {}).get(id(transfer_group))
+        if comm_ptr is None:
+            raise RuntimeError("NEP zero-SM communicator pointer was not initialized")
+        return comm_ptr
+
+    def _start_nep_nccl_owner_native_gather(
+        self,
+        owner_ep_rank: int,
+        chunk_start: int,
+        chunk_end: int,
+        chunk: torch.Tensor,
+        buffer_slot_key: tuple,
+    ) -> None:
+        """Gather dense follower payloads with NCCL's copy-engine collective."""
+        ep_rank = self._nep_runtime_config['ep_rank']
+        source_ranks = self._nep_nccl_owner_source_ranks(owner_ep_rank)
+        if ep_rank not in source_ranks:
+            return
+        remote_source_ranks = [rank for rank in source_ranks if rank != owner_ep_rank]
+        if not remote_source_ranks:
+            return
+
+        transfer_group, _, transfer_size, transfer_source_ranks = (
+            self._get_nep_nccl_transfer_group_info(owner_ep_rank)
+        )
+        owner_transfer_rank = transfer_source_ranks.index(owner_ep_rank)
+        payload_numel = max(
+            self._nep_nccl_owner_source_payload_numel(
+                owner_ep_rank, source_ep_rank, chunk_start, chunk_end
+            )
+            for source_ep_rank in remote_source_ranks
+        )
+        if payload_numel == 0:
+            return
+        buffer_slot = buffer_slot_key[0]
+        send, recv = self._get_nep_zero_sm_buffers(
+            buffer_slot, chunk.dtype, transfer_size, payload_numel
+        )
+        send.zero_()
+        if ep_rank != owner_ep_rank:
+            local_payload_numel = self._nep_nccl_owner_source_payload_numel(
+                owner_ep_rank, ep_rank, chunk_start, chunk_end
+            )
+            self._pack_nep_nccl_source_payload(
+                owner_ep_rank, ep_rank, chunk_start, chunk_end, send[:local_payload_numel]
+            )
+
+        with torch.profiler.record_function("nep_zero_sm_gather"):
+            get_native_nccl().gather(
+                send,
+                recv,
+                payload_numel,
+                owner_transfer_rank,
+                self._get_nep_zero_sm_comm_ptr(transfer_group),
+            )
+
+        if ep_rank == owner_ep_rank:
+            for source_ep_rank in remote_source_ranks:
+                source_transfer_rank = transfer_source_ranks.index(source_ep_rank)
+                source_numel = self._nep_nccl_owner_source_payload_numel(
+                    owner_ep_rank, source_ep_rank, chunk_start, chunk_end
+                )
+                source_start = source_transfer_rank * payload_numel
+                self._accumulate_nep_nccl_source_payload(
+                    owner_ep_rank,
+                    source_ep_rank,
+                    chunk_start,
+                    chunk_end,
+                    recv[source_start : source_start + source_numel],
+                    chunk,
+                )
+
+    def _start_nep_nccl_owner_native_scatter(
+        self,
+        owner_ep_rank: int,
+        chunk_start: int,
+        chunk_end: int,
+        chunk: torch.Tensor,
+        buffer_slot_key: tuple,
+    ) -> None:
+        """Scatter reduced follower payloads with NCCL's copy-engine collective."""
+        ep_rank = self._nep_runtime_config['ep_rank']
+        source_ranks = self._nep_nccl_owner_source_ranks(owner_ep_rank)
+        if ep_rank not in source_ranks:
+            return
+        remote_source_ranks = [rank for rank in source_ranks if rank != owner_ep_rank]
+        if not remote_source_ranks:
+            if ep_rank == owner_ep_rank:
+                self._copy_nep_nccl_owner_chunk_to_local_grads(
+                    owner_ep_rank, chunk_start, chunk_end, chunk
+                )
+            return
+
+        transfer_group, _, transfer_size, transfer_source_ranks = (
+            self._get_nep_nccl_transfer_group_info(owner_ep_rank)
+        )
+        owner_transfer_rank = transfer_source_ranks.index(owner_ep_rank)
+        payload_numel = max(
+            self._nep_nccl_owner_source_payload_numel(
+                owner_ep_rank, source_ep_rank, chunk_start, chunk_end
+            )
+            for source_ep_rank in remote_source_ranks
+        )
+        if payload_numel == 0:
+            if ep_rank == owner_ep_rank:
+                self._copy_nep_nccl_owner_chunk_to_local_grads(
+                    owner_ep_rank, chunk_start, chunk_end, chunk
+                )
+            return
+        buffer_slot = buffer_slot_key[0]
+        recv, send = self._get_nep_zero_sm_buffers(
+            buffer_slot, chunk.dtype, transfer_size, payload_numel
+        )
+        recv.zero_()
+        send.zero_()
+        if ep_rank == owner_ep_rank:
+            for destination_ep_rank in remote_source_ranks:
+                destination_transfer_rank = transfer_source_ranks.index(destination_ep_rank)
+                destination_numel = self._nep_nccl_owner_source_payload_numel(
+                    owner_ep_rank, destination_ep_rank, chunk_start, chunk_end
+                )
+                destination_start = destination_transfer_rank * payload_numel
+                self._pack_nep_nccl_scatter_payload(
+                    owner_ep_rank,
+                    destination_ep_rank,
+                    chunk_start,
+                    chunk_end,
+                    chunk,
+                    send[destination_start : destination_start + destination_numel],
+                )
+
+        with torch.profiler.record_function("nep_zero_sm_scatter"):
+            get_native_nccl().scatter(
+                send,
+                recv,
+                payload_numel,
+                owner_transfer_rank,
+                self._get_nep_zero_sm_comm_ptr(transfer_group),
+            )
+
+        if ep_rank == owner_ep_rank:
+            self._copy_nep_nccl_owner_chunk_to_local_grads(
+                owner_ep_rank, chunk_start, chunk_end, chunk
+            )
+        else:
+            local_payload_numel = self._nep_nccl_owner_source_payload_numel(
+                owner_ep_rank, ep_rank, chunk_start, chunk_end
+            )
+            self._copy_nep_nccl_scatter_payload_to_local_grads(
+                owner_ep_rank, ep_rank, chunk_start, chunk_end, recv[:local_payload_numel]
+            )
 
     def _start_nep_nccl_owner_all_to_all_gather(
         self,
@@ -1507,6 +1867,12 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             self._pack_nep_nccl_owner_chunk(owner_ep_rank, chunk_start, chunk_end, chunk)
 
         if not remote_source_ranks:
+            return
+
+        if cfg.get('zero_sm_reshard', False):
+            self._start_nep_nccl_owner_native_gather(
+                owner_ep_rank, chunk_start, chunk_end, chunk, buffer_slot_key
+            )
             return
 
         cache = self._get_nep_nccl_shared_buffer_state()['gather_buf_cache']
@@ -1641,6 +2007,12 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 self._copy_nep_nccl_owner_chunk_to_local_grads(
                     owner_ep_rank, chunk_start, chunk_end, chunk
                 )
+            return
+
+        if cfg.get('zero_sm_reshard', False):
+            self._start_nep_nccl_owner_native_scatter(
+                owner_ep_rank, chunk_start, chunk_end, chunk, buffer_slot_key
+            )
             return
 
         cache = self._get_nep_nccl_shared_buffer_state()['gather_buf_cache']
@@ -2456,6 +2828,109 @@ def _configure_nep_nccl_task_scheduler(
     state['pending_scatters'] = []
 
 
+def _configure_nep_zero_sm_buffers(
+    bucket_groups: List[NonuniformEPNCCLParamAndGradBucketGroup],
+) -> None:
+    """Preallocate and register persistent buffers for copy-engine reshard collectives."""
+    if not bucket_groups or not bucket_groups[0]._nep_runtime_config.get('zero_sm_reshard', False):
+        return
+
+    state = getattr(bucket_groups[0], '_nep_nccl_scheduler_state', None)
+    if state is None:
+        raise RuntimeError("NEP zero-SM reshard requires the shared task scheduler")
+    if state.get('zero_sm_mem_pool') is not None:
+        return
+
+    runtime_config = bucket_groups[0]._nep_runtime_config
+    device = torch.device("cuda", torch.cuda.current_device())
+    group_entries = []
+    seen_groups = set()
+    for owner_ep_rank in range(runtime_config['min_ep_size']):
+        group = runtime_config.get('nep_owner_transfer_groups', {}).get(owner_ep_rank)
+        if group is None or id(group) in seen_groups:
+            continue
+        backend = group._get_backend(device)
+        if not hasattr(backend, 'mem_allocator'):
+            raise RuntimeError(
+                "MEGATRON_NONUNIFORM_EP_ZERO_SM_RESHARD requires " "ProcessGroupNCCL.mem_allocator"
+            )
+        if not hasattr(backend, '_comm_ptr'):
+            raise RuntimeError(
+                "MEGATRON_NONUNIFORM_EP_ZERO_SM_RESHARD requires " "ProcessGroupNCCL._comm_ptr()"
+            )
+        seen_groups.add(id(group))
+        group_entries.append((group, backend))
+
+    for group, _ in group_entries:
+        warmup = torch.ones(1, dtype=torch.float32, device=device)
+        dist.all_reduce(warmup, group=group)
+    if group_entries:
+        torch.cuda.synchronize(device)
+    dist.barrier()
+
+    # Reduced replicas have no owner transfers and need no registered staging buffers.
+    if not group_entries:
+        state['zero_sm_mem_pool'] = False
+        state['zero_sm_small_buffers'] = {}
+        state['zero_sm_large_buffers'] = {}
+        state['zero_sm_comm_ptrs'] = {}
+        dist.barrier()
+        return
+
+    buffer_specs = {}
+    for task in state['task_sequence']:
+        group = task['group']
+        owner_ep_rank = task['owner_ep_rank']
+        source_ranks = group._nep_nccl_owner_source_ranks(owner_ep_rank)
+        remote_source_ranks = [rank for rank in source_ranks if rank != owner_ep_rank]
+        if not remote_source_ranks:
+            continue
+        payload_numel = max(
+            group._nep_nccl_owner_source_payload_numel(
+                owner_ep_rank, source_ep_rank, task['chunk_start'], task['chunk_end']
+            )
+            for source_ep_rank in remote_source_ranks
+        )
+        dtype = group.buckets[0].grad_data.dtype
+        spec = buffer_specs.setdefault(dtype, {'small_numel': 0, 'large_numel': 0})
+        spec['small_numel'] = max(spec['small_numel'], payload_numel)
+        spec['large_numel'] = max(spec['large_numel'], len(source_ranks) * payload_numel)
+
+    pool = torch.cuda.MemPool(group_entries[0][1].mem_allocator)
+    small_buffers = {}
+    large_buffers = {}
+    buffer_slots = _get_nep_nccl_async_chunk_window()
+    with torch.cuda.use_mem_pool(pool):
+        for buffer_slot in range(buffer_slots):
+            for dtype in sorted(buffer_specs, key=str):
+                spec = buffer_specs[dtype]
+                small_buffers[(buffer_slot, dtype)] = torch.empty(
+                    spec['small_numel'], dtype=dtype, device=device
+                )
+                large_buffers[(buffer_slot, dtype)] = torch.empty(
+                    spec['large_numel'], dtype=dtype, device=device
+                )
+
+    comm_ptrs = {}
+    for group, backend in group_entries:
+        try:
+            backend.register_mem_pool(pool, symm=True)
+        except TypeError:
+            backend.register_mem_pool(pool)
+        comm_ptrs[id(group)] = int(backend._comm_ptr())
+
+    state['zero_sm_mem_pool'] = pool
+    state['zero_sm_small_buffers'] = small_buffers
+    state['zero_sm_large_buffers'] = large_buffers
+    state['zero_sm_comm_ptrs'] = comm_ptrs
+    state['zero_sm_buffer_specs'] = buffer_specs
+    _nep_debug_print(
+        "configured zero-SM buffers "
+        f"slots={buffer_slots} specs={buffer_specs} groups={len(group_entries)}"
+    )
+    dist.barrier()
+
+
 def build_nonuniform_ep_nccl_bucket_groups(
     buffers,
     ddp_config: DistributedDataParallelConfig,
@@ -2545,6 +3020,7 @@ def build_nonuniform_ep_nccl_bucket_groups(
         bucket_groups, '_nep_nccl_scheduler_state', '_nep_nccl_group_index', '_nep_nccl_ready'
     )
     _configure_nep_nccl_task_scheduler(bucket_groups)
+    _configure_nep_zero_sm_buffers(bucket_groups)
     return bucket_groups
 
 
@@ -2717,6 +3193,27 @@ def build_nonuniform_ep_expert_bucket_groups(
 class NonuniformEPDistributedDataParallel(DistributedDataParallel):
     """DDP wrapper that opts expert params into nonuniform EP ownership transfer."""
 
+    @staticmethod
+    def _synchronize_bucket_size(ddp_config: DistributedDataParallelConfig) -> None:
+        """Make a locally derived num-buckets layout identical across NEP replicas."""
+        if ddp_config.num_buckets is None or ddp_config.bucket_size is None:
+            return
+
+        local_bucket_size = ddp_config.bucket_size
+        bucket_size = torch.tensor(
+            local_bucket_size, dtype=torch.int64, device=torch.cuda.current_device()
+        )
+        dist.all_reduce(
+            bucket_size,
+            op=dist.ReduceOp.MAX,
+            group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+        )
+        ddp_config.bucket_size = int(bucket_size.item())
+        _nep_debug_print(
+            "synchronized DDP bucket size "
+            f"local={local_bucket_size} synchronized={ddp_config.bucket_size}"
+        )
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -2734,6 +3231,8 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 "non-distributed optimizers. Synced expert grads are scattered back "
                 "so every rank can step its local expert params."
             )
+
+        self._synchronize_bucket_size(ddp_config)
 
         parent_kwargs = {
             'config': config,
@@ -2803,20 +3302,31 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         if not self._delay_dense_grad_sync_for_nep():
             return
 
-        for bucket_group in self.bucket_groups:
-            if bucket_group.is_first_batch:
-                continue
+        for bucket_index, bucket_group in enumerate(self.bucket_groups):
             if bucket_group.grad_reduce_handle is not None:
                 continue
-            assert (
-                bucket_group.per_param_grad_ready_counts
-                == bucket_group.golden_per_param_grad_ready_counts
-            ), (
-                f"Communication call has not been issued for this dense bucket "
+            if bucket_group.is_first_batch:
+                dense_grads_ready = len(bucket_group.per_param_grad_ready_counts) == len(
+                    bucket_group.params
+                )
+            else:
+                dense_grads_ready = (
+                    bucket_group.per_param_grad_ready_counts
+                    == bucket_group.golden_per_param_grad_ready_counts
+                )
+            assert dense_grads_ready, (
+                "Communication call has not been issued for this dense bucket "
                 f"({len(bucket_group.per_param_grad_ready_counts)}/{len(bucket_group.params)} "
                 "params have grad available)"
             )
+            _nep_debug_print(
+                "before delayed_dense_grad_sync "
+                f"bucket={bucket_index} buckets={len(bucket_group.buckets)} "
+                f"params={len(bucket_group.params)} "
+                f"numel={sum(bucket.grad_data.numel() for bucket in bucket_group.buckets)}"
+            )
             bucket_group.start_grad_sync(force_all_reduce=force_all_reduce)
+            _nep_debug_print(f"after delayed_dense_grad_sync bucket={bucket_index}")
 
     def _make_backward_post_hook(self, param: torch.nn.Parameter):
         if not self._delay_dense_grad_sync_for_nep():
