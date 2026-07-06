@@ -4,6 +4,27 @@ Append a dated entry whenever we do something new: code changes, job submissions
 
 ## 2026-07-06 - NCCL CTA and copy-engine overlap investigation
 
+### Backward-order scheduler experiment
+
+- Re-examined the remaining large/late host batches in the fused zero-SM path. `build_nonuniform_ep_nccl_bucket_groups` sorted normalized parameter names in reverse lexicographic order, while the shared scheduler only launches a ready prefix. For multi-digit layers this puts layer 9 ahead of layers 45-10 and creates head-of-line blocking until late backward hooks.
+- The prior EP4/2 16-layer zero-SM trace from job `2291922` confirms the effect: one AccumulateGrad hook in each profiled iteration submitted 13 native gathers and occupied about 13.3-13.5 ms, while the other gather-containing hooks normally submitted one gather.
+- Changed NCCL expert-slot grouping to preserve first occurrence in the Megatron grad buffer, whose default layout is already constructed in backprop order. The global task sequence and per-communicator collective order remain deterministic; only the incorrect name-based reordering is removed.
+- Added a focused regression test with backward-order layer keys `45, 44, 10, 9`. A local `py_compile` check passed; repository `uv` is unavailable on the login node, so required isort and pytest run inside the submitted container smoke.
+- Submitted identical profiled two-node EP4/2, 16-layer, zero-SM smoke jobs using public `nvcr.io/nvidia/nemo:26.06` and the enroot/pyxis image cache:
+  - Priority partition job `2292439`, estimated start `2026-07-06T16:01:00-07:00` at submission.
+  - Backfill job `2292443`; use whichever starts first and cancel the duplicate before allocation.
+- Queued exact profiled a3b NEP benchmark `2292458` behind `afterok:2292439`: TP2/EP8, topology 4/2, MBS4/GBS48, 16 scheduler slots, zero-SM Gather/Scatter, low-priority communication groups, and the same NeMo 26.06 image used by job `2291941`.
+- A static replay of the 52-layer a3b hybrid pattern reproduced the trace exactly: reverse lexicographic ordering releases ready-prefix batches of 21 and 19 expert-slot groups at layers 6 and 3, matching the pre-fix 21/19 gather bursts.
+- EP4/2 smoke `2292439` completed 10/10 finite iterations, zero skips/nans, and all five focused tests passed. Duplicate `2292443` was canceled after both allocated.
+- Smoke trace comparison kept 128 native calls but reduced maximum calls per AccumulateGrad hook from 26 to 2 and maximum hook duration from 13.50 to 1.52 ms. The tiny smoke still had 0% CE/EDP overlap because individual transfers complete between compute kernels.
+- Full a3b job `2292458` completed 12/12 finite iterations with zero skips/nans. Clean iterations 8-10 and 12 averaged `1653.3 ms` and `441.6 TFLOP/s/GPU`, slower than pre-fix job `2291941` (`1517.1 ms`, `481.2 TFLOP/s/GPU`).
+- Its rank-0 trace nevertheless shows the scheduler fix working: maximum native calls per hook fell from 41 to 2, longest hook from 38.28 to 1.98 ms, and total reshard-hook CPU from 162.34 to 157.92 ms. Rank-0 profiled steps improved by 30-34 ms; CE union fell `128.54 -> 104.10 ms`, EDP union fell `192.36 -> 179.62 ms`, and EDP/non-NCCL overlap rose `44.1% -> 58.1%`.
+- The clean-step regression appears after the profiler window and coincides with much lower global average GPU power, while the sampled rank improves. This is consistent with an unsampled node/rank straggler, so the single node-set throughput result is not sufficient to accept or reject the scheduler change.
+- Same-allocation A/B job `2293060` completed successfully on `lyris0167-0169`, with identical finite losses and zero skips/nans. Legacy clean iterations 8-10 and 12 averaged `1721.5 ms` / `424.3 TFLOP/s/GPU`; backward order averaged `1633.3 ms` / `447.25 TFLOP/s/GPU`, a `5.4%` throughput gain on the same nodes.
+- Multi-rank traces confirm the mechanism. Rank 0 maximum calls per hook fell `41 -> 2`, longest hook `39.33 -> 2.09 ms`, and profiled steps improved `2284.4 -> 2098.4 ms`. Rank 0 CE overlap rose `12.7% -> 29.2%` and EDP overlap `14.6% -> 44.0%`; rank 4 CE overlap rose `10.4% -> 24.8%`. Native operation counts were unchanged on every sampled rank.
+- Removed the temporary legacy-order environment switch and A/B wrapper after collecting the comparison; only backward grad-buffer ordering and its regression test remain.
+- Required formatting/test job `2293064` completed: `uv run isort` fixed the test import block, targeted Black check passed, and all five focused tests passed.
+
 - Focused the next optimization cycle on physical reshard overlap. The final phase-pipeline trace from job `2263612` still used 32-CTA `ncclDevKernel_SendRecv` kernels for all 184 `nep_owner_transfer` operations and 32-CTA all-reduce kernels for all 92 owner `ep_dp` operations.
 - Checked NVIDIA's NCCL zero-CTA requirements. Copy-engine zero-CTA requires NCCL 2.28 or newer, a zero-CTA communicator, symmetrically registered NCCL-window buffers, and a native supported collective. NCCL 2.29 supports AlltoAll, AllGather, Gather, and Scatter within one NVL/MNNVL domain; variable-split SendRecv is not supported.
 - Probed public 26.04 containers on Lyris GB200:

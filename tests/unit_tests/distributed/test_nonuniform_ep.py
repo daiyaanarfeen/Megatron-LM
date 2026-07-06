@@ -6,6 +6,8 @@ from megatron.core.distributed.nonuniform_ep import (
     NonuniformEPApproach,
     NonuniformEPDistributedDataParallel,
     NonuniformEPNCCLParamAndGradBucketGroup,
+    _ExpertBucketSpec,
+    _group_expert_bucket_specs_in_backward_order,
 )
 
 
@@ -34,6 +36,36 @@ class _FakeDenseBucketGroup:
     def start_grad_sync(self, force_all_reduce=False):
         self.start_calls.append(force_all_reduce)
         self.grad_reduce_handle = object()
+
+
+def _make_expert_bucket_spec(layer: int, expert_id: int) -> _ExpertBucketSpec:
+    return _ExpertBucketSpec(
+        buffer=None,
+        source_bucket_index=0,
+        expert_id=expert_id,
+        params=[],
+        start=0,
+        end=1,
+        slot_key=(f'decoder.layers.{layer}.mlp.experts.local_experts.{{expert}}.weight',),
+    )
+
+
+def test_nep_nccl_slot_groups_preserve_backward_buffer_order():
+    specs = [
+        _make_expert_bucket_spec(layer, expert_id)
+        for layer in (45, 44, 10, 9)
+        for expert_id in (0, 1)
+    ]
+
+    grouped_specs = _group_expert_bucket_specs_in_backward_order(specs)
+
+    assert [int(slot_key[0].split('.')[2]) for slot_key, _ in grouped_specs] == [45, 44, 10, 9]
+    assert [[spec.expert_id for spec in group] for _, group in grouped_specs] == [
+        [0, 1],
+        [0, 1],
+        [0, 1],
+        [0, 1],
+    ]
 
 
 def test_nep_nccl_buffer_slot_reuse_does_not_block_host():

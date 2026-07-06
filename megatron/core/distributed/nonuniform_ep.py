@@ -2692,6 +2692,16 @@ def _build_expert_param_bucket_specs(buffers, runtime_config, config, param_to_n
     return specs
 
 
+def _group_expert_bucket_specs_in_backward_order(
+    specs: List[_ExpertBucketSpec],
+) -> List[Tuple[Tuple[str, ...], List[_ExpertBucketSpec]]]:
+    """Group expert slots while preserving their first grad-buffer occurrence."""
+    grouped_specs: Dict[Tuple[str, ...], List[_ExpertBucketSpec]] = {}
+    for spec in specs:
+        grouped_specs.setdefault(spec.slot_key, []).append(spec)
+    return list(grouped_specs.items())
+
+
 def _build_synthetic_owner_bucket_specs(buffers, local_specs, runtime_config, config):
     """Build owner-side buckets for experts physically held by extra EP ranks."""
     placement = runtime_config.get('expert_placement')
@@ -2950,12 +2960,11 @@ def build_nonuniform_ep_nccl_bucket_groups(
             "NonuniformEPConfig.expert_name_pattern."
         )
 
-    grouped_specs: Dict[Tuple[str, ...], List[_ExpertBucketSpec]] = {}
-    for spec in specs:
-        grouped_specs.setdefault(spec.slot_key, []).append(spec)
-
     bucket_groups = []
-    ordered_grouped_specs = sorted(grouped_specs.items(), key=lambda item: item[0], reverse=True)
+    # Grad-buffer offsets already follow backprop order. Preserve first occurrence
+    # instead of sorting names lexicographically, which puts layer 9 before layer 45
+    # and blocks ready tasks behind a much later gradient.
+    ordered_grouped_specs = _group_expert_bucket_specs_in_backward_order(specs)
     for group_index, (slot_key, unordered_group_specs) in enumerate(ordered_grouped_specs):
         group_specs = sorted(unordered_group_specs, key=lambda spec: spec.expert_id)
         slot_numels = {spec.end - spec.start for spec in group_specs}
