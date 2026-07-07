@@ -39,6 +39,7 @@ GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 RUN_NNODES="${RUN_NNODES:-${SLURM_NNODES}}"
 TRAIN_ITERS="${TRAIN_ITERS:-12}"
 LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-6}"
+NUM_EXPERTS="${NUM_EXPERTS:-128}"
 MASTER_ADDR="${MASTER_ADDR:-$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n 1)}"
 MASTER_PORT="${MASTER_PORT:-29760}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-16}"
@@ -55,6 +56,18 @@ PROFILE_STEP_END="${PROFILE_STEP_END:-7}"
 PROFILE_RANKS="${PROFILE_RANKS:-0}"
 EXTRA_MEGATRON_ARGS="${EXTRA_MEGATRON_ARGS:-}"
 HIGH_PRIORITY_STREAM_GROUPS="${HIGH_PRIORITY_STREAM_GROUPS-ep}"
+CUDA_GRAPH_IMPL="${CUDA_GRAPH_IMPL:-none}"
+SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-0}"
+DISTRIBUTED_TIMEOUT_MINUTES="${DISTRIBUTED_TIMEOUT_MINUTES:-20}"
+EXIT_DURATION_IN_MINS="${EXIT_DURATION_IN_MINS:-40}"
+
+mapfile -t allocated_nodes < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
+if ((RUN_NNODES > ${#allocated_nodes[@]})); then
+    echo "RUN_NNODES=${RUN_NNODES} exceeds the ${#allocated_nodes[@]} allocated nodes" >&2
+    exit 2
+fi
+run_nodes=("${allocated_nodes[@]:0:RUN_NNODES}")
+RUN_NODELIST=$(IFS=,; echo "${run_nodes[*]}")
 
 RUN_DIR="${ROOT_DIR}/${NAME}/${SLURM_JOB_ID}"
 LOGS_DIR="${RUN_DIR}/logs"
@@ -76,7 +89,8 @@ finish() {
 trap finish EXIT
 
 echo "[lyris-a3b] job=${SLURM_JOB_ID} nodes=${SLURM_JOB_NODELIST} image=${IMAGE}"
-echo "[lyris-a3b] topology=${NONUNIFORM_EP_TOPOLOGY} mbs=${MICRO_BATCH_SIZE} gbs=${GLOBAL_BATCH_SIZE} buckets=${DDP_NUM_BUCKETS}"
+echo "[lyris-a3b] topology=${NONUNIFORM_EP_TOPOLOGY} experts=${NUM_EXPERTS} mbs=${MICRO_BATCH_SIZE} gbs=${GLOBAL_BATCH_SIZE} buckets=${DDP_NUM_BUCKETS}"
+echo "[lyris-a3b] run_nodes=${RUN_NODELIST}"
 echo "[lyris-a3b] zero_sm=${MEGATRON_NONUNIFORM_EP_ZERO_SM_RESHARD} cuda_connections=${CUDA_DEVICE_MAX_CONNECTIONS} nccl_implicit_order=${NCCL_LAUNCH_ORDER_IMPLICIT}"
 
 container_args=(
@@ -91,8 +105,10 @@ fi
 
 # Compile the dataset helper once into the shared checkout and validate the
 # Mamba-specific runtime before starting the distributed workers.
-srun --nodes=1 --ntasks=1 --mpi=none "${container_args[@]}" \
-    bash -lc "cd '${REPO_DIR}' && python -c 'import mamba_ssm, causal_conv1d; from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec; from megatron.core.datasets.utils import compile_helpers; compile_helpers(); print(\"[lyris-a3b] runtime preflight: ok\")'"
+if [[ "${SKIP_PREFLIGHT}" != "1" ]]; then
+    srun --nodes=1 --ntasks=1 --mpi=none "${container_args[@]}" \
+        bash -lc "cd '${REPO_DIR}' && python -c 'import mamba_ssm, causal_conv1d; from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec; from megatron.core.datasets.utils import compile_helpers; compile_helpers(); print(\"[lyris-a3b] runtime preflight: ok\")'"
+fi
 
 profile_args=""
 if [[ "${PROFILE}" == "1" ]]; then
@@ -103,6 +119,19 @@ high_priority_stream_args=""
 if [[ -n "${HIGH_PRIORITY_STREAM_GROUPS}" ]]; then
     high_priority_stream_args=" --high-priority-stream-groups ${HIGH_PRIORITY_STREAM_GROUPS} "
 fi
+
+case "${CUDA_GRAPH_IMPL}" in
+    none)
+        cuda_graph_args=" --cuda-graph-impl none "
+        ;;
+    local)
+        cuda_graph_args=" --cuda-graph-impl local --cuda-graph-modules mamba attn moe_router "
+        ;;
+    *)
+        echo "Unsupported CUDA_GRAPH_IMPL=${CUDA_GRAPH_IMPL}" >&2
+        exit 2
+        ;;
+esac
 
 options=" \
     --use-mcore-models \
@@ -123,7 +152,7 @@ options=" \
     --hidden-dropout 0.0 \
     --disable-bias-linear \
     --normalization RMSNorm \
-    --num-experts 128 \
+    --num-experts ${NUM_EXPERTS} \
     --moe-router-topk 6 \
     --moe-shared-expert-intermediate-size 3712 \
     --moe-token-dispatcher-type alltoall \
@@ -156,7 +185,7 @@ options=" \
     --adam-beta2 0.95 \
     --eval-interval 1000 \
     --eval-iters 0 \
-    --cuda-graph-impl none \
+    ${cuda_graph_args} \
     --te-rng-tracker \
     --no-load-rng \
     --mock-data \
@@ -190,8 +219,8 @@ options=" \
     ${profile_args} \
     --manual-gc \
     --manual-gc-interval 10 \
-    --distributed-timeout-minutes 20 \
-    --exit-duration-in-mins 40 \
+    --distributed-timeout-minutes ${DISTRIBUTED_TIMEOUT_MINUTES} \
+    --exit-duration-in-mins ${EXIT_DURATION_IN_MINS} \
     --disable-gloo-process-groups \
     --disable-straggler-on-startup \
     --straggler-minmax-count 16 \
@@ -199,7 +228,8 @@ options=" \
 
 export RUN_NNODES GPUS_PER_NODE MASTER_ADDR MASTER_PORT REPO_DIR options
 echo "[lyris-a3b] launching ${RUN_NNODES} nodes x ${GPUS_PER_NODE} GPUs"
-srun --nodes="${RUN_NNODES}" --ntasks="${RUN_NNODES}" --ntasks-per-node=1 \
+srun --overlap --nodes="${RUN_NNODES}" --nodelist="${RUN_NODELIST}" \
+    --ntasks="${RUN_NNODES}" --ntasks-per-node=1 \
     --kill-on-bad-exit=1 --mpi=none "${container_args[@]}" \
     bash -lc 'cd "${REPO_DIR}" && python -u -m torch.distributed.run \
         --nnodes="${RUN_NNODES}" \

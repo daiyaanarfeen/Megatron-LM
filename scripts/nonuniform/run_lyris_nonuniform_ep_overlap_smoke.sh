@@ -27,10 +27,15 @@ MASTER_ADDR="${MASTER_ADDR:-$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | 
 MASTER_PORT="${MASTER_PORT:-29890}"
 RUN_NNODES="${RUN_NNODES:-${SLURM_NNODES}}"
 RUN_NPROC_PER_NODE="${RUN_NPROC_PER_NODE:-4}"
+RUN_WORLD_SIZE="${RUN_WORLD_SIZE:-$((RUN_NNODES * RUN_NPROC_PER_NODE))}"
+USE_DIRECT_SRUN_RANKS="${USE_DIRECT_SRUN_RANKS:-0}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-12}"
 NUM_EXPERTS="${NUM_EXPERTS:-8}"
 NONUNIFORM_EP_TOPOLOGY="${NONUNIFORM_EP_TOPOLOGY:-8 4}"
 FORMAT_SOURCES="${FORMAT_SOURCES:-0}"
+RUN_PREFLIGHT_TESTS="${RUN_PREFLIGHT_TESTS:-1}"
+ENABLE_PYTORCH_PROFILER="${ENABLE_PYTORCH_PROFILER:-1}"
+EXTRA_MEGATRON_ARGS="${EXTRA_MEGATRON_ARGS:-}"
 export FORMAT_SOURCES
 
 mkdir -p "${RUN_DIR}"
@@ -56,7 +61,8 @@ fi
 
 echo "[lyris-nep-smoke] job=${SLURM_JOB_ID} nodes=${SLURM_JOB_NODELIST} image=${IMAGE}"
 
-srun --nodes=1 --ntasks=1 --mpi=none "${container_args[@]}" bash -lc '
+if [[ "${RUN_PREFLIGHT_TESTS}" == "1" ]]; then
+    srun --nodes=1 --ntasks=1 --mpi=none "${container_args[@]}" bash -lc '
 cd /home/darfeen/Megatron-LM
 if [[ "${FORMAT_SOURCES}" == "1" ]]; then
     python -m black \
@@ -100,6 +106,7 @@ assert all(work.block_calls == 1 and work.wait_calls == 0 for work in works)
 print("[lyris-nep-smoke] nonblocking slot test: ok")
 PY
 '
+fi
 
 export CUDA_DEVICE_MAX_CONNECTIONS=32
 export NVTE_FUSED_ATTN=0
@@ -125,10 +132,21 @@ export TENSOR_MODEL_PARALLEL_SIZE="${TENSOR_MODEL_PARALLEL_SIZE:-1}"
 export EXPERT_TENSOR_PARALLEL_SIZE="${EXPERT_TENSOR_PARALLEL_SIZE:-1}"
 export SEQ_LENGTH="${SEQ_LENGTH:-1024}"
 export NUM_EXPERTS NONUNIFORM_EP_TOPOLOGY
-export ENABLE_PYTORCH_PROFILER=1
+export ENABLE_PYTORCH_PROFILER
 export PROFILE_STEP_START="${PROFILE_STEP_START:-4}"
 export PROFILE_STEP_END="${PROFILE_STEP_END:-6}"
 export PROFILE_RANKS="${PROFILE_RANKS:-0}"
-export EXTRA_MEGATRON_ARGS="--nonuniform-skip-optimizer-step"
+export EXTRA_MEGATRON_ARGS="--nonuniform-skip-optimizer-step ${EXTRA_MEGATRON_ARGS}"
 
-srun --nodes="${RUN_NNODES}" --ntasks="${RUN_NNODES}" --ntasks-per-node=1 --kill-on-bad-exit=1 --mpi=none "${container_args[@]}" bash examples/training_scripts/nonuniform_ep_approach_a_smoke.sh
+if [[ "${USE_DIRECT_SRUN_RANKS}" == "1" ]]; then
+    export LAUNCHER_MODE=direct
+    export WORLD_SIZE="${RUN_WORLD_SIZE}"
+    srun --nodes="${RUN_NNODES}" --ntasks="${RUN_WORLD_SIZE}" \
+        --ntasks-per-node="${RUN_NPROC_PER_NODE}" --kill-on-bad-exit=1 \
+        --mpi=none "${container_args[@]}" \
+        bash -lc 'export RANK="${SLURM_PROCID}" LOCAL_RANK=0 TORCH_CUDA_VISIBLE_DEVICES="${SLURM_LOCALID}"; bash examples/training_scripts/nonuniform_ep_approach_a_smoke.sh'
+else
+    srun --nodes="${RUN_NNODES}" --ntasks="${RUN_NNODES}" --ntasks-per-node=1 \
+        --kill-on-bad-exit=1 --mpi=none "${container_args[@]}" \
+        bash examples/training_scripts/nonuniform_ep_approach_a_smoke.sh
+fi
