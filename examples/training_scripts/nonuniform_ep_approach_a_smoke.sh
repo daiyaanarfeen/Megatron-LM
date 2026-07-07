@@ -29,6 +29,8 @@ NUM_LAYERS="${NUM_LAYERS:-2}"
 HIDDEN_SIZE="${HIDDEN_SIZE:-256}"
 FFN_HIDDEN_SIZE="${FFN_HIDDEN_SIZE:-1024}"
 NUM_ATTENTION_HEADS="${NUM_ATTENTION_HEADS:-4}"
+TENSOR_MODEL_PARALLEL_SIZE="${TENSOR_MODEL_PARALLEL_SIZE:-1}"
+EXPERT_TENSOR_PARALLEL_SIZE="${EXPERT_TENSOR_PARALLEL_SIZE:-1}"
 SEQ_LENGTH="${SEQ_LENGTH:-128}"
 NUM_EXPERTS="${NUM_EXPERTS:-6}"
 NAME="${NAME:-nonuniform_ep_approach_a_smoke}"
@@ -79,6 +81,11 @@ if [[ -n "${DDP_BUCKET_SIZE}" ]]; then
     DDP_BUCKET_OPTIONS=" --ddp-bucket-size ${DDP_BUCKET_SIZE} "
 fi
 
+PARALLEL_OPTIONS=""
+if (( TENSOR_MODEL_PARALLEL_SIZE > 1 )); then
+    PARALLEL_OPTIONS=" --sequence-parallel "
+fi
+
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 RUN_DIR="${ROOT_DIR}/${NAME}"
 LOGS_DIR="${RUN_DIR}/logs"
@@ -116,9 +123,10 @@ options=" \
     ${DDP_BUCKET_OPTIONS} \
     --overlap-grad-reduce \
     --bf16 \
-    --tensor-model-parallel-size 1 \
+    --tensor-model-parallel-size ${TENSOR_MODEL_PARALLEL_SIZE} \
+    ${PARALLEL_OPTIONS} \
     --context-parallel-size 1 \
-    --expert-tensor-parallel-size 1 \
+    --expert-tensor-parallel-size ${EXPERT_TENSOR_PARALLEL_SIZE} \
     --num-experts ${NUM_EXPERTS} \
     --moe-router-topk 1 \
     --moe-router-pre-softmax \

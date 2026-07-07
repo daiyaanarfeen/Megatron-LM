@@ -30,6 +30,8 @@ RUN_NPROC_PER_NODE="${RUN_NPROC_PER_NODE:-4}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-12}"
 NUM_EXPERTS="${NUM_EXPERTS:-8}"
 NONUNIFORM_EP_TOPOLOGY="${NONUNIFORM_EP_TOPOLOGY:-8 4}"
+FORMAT_SOURCES="${FORMAT_SOURCES:-0}"
+export FORMAT_SOURCES
 
 mkdir -p "${RUN_DIR}"
 exec > >(tee -a "${DRIVER_LOG}") 2>&1
@@ -56,6 +58,14 @@ echo "[lyris-nep-smoke] job=${SLURM_JOB_ID} nodes=${SLURM_JOB_NODELIST} image=${
 
 srun --nodes=1 --ntasks=1 --mpi=none "${container_args[@]}" bash -lc '
 cd /home/darfeen/Megatron-LM
+if [[ "${FORMAT_SOURCES}" == "1" ]]; then
+    python -m black \
+        megatron/core/distributed/nonuniform_ep.py \
+        tests/unit_tests/distributed/test_nonuniform_ep.py
+fi
+python -m black --check \
+    megatron/core/distributed/nonuniform_ep.py \
+    tests/unit_tests/distributed/test_nonuniform_ep.py
 python -m compileall -q \
     megatron/core/distributed/_native_nccl.py \
     megatron/core/distributed/nonuniform_ep.py
@@ -104,19 +114,21 @@ export ROOT_DIR REPO_DIR NAME MASTER_ADDR MASTER_PORT IMAGE_PATH
 export NNODES="${RUN_NNODES}"
 export GPUS_PER_NODE=4
 export NPROC_PER_NODE="${RUN_NPROC_PER_NODE}"
-export TRAIN_ITERS=10
+export TRAIN_ITERS="${TRAIN_ITERS:-10}"
 export GLOBAL_BATCH_SIZE
-export MICRO_BATCH_SIZE=1
-export NUM_LAYERS=16
-export HIDDEN_SIZE=1024
-export FFN_HIDDEN_SIZE=4096
-export NUM_ATTENTION_HEADS=16
-export SEQ_LENGTH=1024
+export MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
+export NUM_LAYERS="${NUM_LAYERS:-16}"
+export HIDDEN_SIZE="${HIDDEN_SIZE:-1024}"
+export FFN_HIDDEN_SIZE="${FFN_HIDDEN_SIZE:-4096}"
+export NUM_ATTENTION_HEADS="${NUM_ATTENTION_HEADS:-16}"
+export TENSOR_MODEL_PARALLEL_SIZE="${TENSOR_MODEL_PARALLEL_SIZE:-1}"
+export EXPERT_TENSOR_PARALLEL_SIZE="${EXPERT_TENSOR_PARALLEL_SIZE:-1}"
+export SEQ_LENGTH="${SEQ_LENGTH:-1024}"
 export NUM_EXPERTS NONUNIFORM_EP_TOPOLOGY
 export ENABLE_PYTORCH_PROFILER=1
-export PROFILE_STEP_START=4
-export PROFILE_STEP_END=6
-export PROFILE_RANKS=0
+export PROFILE_STEP_START="${PROFILE_STEP_START:-4}"
+export PROFILE_STEP_END="${PROFILE_STEP_END:-6}"
+export PROFILE_RANKS="${PROFILE_RANKS:-0}"
 export EXTRA_MEGATRON_ARGS="--nonuniform-skip-optimizer-step"
 
 srun --nodes="${RUN_NNODES}" --ntasks="${RUN_NNODES}" --ntasks-per-node=1 --kill-on-bad-exit=1 --mpi=none "${container_args[@]}" bash examples/training_scripts/nonuniform_ep_approach_a_smoke.sh

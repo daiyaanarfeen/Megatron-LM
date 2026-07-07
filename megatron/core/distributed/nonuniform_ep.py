@@ -85,6 +85,15 @@ def _nep_zero_sm_reshard_enabled() -> bool:
     )
 
 
+def _nep_edp_ready_gate_enabled() -> bool:
+    return os.getenv("MEGATRON_NONUNIFORM_EP_EDP_READY_GATE", "1").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 class NonuniformEPApproach(str, Enum):
     """Gradient synchronization approach for nonuniform EP expert params."""
 
@@ -309,20 +318,28 @@ def _get_nccl_communicator_configs(path: Optional[str]) -> dict:
         return yaml.safe_load(stream)
 
 
-def _create_group(ranks, timeout, nccl_comm_cfgs, desc, backend=None, cta_policy=None):
+def _create_group(
+    ranks, timeout, nccl_comm_cfgs, desc, backend=None, cta_policy=None, max_ctas=None
+):
     _nep_debug_print(f"before_create_group desc={desc} backend={backend} ranks={ranks}")
     pg_options = (
         None if backend == "gloo" else parallel_state.get_nccl_options(desc, nccl_comm_cfgs)
     )
-    if cta_policy is not None:
+    if cta_policy is not None or max_ctas is not None:
         if pg_options is None:
             pg_options = dist.ProcessGroupNCCL.Options()
+    if cta_policy is not None:
         if not hasattr(pg_options.config, "cta_policy"):
             raise RuntimeError(
                 "MEGATRON_NONUNIFORM_EP_ZERO_SM_RESHARD requires a PyTorch build "
                 "that exposes ProcessGroupNCCL.Options.config.cta_policy"
             )
         pg_options.config.cta_policy = cta_policy
+    if max_ctas is not None:
+        if not hasattr(pg_options.config, "max_ctas") or not hasattr(pg_options.config, "min_ctas"):
+            raise RuntimeError("NEP EDP readiness gating requires ProcessGroupNCCL CTA limits")
+        pg_options.config.max_ctas = max_ctas
+        pg_options.config.min_ctas = max_ctas
     group = parallel_state.create_group(
         ranks, timeout=timeout, backend=backend, pg_options=pg_options, group_desc=desc
     )
@@ -341,6 +358,7 @@ def initialize_nonuniform_ep_process_groups(
     create_gloo_process_groups: bool = True,
     get_embedding_ranks: Optional[Callable[[List[int]], List[int]]] = None,
     get_position_embedding_ranks: Optional[Callable[[List[int]], List[int]]] = None,
+    enable_edp_ready_gate: bool = False,
 ) -> dict:
     """Initialize opt-in nonuniform EP process groups and runtime metadata.
 
@@ -389,6 +407,11 @@ def initialize_nonuniform_ep_process_groups(
     timeout = timedelta(minutes=distributed_timeout_minutes)
     nccl_comm_cfgs = _get_nccl_communicator_configs(nccl_communicator_config_path)
     zero_sm_reshard = _nep_zero_sm_reshard_enabled()
+    edp_ready_gate_enabled = (
+        enable_edp_ready_gate
+        and _nep_edp_ready_gate_enabled()
+        and len(set(num_tp_cp_per_replica)) > 1
+    )
 
     # Attention/data groups.
     for ranks in generator.get_ranks('dp-cp'):
@@ -526,8 +549,12 @@ def initialize_nonuniform_ep_process_groups(
     all_edp_groups = edp_groups + [
         [uncovered_rank] for uncovered_rank in sorted(set(range(world_size)) - covered_edp_ranks)
     ]
+    nep_edp_ready_group = None
     for ranks in all_edp_groups:
         group = _create_group(ranks, timeout, nccl_comm_cfgs, "ep_dp")
+        ready_group = None
+        if edp_ready_gate_enabled and len(ranks) > 1:
+            ready_group = _create_group(ranks, timeout, nccl_comm_cfgs, "nep_edp_ready", max_ctas=1)
         group_gloo = (
             _create_group(ranks, timeout, nccl_comm_cfgs, "EXPERT_DATA_PARALLEL_GROUP_GLOO", "gloo")
             if create_gloo_process_groups
@@ -539,6 +566,7 @@ def initialize_nonuniform_ep_process_groups(
             _set_parallel_state_attr("_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP", group)
             _set_parallel_state_attr("_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO", group_gloo)
             _set_parallel_state_attr("_INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP", None)
+            nep_edp_ready_group = ready_group
 
     _set_parallel_state_attr("_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP", dist.group.WORLD)
     parallel_state._set_global_memory_buffer()
@@ -569,6 +597,8 @@ def initialize_nonuniform_ep_process_groups(
         'nep_owner_transfer_groups': nep_owner_transfer_groups,
         'nep_owner_transfer_group_ranks': nep_owner_transfer_group_ranks,
         'edp_group': parallel_state.get_expert_data_parallel_group(),
+        'nep_edp_ready_group': nep_edp_ready_group,
+        'edp_ready_gate_enabled': edp_ready_gate_enabled,
         'ep_rank': ep_rank,
         'is_edp_eligible': ep_rank < min_ep_size,
         'is_b_leader': ep_rank < min_ep_size,
@@ -1100,6 +1130,24 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if buffer_slot_key is not None:
             state = self._get_nep_nccl_shared_buffer_state()
             state['buffer_slot_handles'].setdefault(buffer_slot_key, []).append(work)
+        _nep_block_current_stream(work)
+
+    def _start_nep_nccl_edp_ready_gate(self, buffer_slot: int) -> None:
+        """Keep the SM-based EDP all-reduce behind peer owner readiness."""
+        cfg = self._nep_runtime_config
+        ready_group = cfg.get('nep_edp_ready_group')
+        if not cfg.get('edp_ready_gate_enabled', False) or ready_group is None:
+            return
+
+        state = self._get_nep_nccl_shared_buffer_state()
+        ready_buffers = state.get('edp_ready_buffers')
+        if ready_buffers is None or buffer_slot not in ready_buffers:
+            raise RuntimeError("NEP EDP readiness gate buffers were not initialized")
+        token = ready_buffers[buffer_slot]
+        readiness_slot_key = ('edp_ready', buffer_slot)
+        self._order_nep_nccl_buffer_slot(readiness_slot_key)
+        work = dist.all_reduce(token, group=ready_group, async_op=True)
+        state['buffer_slot_handles'].setdefault(readiness_slot_key, []).append(work)
         _nep_block_current_stream(work)
 
     def _drain_nep_nccl_async_window(self, force_all: bool = False) -> None:
@@ -2179,6 +2227,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 raise RuntimeError(
                     "Nonuniform EP NCCL owner rank requires runtime_config['edp_group']."
                 )
+            if async_op:
+                self._start_nep_nccl_edp_ready_gate(buffer_slot)
             _nep_debug_print(
                 "before edp_all_reduce_owner_chunk "
                 f"group={group_index} owner={owner_ep_rank} chunk={chunk_index} "
@@ -2838,6 +2888,39 @@ def _configure_nep_nccl_task_scheduler(
     state['pending_scatters'] = []
 
 
+def _configure_nep_edp_ready_gate(
+    bucket_groups: List[NonuniformEPNCCLParamAndGradBucketGroup],
+) -> None:
+    """Allocate per-slot tokens for the one-CTA EDP readiness communicator."""
+    if not bucket_groups:
+        return
+
+    state = getattr(bucket_groups[0], '_nep_nccl_scheduler_state', None)
+    if state is None:
+        raise RuntimeError("NEP EDP readiness gating requires the shared task scheduler")
+    if 'edp_ready_buffers' in state:
+        return
+
+    runtime_config = bucket_groups[0]._nep_runtime_config
+    ready_group = runtime_config.get('nep_edp_ready_group')
+    if not runtime_config.get('edp_ready_gate_enabled', False) or ready_group is None:
+        state['edp_ready_buffers'] = {}
+        return
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    state['edp_ready_buffers'] = {
+        buffer_slot: torch.zeros(1, dtype=torch.float32, device=device)
+        for buffer_slot in range(_get_nep_nccl_async_chunk_window())
+    }
+    _nep_debug_print("before one-CTA EDP readiness warmup")
+    dist.all_reduce(state['edp_ready_buffers'][0], group=ready_group)
+    torch.cuda.synchronize(device)
+    _nep_debug_print("after one-CTA EDP readiness warmup")
+    _nep_debug_print(
+        "configured one-CTA EDP readiness gate " f"slots={len(state['edp_ready_buffers'])}"
+    )
+
+
 def _configure_nep_zero_sm_buffers(
     bucket_groups: List[NonuniformEPNCCLParamAndGradBucketGroup],
 ) -> None:
@@ -3029,6 +3112,7 @@ def build_nonuniform_ep_nccl_bucket_groups(
         bucket_groups, '_nep_nccl_scheduler_state', '_nep_nccl_group_index', '_nep_nccl_ready'
     )
     _configure_nep_nccl_task_scheduler(bucket_groups)
+    _configure_nep_edp_ready_gate(bucket_groups)
     _configure_nep_zero_sm_buffers(bucket_groups)
     return bucket_groups
 

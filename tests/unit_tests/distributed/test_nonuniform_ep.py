@@ -124,6 +124,79 @@ def test_nep_nccl_owner_tasks_use_bounded_distinct_stream_slots(monkeypatch):
     assert next_group_slots == [2, 3, 0, 1, 2, 3]
 
 
+def test_nep_nccl_edp_ready_gate_reuses_slots_without_host_wait(monkeypatch):
+    bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
+        NonuniformEPNCCLParamAndGradBucketGroup
+    )
+    ready_group = object()
+    works = [_FakeWork(), _FakeWork()]
+    calls = []
+    bucket_group._nep_runtime_config = {
+        'edp_ready_gate_enabled': True,
+        'nep_edp_ready_group': ready_group,
+    }
+    bucket_group._nep_nccl_scheduler_state = {
+        'gather_buf_cache': {},
+        'buffer_slot_handles': {},
+        'edp_ready_buffers': {0: torch.empty(1)},
+    }
+
+    def fake_all_reduce(token, group, async_op):
+        calls.append((token, group, async_op))
+        return works[len(calls) - 1]
+
+    monkeypatch.setattr(torch.distributed, 'all_reduce', fake_all_reduce)
+
+    bucket_group._start_nep_nccl_edp_ready_gate(0)
+    bucket_group._start_nep_nccl_edp_ready_gate(0)
+
+    assert len(calls) == 2
+    assert all(call[1] is ready_group and call[2] for call in calls)
+    assert works[0].block_calls == 2
+    assert works[1].block_calls == 1
+    assert all(work.wait_calls == 0 for work in works)
+    assert bucket_group._nep_nccl_scheduler_state['buffer_slot_handles'][('edp_ready', 0)] == [
+        works[1]
+    ]
+
+
+def test_nep_nccl_owner_task_gates_edp_all_reduce_after_gather(monkeypatch):
+    bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
+        NonuniformEPNCCLParamAndGradBucketGroup
+    )
+    calls = []
+    fake_work = _FakeWork()
+    fake_edp_group = type('FakeGroup', (), {'rank': lambda self: 0})()
+    bucket_group.buckets = [type('Bucket', (), {'grad_data': torch.empty(8)})()]
+    bucket_group.ddp_config = type('DDPConfig', (), {'average_in_collective': False})()
+    bucket_group._nep_runtime_config = {'ep_rank': 0, 'edp_group': fake_edp_group}
+    bucket_group._nep_nccl_group_index = 0
+    bucket_group._nep_nccl_async_tensors = []
+    bucket_group._nep_nccl_scheduler_state = {'gather_buf_cache': {}, 'buffer_slot_handles': {}}
+    bucket_group._get_nep_nccl_owner_layout = lambda: {}
+    bucket_group._get_nep_nccl_task_buffer_slot = lambda owner, chunk: 0
+    bucket_group._prep_nep_nccl_owner_entries_for_sync = lambda owner: None
+    bucket_group._start_nep_nccl_owner_all_to_all_gather = lambda *args, **kwargs: calls.append(
+        'gather'
+    )
+    bucket_group._start_nep_nccl_edp_ready_gate = lambda slot: calls.append('ready')
+    bucket_group._record_nep_nccl_work = lambda work, slot: calls.append('record')
+    bucket_group._start_nep_nccl_owner_task_scatter = lambda context: calls.append('scatter')
+
+    def fake_all_reduce(tensor, op, group, async_op):
+        calls.append('all_reduce')
+        assert group is fake_edp_group
+        return fake_work
+
+    monkeypatch.setattr(torch.distributed, 'all_reduce', fake_all_reduce)
+
+    bucket_group._start_nep_nccl_owner_task(
+        owner_ep_rank=0, chunk_index=0, chunk_start=0, chunk_end=8, async_op=True
+    )
+
+    assert calls == ['gather', 'ready', 'all_reduce', 'record', 'scatter']
+
+
 def test_nep_nccl_dense_source_payload_round_trip():
     bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
         NonuniformEPNCCLParamAndGradBucketGroup
