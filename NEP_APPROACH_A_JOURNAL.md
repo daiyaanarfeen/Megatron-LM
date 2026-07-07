@@ -50,6 +50,7 @@ Append a dated entry whenever we do something new: code changes, job submissions
 - Resubmitted Black, compile, and focused pytest validation as job `2295366` using NeMo 25.09, whose toolchain predates that mismatch.
 - Job `2295366` reached Black 24 and reported formatting changes were required, so job `2295398` reran Black in write mode, verified Black check and compile, and passed all seven focused tests.
 - Reverted unrelated whole-file Black churn in the two entrypoints and reapplied only their readiness-gate keywords. The core implementation and focused test retain Black 24 formatting; login-node compile and `git diff --check` pass for the scoped final tree.
+- Committed the validated implementation as `7f2189347` (`Gate NEP EDP reduction on owner readiness`) and pushed `nonuniform-approach-a-training-scripts` to the `daiyaanarfeen/Megatron-LM` fork.
 
 ### Backward-order scheduler experiment
 
