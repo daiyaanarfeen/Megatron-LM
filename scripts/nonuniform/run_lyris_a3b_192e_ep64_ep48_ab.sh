@@ -31,6 +31,15 @@ CASE_PROFILE_STEP_START="${CASE_PROFILE_STEP_START:-2}"
 CASE_PROFILE_STEP_END="${CASE_PROFILE_STEP_END:-3}"
 CASE_EXIT_DURATION_IN_MINS="${CASE_EXIT_DURATION_IN_MINS:-13}"
 CASE_NAME_SUFFIX="${CASE_NAME_SUFFIX:-}"
+CASE_SELECTION="${CASE_SELECTION:-both}"
+
+case "${CASE_SELECTION}" in
+    both|nep|healthy) ;;
+    *)
+        echo "Unsupported CASE_SELECTION=${CASE_SELECTION}; expected both, nep, or healthy" >&2
+        exit 2
+        ;;
+esac
 
 run_case() {
     local case_name="$1"
@@ -79,7 +88,11 @@ run_case() {
 }
 
 # Full-replica owner 0, full-replica follower 48, and reduced-replica owner 0.
-run_case "a3b_192e_nep_ep64_ep48${CASE_NAME_SUFFIX}" "64 48" 28 224 "0 48 64" 1
+if [[ "${CASE_SELECTION}" != "healthy" ]]; then
+    run_case "a3b_192e_nep_ep64_ep48${CASE_NAME_SUFFIX}" "64 48" 28 224 "0 48 64" 1
+fi
 
 # Both matching expert-DP owners in the healthy two-replica control.
-run_case "a3b_192e_healthy_ep64_ep64${CASE_NAME_SUFFIX}" "64 64" 32 256 "0 64" 1
+if [[ "${CASE_SELECTION}" != "nep" ]]; then
+    run_case "a3b_192e_healthy_ep64_ep64${CASE_NAME_SUFFIX}" "64 64" 32 256 "0 64" 1
+fi
