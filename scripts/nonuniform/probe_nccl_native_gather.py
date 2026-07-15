@@ -83,13 +83,13 @@ class _NativeNCCL:
         self._check(result, "ncclScatter")
 
 
-def _new_zero_cta_group():
+def _new_zero_cta_group(ranks):
     options = dist.ProcessGroupNCCL.Options()
     if not hasattr(options.config, "cta_policy"):
         raise RuntimeError("This PyTorch build does not expose NCCL cta_policy")
     options.config.cta_policy = 2
     return dist.new_group(
-        ranks=list(range(dist.get_world_size())),
+        ranks=ranks,
         backend="nccl",
         pg_options=options,
         group_desc="probe_native_zero_cta",
@@ -133,6 +133,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--trace-dir", type=Path, required=True)
     parser.add_argument("--elements-per-rank", type=int, default=1 << 20)
+    parser.add_argument("--group-ranks", type=int, nargs="+")
     args = parser.parse_args()
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -143,7 +144,25 @@ def main() -> None:
     if world_size < 2:
         raise RuntimeError("native zero-CTA probe requires at least two ranks")
 
-    group = _new_zero_cta_group()
+    group_ranks = args.group_ranks or list(range(world_size))
+    if len(group_ranks) < 2 or len(set(group_ranks)) != len(group_ranks):
+        raise RuntimeError(f"invalid native zero-CTA probe ranks: {group_ranks}")
+    if min(group_ranks) < 0 or max(group_ranks) >= world_size:
+        raise RuntimeError(
+            f"native zero-CTA probe ranks {group_ranks} exceed world size {world_size}"
+        )
+
+    control_group = dist.new_group(
+        ranks=list(range(world_size)), backend="gloo", group_desc="probe_control"
+    )
+    group = _new_zero_cta_group(group_ranks)
+    if rank not in group_ranks:
+        dist.barrier(group=control_group)
+        dist.destroy_process_group()
+        return
+
+    group_rank = dist.get_rank(group=group)
+    group_size = dist.get_world_size(group=group)
     warmup = torch.ones(1, device="cuda")
     dist.all_reduce(warmup, group=group)
     torch.cuda.synchronize()
@@ -152,7 +171,7 @@ def main() -> None:
     with torch.cuda.use_mem_pool(pool):
         small = torch.empty(args.elements_per_rank, dtype=torch.bfloat16, device="cuda")
         large = torch.empty(
-            world_size * args.elements_per_rank, dtype=torch.bfloat16, device="cuda"
+            group_size * args.elements_per_rank, dtype=torch.bfloat16, device="cuda"
         )
     try:
         backend.register_mem_pool(pool, symm=True)
@@ -160,21 +179,21 @@ def main() -> None:
         backend.register_mem_pool(pool)
 
     native_nccl = _NativeNCCL()
-    small.fill_(rank)
+    small.fill_(group_rank)
     large.fill_(-1)
     _run_profiled(
         "native_zero_gather",
         lambda: native_nccl.gather(small, large, small.numel(), 0, comm_ptr),
         args.trace_dir,
     )
-    if rank == 0:
+    if group_rank == 0:
         expected = torch.cat(
-            [torch.full_like(small, source_rank) for source_rank in range(world_size)]
+            [torch.full_like(small, source_rank) for source_rank in range(group_size)]
         )
         torch.testing.assert_close(large, expected)
 
-    if rank == 0:
-        for destination_rank, destination in enumerate(large.chunk(world_size)):
+    if group_rank == 0:
+        for destination_rank, destination in enumerate(large.chunk(group_size)):
             destination.fill_(100 + destination_rank)
     small.fill_(-1)
     _run_profiled(
@@ -182,14 +201,15 @@ def main() -> None:
         lambda: native_nccl.scatter(large, small, small.numel(), 0, comm_ptr),
         args.trace_dir,
     )
-    torch.testing.assert_close(small, torch.full_like(small, 100 + rank))
+    torch.testing.assert_close(small, torch.full_like(small, 100 + group_rank))
 
-    if rank == 0:
+    if group_rank == 0:
         print(
-            f"[native-zero-cta-probe] PASS world_size={world_size} "
+            f"[native-zero-cta-probe] PASS group_ranks={group_ranks} "
             f"nccl={torch.cuda.nccl.version()} comm_ptr={comm_ptr:#x}",
             flush=True,
         )
+    dist.barrier(group=control_group)
     dist.destroy_process_group()
 
 

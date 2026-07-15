@@ -5,6 +5,7 @@
 #SBATCH --account=coreai_comparch_sysarch
 #SBATCH --partition=gb200-backfill
 #SBATCH --nodes=2
+#SBATCH --segment=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --exclusive
 #SBATCH --mem=0
@@ -27,9 +28,9 @@ env \
     NAME="ep4_2_graph_record_${SLURM_JOB_ID}" \
     RUN_NNODES=2 \
     RUN_NPROC_PER_NODE=3 \
-    RUN_PREFLIGHT_TESTS=0 \
-    ENABLE_PYTORCH_PROFILER=0 \
-    TRAIN_ITERS=3 \
+    RUN_PREFLIGHT_TESTS="${RUN_PREFLIGHT_TESTS:-0}" \
+    ENABLE_PYTORCH_PROFILER="${ENABLE_PYTORCH_PROFILER:-0}" \
+    TRAIN_ITERS="${TRAIN_ITERS:-3}" \
     GLOBAL_BATCH_SIZE=6 \
     MICRO_BATCH_SIZE=1 \
     NUM_LAYERS=4 \

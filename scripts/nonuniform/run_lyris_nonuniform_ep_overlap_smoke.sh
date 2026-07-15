@@ -23,7 +23,6 @@ CONTAINER_NAME="${CONTAINER_NAME:-}"
 NAME="${NAME:-ep8_4_l16_h1024_s1024_nonblocking_slots_${SLURM_JOB_ID}}"
 RUN_DIR="${ROOT_DIR}/${NAME}"
 DRIVER_LOG="${RUN_DIR}/driver_${SLURM_JOB_ID}.log"
-MASTER_ADDR="${MASTER_ADDR:-$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n 1)}"
 MASTER_PORT="${MASTER_PORT:-29890}"
 RUN_NNODES="${RUN_NNODES:-${SLURM_NNODES}}"
 RUN_NPROC_PER_NODE="${RUN_NPROC_PER_NODE:-4}"
@@ -34,9 +33,19 @@ NUM_EXPERTS="${NUM_EXPERTS:-8}"
 NONUNIFORM_EP_TOPOLOGY="${NONUNIFORM_EP_TOPOLOGY:-8 4}"
 FORMAT_SOURCES="${FORMAT_SOURCES:-0}"
 RUN_PREFLIGHT_TESTS="${RUN_PREFLIGHT_TESTS:-1}"
+PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
 ENABLE_PYTORCH_PROFILER="${ENABLE_PYTORCH_PROFILER:-1}"
 EXTRA_MEGATRON_ARGS="${EXTRA_MEGATRON_ARGS:-}"
 export FORMAT_SOURCES
+
+mapfile -t allocated_nodes < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
+if ((RUN_NNODES > ${#allocated_nodes[@]})); then
+    echo "RUN_NNODES=${RUN_NNODES} exceeds the ${#allocated_nodes[@]} allocated nodes" >&2
+    exit 2
+fi
+run_nodes=("${allocated_nodes[@]:0:RUN_NNODES}")
+RUN_NODELIST=$(IFS=,; echo "${run_nodes[*]}")
+MASTER_ADDR="${MASTER_ADDR:-${run_nodes[0]}}"
 
 mkdir -p "${RUN_DIR}"
 exec > >(tee -a "${DRIVER_LOG}") 2>&1
@@ -63,18 +72,42 @@ echo "[lyris-nep-smoke] job=${SLURM_JOB_ID} nodes=${SLURM_JOB_NODELIST} image=${
 
 if [[ "${RUN_PREFLIGHT_TESTS}" == "1" ]]; then
     srun --nodes=1 --ntasks=1 --mpi=none "${container_args[@]}" bash -lc '
+set -euo pipefail
 cd /home/darfeen/Megatron-LM
 if [[ "${FORMAT_SOURCES}" == "1" ]]; then
-    python -m black \
+    uv run isort \
+        megatron/core/transformer/moe/moe_layer.py \
+        megatron/core/transformer/moe/token_dispatcher.py \
+        megatron/core/distributed/_cuda_stream_ops.py \
+        megatron/core/distributed/nonuniform_common.py \
         megatron/core/distributed/nonuniform_ep.py \
+        scripts/nonuniform/probe_cuda_stream_ops.py \
+        tests/unit_tests/distributed/test_nonuniform_ep.py
+    python -m black \
+        megatron/core/transformer/moe/moe_layer.py \
+        megatron/core/transformer/moe/token_dispatcher.py \
+        megatron/core/distributed/_cuda_stream_ops.py \
+        megatron/core/distributed/nonuniform_common.py \
+        megatron/core/distributed/nonuniform_ep.py \
+        scripts/nonuniform/probe_cuda_stream_ops.py \
         tests/unit_tests/distributed/test_nonuniform_ep.py
 fi
 python -m black --check \
+    megatron/core/transformer/moe/moe_layer.py \
+    megatron/core/transformer/moe/token_dispatcher.py \
+    megatron/core/distributed/_cuda_stream_ops.py \
+    megatron/core/distributed/nonuniform_common.py \
     megatron/core/distributed/nonuniform_ep.py \
+    scripts/nonuniform/probe_cuda_stream_ops.py \
     tests/unit_tests/distributed/test_nonuniform_ep.py
 python -m compileall -q \
     megatron/core/distributed/_native_nccl.py \
-    megatron/core/distributed/nonuniform_ep.py
+    megatron/core/distributed/_cuda_stream_ops.py \
+    megatron/core/distributed/nonuniform_common.py \
+    megatron/core/distributed/nonuniform_ep.py \
+    megatron/core/transformer/moe/moe_layer.py \
+    megatron/core/transformer/moe/token_dispatcher.py \
+    scripts/nonuniform/probe_cuda_stream_ops.py
 python -m pytest -q tests/unit_tests/distributed/test_nonuniform_ep.py
 python - <<'"'"'PY'"'"'
 from megatron.core.distributed.nonuniform_ep import NonuniformEPNCCLParamAndGradBucketGroup
@@ -106,6 +139,10 @@ assert all(work.block_calls == 1 and work.wait_calls == 0 for work in works)
 print("[lyris-nep-smoke] nonblocking slot test: ok")
 PY
 '
+fi
+
+if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
+    exit 0
 fi
 
 export CUDA_DEVICE_MAX_CONNECTIONS=32
@@ -141,12 +178,14 @@ export EXTRA_MEGATRON_ARGS="--nonuniform-skip-optimizer-step ${EXTRA_MEGATRON_AR
 if [[ "${USE_DIRECT_SRUN_RANKS}" == "1" ]]; then
     export LAUNCHER_MODE=direct
     export WORLD_SIZE="${RUN_WORLD_SIZE}"
-    srun --nodes="${RUN_NNODES}" --ntasks="${RUN_WORLD_SIZE}" \
-        --ntasks-per-node="${RUN_NPROC_PER_NODE}" --kill-on-bad-exit=1 \
+    srun --nodes="${RUN_NNODES}" --nodelist="${RUN_NODELIST}" \
+        --ntasks="${RUN_WORLD_SIZE}" --ntasks-per-node="${RUN_NPROC_PER_NODE}" \
+        --kill-on-bad-exit=1 \
         --mpi=none "${container_args[@]}" \
         bash -lc 'export RANK="${SLURM_PROCID}" LOCAL_RANK=0 TORCH_CUDA_VISIBLE_DEVICES="${SLURM_LOCALID}"; bash examples/training_scripts/nonuniform_ep_approach_a_smoke.sh'
 else
-    srun --nodes="${RUN_NNODES}" --ntasks="${RUN_NNODES}" --ntasks-per-node=1 \
+    srun --nodes="${RUN_NNODES}" --nodelist="${RUN_NODELIST}" \
+        --ntasks="${RUN_NNODES}" --ntasks-per-node=1 \
         --kill-on-bad-exit=1 --mpi=none "${container_args[@]}" \
         bash examples/training_scripts/nonuniform_ep_approach_a_smoke.sh
 fi

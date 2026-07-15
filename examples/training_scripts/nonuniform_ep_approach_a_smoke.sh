@@ -30,6 +30,7 @@ HIDDEN_SIZE="${HIDDEN_SIZE:-256}"
 FFN_HIDDEN_SIZE="${FFN_HIDDEN_SIZE:-1024}"
 NUM_ATTENTION_HEADS="${NUM_ATTENTION_HEADS:-4}"
 TENSOR_MODEL_PARALLEL_SIZE="${TENSOR_MODEL_PARALLEL_SIZE:-1}"
+EXPERT_MODEL_PARALLEL_SIZE="${EXPERT_MODEL_PARALLEL_SIZE:-1}"
 EXPERT_TENSOR_PARALLEL_SIZE="${EXPERT_TENSOR_PARALLEL_SIZE:-1}"
 SEQ_LENGTH="${SEQ_LENGTH:-128}"
 NUM_EXPERTS="${NUM_EXPERTS:-6}"
@@ -44,6 +45,7 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-${GPUS_PER_NODE}}"
 TORCH_CUDA_VISIBLE_DEVICES="${TORCH_CUDA_VISIBLE_DEVICES:-}"
 NONUNIFORM_EP_DDP_APPROACH="${NONUNIFORM_EP_DDP_APPROACH:-nccl}"
 NONUNIFORM_EP_TOPOLOGY="${NONUNIFORM_EP_TOPOLOGY:-2 2}"
+NONUNIFORM_MODE="${NONUNIFORM_MODE:-ep}"
 MOE_TOKEN_DISPATCHER_TYPE="${MOE_TOKEN_DISPATCHER_TYPE:-alltoall}"
 MASTER_ADDR="${MASTER_ADDR:-$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n1)}"
 ENABLE_PYTORCH_PROFILER="${ENABLE_PYTORCH_PROFILER:-0}"
@@ -79,6 +81,14 @@ fi
 DDP_BUCKET_OPTIONS=""
 if [[ -n "${DDP_BUCKET_SIZE}" ]]; then
     DDP_BUCKET_OPTIONS=" --ddp-bucket-size ${DDP_BUCKET_SIZE} "
+fi
+
+NONUNIFORM_OPTIONS=" --nonuniform-mode ${NONUNIFORM_MODE} "
+if [[ "${NONUNIFORM_MODE}" == "ep" ]]; then
+    NONUNIFORM_OPTIONS+=" --nonuniform-ep-num-tp-cp-per-replica ${NONUNIFORM_EP_TOPOLOGY} --nonuniform-ep-ddp-approach ${NONUNIFORM_EP_DDP_APPROACH} "
+elif [[ "${NONUNIFORM_MODE}" != "none" ]]; then
+    echo "Unsupported NONUNIFORM_MODE=${NONUNIFORM_MODE}" >&2
+    exit 2
 fi
 
 PARALLEL_OPTIONS=""
@@ -126,6 +136,7 @@ options=" \
     --tensor-model-parallel-size ${TENSOR_MODEL_PARALLEL_SIZE} \
     ${PARALLEL_OPTIONS} \
     --context-parallel-size 1 \
+    --expert-model-parallel-size ${EXPERT_MODEL_PARALLEL_SIZE} \
     --expert-tensor-parallel-size ${EXPERT_TENSOR_PARALLEL_SIZE} \
     --num-experts ${NUM_EXPERTS} \
     --moe-router-topk 1 \
@@ -144,9 +155,7 @@ options=" \
     --lr-decay-style constant \
     --tensorboard-dir ${TENSORBOARD_DIR} \
     ${PROFILE_OPTIONS} \
-    --nonuniform-mode ep \
-    --nonuniform-ep-num-tp-cp-per-replica ${NONUNIFORM_EP_TOPOLOGY} \
-    --nonuniform-ep-ddp-approach ${NONUNIFORM_EP_DDP_APPROACH} \
+    ${NONUNIFORM_OPTIONS} \
     ${EXTRA_MEGATRON_ARGS} "
 
 if [[ "${LAUNCHER_MODE}" != "direct" && -z "${TORCH_CUDA_VISIBLE_DEVICES}" && "${NPROC_PER_NODE}" != "${GPUS_PER_NODE}" ]]; then

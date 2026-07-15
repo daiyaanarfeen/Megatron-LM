@@ -57,9 +57,12 @@ PROFILE_RANKS="${PROFILE_RANKS:-0}"
 EXTRA_MEGATRON_ARGS="${EXTRA_MEGATRON_ARGS:-}"
 HIGH_PRIORITY_STREAM_GROUPS="${HIGH_PRIORITY_STREAM_GROUPS-ep}"
 CUDA_GRAPH_IMPL="${CUDA_GRAPH_IMPL:-none}"
+NONUNIFORM_MODE="${NONUNIFORM_MODE:-ep}"
+USE_GLOO_PROCESS_GROUPS="${USE_GLOO_PROCESS_GROUPS:-0}"
 SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-0}"
 DISTRIBUTED_TIMEOUT_MINUTES="${DISTRIBUTED_TIMEOUT_MINUTES:-20}"
 EXIT_DURATION_IN_MINS="${EXIT_DURATION_IN_MINS:-40}"
+HYBRID_LAYER_PATTERN="${HYBRID_LAYER_PATTERN:-MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME}"
 
 mapfile -t allocated_nodes < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
 if ((RUN_NNODES > ${#allocated_nodes[@]})); then
@@ -89,7 +92,7 @@ finish() {
 trap finish EXIT
 
 echo "[lyris-a3b] job=${SLURM_JOB_ID} nodes=${SLURM_JOB_NODELIST} image=${IMAGE}"
-echo "[lyris-a3b] topology=${NONUNIFORM_EP_TOPOLOGY} experts=${NUM_EXPERTS} mbs=${MICRO_BATCH_SIZE} gbs=${GLOBAL_BATCH_SIZE} buckets=${DDP_NUM_BUCKETS}"
+echo "[lyris-a3b] topology=${NONUNIFORM_EP_TOPOLOGY} experts=${NUM_EXPERTS} mbs=${MICRO_BATCH_SIZE} gbs=${GLOBAL_BATCH_SIZE} buckets=${DDP_NUM_BUCKETS} pattern=${HYBRID_LAYER_PATTERN}"
 echo "[lyris-a3b] run_nodes=${RUN_NODELIST}"
 echo "[lyris-a3b] zero_sm=${MEGATRON_NONUNIFORM_EP_ZERO_SM_RESHARD} cuda_connections=${CUDA_DEVICE_MAX_CONNECTIONS} nccl_implicit_order=${NCCL_LAUNCH_ORDER_IMPLICIT}"
 
@@ -120,6 +123,19 @@ if [[ -n "${HIGH_PRIORITY_STREAM_GROUPS}" ]]; then
     high_priority_stream_args=" --high-priority-stream-groups ${HIGH_PRIORITY_STREAM_GROUPS} "
 fi
 
+nonuniform_args=" --nonuniform-mode ${NONUNIFORM_MODE} --nonuniform-skip-optimizer-step "
+if [[ "${NONUNIFORM_MODE}" == "ep" ]]; then
+    nonuniform_args+=" --nonuniform-ep-ddp-approach nccl --nonuniform-ep-num-tp-cp-per-replica ${NONUNIFORM_EP_TOPOLOGY} "
+elif [[ "${NONUNIFORM_MODE}" != "none" ]]; then
+    echo "Unsupported NONUNIFORM_MODE=${NONUNIFORM_MODE}" >&2
+    exit 2
+fi
+
+gloo_args=""
+if [[ "${USE_GLOO_PROCESS_GROUPS}" != "1" ]]; then
+    gloo_args=" --disable-gloo-process-groups "
+fi
+
 case "${CUDA_GRAPH_IMPL}" in
     none)
         cuda_graph_args=" --cuda-graph-impl none "
@@ -135,7 +151,7 @@ esac
 
 options=" \
     --use-mcore-models \
-    --hybrid-layer-pattern MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME \
+    --hybrid-layer-pattern ${HYBRID_LAYER_PATTERN} \
     --spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec \
     --hidden-size 2688 \
     --num-attention-heads 32 \
@@ -194,10 +210,7 @@ options=" \
     --num-workers 1 \
     --no-create-attention-mask-in-dataloader \
     --overlap-grad-reduce \
-    --nonuniform-mode ep \
-    --nonuniform-ep-ddp-approach nccl \
-    --nonuniform-skip-optimizer-step \
-    --nonuniform-ep-num-tp-cp-per-replica ${NONUNIFORM_EP_TOPOLOGY} \
+    ${nonuniform_args} \
     --tensor-model-parallel-size ${TENSOR_MODEL_PARALLEL_SIZE} \
     --sequence-parallel \
     --expert-model-parallel-size ${EXPERT_MODEL_PARALLEL_SIZE} \
@@ -221,7 +234,7 @@ options=" \
     --manual-gc-interval 10 \
     --distributed-timeout-minutes ${DISTRIBUTED_TIMEOUT_MINUTES} \
     --exit-duration-in-mins ${EXIT_DURATION_IN_MINS} \
-    --disable-gloo-process-groups \
+    ${gloo_args} \
     --disable-straggler-on-startup \
     --straggler-minmax-count 16 \
     ${EXTRA_MEGATRON_ARGS} "
