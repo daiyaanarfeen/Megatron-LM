@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from typing import Callable, Optional, Protocol
 
 import torch
 
@@ -184,20 +184,37 @@ class BaseMoELayer(MegatronModule, ABC):
 
         assert self.config.num_moe_experts % ep_size == 0
         self.num_local_experts = self.config.num_moe_experts // ep_size
-        local_expert_indices_offset = ep_rank * self.num_local_experts
 
         self.use_shared_expert = self.config.moe_shared_expert_intermediate_size is not None
         self.shared_expert_overlap = self.config.moe_shared_expert_overlap
 
-        self.local_expert_indices = [
-            local_expert_indices_offset + i for i in range(self.num_local_experts)
-        ]
+        from megatron.core.distributed.nonuniform_common import (
+            get_nonuniform_ep_local_expert_indices,
+        )
+
+        nonuniform_expert_indices = get_nonuniform_ep_local_expert_indices()
+        if nonuniform_expert_indices is not None:
+            if len(nonuniform_expert_indices) != self.num_local_experts:
+                raise RuntimeError(
+                    "NEP local expert placement length must match this rank's "
+                    f"num_local_experts: got {len(nonuniform_expert_indices)}, "
+                    f"expected {self.num_local_experts}"
+                )
+            self.local_expert_indices = nonuniform_expert_indices
+        else:
+            local_expert_indices_offset = ep_rank * self.num_local_experts
+            self.local_expert_indices = [
+                local_expert_indices_offset + i for i in range(self.num_local_experts)
+            ]
         assert all(map(lambda x: x < self.config.num_moe_experts, self.local_expert_indices))
         self.router: RouterInterface = None
         self.experts = None
         self.shared_experts = None
         self.token_dispatcher: Optional[MoETokenDispatcher] = None
         self.layer_number = layer_number
+        self._expert_compute_input_grad_callbacks: list[Callable[[], None]] = []
+        self._expert_compute_dgrad_callbacks: list[Callable[[], None]] = []
+        self._expert_compute_output_grad_callbacks: list[Callable[[], None]] = []
 
     @abstractmethod
     def forward(self, hidden_states):
@@ -208,6 +225,45 @@ class BaseMoELayer(MegatronModule, ABC):
         """Set the layer number for the MoE layer."""
         self.layer_number = layer_number
         self.router.set_layer_number(layer_number)
+
+    def register_expert_compute_input_grad_callback(self, callback: Callable[[], None]) -> None:
+        """Register a callback invoked when eager expert-compute input grad is ready."""
+        self._expert_compute_input_grad_callbacks.append(callback)
+
+    def register_expert_compute_dgrad_callback(self, callback: Callable[[], None]) -> None:
+        """Register a callback invoked after expert dgrad and before dispatch backward."""
+        self._expert_compute_dgrad_callbacks.append(callback)
+
+    def register_expert_compute_output_grad_callback(self, callback: Callable[[], None]) -> None:
+        """Register a callback invoked after combine backward and before expert dgrad."""
+        self._expert_compute_output_grad_callbacks.append(callback)
+
+    @staticmethod
+    def _attach_expert_compute_callbacks(
+        callbacks: list[Callable[[], None]], hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        if not callbacks:
+            return hidden_states
+        return _RunCallbacksOnBackward.apply(tuple(callbacks), hidden_states)
+
+    def _attach_expert_compute_input_grad_callbacks(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        return self._attach_expert_compute_callbacks(
+            self._expert_compute_input_grad_callbacks, hidden_states
+        )
+
+    def _attach_expert_compute_dgrad_callbacks(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self._attach_expert_compute_callbacks(
+            self._expert_compute_dgrad_callbacks, hidden_states
+        )
+
+    def _attach_expert_compute_output_grad_callbacks(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        return self._attach_expert_compute_callbacks(
+            self._expert_compute_output_grad_callbacks, hidden_states
+        )
 
 
 class MoELayer(BaseMoELayer):
@@ -661,11 +717,14 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
+                hidden_states = self._attach_expert_compute_input_grad_callbacks(hidden_states)
                 dispatched_input, probs = self.dispatch(hidden_states, probs)
+                dispatched_input = self._attach_expert_compute_dgrad_callbacks(dispatched_input)
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+                output = self._attach_expert_compute_output_grad_callbacks(output)
                 output = self.combine(output)
 
                 if intermediate_tensors is not None:
@@ -732,6 +791,23 @@ class MoELayer(BaseMoELayer):
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.shared_experts.linear_fc1)
+
+
+class _RunCallbacksOnBackward(torch.autograd.Function):
+    """Run host callbacks when backward reaches an eager MoE boundary."""
+
+    @staticmethod
+    def forward(ctx, callbacks: tuple[Callable[[], None], ...], hidden_states):
+        ctx.callbacks = callbacks
+        return hidden_states
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        callbacks = ctx.callbacks
+        ctx.callbacks = ()
+        for callback in callbacks:
+            callback()
+        return None, grad_output
 
 
 class _RecordExpertDgradCompletion(torch.autograd.Function):

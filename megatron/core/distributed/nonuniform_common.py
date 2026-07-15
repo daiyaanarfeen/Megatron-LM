@@ -18,7 +18,6 @@ import torch.distributed as dist
 
 from . import distributed_data_parallel as ddp_module
 
-
 _NONUNIFORM_EP_RUNTIME_CONFIG: Optional[dict] = None
 
 
@@ -50,8 +49,7 @@ def get_nonuniform_ep_local_expert_indices() -> Optional[List[int]]:
 
 
 def build_expert_to_ep_rank_map(
-    expert_placement: Optional[Sequence[Sequence[int]]],
-    num_experts: Optional[int] = None,
+    expert_placement: Optional[Sequence[Sequence[int]]], num_experts: Optional[int] = None
 ) -> Optional[List[int]]:
     """Build ``expert_id -> ep_rank`` from a placement table.
 
@@ -113,6 +111,24 @@ def get_nonuniform_ep_expert_to_ep_rank_map(num_experts: int) -> Optional[List[i
     return build_expert_to_ep_rank_map(runtime_config.get('expert_placement'), num_experts)
 
 
+def build_expert_axis_permutation(
+    expert_placement: Optional[Sequence[Sequence[int]]], num_experts: int
+) -> Optional[List[int]]:
+    """Return logical expert IDs in physical EP-rank/local-slot order."""
+    if expert_placement is None:
+        return None
+    build_expert_to_ep_rank_map(expert_placement, num_experts)
+    return [int(expert_id) for expert_ids in expert_placement for expert_id in expert_ids]
+
+
+def get_nonuniform_ep_expert_axis_permutation(num_experts: int) -> Optional[List[int]]:
+    """Return the placement-aware expert-axis permutation, if NEP is active."""
+    runtime_config = get_nonuniform_ep_runtime_config()
+    if runtime_config is None:
+        return None
+    return build_expert_axis_permutation(runtime_config.get('expert_placement'), num_experts)
+
+
 def local_expert_indices_are_contiguous(local_expert_indices: Sequence[int]) -> bool:
     """Return whether local expert IDs form one contiguous ascending range."""
     return list(local_expert_indices) == list(
@@ -121,14 +137,20 @@ def local_expert_indices_are_contiguous(local_expert_indices: Sequence[int]) -> 
 
 
 def compute_nonuniform_ep_expert_placement(
-    num_experts: int, local_ep_size: int, min_ep_size: int
+    num_experts: int,
+    local_ep_size: int,
+    min_ep_size: int,
+    preferred_follower_fanout: Optional[int] = None,
 ) -> Tuple[List[List[int]], Dict[int, List[Tuple[int, int, int]]]]:
     """Compute placement for replicas with ``local_ep_size >= min_ep_size``.
 
     Min-EP replicas use contiguous owner ranges. Wider replicas keep the first
-    slice of each owner range on owner ranks and place the remaining experts
-    round-robin on follower ranks. The returned gather map is shared by token
-    routing tests and NEP gradient ownership transfer setup.
+    slice of each owner range on owner ranks. By default, remaining experts are
+    placed round-robin on follower ranks. When ``preferred_follower_fanout`` is
+    set, use the smallest exactly balanced striped placement at or above that
+    fanout, falling back to round-robin when no such stripe exists. The returned
+    gather map is shared by token routing tests and NEP gradient ownership
+    transfer setup.
     """
     if num_experts % local_ep_size != 0 or num_experts % min_ep_size != 0:
         raise RuntimeError(
@@ -140,6 +162,8 @@ def compute_nonuniform_ep_expert_placement(
         raise RuntimeError(
             f"local_ep_size ({local_ep_size}) must be >= min_ep_size ({min_ep_size})"
         )
+    if preferred_follower_fanout is not None and preferred_follower_fanout <= 0:
+        raise RuntimeError("preferred_follower_fanout must be positive")
 
     experts_per_rank = num_experts // local_ep_size
     experts_per_owner = num_experts // min_ep_size
@@ -151,7 +175,46 @@ def compute_nonuniform_ep_expert_placement(
         start = owner_rank * experts_per_owner
         placement[owner_rank] = list(range(start, start + experts_per_rank))
 
-    if num_followers > 0 and experts_offloaded > 0:
+    striped_assignment = None
+    if preferred_follower_fanout is not None and num_followers > 0 and experts_offloaded > 0:
+        minimum_fanout = max(
+            preferred_follower_fanout, math.ceil(experts_offloaded / experts_per_rank)
+        )
+        maximum_fanout = min(experts_offloaded, num_followers)
+        for fanout in range(min(minimum_fanout, maximum_fanout), maximum_fanout + 1):
+            if experts_offloaded % fanout != 0:
+                continue
+            if min_ep_size * fanout % num_followers != 0:
+                continue
+            expected_follower_degree = min_ep_size * fanout // num_followers
+            chunk_size = experts_offloaded // fanout
+            for stride in range(1, num_followers + 1):
+                follower_offsets_by_owner = [
+                    [(owner_rank * stride + lane) % num_followers for lane in range(fanout)]
+                    for owner_rank in range(min_ep_size)
+                ]
+                follower_degrees = [0] * num_followers
+                for follower_offsets in follower_offsets_by_owner:
+                    for follower_offset in set(follower_offsets):
+                        follower_degrees[follower_offset] += 1
+                if all(
+                    len(set(follower_offsets)) == fanout
+                    for follower_offsets in follower_offsets_by_owner
+                ) and all(degree == expected_follower_degree for degree in follower_degrees):
+                    striped_assignment = (follower_offsets_by_owner, chunk_size)
+                    break
+            if striped_assignment is not None:
+                break
+
+    if striped_assignment is not None:
+        follower_offsets_by_owner, chunk_size = striped_assignment
+        for owner_rank, follower_offsets in enumerate(follower_offsets_by_owner):
+            offload_start = owner_rank * experts_per_owner + experts_per_rank
+            for lane, follower_offset in enumerate(follower_offsets):
+                follower_rank = min_ep_size + follower_offset
+                chunk_start = offload_start + lane * chunk_size
+                placement[follower_rank].extend(range(chunk_start, chunk_start + chunk_size))
+    elif num_followers > 0 and experts_offloaded > 0:
         follower_index = 0
         for owner_rank in range(min_ep_size):
             offload_start = owner_rank * experts_per_owner + experts_per_rank
@@ -276,7 +339,7 @@ class NonuniformEPRankGenerator:
             start = self.rank_offset + self.replica_offsets[replica_index]
             block = list(range(start, start + num_tp_cp * self.tp_cp))
             for etp_position in range(self.etp):
-                groups.append(block[etp_position::self.etp])
+                groups.append(block[etp_position :: self.etp])
         return groups
 
     def _get_edp_ranks(self) -> List[List[int]]:
@@ -340,25 +403,19 @@ class NonuniformTPTopologyRankGenerator:
         self.cp = int(cp)
         self.tp_domain_sizes = [int(size) for size in tp_domain_sizes]
         self.rank_offset = int(rank_offset)
-        self.physical_tp_size = (
-            int(physical_tp_size) if physical_tp_size is not None else None
-        )
+        self.physical_tp_size = int(physical_tp_size) if physical_tp_size is not None else None
 
         if self.tp < 1 or self.cp < 1:
             raise RuntimeError(f"TP and CP sizes must be positive; got TP={tp}, CP={cp}")
         if not self.tp_domain_sizes:
             raise RuntimeError("NTP topology requires at least one TP domain size")
-        invalid_sizes = [
-            size for size in self.tp_domain_sizes if size < 1 or size > self.tp
-        ]
+        invalid_sizes = [size for size in self.tp_domain_sizes if size < 1 or size > self.tp]
         if invalid_sizes:
             raise RuntimeError(
                 "NTP TP domain sizes must be in [1, tp_base]; got "
                 f"{invalid_sizes} for tp_base={self.tp}"
             )
-        if self.physical_tp_size is not None and self.physical_tp_size < max(
-            self.tp_domain_sizes
-        ):
+        if self.physical_tp_size is not None and self.physical_tp_size < max(self.tp_domain_sizes):
             raise RuntimeError(
                 "NTP physical TP block size must be >= every active TP domain size; "
                 f"got physical_tp_size={self.physical_tp_size}, "
@@ -373,9 +430,7 @@ class NonuniformTPTopologyRankGenerator:
         self.world_size = sum(self._physical_tp_sizes) * self.cp
         self.replica_offsets = [0]
         for physical_tp_size in self._physical_tp_sizes:
-            self.replica_offsets.append(
-                self.replica_offsets[-1] + physical_tp_size * self.cp
-            )
+            self.replica_offsets.append(self.replica_offsets[-1] + physical_tp_size * self.cp)
 
         self.replicas: List[NonuniformTPReplicaRanks] = []
         self.rank_metadata: Dict[int, Dict[str, int]] = {}
@@ -458,17 +513,13 @@ class NonuniformTPTopologyRankGenerator:
         return result
 
     def _get_tp_ranks(self) -> List[List[int]]:
-        return [
-            list(cp_ranks) for replica in self.replicas for cp_ranks in replica.ranks_by_cp
-        ]
+        return [list(cp_ranks) for replica in self.replicas for cp_ranks in replica.ranks_by_cp]
 
     def _get_cp_ranks(self) -> List[List[int]]:
         groups = []
         for replica in self.replicas:
             for tp_rank in range(replica.active_tp_size):
-                groups.append(
-                    [replica.ranks_by_cp[cp_rank][tp_rank] for cp_rank in range(self.cp)]
-                )
+                groups.append([replica.ranks_by_cp[cp_rank][tp_rank] for cp_rank in range(self.cp)])
         return groups
 
     def _get_tp_cp_ranks(self) -> List[List[int]]:
@@ -690,10 +741,7 @@ def wrap_bucket_groups_with_subclass(
 
 
 def configure_ordered_bucket_group_scheduler(
-    bucket_groups: List[object],
-    state_attr: str,
-    index_attr: str,
-    ready_attr: str,
+    bucket_groups: List[object], state_attr: str, index_attr: str, ready_attr: str
 ) -> None:
     """Attach deterministic launch state to bucket groups that must start in list order."""
     state = {"groups": bucket_groups, "next_index": 0}
@@ -704,12 +752,7 @@ def configure_ordered_bucket_group_scheduler(
 
 
 def try_start_ordered_bucket_groups(
-    bucket_group,
-    state_attr: str,
-    ready_attr: str,
-    start_fn_name: str,
-    *args,
-    **kwargs,
+    bucket_group, state_attr: str, ready_attr: str, start_fn_name: str, *args, **kwargs
 ) -> None:
     """Start ready bucket groups in deterministic order."""
     state = getattr(bucket_group, state_attr, None)

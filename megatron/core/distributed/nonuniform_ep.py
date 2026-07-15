@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import Enum
@@ -26,6 +27,7 @@ from .. import parallel_state
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
+from ._cuda_stream_ops import get_cuda_stream_memory_ops
 from ._native_nccl import get_native_nccl
 from .distributed_data_parallel import DistributedDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
@@ -94,6 +96,42 @@ def _nep_edp_ready_gate_enabled() -> bool:
     )
 
 
+def _nep_host_edp_ready_gate_enabled() -> bool:
+    return os.getenv("MEGATRON_NONUNIFORM_EP_HOST_EDP_READY_GATE", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _nep_same_communicator_ready_enabled() -> bool:
+    return os.getenv("MEGATRON_NONUNIFORM_EP_SAME_COMM_READY", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _nep_defer_dispatch_host_launch_enabled() -> bool:
+    return os.getenv("MEGATRON_NONUNIFORM_EP_DEFER_HOST_LAUNCH", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _nep_split_host_phases_enabled() -> bool:
+    return os.getenv("MEGATRON_NONUNIFORM_EP_SPLIT_HOST_PHASES", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 class NonuniformEPApproach(str, Enum):
     """Gradient synchronization approach for nonuniform EP expert params."""
 
@@ -139,6 +177,49 @@ def _nep_block_current_stream(work) -> None:
         # Older torch Work objects may not expose block_current_stream. This keeps the
         # path correct, but removes overlap on those builds.
         work.wait()
+
+
+def _signal_nep_edp_ready(
+    ready_group,
+    device_ready_event: Optional[torch.cuda.Event],
+    device_index: int,
+    stream_ptr: int,
+    address: int,
+    generation: int,
+    group_index: int,
+    buffer_slot: int,
+    gate_name: str,
+) -> None:
+    """Release a GPU stream wait after device readiness and a host rendezvous."""
+    torch.cuda.set_device(device_index)
+    if device_ready_event is not None:
+        _nep_debug_print(
+            "before stream_ready_device_wait "
+            f"gate={gate_name} group={group_index} slot={buffer_slot} "
+            f"generation={generation}"
+        )
+        device_ready_event.synchronize()
+        _nep_debug_print(
+            "after stream_ready_device_wait "
+            f"gate={gate_name} group={group_index} slot={buffer_slot} "
+            f"generation={generation}"
+        )
+
+    ready_work = dist.barrier(group=ready_group, async_op=True)
+    _nep_debug_print(
+        "before stream_ready_host_wait "
+        f"gate={gate_name} group={group_index} slot={buffer_slot} generation={generation}"
+    )
+    ready_work.wait()
+    _nep_debug_print(
+        "after stream_ready_host_wait "
+        f"gate={gate_name} group={group_index} slot={buffer_slot} generation={generation}"
+    )
+    get_cuda_stream_memory_ops().write_value32(stream_ptr, address, generation)
+    _nep_debug_print(
+        "after stream_ready_stream_write "
+        f"gate={gate_name} group={group_index} slot={buffer_slot} generation={generation}"
+    )
 
 
 @dataclass
@@ -265,6 +346,60 @@ def _source_ep_ranks_for_owner(
     ]
 
 
+def _zero_sm_transfer_ranks_by_owner(
+    source_ranks_by_owner: Dict[int, List[int]], min_ep_size: int
+) -> Dict[int, List[int]]:
+    """Avoid two-rank cross-host CE groups with a helper from the same follower lane."""
+    transfer_ranks_by_owner = {
+        owner_ep_rank: [owner_ep_rank]
+        + [source_rank for source_rank in source_ranks if source_rank != owner_ep_rank]
+        for owner_ep_rank, source_ranks in source_ranks_by_owner.items()
+    }
+    available_ranks = sorted(
+        set(range(min_ep_size)).union(
+            source_rank
+            for source_ranks in source_ranks_by_owner.values()
+            for source_rank in source_ranks
+        )
+    )
+    owners_by_follower = {}
+    for owner_ep_rank, source_ranks in source_ranks_by_owner.items():
+        if len(source_ranks) != 2 or owner_ep_rank not in source_ranks:
+            continue
+        follower_ep_rank = next(rank for rank in source_ranks if rank != owner_ep_rank)
+        owners_by_follower.setdefault(follower_ep_rank, []).append(owner_ep_rank)
+
+    for follower_ep_rank, owner_ep_ranks in owners_by_follower.items():
+        owner_ep_ranks = sorted(owner_ep_ranks)
+        for owner_index, owner_ep_rank in enumerate(owner_ep_ranks):
+            if len(owner_ep_ranks) > 1:
+                helper_ep_rank = owner_ep_ranks[(owner_index + 1) % len(owner_ep_ranks)]
+            else:
+                rotated_owner_ranks = [
+                    (owner_ep_rank + offset) % min_ep_size for offset in range(1, min_ep_size)
+                ]
+                helper_candidates = rotated_owner_ranks + [
+                    rank for rank in available_ranks if rank not in rotated_owner_ranks
+                ]
+                try:
+                    helper_ep_rank = next(
+                        rank
+                        for rank in helper_candidates
+                        if rank not in (owner_ep_rank, follower_ep_rank)
+                    )
+                except StopIteration as exc:
+                    raise RuntimeError(
+                        "A two-rank cross-host NEP transfer group requires a third helper rank"
+                    ) from exc
+            transfer_ranks_by_owner[owner_ep_rank] = [
+                owner_ep_rank,
+                helper_ep_rank,
+                follower_ep_rank,
+            ]
+
+    return transfer_ranks_by_owner
+
+
 def _runtime_config_from_parallel_state() -> dict:
     runtime_config = get_nonuniform_ep_runtime_config()
     if runtime_config is not None:
@@ -284,10 +419,14 @@ def _runtime_config_from_parallel_state() -> dict:
         'num_replicas': 1,
         'dp_size': 1,
         'ep_group': ep_group if ep_group is not None else dist.group.WORLD,
+        'ep_group_gloo': None,
         'nep_transfer_group': ep_group if ep_group is not None else dist.group.WORLD,
         'nep_owner_transfer_groups': {},
+        'nep_owner_transfer_groups_gloo': {},
         'nep_owner_transfer_group_ranks': {},
+        'nep_owner_source_ranks': {},
         'edp_group': None,
+        'edp_group_gloo': None,
         'ep_rank': ep_rank,
         'local_expert_indices': None,
         'expert_placement': None,
@@ -498,36 +637,73 @@ def initialize_nonuniform_ep_process_groups(
     # Expert groups.
     min_ep_size = generator.min_k * tp * cp // etp
     nep_transfer_group = None
+    ep_phase_group_gloo = None
     nep_owner_transfer_groups = {}
+    nep_owner_transfer_groups_gloo = {}
     nep_owner_transfer_group_ranks = {}
+    nep_owner_source_ranks = {}
     for ranks in generator.get_ranks('ep'):
         group = _create_group(ranks, timeout, nccl_comm_cfgs, "ep")
+        group_gloo = (
+            _create_group(ranks, timeout, nccl_comm_cfgs, "NEP_EP_PHASE_GLOO", "gloo")
+            if create_gloo_process_groups
+            else None
+        )
         transfer_group = _create_group(ranks, timeout, nccl_comm_cfgs, "nep_grad_transfer")
         group_expert_placement, _ = compute_nonuniform_ep_expert_placement(
-            num_moe_experts, len(ranks), min_ep_size
+            num_moe_experts,
+            len(ranks),
+            min_ep_size,
+            preferred_follower_fanout=2 if zero_sm_reshard else 1,
         )
-        for owner_ep_rank in range(min_ep_size):
-            source_ep_ranks = _source_ep_ranks_for_owner(
+        source_ranks_by_owner = {
+            owner_ep_rank: _source_ep_ranks_for_owner(
                 group_expert_placement, owner_ep_rank, num_moe_experts, min_ep_size
             )
-            source_global_ranks = [ranks[source_ep_rank] for source_ep_rank in source_ep_ranks]
+            for owner_ep_rank in range(min_ep_size)
+        }
+        transfer_ranks_by_owner = (
+            _zero_sm_transfer_ranks_by_owner(source_ranks_by_owner, min_ep_size)
+            if zero_sm_reshard
+            else {
+                owner_ep_rank: [owner_ep_rank]
+                + [source_rank for source_rank in source_ranks if source_rank != owner_ep_rank]
+                for owner_ep_rank, source_ranks in source_ranks_by_owner.items()
+            }
+        )
+        for owner_ep_rank in range(min_ep_size):
+            source_ep_ranks = source_ranks_by_owner[owner_ep_rank]
+            transfer_ep_ranks = transfer_ranks_by_owner[owner_ep_rank]
+            transfer_global_ranks = [ranks[ep_rank] for ep_rank in transfer_ep_ranks]
             owner_transfer_group = None
-            if len(source_global_ranks) > 1:
+            owner_transfer_group_gloo = None
+            if len(transfer_global_ranks) > 1:
                 owner_transfer_group = _create_group(
-                    source_global_ranks,
+                    transfer_global_ranks,
                     timeout,
                     nccl_comm_cfgs,
                     "nep_owner_transfer",
                     cta_policy=_NCCL_CTA_POLICY_ZERO if zero_sm_reshard else None,
                 )
+                if create_gloo_process_groups:
+                    owner_transfer_group_gloo = _create_group(
+                        transfer_global_ranks,
+                        timeout,
+                        nccl_comm_cfgs,
+                        "nep_owner_transfer_gloo",
+                        "gloo",
+                    )
             if rank in ranks:
-                nep_owner_transfer_group_ranks[owner_ep_rank] = source_ep_ranks
-                if rank in source_global_ranks:
+                nep_owner_source_ranks[owner_ep_rank] = source_ep_ranks
+                nep_owner_transfer_group_ranks[owner_ep_rank] = transfer_ep_ranks
+                if rank in transfer_global_ranks:
                     nep_owner_transfer_groups[owner_ep_rank] = owner_transfer_group
+                    nep_owner_transfer_groups_gloo[owner_ep_rank] = owner_transfer_group_gloo
         if rank in ranks:
             _set_parallel_state_attr("_EXPERT_MODEL_PARALLEL_GROUP", group)
             _set_parallel_state_attr("_EXPERT_MODEL_PARALLEL_RANKS", ranks)
             nep_transfer_group = transfer_group
+            ep_phase_group_gloo = group_gloo
 
     for ranks in generator.get_ranks('etp'):
         group = _create_group(ranks, timeout, nccl_comm_cfgs, "ep_tp")
@@ -549,12 +725,8 @@ def initialize_nonuniform_ep_process_groups(
     all_edp_groups = edp_groups + [
         [uncovered_rank] for uncovered_rank in sorted(set(range(world_size)) - covered_edp_ranks)
     ]
-    nep_edp_ready_group = None
     for ranks in all_edp_groups:
         group = _create_group(ranks, timeout, nccl_comm_cfgs, "ep_dp")
-        ready_group = None
-        if edp_ready_gate_enabled and len(ranks) > 1:
-            ready_group = _create_group(ranks, timeout, nccl_comm_cfgs, "nep_edp_ready", max_ctas=1)
         group_gloo = (
             _create_group(ranks, timeout, nccl_comm_cfgs, "EXPERT_DATA_PARALLEL_GROUP_GLOO", "gloo")
             if create_gloo_process_groups
@@ -566,7 +738,6 @@ def initialize_nonuniform_ep_process_groups(
             _set_parallel_state_attr("_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP", group)
             _set_parallel_state_attr("_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO", group_gloo)
             _set_parallel_state_attr("_INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP", None)
-            nep_edp_ready_group = ready_group
 
     _set_parallel_state_attr("_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP", dist.group.WORLD)
     parallel_state._set_global_memory_buffer()
@@ -584,7 +755,10 @@ def initialize_nonuniform_ep_process_groups(
     ep_group = parallel_state.get_expert_model_parallel_group()
     ep_rank = ep_group.rank()
     expert_placement, expert_gather_map = compute_nonuniform_ep_expert_placement(
-        num_moe_experts, local_ep_size, min_ep_size
+        num_moe_experts,
+        local_ep_size,
+        min_ep_size,
+        preferred_follower_fanout=2 if zero_sm_reshard else 1,
     )
     runtime_config = {
         'needs_reshard': local_ep_size > min_ep_size,
@@ -593,11 +767,24 @@ def initialize_nonuniform_ep_process_groups(
         'num_replicas': generator.num_replicas,
         'dp_size': sum(num_tp_cp_per_replica),
         'ep_group': ep_group,
+        'ep_group_gloo': ep_phase_group_gloo,
         'nep_transfer_group': nep_transfer_group,
         'nep_owner_transfer_groups': nep_owner_transfer_groups,
+        'nep_owner_transfer_groups_gloo': nep_owner_transfer_groups_gloo,
         'nep_owner_transfer_group_ranks': nep_owner_transfer_group_ranks,
+        'nep_owner_source_ranks': nep_owner_source_ranks,
+        'dp_cp_group_gloo': (
+            parallel_state.get_data_parallel_group_gloo(with_context_parallel=True)
+            if create_gloo_process_groups
+            else None
+        ),
         'edp_group': parallel_state.get_expert_data_parallel_group(),
-        'nep_edp_ready_group': nep_edp_ready_group,
+        'edp_group_gloo': (
+            parallel_state.get_expert_data_parallel_group_gloo()
+            if create_gloo_process_groups
+            else None
+        ),
+        'nep_edp_ready_group': None,
         'edp_ready_gate_enabled': edp_ready_gate_enabled,
         'ep_rank': ep_rank,
         'is_edp_eligible': ep_rank < min_ep_size,
@@ -1090,6 +1277,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         self._nep_nccl_bucket_numels_cache = {}
         self._nep_nccl_async_handles = []
         self._nep_nccl_async_tensors = []
+        self._nep_edp_ready_futures = []
         self._nep_nccl_streams = {}
         self._nep_nccl_logical_grad_data_cache = {}
         self._nep_nccl_send_chunk_cache = {}
@@ -1106,6 +1294,15 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         self._nep_nccl_prepped_experts = set()
         self._nep_nccl_task_count = 0
         self._nep_nccl_overlap_debug_events = []
+        self._nep_dispatch_boundary_launch = False
+        self._nep_dispatch_boundary_ready = False
+        self._nep_dispatch_boundary_graph_replay_ready = False
+        self._nep_dispatch_boundary_launched = False
+        self._nep_dispatch_boundary_launching = False
+        self._nep_dispatch_boundary_wait_logged = False
+        self._nep_dispatch_boundary_callback = None
+        self._nep_dispatch_boundary_groups = ()
+        self._nep_dispatch_boundary_module_label = None
 
     def _get_nep_nccl_shared_buffer_state(self) -> dict:
         state = getattr(self, '_nep_nccl_scheduler_state', None)
@@ -1132,23 +1329,131 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             state['buffer_slot_handles'].setdefault(buffer_slot_key, []).append(work)
         _nep_block_current_stream(work)
 
-    def _start_nep_nccl_edp_ready_gate(self, buffer_slot: int) -> None:
-        """Keep the SM-based EDP all-reduce behind peer owner readiness."""
-        cfg = self._nep_runtime_config
-        ready_group = cfg.get('nep_edp_ready_group')
-        if not cfg.get('edp_ready_gate_enabled', False) or ready_group is None:
+    def _start_nep_nccl_same_communicator_ready(self, group, token_key: tuple) -> None:
+        """Rendezvous on the communicator that owns the following data operation."""
+        if group is None or group.size() <= 1:
             return
 
         state = self._get_nep_nccl_shared_buffer_state()
-        ready_buffers = state.get('edp_ready_buffers')
-        if ready_buffers is None or buffer_slot not in ready_buffers:
-            raise RuntimeError("NEP EDP readiness gate buffers were not initialized")
-        token = ready_buffers[buffer_slot]
-        readiness_slot_key = ('edp_ready', buffer_slot)
-        self._order_nep_nccl_buffer_slot(readiness_slot_key)
-        work = dist.all_reduce(token, group=ready_group, async_op=True)
-        state['buffer_slot_handles'].setdefault(readiness_slot_key, []).append(work)
-        _nep_block_current_stream(work)
+        buffers = state.setdefault('same_communicator_ready_buffers', {})
+        token = buffers.get(token_key)
+        if token is None:
+            token = torch.zeros(1, dtype=torch.float32, device=torch.cuda.current_device())
+            buffers[token_key] = token
+        slot_key = ('same_communicator_ready',) + token_key
+        self._order_nep_nccl_buffer_slot(slot_key)
+        _nep_debug_print(
+            f"before same_communicator_ready token={token_key} group_size={group.size()}"
+        )
+        work = dist.all_reduce(token, group=group, async_op=True)
+        self._record_nep_nccl_work(work, slot_key)
+        _nep_debug_print(f"after same_communicator_ready token={token_key}")
+
+    def _start_nep_nccl_stream_ready_gate(
+        self,
+        buffer_slot: int,
+        ready_group,
+        device_ready_event: Optional[torch.cuda.Event],
+        gate_name: str,
+    ) -> None:
+        """Gate the current stream on device completion plus a host rendezvous."""
+        state = self._get_nep_nccl_shared_buffer_state()
+        flags = state.get('edp_ready_flags')
+        generations = state.get('edp_ready_generations')
+        executor = state.get('edp_ready_executor')
+        signal_stream = state.get('edp_ready_signal_stream')
+        if (
+            flags is None
+            or generations is None
+            or executor is None
+            or signal_stream is None
+            or buffer_slot not in flags
+        ):
+            raise RuntimeError("NEP stream-readiness gate was not initialized")
+
+        generation = generations[buffer_slot] + 1
+        generations[buffer_slot] = generation
+        flag = flags[buffer_slot]
+        group_index = getattr(self, '_nep_nccl_group_index', -1)
+        future = executor.submit(
+            _signal_nep_edp_ready,
+            ready_group,
+            device_ready_event,
+            torch.cuda.current_device(),
+            signal_stream.cuda_stream,
+            flag.data_ptr(),
+            generation,
+            group_index,
+            buffer_slot,
+            gate_name,
+        )
+        self._nep_edp_ready_futures.append(future)
+        _nep_debug_print(
+            "submitted stream_ready_host_wait "
+            f"gate={gate_name} group={group_index} slot={buffer_slot} "
+            f"generation={generation}"
+        )
+
+        with torch.profiler.record_function(f"nep_stream_{gate_name}_ready"):
+            get_cuda_stream_memory_ops().wait_value32(
+                torch.cuda.current_stream().cuda_stream, flag.data_ptr(), generation
+            )
+        _nep_debug_print(
+            "enqueued stream_ready_stream_wait "
+            f"gate={gate_name} group={group_index} slot={buffer_slot} "
+            f"generation={generation}"
+        )
+
+    def _start_nep_nccl_edp_ready_gate(
+        self, buffer_slot: int, device_ready_event: Optional[torch.cuda.Event] = None
+    ) -> None:
+        """Gate EDP until both owner replicas have device-ready Gather payloads."""
+        cfg = self._nep_runtime_config
+        ready_group = cfg.get('edp_group_gloo')
+        if not cfg.get('edp_ready_gate_enabled', False) or ready_group is None:
+            return
+        self._start_nep_nccl_stream_ready_gate(buffer_slot, ready_group, device_ready_event, "edp")
+
+    def _start_nep_nccl_scatter_ready_gate(
+        self, owner_ep_rank: int, buffer_slot: int, device_ready_event: torch.cuda.Event
+    ) -> None:
+        """Gate Scatter until the owner finishes its EDP reduction."""
+        cfg = self._nep_runtime_config
+        ready_group = cfg.get('nep_owner_transfer_groups_gloo', {}).get(owner_ep_rank)
+        if not cfg.get('edp_ready_gate_enabled', False) or ready_group is None:
+            return
+        self._start_nep_nccl_stream_ready_gate(
+            buffer_slot, ready_group, device_ready_event, f"scatter_owner_{owner_ep_rank}"
+        )
+
+    def _start_nep_nccl_edp_readiness(
+        self, buffer_slot: int, device_ready_event: Optional[torch.cuda.Event] = None
+    ) -> None:
+        """Rendezvous EDP owners without queueing NCCL ahead of warmup reshards."""
+        cfg = self._nep_runtime_config
+        if self.is_first_batch and cfg.get('edp_ready_gate_enabled', False):
+            # First-batch task barriers establish ordering while NCCL and CUDA paths warm up.
+            return
+
+        self._start_nep_nccl_edp_ready_gate(buffer_slot, device_ready_event)
+
+    def _drain_nep_edp_ready_futures(self) -> None:
+        """Surface readiness-worker failures before waiting on dependent NCCL work."""
+        for future in self._nep_edp_ready_futures:
+            future.result()
+        self._nep_edp_ready_futures.clear()
+
+    def _synchronize_first_batch_zero_sm_phase(self, owner_ep_rank: int, phase: str) -> None:
+        """Finish zero-SM phases before crossing communicators on warmup."""
+        if not self.is_first_batch or not self._nep_runtime_config.get('zero_sm_reshard', False):
+            return
+        transfer_ranks = self._nep_nccl_owner_transfer_ranks(owner_ep_rank)
+        ep_rank = self._nep_runtime_config['ep_rank']
+        if phase != "edp" and (len(transfer_ranks) <= 1 or ep_rank not in transfer_ranks):
+            return
+        _nep_debug_print(f"before first_batch_zero_sm_sync phase={phase} owner={owner_ep_rank}")
+        torch.cuda.current_stream().synchronize()
+        _nep_debug_print(f"after first_batch_zero_sm_sync phase={phase} owner={owner_ep_rank}")
 
     def _drain_nep_nccl_async_window(self, force_all: bool = False) -> None:
         if not self._nep_nccl_async_handles:
@@ -1182,19 +1487,25 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
 
     def _get_nep_nccl_comm_stream(self, stream_slot: int) -> torch.cuda.Stream:
         state = getattr(self, '_nep_nccl_scheduler_state', None)
+        if self._nep_runtime_config.get('zero_sm_reshard', False) and not self.is_first_batch:
+            stream_key = 'zero_sm'
+        elif self._nep_dispatch_boundary_launch and not self.is_first_batch:
+            stream_key = 'dispatch'
+        else:
+            stream_key = stream_slot
         if state is not None:
             streams = state.setdefault('comm_streams', {})
-            stream = streams.get(stream_slot)
+            stream = streams.get(stream_key)
             if stream is None:
                 stream = torch.cuda.Stream(device=torch.cuda.current_device())
-                streams[stream_slot] = stream
-            self._nep_nccl_streams[stream_slot] = stream
+                streams[stream_key] = stream
+            self._nep_nccl_streams[stream_key] = stream
             return stream
 
-        stream = self._nep_nccl_streams.get(stream_slot)
+        stream = self._nep_nccl_streams.get(stream_key)
         if stream is None:
             stream = torch.cuda.Stream(device=torch.cuda.current_device())
-            self._nep_nccl_streams[stream_slot] = stream
+            self._nep_nccl_streams[stream_key] = stream
         return stream
 
     def _get_nep_nccl_task_buffer_slot(self, owner_ep_rank: int, chunk_index: int) -> int:
@@ -1280,27 +1591,27 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
     def _get_nep_nccl_transfer_group_info(self, owner_ep_rank: int) -> tuple:
         """Return the owner-source communicator used for NEP reshard all-to-alls."""
         cfg = self._nep_runtime_config
-        source_ranks = self._nep_nccl_owner_source_ranks(owner_ep_rank)
+        transfer_ranks = self._nep_nccl_owner_transfer_ranks(owner_ep_rank)
         ep_rank = cfg['ep_rank']
-        if ep_rank not in source_ranks:
-            return None, -1, len(source_ranks), source_ranks
-        if len(source_ranks) <= 1:
-            return None, 0, len(source_ranks), source_ranks
+        if ep_rank not in transfer_ranks:
+            return None, -1, len(transfer_ranks), transfer_ranks
+        if len(transfer_ranks) <= 1:
+            return None, 0, len(transfer_ranks), transfer_ranks
 
         transfer_group = cfg.get('nep_owner_transfer_groups', {}).get(owner_ep_rank)
         if transfer_group is None:
             raise RuntimeError(
                 "Missing NEP owner transfer group for owner "
-                f"{owner_ep_rank} with source EP ranks {source_ranks}"
+                f"{owner_ep_rank} with transfer EP ranks {transfer_ranks}"
             )
         transfer_rank = dist.get_rank(group=transfer_group)
         transfer_size = dist.get_world_size(group=transfer_group)
-        if transfer_size != len(source_ranks):
+        if transfer_size != len(transfer_ranks):
             raise RuntimeError(
-                "NEP owner transfer group size must match owner source count; got "
-                f"transfer_size={transfer_size}, source_ranks={source_ranks}"
+                "NEP owner transfer group size must match transfer-rank count; got "
+                f"transfer_size={transfer_size}, transfer_ranks={transfer_ranks}"
             )
-        return transfer_group, transfer_rank, transfer_size, source_ranks
+        return transfer_group, transfer_rank, transfer_size, transfer_ranks
 
     def _nep_nccl_owner_entries(self, owner_ep_rank: int) -> List[dict]:
         """Return local expert-slot entries that contribute to an owner-layout chunk."""
@@ -1318,6 +1629,10 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         """Return True when this rank's local inputs for an owner task are ready."""
         if self.is_first_batch:
             return False
+        if self._nep_dispatch_boundary_launch and not self._nep_dispatch_boundary_ready:
+            return False
+        if self._nep_dispatch_boundary_graph_replay_ready:
+            return True
         for entry in self._nep_nccl_owner_entries(owner_ep_rank):
             for param in entry['bucket'].params_list:
                 ready_count = self.per_param_grad_ready_counts.get(param, 0)
@@ -1325,6 +1640,14 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 if expected_count is None or ready_count < expected_count:
                     return False
         return True
+
+    def _nep_dispatch_boundary_inputs_ready(self) -> bool:
+        """Return True when every local source needed by this layer group is ready."""
+        layout = self._get_nep_nccl_owner_layout()
+        return all(
+            self._nep_nccl_owner_task_ready(owner_ep_rank)
+            for owner_ep_rank in range(layout['min_ep_size'])
+        )
 
     def _prep_nep_nccl_owner_entries_for_sync(self, owner_ep_rank: int) -> None:
         """Apply one-time local grad prep for entries used by one owner task."""
@@ -1691,9 +2014,13 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
 
     def _nep_nccl_owner_source_ranks(self, owner_ep_rank: int) -> List[int]:
         """Return EP ranks that physically hold experts for an owner-layout chunk."""
-        source_ranks_by_owner = self._nep_runtime_config.get('nep_owner_transfer_group_ranks')
+        source_ranks_by_owner = self._nep_runtime_config.get('nep_owner_source_ranks')
         if source_ranks_by_owner is not None and owner_ep_rank in source_ranks_by_owner:
             return list(source_ranks_by_owner[owner_ep_rank])
+
+        legacy_source_ranks = self._nep_runtime_config.get('nep_owner_transfer_group_ranks')
+        if legacy_source_ranks is not None and owner_ep_rank in legacy_source_ranks:
+            return list(legacy_source_ranks[owner_ep_rank])
 
         placement = self._nep_runtime_config.get('expert_placement')
         if placement is None:
@@ -1707,6 +2034,13 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             if any(owner_first_expert <= expert_id < owner_last_expert for expert_id in expert_ids):
                 source_ranks.append(source_ep_rank)
         return source_ranks
+
+    def _nep_nccl_owner_transfer_ranks(self, owner_ep_rank: int) -> List[int]:
+        """Return all ranks that participate in an owner's reshard communicator."""
+        transfer_ranks = self._nep_runtime_config.get('nep_owner_transfer_group_ranks')
+        if transfer_ranks is not None and owner_ep_rank in transfer_ranks:
+            return list(transfer_ranks[owner_ep_rank])
+        return self._nep_nccl_owner_source_ranks(owner_ep_rank)
 
     def _get_nep_zero_sm_buffers(
         self, buffer_slot: int, dtype: torch.dtype, transfer_size: int, payload_numel: int
@@ -1745,7 +2079,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         """Gather dense follower payloads with NCCL's copy-engine collective."""
         ep_rank = self._nep_runtime_config['ep_rank']
         source_ranks = self._nep_nccl_owner_source_ranks(owner_ep_rank)
-        if ep_rank not in source_ranks:
+        transfer_ranks = self._nep_nccl_owner_transfer_ranks(owner_ep_rank)
+        if ep_rank not in transfer_ranks:
             return
         remote_source_ranks = [rank for rank in source_ranks if rank != owner_ep_rank]
         if not remote_source_ranks:
@@ -1768,7 +2103,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             buffer_slot, chunk.dtype, transfer_size, payload_numel
         )
         send.zero_()
-        if ep_rank != owner_ep_rank:
+        if ep_rank in remote_source_ranks:
             local_payload_numel = self._nep_nccl_owner_source_payload_numel(
                 owner_ep_rank, ep_rank, chunk_start, chunk_end
             )
@@ -1776,6 +2111,18 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 owner_ep_rank, ep_rank, chunk_start, chunk_end, send[:local_payload_numel]
             )
 
+        role = (
+            "owner"
+            if ep_rank == owner_ep_rank
+            else "source" if ep_rank in remote_source_ranks else "helper"
+        )
+        _nep_debug_print(
+            "before native_zero_sm_gather "
+            f"group={getattr(self, '_nep_nccl_group_index', -1)} "
+            f"owner={owner_ep_rank} ep_rank={ep_rank} role={role} "
+            f"transfer_ranks={transfer_ranks} payload_numel={payload_numel}"
+        )
+        host_start = time.perf_counter()
         with torch.profiler.record_function("nep_zero_sm_gather"):
             get_native_nccl().gather(
                 send,
@@ -1784,6 +2131,12 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 owner_transfer_rank,
                 self._get_nep_zero_sm_comm_ptr(transfer_group),
             )
+        _nep_debug_print(
+            "after native_zero_sm_gather "
+            f"group={getattr(self, '_nep_nccl_group_index', -1)} "
+            f"owner={owner_ep_rank} ep_rank={ep_rank} role={role} "
+            f"host_ms={(time.perf_counter() - host_start) * 1000.0:.3f}"
+        )
 
         if ep_rank == owner_ep_rank:
             for source_ep_rank in remote_source_ranks:
@@ -1812,7 +2165,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         """Scatter reduced follower payloads with NCCL's copy-engine collective."""
         ep_rank = self._nep_runtime_config['ep_rank']
         source_ranks = self._nep_nccl_owner_source_ranks(owner_ep_rank)
-        if ep_rank not in source_ranks:
+        transfer_ranks = self._nep_nccl_owner_transfer_ranks(owner_ep_rank)
+        if ep_rank not in transfer_ranks:
             return
         remote_source_ranks = [rank for rank in source_ranks if rank != owner_ep_rank]
         if not remote_source_ranks:
@@ -1860,6 +2214,18 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     send[destination_start : destination_start + destination_numel],
                 )
 
+        role = (
+            "owner"
+            if ep_rank == owner_ep_rank
+            else "source" if ep_rank in remote_source_ranks else "helper"
+        )
+        _nep_debug_print(
+            "before native_zero_sm_scatter "
+            f"group={getattr(self, '_nep_nccl_group_index', -1)} "
+            f"owner={owner_ep_rank} ep_rank={ep_rank} role={role} "
+            f"transfer_ranks={transfer_ranks} payload_numel={payload_numel}"
+        )
+        host_start = time.perf_counter()
         with torch.profiler.record_function("nep_zero_sm_scatter"):
             get_native_nccl().scatter(
                 send,
@@ -1868,12 +2234,18 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 owner_transfer_rank,
                 self._get_nep_zero_sm_comm_ptr(transfer_group),
             )
+        _nep_debug_print(
+            "after native_zero_sm_scatter "
+            f"group={getattr(self, '_nep_nccl_group_index', -1)} "
+            f"owner={owner_ep_rank} ep_rank={ep_rank} role={role} "
+            f"host_ms={(time.perf_counter() - host_start) * 1000.0:.3f}"
+        )
 
         if ep_rank == owner_ep_rank:
             self._copy_nep_nccl_owner_chunk_to_local_grads(
                 owner_ep_rank, chunk_start, chunk_end, chunk
             )
-        else:
+        elif ep_rank in remote_source_ranks:
             local_payload_numel = self._nep_nccl_owner_source_payload_numel(
                 owner_ep_rank, ep_rank, chunk_start, chunk_end
             )
@@ -1897,11 +2269,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         group_index = getattr(self, '_nep_nccl_group_index', -1)
         chunk_size = chunk_end - chunk_start
         source_ranks = self._nep_nccl_owner_source_ranks(owner_ep_rank)
-        if owner_ep_rank not in source_ranks:
-            raise RuntimeError(
-                f"NEP owner {owner_ep_rank} is not in its source ranks {source_ranks}"
-            )
-        if ep_rank not in source_ranks:
+        transfer_ranks = self._nep_nccl_owner_transfer_ranks(owner_ep_rank)
+        if ep_rank not in transfer_ranks:
             return
 
         remote_source_ranks = [rank for rank in source_ranks if rank != owner_ep_rank]
@@ -2036,11 +2405,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         group_index = getattr(self, '_nep_nccl_group_index', -1)
         chunk_size = chunk_end - chunk_start
         source_ranks = self._nep_nccl_owner_source_ranks(owner_ep_rank)
-        if owner_ep_rank not in source_ranks:
-            raise RuntimeError(
-                f"NEP owner {owner_ep_rank} is not in its source ranks {source_ranks}"
-            )
-        if ep_rank not in source_ranks:
+        transfer_ranks = self._nep_nccl_owner_transfer_ranks(owner_ep_rank)
+        if ep_rank not in transfer_ranks:
             return
 
         remote_source_ranks = [rank for rank in source_ranks if rank != owner_ep_rank]
@@ -2170,21 +2536,92 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if len(self._nep_nccl_started_tasks) == self._nep_nccl_task_count:
             self._nep_nccl_ready = True
 
-    def _start_nep_nccl_owner_task(
-        self,
-        owner_ep_rank: int,
-        chunk_index: int,
-        chunk_start: int,
-        chunk_end: int,
-        async_op: bool,
-        defer_scatter: bool = False,
+    def _start_nep_nccl_owner_edp_reduce(
+        self, context: dict, use_device_readiness: bool = True
     ) -> None:
-        """Launch one ordered owner-layout gather/allreduce/scatter task."""
-        layout = self._get_nep_nccl_owner_layout()
+        """Launch the owner-layout EDP reduction after replica readiness."""
+        cfg = self._nep_runtime_config
+        owner_ep_rank = context['owner_ep_rank']
+        first_batch_task_group = None
+        if self.is_first_batch and cfg.get('edp_ready_gate_enabled', False):
+            first_batch_task_group = cfg.get('dp_cp_group_gloo')
+            if first_batch_task_group is None:
+                raise RuntimeError("First-batch NEP readiness requires a DP-CP Gloo group")
+            torch.cuda.current_stream().synchronize()
+            dist.barrier(group=first_batch_task_group)
+        if cfg['ep_rank'] != owner_ep_rank:
+            if first_batch_task_group is not None:
+                dist.barrier(group=first_batch_task_group)
+            return
+
+        edp_group = cfg.get('edp_group')
+        if edp_group is None:
+            raise RuntimeError(
+                "Nonuniform EP NCCL owner rank requires runtime_config['edp_group']."
+            )
+        if use_device_readiness and cfg.get('edp_ready_gate_enabled', False):
+            self._start_nep_nccl_edp_readiness(
+                context['buffer_slot'], context.get('gather_done_event')
+            )
+
+        reduce_op = dist.ReduceOp.SUM
+        if self.ddp_config.average_in_collective:
+            reduce_op = dist.ReduceOp.AVG
+        group_index = getattr(self, '_nep_nccl_group_index', -1)
+        _nep_debug_print(
+            "before edp_all_reduce_owner_chunk "
+            f"group={group_index} owner={owner_ep_rank} chunk={context['chunk_index']} "
+            f"chunk_size={context['chunk_end'] - context['chunk_start']} "
+            f"edp_rank={edp_group.rank()}"
+        )
+        work = dist.all_reduce(
+            context['chunk'], op=reduce_op, group=edp_group, async_op=context['async_op']
+        )
+        self._record_nep_nccl_work(work, context['buffer_slot_key'])
+        self._synchronize_first_batch_zero_sm_phase(owner_ep_rank, "edp")
+        if first_batch_task_group is not None:
+            torch.cuda.current_stream().synchronize()
+            dist.barrier(group=first_batch_task_group)
+        _nep_debug_print(
+            "after edp_all_reduce_owner_chunk "
+            f"group={group_index} owner={owner_ep_rank} chunk={context['chunk_index']}"
+        )
+
+    def _start_nep_nccl_owner_edp_reduce_batch(
+        self, contexts: List[dict], use_device_readiness: bool = True
+    ) -> None:
+        """Launch owner chunks that become ready at the same dispatch boundary."""
+        for context in contexts:
+            group = context['group']
+            if group._nep_runtime_config['ep_rank'] != context['owner_ep_rank']:
+                continue
+            group._start_nep_nccl_owner_edp_reduce(
+                context, use_device_readiness=use_device_readiness
+            )
+
+    def _start_nep_nccl_dispatch_boundary_task(self, context: dict) -> None:
+        """Enqueue one ordered zero-SM task at a post-dispatch backward boundary."""
+        owner_ep_rank = context['owner_ep_rank']
+        self._start_nep_nccl_owner_all_to_all_gather(
+            owner_ep_rank,
+            context['chunk_index'],
+            context['chunk_start'],
+            context['chunk_end'],
+            context['chunk'],
+            context['buffer_slot_key'],
+            async_op=True,
+        )
+        self._start_nep_nccl_owner_edp_reduce(context, use_device_readiness=True)
+        self._start_nep_nccl_owner_task_scatter(context)
+
+    def _prepare_nep_nccl_owner_task_context(
+        self, owner_ep_rank: int, chunk_index: int, chunk_start: int, chunk_end: int, async_op: bool
+    ) -> Optional[dict]:
+        """Allocate and prepare one owner task without launching collectives."""
         chunk_size = chunk_end - chunk_start
         if chunk_size <= 0:
             self._mark_nep_nccl_task_started(owner_ep_rank, chunk_index)
-            return
+            return None
 
         buffer_slot = self._get_nep_nccl_task_buffer_slot(owner_ep_rank, chunk_index)
         chunk_dtype = self.buckets[0].grad_data.dtype
@@ -2204,44 +2641,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             self._nep_nccl_async_tensors.append(chunk)
 
         self._prep_nep_nccl_owner_entries_for_sync(owner_ep_rank)
-        self._start_nep_nccl_owner_all_to_all_gather(
-            owner_ep_rank,
-            chunk_index,
-            chunk_start,
-            chunk_end,
-            chunk,
-            buffer_slot_key,
-            async_op=async_op,
-        )
-
-        cfg = self._nep_runtime_config
-        ep_rank = cfg['ep_rank']
-        edp_group = cfg.get('edp_group')
-        reduce_op = dist.ReduceOp.SUM
-        if self.ddp_config.average_in_collective:
-            reduce_op = dist.ReduceOp.AVG
-
-        group_index = getattr(self, '_nep_nccl_group_index', -1)
-        if ep_rank == owner_ep_rank:
-            if edp_group is None:
-                raise RuntimeError(
-                    "Nonuniform EP NCCL owner rank requires runtime_config['edp_group']."
-                )
-            if async_op:
-                self._start_nep_nccl_edp_ready_gate(buffer_slot)
-            _nep_debug_print(
-                "before edp_all_reduce_owner_chunk "
-                f"group={group_index} owner={owner_ep_rank} chunk={chunk_index} "
-                f"chunk_size={chunk_size} edp_rank={edp_group.rank()}"
-            )
-            work = dist.all_reduce(chunk, op=reduce_op, group=edp_group, async_op=async_op)
-            self._record_nep_nccl_work(work, buffer_slot_key)
-            _nep_debug_print(
-                "after edp_all_reduce_owner_chunk "
-                f"group={group_index} owner={owner_ep_rank} chunk={chunk_index}"
-            )
-
-        context = {
+        return {
             'group': self,
             'owner_ep_rank': owner_ep_rank,
             'chunk_index': chunk_index,
@@ -2252,6 +2652,80 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             'buffer_slot_key': buffer_slot_key,
             'async_op': async_op,
         }
+
+    def _start_nep_nccl_owner_task(
+        self,
+        owner_ep_rank: int,
+        chunk_index: int,
+        chunk_start: int,
+        chunk_end: int,
+        async_op: bool,
+        defer_scatter: bool = False,
+    ) -> None:
+        """Launch one ordered owner-layout gather/allreduce/scatter task."""
+        context = self._prepare_nep_nccl_owner_task_context(
+            owner_ep_rank, chunk_index, chunk_start, chunk_end, async_op
+        )
+        if context is None:
+            return
+
+        cfg = self._nep_runtime_config
+        ep_rank = cfg['ep_rank']
+        chunk = context['chunk']
+        buffer_slot_key = context['buffer_slot_key']
+        host_phase_gating = (
+            async_op
+            and _nep_host_edp_ready_gate_enabled()
+            and not cfg.get('zero_sm_reshard', False)
+        )
+        if host_phase_gating:
+            transfer_ranks = self._nep_nccl_owner_transfer_ranks(owner_ep_rank)
+            if ep_rank not in transfer_ranks:
+                self._mark_nep_nccl_task_started(owner_ep_rank, chunk_index)
+                return
+            self._start_nep_nccl_owner_all_to_all_gather(
+                owner_ep_rank,
+                chunk_index,
+                chunk_start,
+                chunk_end,
+                chunk,
+                buffer_slot_key,
+                async_op=True,
+            )
+            gather_done_event = torch.cuda.Event()
+            gather_done_event.record(torch.cuda.current_stream())
+            context['gather_done_event'] = gather_done_event
+            context['stage'] = 'gather'
+            state = getattr(self, '_nep_nccl_scheduler_state', None)
+            if state is None:
+                raise RuntimeError("Host-gated NEP phases require a shared task scheduler")
+            state.setdefault('pending_owner_tasks', []).append(context)
+            return
+
+        if (
+            getattr(self, '_nep_dispatch_boundary_launch', False)
+            and async_op
+            and cfg.get('zero_sm_reshard', False)
+        ):
+            transfer_ranks = self._nep_nccl_owner_transfer_ranks(owner_ep_rank)
+            if ep_rank not in transfer_ranks:
+                self._mark_nep_nccl_task_started(owner_ep_rank, chunk_index)
+                return
+            self._start_nep_nccl_dispatch_boundary_task(context)
+            return
+
+        self._start_nep_nccl_owner_all_to_all_gather(
+            owner_ep_rank,
+            chunk_index,
+            chunk_start,
+            chunk_end,
+            chunk,
+            buffer_slot_key,
+            async_op=async_op,
+        )
+        self._synchronize_first_batch_zero_sm_phase(owner_ep_rank, "gather")
+
+        self._start_nep_nccl_owner_edp_reduce(context)
         if defer_scatter:
             state = getattr(self, '_nep_nccl_scheduler_state', None)
             if state is None:
@@ -2270,11 +2744,439 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             context['buffer_slot_key'],
             async_op=context['async_op'],
         )
+        self._synchronize_first_batch_zero_sm_phase(context['owner_ep_rank'], "scatter")
+        cfg = self._nep_runtime_config
+        if self.is_first_batch and cfg.get('edp_ready_gate_enabled', False):
+            task_group_gloo = cfg.get('dp_cp_group_gloo')
+            if task_group_gloo is None:
+                raise RuntimeError("First-batch NEP readiness requires a DP-CP Gloo group")
+            torch.cuda.current_stream().synchronize()
+            dist.barrier(group=task_group_gloo)
         self._mark_nep_nccl_task_started(context['owner_ep_rank'], context['chunk_index'])
 
-    def _try_start_nep_nccl_ready_tasks(
-        self, force_ready: bool = False, async_op_override: Optional[bool] = None
+    def _progress_nep_nccl_pending_owner_tasks(self, force_all: bool = False) -> bool:
+        """Advance host-gated tasks without queueing a GPU readiness collective."""
+        state = getattr(self, '_nep_nccl_scheduler_state', None)
+        if state is None:
+            return True
+
+        def event_is_complete(event: torch.cuda.Event) -> bool:
+            if force_all:
+                event.synchronize()
+                return True
+            return event.query()
+
+        def work_is_complete(work) -> bool:
+            if force_all:
+                work.wait()
+                return True
+            return work.is_completed()
+
+        pending_tasks = state.setdefault('pending_owner_tasks', [])
+        while pending_tasks:
+            context = pending_tasks[0]
+            group = context['group']
+            cfg = group._nep_runtime_config
+            owner_ep_rank = context['owner_ep_rank']
+            is_owner = cfg['ep_rank'] == owner_ep_rank
+            source_group_gloo = cfg.get('nep_owner_transfer_groups_gloo', {}).get(owner_ep_rank)
+
+            if context['stage'] == 'gather':
+                if not event_is_complete(context['gather_done_event']):
+                    return False
+                if source_group_gloo is not None and not context.get('gather_launch_gated'):
+                    _nep_debug_print(
+                        "before host_source_gather_barrier "
+                        f"group={getattr(group, '_nep_nccl_group_index', -1)} "
+                        f"owner={owner_ep_rank} chunk={context['chunk_index']}"
+                    )
+                    context['source_gather_ready_work'] = dist.barrier(
+                        group=source_group_gloo, async_op=True
+                    )
+                    context['stage'] = 'source_gather_ready'
+                else:
+                    context['stage'] = 'source_gather_ready_done'
+
+            if context['stage'] == 'source_gather_ready':
+                if not work_is_complete(context['source_gather_ready_work']):
+                    return False
+                _nep_debug_print(
+                    "after host_source_gather_barrier "
+                    f"group={getattr(group, '_nep_nccl_group_index', -1)} "
+                    f"owner={owner_ep_rank} chunk={context['chunk_index']}"
+                )
+                context['stage'] = 'source_gather_ready_done'
+
+            if context['stage'] == 'source_gather_ready_done':
+                if is_owner:
+                    edp_group_gloo = cfg.get('edp_group_gloo')
+                    if edp_group_gloo is None:
+                        raise RuntimeError("Host-gated NEP EDP readiness requires EDP Gloo groups")
+                    _nep_debug_print(
+                        "before host_edp_ready_barrier "
+                        f"group={getattr(group, '_nep_nccl_group_index', -1)} "
+                        f"owner={owner_ep_rank} chunk={context['chunk_index']}"
+                    )
+                    context['edp_ready_work'] = dist.barrier(group=edp_group_gloo, async_op=True)
+                    context['stage'] = 'edp_ready'
+                else:
+                    if source_group_gloo is None:
+                        raise RuntimeError(
+                            "NEP follower rank is missing its owner-transfer Gloo group"
+                        )
+                    _nep_debug_print(
+                        "before host_source_scatter_barrier "
+                        f"group={getattr(group, '_nep_nccl_group_index', -1)} "
+                        f"owner={owner_ep_rank} chunk={context['chunk_index']}"
+                    )
+                    context['source_scatter_ready_work'] = dist.barrier(
+                        group=source_group_gloo, async_op=True
+                    )
+                    context['stage'] = 'source_scatter_ready'
+
+            if context['stage'] == 'edp_ready':
+                if not work_is_complete(context['edp_ready_work']):
+                    return False
+                _nep_debug_print(
+                    "after host_edp_ready_barrier "
+                    f"group={getattr(group, '_nep_nccl_group_index', -1)} "
+                    f"owner={owner_ep_rank} chunk={context['chunk_index']}"
+                )
+                nccl_stream = group._get_nep_nccl_comm_stream(context['buffer_slot'])
+                with torch.cuda.stream(nccl_stream):
+                    group._start_nep_nccl_owner_edp_reduce(context, use_device_readiness=False)
+                    edp_done_event = torch.cuda.Event()
+                    edp_done_event.record(nccl_stream)
+                context['edp_done_event'] = edp_done_event
+                context['stage'] = 'edp'
+
+            if context['stage'] == 'edp':
+                if not event_is_complete(context['edp_done_event']):
+                    return False
+                if source_group_gloo is not None:
+                    _nep_debug_print(
+                        "before host_source_scatter_barrier "
+                        f"group={getattr(group, '_nep_nccl_group_index', -1)} "
+                        f"owner={owner_ep_rank} chunk={context['chunk_index']}"
+                    )
+                    context['source_scatter_ready_work'] = dist.barrier(
+                        group=source_group_gloo, async_op=True
+                    )
+                    context['stage'] = 'source_scatter_ready'
+                else:
+                    nccl_stream = group._get_nep_nccl_comm_stream(context['buffer_slot'])
+                    with torch.cuda.stream(nccl_stream):
+                        group._start_nep_nccl_owner_task_scatter(context)
+                    pending_tasks.pop(0)
+                    continue
+
+            if context['stage'] == 'source_scatter_ready':
+                if not work_is_complete(context['source_scatter_ready_work']):
+                    return False
+                _nep_debug_print(
+                    "after host_source_scatter_barrier "
+                    f"group={getattr(group, '_nep_nccl_group_index', -1)} "
+                    f"owner={owner_ep_rank} chunk={context['chunk_index']}"
+                )
+                nccl_stream = group._get_nep_nccl_comm_stream(context['buffer_slot'])
+                with torch.cuda.stream(nccl_stream):
+                    group._start_nep_nccl_owner_task_scatter(context)
+                pending_tasks.pop(0)
+                continue
+
+            raise RuntimeError(f"Unknown pending NEP task stage: {context['stage']}")
+        return True
+
+    def _start_nep_nccl_process_group_dispatch_batch(
+        self,
+        state: dict,
+        force_ready: bool,
+        async_op: bool,
+        compute_ready_event: torch.cuda.Event,
+        split_host_phases: bool = False,
+    ) -> List[dict]:
+        """Launch ready ProcessGroup tasks in pair-scoped ordered phases."""
+        if not async_op:
+            raise RuntimeError("NEP dispatch-boundary tasks must be asynchronous")
+
+        ready_tasks = []
+        tasks = state['task_sequence']
+        while state['task_next_index'] < len(tasks):
+            task = tasks[state['task_next_index']]
+            if not force_ready and not task['group']._nep_nccl_owner_task_ready(
+                task['owner_ep_rank']
+            ):
+                break
+            ready_tasks.append(task)
+            state['task_next_index'] += 1
+        if not ready_tasks:
+            return []
+
+        dispatch_stream = self._get_nep_nccl_comm_stream(0)
+        dispatch_stream.wait_event(compute_ready_event)
+
+        owner_order = []
+        owner_transfer_ranks = {}
+        for task in ready_tasks:
+            owner = task['owner_ep_rank']
+            transfer_ranks = frozenset(task['group']._nep_nccl_owner_transfer_ranks(owner))
+            previous_ranks = owner_transfer_ranks.setdefault(owner, transfer_ranks)
+            if previous_ranks != transfer_ranks:
+                raise RuntimeError(
+                    f"NEP owner {owner} has inconsistent transfer ranks within one boundary"
+                )
+            if owner not in owner_order:
+                owner_order.append(owner)
+
+        owner_waves = []
+        for owner in owner_order:
+            transfer_ranks = owner_transfer_ranks[owner]
+            for wave in owner_waves:
+                if wave['transfer_ranks'].isdisjoint(transfer_ranks):
+                    wave['owners'].add(owner)
+                    wave['transfer_ranks'].update(transfer_ranks)
+                    break
+            else:
+                owner_waves.append({'owners': {owner}, 'transfer_ranks': set(transfer_ranks)})
+
+        task_batches = []
+        max_batch_size = _get_nep_nccl_async_chunk_window()
+        for wave in owner_waves:
+            current_batch = []
+            current_slots = set()
+            for task in ready_tasks:
+                if task['owner_ep_rank'] not in wave['owners']:
+                    continue
+                slot = task['group']._get_nep_nccl_task_buffer_slot(
+                    task['owner_ep_rank'], task['chunk_index']
+                )
+                if current_batch and (
+                    len(current_batch) >= max_batch_size or slot in current_slots
+                ):
+                    task_batches.append(current_batch)
+                    current_batch = []
+                    current_slots = set()
+                current_batch.append(task)
+                current_slots.add(slot)
+            if current_batch:
+                task_batches.append(current_batch)
+
+        if split_host_phases and len(task_batches) != 1:
+            _nep_debug_print(
+                "split_host_phases_fallback "
+                f"task_batches={len(task_batches)} ready_tasks={len(ready_tasks)}"
+            )
+            split_host_phases = False
+
+        pending_host_phases = []
+        for batch_index, task_batch in enumerate(task_batches):
+            contexts = []
+            same_communicator_ready = _nep_same_communicator_ready_enabled()
+            with torch.cuda.stream(dispatch_stream):
+                for task in task_batch:
+                    context = task['group']._prepare_nep_nccl_owner_task_context(
+                        task['owner_ep_rank'],
+                        task['chunk_index'],
+                        task['chunk_start'],
+                        task['chunk_end'],
+                        async_op=True,
+                    )
+                    if context is not None:
+                        contexts.append(context)
+                for context in contexts:
+                    group = context['group']
+                    group._start_nep_nccl_owner_all_to_all_gather(
+                        context['owner_ep_rank'],
+                        context['chunk_index'],
+                        context['chunk_start'],
+                        context['chunk_end'],
+                        context['chunk'],
+                        context['buffer_slot_key'],
+                        async_op=True,
+                    )
+                gather_done_event = torch.cuda.Event()
+                gather_done_event.record(dispatch_stream)
+                for context in contexts:
+                    context['gather_done_event'] = gather_done_event
+
+            local_transfer_contexts = {}
+            for context in contexts:
+                cfg = context['group']._nep_runtime_config
+                owner = context['owner_ep_rank']
+                source_group_gloo = cfg.get('nep_owner_transfer_groups_gloo', {}).get(owner)
+                if source_group_gloo is not None:
+                    local_transfer_contexts.setdefault(owner, (context, source_group_gloo))
+
+            local_edp_contexts = {}
+            for context in contexts:
+                cfg = context['group']._nep_runtime_config
+                owner = context['owner_ep_rank']
+                if cfg['ep_rank'] != owner:
+                    continue
+                edp_group_gloo = cfg.get('edp_group_gloo')
+                if edp_group_gloo is not None and edp_group_gloo.size() > 1:
+                    local_edp_contexts.setdefault(owner, (context, edp_group_gloo))
+
+            if split_host_phases:
+                if same_communicator_ready:
+                    raise RuntimeError(
+                        "Split NEP host phases do not support same-communicator readiness"
+                    )
+                if any(
+                    context['group']._nep_runtime_config.get('edp_ready_gate_enabled', False)
+                    for context in contexts
+                ):
+                    raise RuntimeError(
+                        "Split NEP host phases require the device EDP readiness gate to be disabled"
+                    )
+                gather_barrier_works = []
+                for owner, (_, source_group_gloo) in local_transfer_contexts.items():
+                    _nep_debug_print(
+                        f"submit split_dispatch_gather_owner_barrier "
+                        f"batch={batch_index} owner={owner}"
+                    )
+                    gather_barrier_works.append(
+                        (owner, dist.barrier(group=source_group_gloo, async_op=True))
+                    )
+                pending_host_phases.append(
+                    {
+                        'batch_index': batch_index,
+                        'contexts': contexts,
+                        'dispatch_stream': dispatch_stream,
+                        'local_transfer_contexts': local_transfer_contexts,
+                        'local_edp_contexts': local_edp_contexts,
+                        'gather_barrier_works': gather_barrier_works,
+                    }
+                )
+                continue
+
+            if not same_communicator_ready:
+                for owner, (_, source_group_gloo) in local_transfer_contexts.items():
+                    _nep_debug_print(
+                        f"before dispatch_gather_owner_barrier batch={batch_index} owner={owner}"
+                    )
+                    dist.barrier(group=source_group_gloo)
+                    _nep_debug_print(
+                        f"after dispatch_gather_owner_barrier batch={batch_index} owner={owner}"
+                    )
+
+            if not same_communicator_ready:
+                for owner, (_, edp_group_gloo) in local_edp_contexts.items():
+                    _nep_debug_print(
+                        f"before dispatch_edp_owner_launch_barrier "
+                        f"batch={batch_index} owner={owner}"
+                    )
+                    dist.barrier(group=edp_group_gloo)
+                    _nep_debug_print(
+                        f"after dispatch_edp_owner_launch_barrier "
+                        f"batch={batch_index} owner={owner}"
+                    )
+
+            with torch.cuda.stream(dispatch_stream):
+                if same_communicator_ready:
+                    for owner, (context, _) in local_edp_contexts.items():
+                        edp_group = context['group']._nep_runtime_config.get('edp_group')
+                        context['group']._start_nep_nccl_same_communicator_ready(
+                            edp_group, ('edp', owner)
+                        )
+                self._start_nep_nccl_owner_edp_reduce_batch(contexts, use_device_readiness=True)
+                edp_done_event = torch.cuda.Event()
+                edp_done_event.record(dispatch_stream)
+
+            if not same_communicator_ready:
+                for owner, (_, source_group_gloo) in local_transfer_contexts.items():
+                    _nep_debug_print(
+                        f"before dispatch_edp_owner_barrier batch={batch_index} owner={owner}"
+                    )
+                    dist.barrier(group=source_group_gloo)
+                    _nep_debug_print(
+                        f"after dispatch_edp_owner_barrier batch={batch_index} owner={owner}"
+                    )
+
+            with torch.cuda.stream(dispatch_stream):
+                for owner, (context, _) in local_transfer_contexts.items():
+                    if same_communicator_ready:
+                        transfer_group = (
+                            context['group']
+                            ._nep_runtime_config.get('nep_owner_transfer_groups', {})
+                            .get(owner)
+                        )
+                        context['group']._start_nep_nccl_same_communicator_ready(
+                            transfer_group, ('scatter', owner)
+                        )
+                    else:
+                        context['group']._start_nep_nccl_scatter_ready_gate(
+                            owner, context['buffer_slot'], edp_done_event
+                        )
+                for context in contexts:
+                    context['group']._start_nep_nccl_owner_task_scatter(context)
+
+        return pending_host_phases
+
+    def _finish_nep_nccl_process_group_dispatch_batches(
+        self, pending_host_phases: List[dict]
     ) -> None:
+        """Finish ordered EDP and Scatter phases after queued backward compute can run."""
+        for pending in pending_host_phases:
+            batch_index = pending['batch_index']
+            contexts = pending['contexts']
+            dispatch_stream = pending['dispatch_stream']
+            for owner, work in pending['gather_barrier_works']:
+                with torch.profiler.record_function("nep_split_wait_gather_launch"):
+                    work.wait()
+                _nep_debug_print(
+                    f"finish split_dispatch_gather_owner_barrier "
+                    f"batch={batch_index} owner={owner}"
+                )
+            edp_launch_barrier_works = []
+            for owner, (_, edp_group_gloo) in pending['local_edp_contexts'].items():
+                _nep_debug_print(
+                    f"submit split_dispatch_edp_owner_launch_barrier "
+                    f"batch={batch_index} owner={owner}"
+                )
+                edp_launch_barrier_works.append(
+                    (owner, dist.barrier(group=edp_group_gloo, async_op=True))
+                )
+            for owner, work in edp_launch_barrier_works:
+                with torch.profiler.record_function("nep_split_wait_edp_launch"):
+                    work.wait()
+                _nep_debug_print(
+                    f"finish split_dispatch_edp_owner_launch_barrier "
+                    f"batch={batch_index} owner={owner}"
+                )
+
+            with torch.cuda.stream(dispatch_stream):
+                self._start_nep_nccl_owner_edp_reduce_batch(
+                    contexts, use_device_readiness=False
+                )
+
+            scatter_barrier_works = []
+            for owner, (_, source_group_gloo) in pending['local_transfer_contexts'].items():
+                _nep_debug_print(
+                    f"submit split_dispatch_edp_owner_barrier "
+                    f"batch={batch_index} owner={owner}"
+                )
+                scatter_barrier_works.append(
+                    (owner, dist.barrier(group=source_group_gloo, async_op=True))
+                )
+            for owner, work in scatter_barrier_works:
+                with torch.profiler.record_function("nep_split_wait_scatter_launch"):
+                    work.wait()
+                _nep_debug_print(
+                    f"finish split_dispatch_edp_owner_barrier "
+                    f"batch={batch_index} owner={owner}"
+                )
+
+            with torch.cuda.stream(dispatch_stream):
+                for context in contexts:
+                    context['group']._start_nep_nccl_owner_task_scatter(context)
+
+    def _try_start_nep_nccl_ready_tasks(
+        self,
+        force_ready: bool = False,
+        async_op_override: Optional[bool] = None,
+        compute_ready_event: Optional[torch.cuda.Event] = None,
+    ) -> Optional[List[dict]]:
         """Launch globally ordered owner tasks while local dependencies are ready."""
         state = getattr(self, '_nep_nccl_scheduler_state', None)
         if state is None or 'task_sequence' not in state:
@@ -2292,6 +3194,19 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             if async_op_override is None
             else async_op_override
         )
+
+        if (
+            compute_ready_event is not None
+            and async_op
+            and not self._nep_runtime_config.get('zero_sm_reshard', False)
+        ):
+            return self._start_nep_nccl_process_group_dispatch_batch(
+                state,
+                force_ready,
+                async_op,
+                compute_ready_event,
+                split_host_phases=_nep_split_host_phases_enabled(),
+            )
 
         def next_task_is_ready() -> bool:
             tasks = state['task_sequence']
@@ -2318,8 +3233,16 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 launch_next_task()
 
         if async_op:
-            compute_stream = torch.cuda.current_stream()
-            while next_task_is_ready():
+            compute_stream = (
+                None if compute_ready_event is not None else torch.cuda.current_stream()
+            )
+            while True:
+                if state.setdefault('pending_owner_tasks', []):
+                    self._progress_nep_nccl_pending_owner_tasks(force_all=force_ready)
+                    if state['pending_owner_tasks']:
+                        break
+                if not next_task_is_ready():
+                    break
                 task_index = state['task_next_index']
                 task = state['task_sequence'][task_index]
                 group = task['group']
@@ -2328,7 +3251,10 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     owner_ep_rank, task['chunk_index']
                 )
                 nccl_stream = group._get_nep_nccl_comm_stream(stream_slot)
-                nccl_stream.wait_stream(compute_stream)
+                if compute_ready_event is not None:
+                    nccl_stream.wait_event(compute_ready_event)
+                else:
+                    nccl_stream.wait_stream(compute_stream)
                 debug_start_event = None
                 debug_done_event = None
                 with torch.cuda.stream(nccl_stream):
@@ -2344,7 +3270,10 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     group._nep_nccl_overlap_debug_events.append(
                         (task_index, task_index + 1, debug_start_event, debug_done_event)
                     )
+                if state['pending_owner_tasks'] and not force_ready:
+                    break
             if force_ready:
+                self._progress_nep_nccl_pending_owner_tasks(force_all=True)
                 self._flush_nep_nccl_pending_scatters(force_all=True)
         else:
             launch_ready_tasks_on_current_stream()
@@ -2420,6 +3349,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             compute_ready_event = torch.cuda.Event(enable_timing=True)
             compute_ready_event.record(torch.cuda.current_stream())
         drain_start = time.perf_counter() if overlap_debug else None
+        self._drain_nep_edp_ready_futures()
         self._drain_nep_nccl_async_window(force_all=True)
         drain_ms = (time.perf_counter() - drain_start) * 1000.0 if overlap_debug else None
         for nccl_stream in self._nep_nccl_streams.values():
@@ -2535,7 +3465,15 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 self.per_param_grad_ready_counts[param] = 0
             self.per_param_grad_ready_counts[param] += 1
             if not self.is_first_batch:
-                self._try_start_nep_nccl_ready_tasks(force_ready=False, async_op_override=True)
+                if self._nep_dispatch_boundary_launch:
+                    callback = self._nep_dispatch_boundary_callback
+                    if self._nep_dispatch_boundary_ready and callback is not None:
+                        callback(
+                            self._nep_dispatch_boundary_groups,
+                            self._nep_dispatch_boundary_module_label,
+                        )
+                else:
+                    self._try_start_nep_nccl_ready_tasks(force_ready=False, async_op_override=True)
                 if self.per_param_grad_ready_counts == self.golden_per_param_grad_ready_counts:
                     assert len(self.per_param_grad_ready_counts) == len(self.params)
                     _nep_debug_print(
@@ -2553,6 +3491,11 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         self._nep_nccl_async_tensors = []
         self._nep_nccl_started_tasks = set()
         self._nep_nccl_prepped_experts = set()
+        self._nep_dispatch_boundary_ready = False
+        self._nep_dispatch_boundary_graph_replay_ready = False
+        self._nep_dispatch_boundary_launched = False
+        self._nep_dispatch_boundary_launching = False
+        self._nep_dispatch_boundary_wait_logged = False
         reset_ordered_bucket_group_scheduler(
             self, '_nep_nccl_scheduler_state', '_nep_nccl_group_index'
         )
@@ -2560,8 +3503,11 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if state is not None and getattr(self, '_nep_nccl_group_index', -1) == 0:
             if state.get('pending_scatters'):
                 raise RuntimeError("NEP reset found deferred scatters that were not flushed")
+            if state.get('pending_owner_tasks'):
+                raise RuntimeError("NEP reset found host-gated owner tasks that were not flushed")
             state['task_next_index'] = 0
             state['pending_scatters'] = []
+            state['pending_owner_tasks'] = []
 
 
 def _coalesce_nep_nccl_bucket_groups_for_edp_order(
@@ -2886,39 +3832,63 @@ def _configure_nep_nccl_task_scheduler(
     state['task_sequence'] = task_sequence
     state['task_next_index'] = 0
     state['pending_scatters'] = []
+    state['pending_owner_tasks'] = []
 
 
 def _configure_nep_edp_ready_gate(
     bucket_groups: List[NonuniformEPNCCLParamAndGradBucketGroup],
 ) -> None:
-    """Allocate per-slot tokens for the one-CTA EDP readiness communicator."""
+    """Configure host rendezvous plus stream-ordered readiness signaling."""
     if not bucket_groups:
         return
 
     state = getattr(bucket_groups[0], '_nep_nccl_scheduler_state', None)
     if state is None:
         raise RuntimeError("NEP EDP readiness gating requires the shared task scheduler")
-    if 'edp_ready_buffers' in state:
+    if 'edp_ready_flags' in state:
         return
 
     runtime_config = bucket_groups[0]._nep_runtime_config
-    ready_group = runtime_config.get('nep_edp_ready_group')
-    if not runtime_config.get('edp_ready_gate_enabled', False) or ready_group is None:
-        state['edp_ready_buffers'] = {}
+    ready_group = runtime_config.get('edp_group_gloo')
+    transfer_groups = runtime_config.get('nep_owner_transfer_groups_gloo', {})
+    has_edp_peer = (
+        runtime_config.get('is_edp_eligible', False)
+        and ready_group is not None
+        and ready_group.size() > 1
+    )
+    has_transfer_peer = any(group is not None for group in transfer_groups.values())
+    enabled = runtime_config.get('edp_ready_gate_enabled', False) and (
+        has_edp_peer or has_transfer_peer
+    )
+    if not enabled:
+        state['edp_ready_flags'] = {}
+        state['edp_ready_generations'] = {}
+        state['edp_ready_executor'] = None
+        state['edp_ready_signal_stream'] = None
         return
 
     device = torch.device("cuda", torch.cuda.current_device())
-    state['edp_ready_buffers'] = {
-        buffer_slot: torch.zeros(1, dtype=torch.float32, device=device)
-        for buffer_slot in range(_get_nep_nccl_async_chunk_window())
+    buffer_slots = _get_nep_nccl_async_chunk_window()
+    flags = {
+        buffer_slot: torch.zeros(1, dtype=torch.int32, device=device)
+        for buffer_slot in range(buffer_slots)
     }
-    _nep_debug_print("before one-CTA EDP readiness warmup")
-    dist.all_reduce(state['edp_ready_buffers'][0], group=ready_group)
     torch.cuda.synchronize(device)
-    _nep_debug_print("after one-CTA EDP readiness warmup")
-    _nep_debug_print(
-        "configured one-CTA EDP readiness gate " f"slots={len(state['edp_ready_buffers'])}"
+    get_cuda_stream_memory_ops()
+
+    state['edp_ready_flags'] = flags
+    state['edp_ready_generations'] = {buffer_slot: 0 for buffer_slot in flags}
+    state['edp_ready_executor'] = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="nep-edp-ready"
     )
+    state['edp_ready_signal_stream'] = torch.cuda.Stream(device=device)
+    if has_edp_peer:
+        dist.barrier(group=ready_group)
+    for owner_ep_rank in sorted(transfer_groups):
+        transfer_group = transfer_groups[owner_ep_rank]
+        if transfer_group is not None:
+            dist.barrier(group=transfer_group)
+    _nep_debug_print("configured stream-ordered readiness gate " f"slots={len(flags)}")
 
 
 def _configure_nep_zero_sm_buffers(
@@ -2975,6 +3945,7 @@ def _configure_nep_zero_sm_buffers(
         group = task['group']
         owner_ep_rank = task['owner_ep_rank']
         source_ranks = group._nep_nccl_owner_source_ranks(owner_ep_rank)
+        transfer_ranks = group._nep_nccl_owner_transfer_ranks(owner_ep_rank)
         remote_source_ranks = [rank for rank in source_ranks if rank != owner_ep_rank]
         if not remote_source_ranks:
             continue
@@ -2987,7 +3958,7 @@ def _configure_nep_zero_sm_buffers(
         dtype = group.buckets[0].grad_data.dtype
         spec = buffer_specs.setdefault(dtype, {'small_numel': 0, 'large_numel': 0})
         spec['small_numel'] = max(spec['small_numel'], payload_numel)
-        spec['large_numel'] = max(spec['large_numel'], len(source_ranks) * payload_numel)
+        spec['large_numel'] = max(spec['large_numel'], len(transfer_ranks) * payload_numel)
 
     pool = torch.cuda.MemPool(group_entries[0][1].mem_allocator)
     small_buffers = {}
@@ -3358,7 +4329,413 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 self.param_to_bucket_group,
                 self._param_to_name,
             )
+        self._nep_dispatch_boundary_hook_handles = []
+        self._nep_dispatch_boundary_pre_hook_handles = []
+        self._nep_dispatch_completion_executor = None
+        self._nep_dispatch_pending_completion_event = None
+        self._nep_dispatch_pending_completion_future = None
+        self._nep_dispatch_pending_host_phases = None
+        self._nep_dispatch_waiting_groups = None
+        self._nep_dispatch_waiting_module_label = None
+        if self.nonuniform_ep_config.approach == NonuniformEPApproach.NCCL:
+            if runtime_config.get('zero_sm_reshard', False):
+                self._nep_dispatch_completion_executor = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="nep-completion"
+                )
+            self._configure_nep_dispatch_boundary_hooks()
         self._configure_expert_gradient_scaling(config, runtime_config)
+
+    @staticmethod
+    def _find_nep_local_cuda_graph_manager(module_name: str, named_modules: dict):
+        """Find the nearest full-layer local graph manager containing an MoE module."""
+        path = module_name.split('.') if module_name else []
+        for prefix_length in range(len(path), -1, -1):
+            parent_name = '.'.join(path[:prefix_length])
+            parent = named_modules.get(parent_name)
+            if getattr(parent, 'use_partial_cudagraphs', False):
+                return None
+            graph_manager = getattr(parent, 'cudagraph_manager', None)
+            if graph_manager is not None:
+                return graph_manager
+        return None
+
+    @staticmethod
+    def _nep_module_uses_partial_cuda_graphs(module_name: str, named_modules: dict) -> bool:
+        """Return whether an MoE module is owned by a partial-graph transformer layer."""
+        path = module_name.split('.') if module_name else []
+        for prefix_length in range(len(path), -1, -1):
+            parent_name = '.'.join(path[:prefix_length])
+            parent = named_modules.get(parent_name)
+            if getattr(parent, 'use_partial_cudagraphs', False):
+                return True
+        return False
+
+    @staticmethod
+    def _coalesce_nep_cuda_graph_boundary(module_entries: list) -> tuple:
+        """Combine all MoE groups covered by one local CUDA graph replay."""
+        groups = []
+        seen_group_ids = set()
+        for _, module_groups in module_entries:
+            for group in module_groups:
+                if id(group) in seen_group_ids:
+                    continue
+                seen_group_ids.add(id(group))
+                groups.append(group)
+        ordered_groups = tuple(sorted(groups, key=lambda group: group._nep_nccl_group_index))
+        module_label = (
+            "cuda_graph[" + ",".join(module_name for module_name, _ in module_entries) + "]"
+        )
+        return ordered_groups, module_label
+
+    def _configure_nep_dispatch_boundary_hooks(self) -> None:
+        """Launch NCCL reshard pipelines after each MoE dispatch backward."""
+        from ..transformer.moe.moe_layer import BaseMoELayer
+
+        expert_groups = set(self.expert_parallel_bucket_groups)
+        assigned_groups = {}
+        named_modules = dict(self.module.named_modules())
+        graph_manager_entries = {}
+        for module_name, module in named_modules.items():
+            if not isinstance(module, BaseMoELayer):
+                continue
+
+            module_groups = []
+            for param in module.parameters():
+                bucket_group = self.param_to_bucket_group.get(param)
+                if bucket_group in expert_groups and bucket_group not in module_groups:
+                    module_groups.append(bucket_group)
+            if not module_groups:
+                continue
+
+            module_groups.sort(key=lambda group: group._nep_nccl_group_index)
+            for bucket_group in module_groups:
+                previous_module = assigned_groups.setdefault(bucket_group, module_name)
+                if previous_module != module_name:
+                    raise RuntimeError(
+                        "NEP expert bucket group maps to multiple MoE modules: "
+                        f"{previous_module!r} and {module_name!r}"
+                    )
+                bucket_group._nep_dispatch_boundary_launch = True
+                bucket_group._nep_dispatch_boundary_callback = (
+                    self._launch_nep_dispatch_boundary_tasks
+                )
+                bucket_group._nep_dispatch_boundary_groups = tuple(module_groups)
+                bucket_group._nep_dispatch_boundary_module_label = module_name
+
+            uses_partial_cuda_graphs = self._nep_module_uses_partial_cuda_graphs(
+                module_name, named_modules
+            )
+            graph_manager = self._find_nep_local_cuda_graph_manager(module_name, named_modules)
+            if graph_manager is not None:
+                entry = graph_manager_entries.setdefault(
+                    id(graph_manager), {'manager': graph_manager, 'modules': []}
+                )
+                entry['modules'].append((module_name, tuple(module_groups)))
+
+            def dispatch_boundary_hook(
+                unused_module,
+                unused_grad_input,
+                unused_grad_output,
+                groups=tuple(module_groups),
+                module_label=module_name,
+            ):
+                self._mark_nep_dispatch_boundary_ready(groups, module_label)
+
+            def dispatch_boundary_pre_hook(unused_module, unused_grad_output):
+                if not is_graph_capturing():
+                    self._wait_for_nep_dispatch_launch()
+
+            if uses_partial_cuda_graphs:
+
+                def dispatch_input_grad_callback(
+                    groups=tuple(module_groups), module_label=module_name
+                ):
+                    self._mark_nep_dispatch_boundary_ready(groups, module_label)
+
+                module.register_expert_compute_input_grad_callback(dispatch_input_grad_callback)
+                module.register_expert_compute_dgrad_callback(self._wait_for_nep_dispatch_launch)
+                self._nep_dispatch_boundary_pre_hook_handles.append(
+                    module.register_full_backward_pre_hook(dispatch_boundary_pre_hook)
+                )
+            else:
+                self._nep_dispatch_boundary_hook_handles.append(
+                    module.register_full_backward_hook(dispatch_boundary_hook)
+                )
+                self._nep_dispatch_boundary_pre_hook_handles.append(
+                    module.register_full_backward_pre_hook(dispatch_boundary_pre_hook)
+                )
+
+        for entry in graph_manager_entries.values():
+            graph_groups, graph_label = self._coalesce_nep_cuda_graph_boundary(entry['modules'])
+
+            def graph_post_replay_hook(groups=graph_groups, module_label=graph_label):
+                self._mark_nep_dispatch_boundary_ready(groups, module_label, graph_replay=True)
+
+            entry['manager'].register_backward_replay_hooks(
+                pre_hook=self._wait_for_nep_dispatch_launch, post_hook=graph_post_replay_hook
+            )
+
+        missing_groups = expert_groups - set(assigned_groups)
+        if missing_groups:
+            missing_indices = sorted(group._nep_nccl_group_index for group in missing_groups)
+            raise RuntimeError(
+                "NCCL NEP could not map expert bucket groups to MoE dispatch boundaries: "
+                f"groups={missing_indices}"
+            )
+
+    def _mark_nep_dispatch_boundary_ready(
+        self,
+        groups: tuple,
+        module_label: str,
+        graph_replay: bool = False,
+        defer_launch: bool = False,
+    ) -> None:
+        """Mark one layer ready and submit its ordered NEP task batch when possible."""
+        if (
+            is_graph_capturing()
+            or any(group.is_first_batch for group in groups)
+            or not all(group.is_last_microbatch for group in groups)
+        ):
+            return
+        for group in groups:
+            group._nep_dispatch_boundary_ready = True
+            if graph_replay:
+                group._nep_dispatch_boundary_graph_replay_ready = True
+        self._nep_dispatch_waiting_groups = groups
+        self._nep_dispatch_waiting_module_label = module_label
+        if not defer_launch and not _nep_defer_dispatch_host_launch_enabled():
+            self._launch_nep_dispatch_boundary_tasks(groups, module_label)
+
+    def _launch_waiting_nep_dispatch_boundary_tasks(self) -> None:
+        """Launch the prior ready layer after the next combine backward is enqueued."""
+        groups = self._nep_dispatch_waiting_groups
+        if (
+            groups is None
+            or self._nep_dispatch_pending_completion_event is not None
+            or getattr(self, '_nep_dispatch_pending_completion_future', None) is not None
+            or getattr(self, '_nep_dispatch_pending_host_phases', None) is not None
+        ):
+            return
+        module_label = self._nep_dispatch_waiting_module_label
+        if not self._launch_nep_dispatch_boundary_tasks(groups, module_label):
+            raise RuntimeError(
+                "NEP dispatch boundary reached its launch point before gradients were ready: "
+                f"module={module_label}"
+            )
+
+    def _launch_nep_dispatch_boundary_tasks(self, groups: tuple, module_label: str) -> bool:
+        """Submit a layer batch after dispatch and all local source grads are ready."""
+        if any(group._nep_dispatch_boundary_launched for group in groups):
+            return True
+        if any(group._nep_dispatch_boundary_launching for group in groups):
+            return False
+        if not all(group._nep_dispatch_boundary_ready for group in groups):
+            return False
+        if not all(group._nep_dispatch_boundary_inputs_ready() for group in groups):
+            if not all(group._nep_dispatch_boundary_wait_logged for group in groups):
+                _nep_debug_print(
+                    f"dispatch_backward_boundary_waiting_for_grads module={module_label} "
+                    f"groups={[group._nep_nccl_group_index for group in groups]}"
+                )
+                for group in groups:
+                    group._nep_dispatch_boundary_wait_logged = True
+            return False
+
+        if (
+            self._nep_dispatch_pending_completion_event is not None
+            or getattr(self, '_nep_dispatch_pending_completion_future', None) is not None
+            or getattr(self, '_nep_dispatch_pending_host_phases', None) is not None
+        ):
+            raise RuntimeError("Prior NEP dispatch completion has not been consumed")
+        compute_ready_event = torch.cuda.Event()
+        completion_event = torch.cuda.Event()
+        device_index = torch.cuda.current_device()
+        compute_ready_event.record(torch.cuda.current_stream())
+        for group in groups:
+            group._nep_dispatch_boundary_launching = True
+        self._nep_dispatch_pending_completion_event = completion_event
+        if self._nonuniform_ep_runtime_config.get('zero_sm_reshard', False):
+            self._nep_dispatch_pending_completion_future = (
+                self._submit_nep_dispatch_launch_and_completion(
+                    groups, module_label, compute_ready_event, completion_event, device_index
+                )
+            )
+        else:
+            self._run_nep_dispatch_boundary_tasks(
+                groups, module_label, compute_ready_event, completion_event
+            )
+        _nep_debug_print(
+            f"launched dispatch_backward_boundary module={module_label} "
+            f"groups={[group._nep_nccl_group_index for group in groups]}"
+        )
+        return True
+
+    def _run_nep_dispatch_boundary_tasks(
+        self,
+        groups: tuple,
+        module_label: str,
+        compute_ready_event: torch.cuda.Event,
+        completion_event: Optional[torch.cuda.Event] = None,
+    ) -> torch.cuda.Event:
+        """Enqueue one layer batch and return its completion event."""
+        group_indices = [group._nep_nccl_group_index for group in groups]
+        _nep_debug_print(
+            f"before dispatch_backward_boundary module={module_label} groups={group_indices}"
+        )
+        try:
+            launch_start = time.perf_counter()
+            pending_host_phases = groups[0]._try_start_nep_nccl_ready_tasks(
+                force_ready=False, async_op_override=True, compute_ready_event=compute_ready_event
+            )
+            launch_ms = (time.perf_counter() - launch_start) * 1000.0
+
+            if completion_event is None:
+                completion_event = torch.cuda.Event()
+            if pending_host_phases:
+                if getattr(self, '_nep_dispatch_pending_host_phases', None) is not None:
+                    raise RuntimeError("Prior split NEP host phases have not been consumed")
+                self._nep_dispatch_pending_host_phases = (
+                    groups[0],
+                    pending_host_phases,
+                )
+            else:
+                not_started = [
+                    group._nep_nccl_group_index for group in groups if not group._nep_nccl_ready
+                ]
+                if not_started:
+                    raise RuntimeError(
+                        "NEP dispatch boundary did not launch every layer bucket group: "
+                        f"module={module_label}, groups={not_started}"
+                    )
+                completion_event.record(groups[0]._get_nep_nccl_comm_stream(0))
+            for group in groups:
+                group._nep_dispatch_boundary_launched = True
+            _nep_debug_print(
+                f"after dispatch_backward_boundary_launched module={module_label} "
+                f"groups={group_indices} split={bool(pending_host_phases)} "
+                f"launch_ms={launch_ms:.3f}"
+            )
+            return completion_event
+        finally:
+            for group in groups:
+                group._nep_dispatch_boundary_launching = False
+
+    @staticmethod
+    def _complete_nep_dispatch_boundary(
+        completion_event: torch.cuda.Event, boundary_group
+    ) -> tuple:
+        """Complete local reshard and rendezvous without blocking the autograd thread."""
+        completion_wait_start = time.perf_counter()
+        completion_event.synchronize()
+        completion_wait_ms = (time.perf_counter() - completion_wait_start) * 1000.0
+        completion_barrier_start = time.perf_counter()
+        dist.barrier(group=boundary_group)
+        completion_barrier_ms = (time.perf_counter() - completion_barrier_start) * 1000.0
+        return completion_wait_ms, completion_barrier_ms
+
+    def _launch_and_complete_nep_dispatch_boundary(
+        self,
+        groups: tuple,
+        module_label: str,
+        compute_ready_event: torch.cuda.Event,
+        completion_event: torch.cuda.Event,
+        boundary_group,
+        device_index: int,
+    ) -> tuple:
+        """Launch reshard work off the autograd thread, then complete its rendezvous."""
+        torch.cuda.set_device(device_index)
+        self._run_nep_dispatch_boundary_tasks(
+            groups, module_label, compute_ready_event, completion_event
+        )
+        return self._complete_nep_dispatch_boundary(completion_event, boundary_group)
+
+    def _submit_nep_dispatch_launch_and_completion(
+        self,
+        groups: tuple,
+        module_label: str,
+        compute_ready_event: torch.cuda.Event,
+        completion_event: torch.cuda.Event,
+        device_index: int,
+    ):
+        executor = self._nep_dispatch_completion_executor
+        if executor is None:
+            raise RuntimeError("Zero-SM NEP completion executor was not initialized")
+        boundary_group = self._nonuniform_ep_runtime_config.get('dp_cp_group_gloo')
+        if boundary_group is None:
+            raise RuntimeError("Zero-SM NEP completion requires a DP-CP Gloo group")
+        return executor.submit(
+            self._launch_and_complete_nep_dispatch_boundary,
+            groups,
+            module_label,
+            compute_ready_event,
+            completion_event,
+            boundary_group,
+            device_index,
+        )
+
+    def _wait_for_nep_dispatch_launch(self) -> None:
+        """Fence the prior layer reshard before the next model-EP collective."""
+        groups = self._nep_dispatch_waiting_groups
+        module_label = self._nep_dispatch_waiting_module_label
+        completion_event = self._nep_dispatch_pending_completion_event
+        completion_future = getattr(self, '_nep_dispatch_pending_completion_future', None)
+        pending_host_phases = getattr(self, '_nep_dispatch_pending_host_phases', None)
+        if groups is not None and completion_event is None:
+            self._launch_waiting_nep_dispatch_boundary_tasks()
+            completion_event = self._nep_dispatch_pending_completion_event
+            completion_future = getattr(self, '_nep_dispatch_pending_completion_future', None)
+            pending_host_phases = getattr(self, '_nep_dispatch_pending_host_phases', None)
+
+        if pending_host_phases is not None:
+            if completion_event is None:
+                raise RuntimeError("Split NEP host phases are missing their completion event")
+            if completion_future is not None:
+                raise RuntimeError("Split ProcessGroup NEP dispatch unexpectedly used a worker")
+            boundary_group, host_phases = pending_host_phases
+            boundary_group._finish_nep_nccl_process_group_dispatch_batches(host_phases)
+            not_ready = [
+                group._nep_nccl_group_index for group in groups if not group._nep_nccl_ready
+            ]
+            if not_ready:
+                raise RuntimeError(
+                    "Split NEP host phases did not finish every layer bucket group: "
+                    f"module={module_label}, groups={not_ready}"
+                )
+            completion_event.record(boundary_group._get_nep_nccl_comm_stream(0))
+            self._nep_dispatch_pending_host_phases = None
+            _nep_debug_print(f"finished split dispatch host phases module={module_label}")
+
+        if completion_event is not None:
+            if not self._nonuniform_ep_runtime_config.get('zero_sm_reshard', False):
+                if completion_future is not None:
+                    raise RuntimeError("ProcessGroup NEP dispatch unexpectedly used a worker")
+                torch.cuda.current_stream().wait_event(completion_event)
+                _nep_debug_print(
+                    f"ordered dispatch_backward_boundary completion module={module_label}"
+                )
+            else:
+                if completion_future is None:
+                    raise RuntimeError("NEP dispatch completion event is missing its worker future")
+                completion_join_start = time.perf_counter()
+                completion_wait_ms, completion_barrier_ms = completion_future.result()
+                completion_join_ms = (time.perf_counter() - completion_join_start) * 1000.0
+                _nep_debug_print(
+                    f"completed dispatch_backward_boundary module={module_label} "
+                    f"completion_wait_ms={completion_wait_ms:.3f} "
+                    f"completion_barrier_ms={completion_barrier_ms:.3f} "
+                    f"completion_join_ms={completion_join_ms:.3f}"
+                )
+            self._nep_dispatch_pending_completion_event = None
+            self._nep_dispatch_pending_completion_future = None
+        elif completion_future is not None:
+            raise RuntimeError("NEP dispatch completion future is missing its CUDA event")
+        elif pending_host_phases is not None:
+            raise RuntimeError("Split NEP host phases are missing their CUDA completion event")
+        if groups is not None:
+            if not all(group._nep_dispatch_boundary_launched for group in groups):
+                raise RuntimeError(f"NEP dispatch launch did not finish: module={module_label}")
+            self._nep_dispatch_waiting_groups = None
+            self._nep_dispatch_waiting_module_label = None
 
     def _configure_expert_gradient_scaling(self, config: TransformerConfig, runtime_config: dict):
         if config.calculate_per_token_loss:
@@ -3456,6 +4833,7 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             f"dense_groups={len(self.bucket_groups)} expert_groups={len(self.expert_parallel_bucket_groups)} "
             f"overlap={self.ddp_config.overlap_grad_reduce}"
         )
+        self._wait_for_nep_dispatch_launch()
         if self.ddp_config.overlap_grad_reduce:
             for bucket_group in self.expert_parallel_bucket_groups:
                 bucket_group.finish_nep_pre_sync(force_all_reduce=force_all_reduce)

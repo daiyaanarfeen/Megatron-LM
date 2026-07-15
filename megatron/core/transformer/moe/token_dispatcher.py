@@ -235,6 +235,9 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         assert self.num_local_experts > 0, "Expected at least one expert"
         self.local_expert_indices = local_expert_indices
         assert len(self.local_expert_indices) > 0, "Expected at least one local expert index"
+        self.local_expert_indices_tensor = torch.tensor(
+            self.local_expert_indices, device=torch.device("cuda")
+        )
         self.router_topk = config.moe_router_topk
         self.add_bias = config.add_bias_linear
 
@@ -288,13 +291,11 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         self.hidden_shape_before_permute = hidden_states.shape
 
         # The routing map and probs that for local experts.
-        self.local_map = self.routing_map[
-            :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
-        ].contiguous()
+        self.local_map = self.routing_map.index_select(
+            1, self.local_expert_indices_tensor
+        ).contiguous()
         # probs of global token assignment to local experts.
-        self.local_probs = probs[
-            :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
-        ].contiguous()
+        self.local_probs = probs.index_select(1, self.local_expert_indices_tensor).contiguous()
 
         tokens_per_expert = self.local_map.sum(dim=0).long().cpu()
 
@@ -393,10 +394,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         assert (
             len(self.local_expert_indices) == self.num_local_experts
         ), "Invalid local expert indices"
-        for i in range(len(self.local_expert_indices) - 1):
-            assert (
-                self.local_expert_indices[i] == self.local_expert_indices[i + 1] - 1
-            ), "local_expert_indices must be continuous"
 
         # [ep_size]. Represents the number of tokens sent by the current rank to other
         # EP ranks.
@@ -408,6 +405,28 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # other TP ranks.
         self.output_splits_tp = None
         self.permute_idx_device = torch.device("cuda") if self.config.moe_permute_fusion else "cpu"
+        from megatron.core.distributed.nonuniform_common import (
+            get_nonuniform_ep_expert_axis_permutation,
+        )
+
+        expert_axis_permutation = get_nonuniform_ep_expert_axis_permutation(self.num_experts)
+        if expert_axis_permutation is not None:
+            local_start = self.ep_rank * self.num_local_experts
+            expected_local_experts = expert_axis_permutation[
+                local_start : local_start + self.num_local_experts
+            ]
+            if expected_local_experts != self.local_expert_indices:
+                raise RuntimeError(
+                    "NEP local expert IDs do not match the physical expert-axis placement: "
+                    f"got {self.local_expert_indices}, expected {expected_local_experts}"
+                )
+        if expert_axis_permutation == list(range(self.num_experts)):
+            expert_axis_permutation = None
+        self.expert_axis_permutation = (
+            torch.tensor(expert_axis_permutation, device=torch.device("cuda"))
+            if expert_axis_permutation is not None
+            else None
+        )
         input_chunk_idxs = torch.arange(
             self.num_experts * self.tp_size, device=self.permute_idx_device
         )
@@ -471,6 +490,17 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         if shared_experts.use_shared_expert_gate:
             self.cudagraph_attrs.append('shared_experts.gate_score')
         self.cudagraph_attrs.append('shared_experts.cached_fc1_input')
+
+    def _apply_expert_axis_permutation(
+        self, routing_map: torch.Tensor, probs: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Group logical expert columns in physical EP-rank/local-slot order."""
+        if self.expert_axis_permutation is None:
+            return routing_map, probs
+        return (
+            routing_map.index_select(1, self.expert_axis_permutation),
+            probs.index_select(1, self.expert_axis_permutation),
+        )
 
     def preprocess(self, routing_map: torch.Tensor) -> torch.Tensor:
         """
@@ -549,8 +579,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 .transpose(0, 1)
             )
             # [tp_size, ep_size, num_experts] -> [tp_size, ep_size, num_local_experts]
+            local_expert_start = self.ep_rank * self.num_local_experts
             num_global_tokens_per_local_expert = num_global_tokens_per_expert[
-                :, :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
+                :, :, local_expert_start : local_expert_start + self.num_local_experts
             ].contiguous()
             # [tp_size, ep_size, num_local_experts] -> [tp_size, ep_size]
             num_global_tokens_per_rank = num_global_tokens_per_local_expert.sum(axis=2)
@@ -613,11 +644,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         """
         # Preprocess: Get the metadata for communication, permutation and computation operations.
         self.hidden_shape = hidden_states.shape
-        self.probs = probs
-        self.routing_map = routing_map
         assert probs.dim() == 2, "Expected 2D tensor for probs"
         assert routing_map.dim() == 2, "Expected 2D tensor for token2expert mask"
         assert routing_map.dtype == torch.bool, "Expected bool tensor for mask"
+        routing_map, probs = self._apply_expert_axis_permutation(routing_map, probs)
+        self.probs = probs
+        self.routing_map = routing_map
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
         if self.config.moe_router_padding_for_quantization:
@@ -1418,6 +1450,16 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
         self.num_local_experts = num_local_experts
         self.local_expert_indices = local_expert_indices
+        from megatron.core.distributed.nonuniform_common import (
+            get_nonuniform_ep_expert_axis_permutation,
+        )
+
+        expert_axis_permutation = get_nonuniform_ep_expert_axis_permutation(config.num_moe_experts)
+        if expert_axis_permutation not in (None, list(range(config.num_moe_experts))):
+            raise RuntimeError(
+                "NEP placement-aware token routing currently supports allgather and "
+                "alltoall token dispatchers. Use --moe-token-dispatcher-type alltoall."
+            )
         if self.config.moe_flex_dispatcher_backend == "deepep":
             assert self.tp_size * self.ep_size > 1, "DeepEP dispatcher requires TPxEP > 1"
             self._comm_manager = _DeepepManager(

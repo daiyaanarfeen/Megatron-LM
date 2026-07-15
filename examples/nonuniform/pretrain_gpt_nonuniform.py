@@ -356,6 +356,112 @@ def _get_no_op_param_scheduler_for_nonuniform_benchmark(*args, **kwargs):
     return _NonuniformBenchmarkNoOpParamScheduler()
 
 
+def _canonical_grad_name(name, local_expert_indices):
+    parts = name.split('.')
+    local_expert_index = None
+    for index, part in enumerate(parts[:-1]):
+        if part == 'local_experts' and parts[index + 1].isdigit():
+            local_expert_index = int(parts[index + 1])
+            break
+    if local_expert_index is None and len(parts) >= 2 and parts[-2] in (
+        'linear_fc1',
+        'linear_fc2',
+    ):
+        for prefix in ('weight', 'bias'):
+            suffix = parts[-1][len(prefix) :]
+            if parts[-1].startswith(prefix) and suffix.isdigit():
+                local_expert_index = int(suffix)
+                break
+    if local_expert_index is None:
+        return name
+    if local_expert_index >= len(local_expert_indices):
+        raise RuntimeError(
+            f"Expert parameter {name!r} has local index {local_expert_index}, but this "
+            f"rank owns only {len(local_expert_indices)} experts"
+        )
+    global_expert_index = local_expert_indices[local_expert_index]
+    if 'local_experts' in parts:
+        parts[parts.index('local_experts') + 1] = str(global_expert_index)
+    else:
+        for prefix in ('weight', 'bias'):
+            if parts[-1].startswith(prefix):
+                parts[-1] = f"{prefix}{global_expert_index}"
+                break
+    return '.'.join(parts)
+
+
+def _log_nonuniform_grad_checksum(model, iteration):
+    args = gpt.get_args()
+    runtime_config = get_nonuniform_ep_runtime_config()
+    if runtime_config is not None and runtime_config.get('local_expert_indices') is not None:
+        local_expert_indices = runtime_config['local_expert_indices']
+    else:
+        ep_size = parallel_state.get_expert_model_parallel_world_size()
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+        experts_per_rank = args.num_experts // ep_size
+        local_expert_indices = list(
+            range(ep_rank * experts_per_rank, (ep_rank + 1) * experts_per_rank)
+        )
+
+    dense_stats = torch.zeros(5, dtype=torch.float64, device='cuda')
+    expert_stats = torch.zeros_like(dense_stats)
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    for model_chunk in model:
+        unwrapped_model = training_module.unwrap_model(model_chunk)
+        for name, param in unwrapped_model.named_parameters():
+            grad = getattr(param, 'main_grad', None)
+            if grad is None or getattr(param, 'shared', False):
+                continue
+            if not getattr(param, 'tensor_model_parallel', False) and tp_rank != 0:
+                continue
+            canonical_name = (
+                _canonical_grad_name(name, local_expert_indices)
+                if not getattr(param, 'allreduce', True)
+                else name
+            )
+            name_weight = 1 + sum(
+                (index + 1) * ord(character)
+                for index, character in enumerate(canonical_name)
+            ) % 104729
+            target = expert_stats if not getattr(param, 'allreduce', True) else dense_stats
+            target[0] += grad.sum(dtype=torch.float64) * name_weight
+            target[1] += grad.abs().sum(dtype=torch.float64) * name_weight
+            target[2] += grad.square().sum(dtype=torch.float64) * name_weight
+            target[3] += grad.numel() * name_weight
+            target[4] += grad.numel()
+
+    dist.all_reduce(dense_stats, group=parallel_state.get_model_parallel_group())
+    dist.all_reduce(
+        expert_stats,
+        group=parallel_state.get_expert_tensor_model_pipeline_parallel_group(),
+    )
+    stats = dense_stats + expert_stats
+    checksum_line = (
+        "[nonuniform-grad-checksum] "
+        f"iteration={iteration} rank={dist.get_rank()} "
+        f"weighted_sum={stats[0].item():.17e} "
+        f"weighted_abs={stats[1].item():.17e} "
+        f"weighted_sq={stats[2].item():.17e} "
+        f"weighted_numel={stats[3].item():.0f} "
+        f"dense_weighted_sum={dense_stats[0].item():.17e} "
+        f"dense_weighted_abs={dense_stats[1].item():.17e} "
+        f"dense_weighted_sq={dense_stats[2].item():.17e} "
+        f"dense_weighted_numel={dense_stats[3].item():.0f} "
+        f"dense_numel={dense_stats[4].item():.0f} "
+        f"expert_weighted_sum={expert_stats[0].item():.17e} "
+        f"expert_weighted_abs={expert_stats[1].item():.17e} "
+        f"expert_weighted_sq={expert_stats[2].item():.17e} "
+        f"expert_weighted_numel={expert_stats[3].item():.0f} "
+        f"expert_numel={expert_stats[4].item():.0f}"
+    )
+    print(checksum_line, flush=True)
+    if args.nonuniform_grad_checksum_dir is not None:
+        checksum_dir = Path(args.nonuniform_grad_checksum_dir)
+        checksum_dir.mkdir(parents=True, exist_ok=True)
+        with (checksum_dir / f"rank_{dist.get_rank()}.log").open('a') as stream:
+            stream.write(f"{checksum_line}\n")
+
+
 def _train_step_without_optimizer_step(*args, **kwargs):
     optimizer = args[3] if len(args) > 3 else kwargs.get('optimizer')
     if optimizer is None:
@@ -364,7 +470,12 @@ def _train_step_without_optimizer_step(*args, **kwargs):
     original_step = optimizer.step
     optimizer.step = _no_op_optimizer_step_for_nonuniform_benchmark
     try:
-        return _ORIGINAL_TRAIN_STEP(*args, **kwargs)
+        result = _ORIGINAL_TRAIN_STEP(*args, **kwargs)
+        if gpt.get_args().nonuniform_log_grad_checksum:
+            model = args[2] if len(args) > 2 else kwargs['model']
+            iteration = args[7] if len(args) > 7 else kwargs.get('iteration')
+            _log_nonuniform_grad_checksum(model, iteration)
+        return result
     finally:
         optimizer.step = original_step
 
@@ -482,6 +593,17 @@ def _add_nonuniform_args(parser):
             'Run forward/backward and nonuniform EP grad sync with a no-op '
             'optimizer for performance-only validation.'
         ),
+    )
+    group.add_argument(
+        '--nonuniform-log-grad-checksum',
+        action='store_true',
+        help='Log topology-aware post-sync gradient fingerprints on every rank.',
+    )
+    group.add_argument(
+        '--nonuniform-grad-checksum-dir',
+        type=str,
+        default=None,
+        help='Also write gradient fingerprints to one file per distributed rank.',
     )
     return parser
 
