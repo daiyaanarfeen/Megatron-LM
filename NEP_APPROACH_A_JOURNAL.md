@@ -2,6 +2,11 @@
 
 Append a dated entry whenever we do something new: code changes, job submissions, benchmark results, trace analysis, or decisions that change the next step. Keep entries factual and include job IDs, run dirs, and commits when available.
 
+## 2026-07-15 - Two-repeat original-pattern scaling benchmark
+
+- Added `run_lyris_a3b_ep8_ep4_repeat14_ab.sh` to test whether exposed reshard becomes a measurable end-to-end cost when the exact original `MEMEM*E` structure is repeated twice. The 14-stage `MEMEM*EMEMEM*E` pattern contains six Mamba, six MoE, and two attention stages.
+- The A/B keeps the seven-stage experiment's four-node segment-4 allocation, NeMo 26.06 image, TP2, MBS1, 128 experts, sequence length 8192, forced load balancing, GBS8 healthy EP8/EP8, GBS6 ordered-split EP8/EP4, ten iterations, and rank-0/4/8 profile window. Only model depth and the corresponding case timeout change.
+
 ## 2026-07-15 - Original-repeat attention overlap benchmark
 
 - Selected the first exact repeat from the original a3b architecture, `MEMEM*E`, rather than a synthetic attention-heavy pattern. It contains three Mamba, three MoE, and one attention stage, preserving the original ordering and local repeat ratio while increasing reshard boundaries from two to three.
