@@ -25,9 +25,12 @@ CONTAINER_NAME="${CONTAINER_NAME:-nep_nemo_26_06}"
 CASE_TIMEOUT="${CASE_TIMEOUT:-5m}"
 CASE_TRAIN_ITERS="${CASE_TRAIN_ITERS:-7}"
 CASE_SELECTION="${CASE_SELECTION:-all}"
+CASE_LABEL="${CASE_LABEL:-l4}"
+CASE_HYBRID_LAYER_PATTERN="${CASE_HYBRID_LAYER_PATTERN:-MEME}"
+CASE_EXIT_DURATION_IN_MINS="${CASE_EXIT_DURATION_IN_MINS:-4}"
 
 case "${CASE_SELECTION}" in
-    all|nep|healthy|stable|split) ;;
+    all|nep|healthy|stable|split|healthy_split) ;;
     *)
         echo "Unsupported CASE_SELECTION=${CASE_SELECTION}" >&2
         exit 2
@@ -55,7 +58,7 @@ run_case() {
             RUN_NNODES="${nodes}" \
             TRAIN_ITERS="${CASE_TRAIN_ITERS}" \
             LR_WSD_DECAY_ITERS=3 \
-            HYBRID_LAYER_PATTERN=MEME \
+            HYBRID_LAYER_PATTERN="${CASE_HYBRID_LAYER_PATTERN}" \
             NUM_EXPERTS=128 \
             NONUNIFORM_MODE="${mode}" \
             NONUNIFORM_EP_TOPOLOGY="${topology}" \
@@ -84,19 +87,19 @@ run_case() {
             MEGATRON_NONUNIFORM_EP_OVERLAP_DEBUG=0 \
             MEGATRON_NONUNIFORM_EP_DEBUG=0 \
             DISTRIBUTED_TIMEOUT_MINUTES=3 \
-            EXIT_DURATION_IN_MINS=4 \
+            EXIT_DURATION_IN_MINS="${CASE_EXIT_DURATION_IN_MINS}" \
             USE_GLOO_PROCESS_GROUPS=1 \
             SKIP_PREFLIGHT=1 \
             bash "${RUNNER}"
     echo "[a3b-ep8-4-split-l4-ab] $(date --iso-8601=seconds) completed ${name}"
 }
 
-if [[ "${CASE_SELECTION}" == "all" || "${CASE_SELECTION}" == "healthy" ]]; then
-    run_case a3b_l4_ep8_dp2_healthy none "4 4" 4 8 0 29941
+if [[ "${CASE_SELECTION}" == "all" || "${CASE_SELECTION}" == "healthy" || "${CASE_SELECTION}" == "healthy_split" ]]; then
+    run_case "a3b_${CASE_LABEL}_ep8_dp2_healthy" none "4 4" 4 8 0 29941
 fi
 if [[ "${CASE_SELECTION}" == "all" || "${CASE_SELECTION}" == "nep" || "${CASE_SELECTION}" == "stable" ]]; then
-    run_case a3b_l4_ep8_ep4_stable ep "4 2" 3 6 0 29942
+    run_case "a3b_${CASE_LABEL}_ep8_ep4_stable" ep "4 2" 3 6 0 29942
 fi
-if [[ "${CASE_SELECTION}" == "all" || "${CASE_SELECTION}" == "nep" || "${CASE_SELECTION}" == "split" ]]; then
-    run_case a3b_l4_ep8_ep4_split ep "4 2" 3 6 1 29943
+if [[ "${CASE_SELECTION}" == "all" || "${CASE_SELECTION}" == "nep" || "${CASE_SELECTION}" == "split" || "${CASE_SELECTION}" == "healthy_split" ]]; then
+    run_case "a3b_${CASE_LABEL}_ep8_ep4_split" ep "4 2" 3 6 1 29943
 fi
