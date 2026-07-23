@@ -32,11 +32,12 @@ GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-12}"
 NUM_EXPERTS="${NUM_EXPERTS:-8}"
 NONUNIFORM_EP_TOPOLOGY="${NONUNIFORM_EP_TOPOLOGY:-8 4}"
 FORMAT_SOURCES="${FORMAT_SOURCES:-0}"
+RUN_ISORT="${RUN_ISORT:-1}"
 RUN_PREFLIGHT_TESTS="${RUN_PREFLIGHT_TESTS:-1}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
 ENABLE_PYTORCH_PROFILER="${ENABLE_PYTORCH_PROFILER:-1}"
 EXTRA_MEGATRON_ARGS="${EXTRA_MEGATRON_ARGS:-}"
-export FORMAT_SOURCES
+export FORMAT_SOURCES RUN_ISORT
 
 mapfile -t allocated_nodes < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
 if ((RUN_NNODES > ${#allocated_nodes[@]})); then
@@ -75,14 +76,16 @@ if [[ "${RUN_PREFLIGHT_TESTS}" == "1" ]]; then
 set -euo pipefail
 cd /home/darfeen/Megatron-LM
 if [[ "${FORMAT_SOURCES}" == "1" ]]; then
-    uv run isort \
-        megatron/core/transformer/moe/moe_layer.py \
-        megatron/core/transformer/moe/token_dispatcher.py \
-        megatron/core/distributed/_cuda_stream_ops.py \
-        megatron/core/distributed/nonuniform_common.py \
-        megatron/core/distributed/nonuniform_ep.py \
-        scripts/nonuniform/probe_cuda_stream_ops.py \
-        tests/unit_tests/distributed/test_nonuniform_ep.py
+    if [[ "${RUN_ISORT}" == "1" ]]; then
+        uv run isort \
+            megatron/core/transformer/moe/moe_layer.py \
+            megatron/core/transformer/moe/token_dispatcher.py \
+            megatron/core/distributed/_cuda_stream_ops.py \
+            megatron/core/distributed/nonuniform_common.py \
+            megatron/core/distributed/nonuniform_ep.py \
+            scripts/nonuniform/probe_cuda_stream_ops.py \
+            tests/unit_tests/distributed/test_nonuniform_ep.py
+    fi
     python -m black \
         megatron/core/transformer/moe/moe_layer.py \
         megatron/core/transformer/moe/token_dispatcher.py \
@@ -146,6 +149,8 @@ if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
 fi
 
 export CUDA_DEVICE_MAX_CONNECTIONS=32
+export NCCL_LAUNCH_ORDER_IMPLICIT="${NCCL_LAUNCH_ORDER_IMPLICIT:-1}"
+export TORCH_NCCL_BLOCKING_WAIT="${TORCH_NCCL_BLOCKING_WAIT:-0}"
 export NVTE_FUSED_ATTN=0
 export TORCHINDUCTOR_WORKER_START=fork
 export TRITON_CACHE_DIR=/tmp/triton_cache

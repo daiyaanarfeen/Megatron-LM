@@ -739,6 +739,11 @@ class TransformerConfig(ModelParallelConfig):
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
 
+    moe_router_force_uniform_routing: bool = False
+    """[Experimental] Force an exactly uniform, deterministic routing map for benchmarking.
+    This mode requires the number of token assignments to be divisible by the number of experts
+    and supports naive top-k routing only."""
+
     moe_router_force_biased: Optional[float] = None
     """Apply random expert bias in normal distribution with specified std
     to router logits. Shared seed across all ranks ensures identical bias.
@@ -2053,6 +2058,19 @@ class TransformerConfig(ModelParallelConfig):
                 "score functions. Please set --moe-router-score-function to 'sigmoid' or "
                 "'sqrtsoftplus', or unset --moe-router-enable-expert-bias."
             )
+
+        if self.moe_router_force_uniform_routing:
+            if self.moe_router_force_load_balancing or self.moe_router_force_biased is not None:
+                raise ValueError(
+                    "Exact-uniform routing cannot be combined with forced random or biased routing."
+                )
+            if self.moe_router_group_topk is not None:
+                raise ValueError("Exact-uniform routing supports naive top-k routing only.")
+            if self.moe_router_enable_expert_bias and self.moe_router_bias_update_rate != 0.0:
+                raise ValueError(
+                    "Exact-uniform routing requires --moe-router-bias-update-rate 0 when expert "
+                    "bias is enabled."
+                )
 
         if self.num_moe_experts and self.fp8:
             # TE version below 1.7.0 will raise Error when handle zeros tokens for expert

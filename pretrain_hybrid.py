@@ -552,6 +552,42 @@ def _get_no_op_param_scheduler_for_nonuniform_benchmark(*args, **kwargs):
     return _NonuniformBenchmarkNoOpParamScheduler()
 
 
+def _log_nonuniform_local_grad_checksum(model, iteration):
+    """Write a per-rank fingerprint for same-topology scheduler comparisons."""
+    stats = torch.zeros(5, dtype=torch.float64, device='cuda')
+    for model_chunk in model:
+        unwrapped_model = training_module.unwrap_model(model_chunk)
+        for name, param in unwrapped_model.named_parameters():
+            grad = getattr(param, 'main_grad', None)
+            if grad is None or getattr(param, 'shared', False):
+                continue
+            name_weight = 1 + sum(
+                (index + 1) * ord(character) for index, character in enumerate(name)
+            ) % 104729
+            stats[0] += grad.sum(dtype=torch.float64) * name_weight
+            stats[1] += grad.abs().sum(dtype=torch.float64) * name_weight
+            stats[2] += grad.square().sum(dtype=torch.float64) * name_weight
+            stats[3] += grad.numel() * name_weight
+            stats[4] += grad.numel()
+
+    checksum_line = (
+        "[nonuniform-local-grad-checksum] "
+        f"iteration={iteration} rank={dist.get_rank()} "
+        f"weighted_sum={stats[0].item():.17e} "
+        f"weighted_abs={stats[1].item():.17e} "
+        f"weighted_sq={stats[2].item():.17e} "
+        f"weighted_numel={stats[3].item():.0f} "
+        f"numel={stats[4].item():.0f}"
+    )
+    print(checksum_line, flush=True)
+    checksum_dir = get_args().nonuniform_grad_checksum_dir
+    if checksum_dir is not None:
+        os.makedirs(checksum_dir, exist_ok=True)
+        checksum_path = os.path.join(checksum_dir, f"rank_{dist.get_rank()}.log")
+        with open(checksum_path, 'a', encoding='utf-8') as stream:
+            stream.write(f"{checksum_line}\n")
+
+
 def _train_step_without_optimizer_step(*args, **kwargs):
     optimizer = args[3] if len(args) > 3 else kwargs.get('optimizer')
     if optimizer is None:
@@ -560,7 +596,17 @@ def _train_step_without_optimizer_step(*args, **kwargs):
     original_step = optimizer.step
     optimizer.step = _no_op_optimizer_step_for_nonuniform_benchmark
     try:
-        return _ORIGINAL_TRAIN_STEP(*args, **kwargs)
+        result = _ORIGINAL_TRAIN_STEP(*args, **kwargs)
+        benchmark_args = get_args()
+        iteration = args[7] if len(args) > 7 else kwargs.get('iteration')
+        if (
+            benchmark_args.nonuniform_log_grad_checksum
+            and iteration is not None
+            and iteration >= benchmark_args.train_iters - 1
+        ):
+            model = args[2] if len(args) > 2 else kwargs['model']
+            _log_nonuniform_local_grad_checksum(model, iteration)
+        return result
     finally:
         optimizer.step = original_step
 
@@ -636,6 +682,17 @@ def _add_nonuniform_args(parser):
             'Run forward/backward and nonuniform EP grad sync with a no-op '
             'optimizer for performance-only validation.'
         ),
+    )
+    group.add_argument(
+        '--nonuniform-log-grad-checksum',
+        action='store_true',
+        help='Log a local post-sync gradient fingerprint on every rank.',
+    )
+    group.add_argument(
+        '--nonuniform-grad-checksum-dir',
+        type=str,
+        default=None,
+        help='Also write each local gradient fingerprint to a per-rank file.',
     )
     return parser
 

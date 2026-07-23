@@ -24,10 +24,33 @@ IMAGE="${IMAGE:-nvcr.io#nvidia/nemo:26.06}"
 CONTAINER_NAME="${CONTAINER_NAME:-nep_nemo_26_06}"
 CASE_TIMEOUT="${CASE_TIMEOUT:-5m}"
 CASE_TRAIN_ITERS="${CASE_TRAIN_ITERS:-7}"
+CASE_MICRO_BATCH_SIZE="${CASE_MICRO_BATCH_SIZE:-1}"
+CASE_HEALTHY_GLOBAL_BATCH_SIZE="${CASE_HEALTHY_GLOBAL_BATCH_SIZE:-8}"
+CASE_NEP_GLOBAL_BATCH_SIZE="${CASE_NEP_GLOBAL_BATCH_SIZE:-6}"
+CASE_SPLIT_TARGET_CHUNKS="${CASE_SPLIT_TARGET_CHUNKS:-}"
+CASE_SPLIT_ASYNC_CHUNK_WINDOW="${CASE_SPLIT_ASYNC_CHUNK_WINDOW:-16}"
+CASE_NEP_EXPERT_BUCKET_GROUPS="${CASE_NEP_EXPERT_BUCKET_GROUPS:-3}"
+CASE_NEP_MAX_GATHER_BYTES="${CASE_NEP_MAX_GATHER_BYTES:-8589934592}"
+CASE_SKIP_SCATTER="${CASE_SKIP_SCATTER:-0}"
 CASE_SELECTION="${CASE_SELECTION:-all}"
 CASE_LABEL="${CASE_LABEL:-l4}"
 CASE_HYBRID_LAYER_PATTERN="${CASE_HYBRID_LAYER_PATTERN:-MEME}"
 CASE_EXIT_DURATION_IN_MINS="${CASE_EXIT_DURATION_IN_MINS:-4}"
+CASE_POST_GRAPH_PHASES="${CASE_POST_GRAPH_PHASES:-0}"
+CASE_POST_GRAPH_HOST_PHASES="${CASE_POST_GRAPH_HOST_PHASES:-0}"
+CASE_DEFER_HOST_LAUNCH="${CASE_DEFER_HOST_LAUNCH:-0}"
+CASE_DEFER_MODEL_EP_FENCE="${CASE_DEFER_MODEL_EP_FENCE:-0}"
+CASE_PIPELINE_HOST_PHASES="${CASE_PIPELINE_HOST_PHASES:-0}"
+CASE_PROFILE="${CASE_PROFILE:-1}"
+CASE_PROFILE_STEP_START="${CASE_PROFILE_STEP_START:-3}"
+CASE_PROFILE_STEP_END="${CASE_PROFILE_STEP_END:-5}"
+CASE_PROFILE_RANKS="${CASE_PROFILE_RANKS:-0 4 8}"
+CASE_PROFILE_RANKS="${CASE_PROFILE_RANKS//:/ }"
+CASE_LOG_GRAD_CHECKSUM="${CASE_LOG_GRAD_CHECKSUM:-0}"
+CASE_EXTRA_MEGATRON_ARGS="${CASE_EXTRA_MEGATRON_ARGS:-}"
+CASE_SPLIT_EXTRA_MEGATRON_ARGS="${CASE_SPLIT_EXTRA_MEGATRON_ARGS:-}"
+CASE_NEP_DEBUG="${CASE_NEP_DEBUG:-0}"
+CASE_NEP_DEBUG_RANKS="${CASE_NEP_DEBUG_RANKS:-0 4 8}"
 
 case "${CASE_SELECTION}" in
     all|nep|healthy|stable|split|healthy_split) ;;
@@ -45,6 +68,31 @@ run_case() {
     local global_batch_size="$5"
     local split_host_phases="$6"
     local master_port="$7"
+    local post_graph_phases=0
+    local post_graph_host_phases=0
+    local defer_host_launch=0
+    local defer_model_ep_fence=0
+    local pipeline_host_phases=0
+    local target_chunks=""
+    local async_chunk_window=16
+    if [[ "${split_host_phases}" == "1" ]]; then
+        post_graph_phases="${CASE_POST_GRAPH_PHASES}"
+        post_graph_host_phases="${CASE_POST_GRAPH_HOST_PHASES}"
+        defer_host_launch="${CASE_DEFER_HOST_LAUNCH}"
+        defer_model_ep_fence="${CASE_DEFER_MODEL_EP_FENCE}"
+        pipeline_host_phases="${CASE_PIPELINE_HOST_PHASES}"
+        target_chunks="${CASE_SPLIT_TARGET_CHUNKS}"
+        async_chunk_window="${CASE_SPLIT_ASYNC_CHUNK_WINDOW}"
+    fi
+    local extra_megatron_args="${CASE_EXTRA_MEGATRON_ARGS}"
+    if [[ "${split_host_phases}" == "1" ]]; then
+        extra_megatron_args+=" ${CASE_SPLIT_EXTRA_MEGATRON_ARGS}"
+    fi
+    if [[ "${CASE_LOG_GRAD_CHECKSUM}" == "1" ]]; then
+        local checksum_dir="${ROOT_DIR}/${name}/${SLURM_JOB_ID}/checksums"
+        extra_megatron_args+=" --nonuniform-log-grad-checksum"
+        extra_megatron_args+=" --nonuniform-grad-checksum-dir ${checksum_dir}"
+    fi
 
     echo "[a3b-ep8-4-split-l4-ab] $(date --iso-8601=seconds) starting ${name}"
     timeout --foreground --signal=TERM --kill-after=45s "${CASE_TIMEOUT}" \
@@ -65,27 +113,38 @@ run_case() {
             TENSOR_MODEL_PARALLEL_SIZE=2 \
             EXPERT_MODEL_PARALLEL_SIZE=8 \
             EXPERT_TENSOR_PARALLEL_SIZE=1 \
-            MICRO_BATCH_SIZE=1 \
+            MICRO_BATCH_SIZE="${CASE_MICRO_BATCH_SIZE}" \
             GLOBAL_BATCH_SIZE="${global_batch_size}" \
             DDP_NUM_BUCKETS=16 \
             CUDA_GRAPH_IMPL=local \
-            PROFILE=1 \
-            PROFILE_STEP_START=3 \
-            PROFILE_STEP_END=5 \
-            PROFILE_RANKS="0 4 8" \
+            PROFILE="${CASE_PROFILE}" \
+            PROFILE_STEP_START="${CASE_PROFILE_STEP_START}" \
+            PROFILE_STEP_END="${CASE_PROFILE_STEP_END}" \
+            PROFILE_RANKS="${CASE_PROFILE_RANKS}" \
+            EXTRA_MEGATRON_ARGS="${extra_megatron_args}" \
             HIGH_PRIORITY_STREAM_GROUPS=ep \
             CUDA_DEVICE_MAX_CONNECTIONS=32 \
             NCCL_LAUNCH_ORDER_IMPLICIT=1 \
+            TORCH_NCCL_BLOCKING_WAIT=0 \
             NCCL_DEBUG=WARN \
             MEGATRON_NONUNIFORM_EP_ZERO_SM_RESHARD=0 \
             MEGATRON_NONUNIFORM_EP_EDP_READY_GATE=0 \
             MEGATRON_NONUNIFORM_EP_HOST_EDP_READY_GATE=0 \
             MEGATRON_NONUNIFORM_EP_SAME_COMM_READY=0 \
-            MEGATRON_NONUNIFORM_EP_DEFER_HOST_LAUNCH=0 \
+            MEGATRON_NONUNIFORM_EP_DEFER_HOST_LAUNCH="${defer_host_launch}" \
+            MEGATRON_NONUNIFORM_EP_DEFER_MODEL_EP_FENCE="${defer_model_ep_fence}" \
+            MEGATRON_NONUNIFORM_EP_PIPELINE_HOST_PHASES="${pipeline_host_phases}" \
             MEGATRON_NONUNIFORM_EP_SPLIT_HOST_PHASES="${split_host_phases}" \
-            MEGATRON_NONUNIFORM_EP_NCCL_ASYNC_CHUNK_WINDOW=16 \
+            MEGATRON_NONUNIFORM_EP_POST_GRAPH_PHASES="${post_graph_phases}" \
+            MEGATRON_NONUNIFORM_EP_POST_GRAPH_HOST_PHASES="${post_graph_host_phases}" \
+            MEGATRON_NONUNIFORM_EP_NCCL_TARGET_CHUNKS="${target_chunks}" \
+            MEGATRON_NONUNIFORM_EP_NCCL_ASYNC_CHUNK_WINDOW="${async_chunk_window}" \
+            MEGATRON_NONUNIFORM_EP_NCCL_EXPERT_BUCKET_GROUPS="${CASE_NEP_EXPERT_BUCKET_GROUPS}" \
+            MEGATRON_NONUNIFORM_EP_NCCL_MAX_GATHER_BYTES="${CASE_NEP_MAX_GATHER_BYTES}" \
+            MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_SCATTER="${CASE_SKIP_SCATTER}" \
             MEGATRON_NONUNIFORM_EP_OVERLAP_DEBUG=0 \
-            MEGATRON_NONUNIFORM_EP_DEBUG=0 \
+            MEGATRON_NONUNIFORM_EP_DEBUG="${CASE_NEP_DEBUG}" \
+            MEGATRON_NONUNIFORM_EP_DEBUG_RANKS="${CASE_NEP_DEBUG_RANKS}" \
             DISTRIBUTED_TIMEOUT_MINUTES=3 \
             EXIT_DURATION_IN_MINS="${CASE_EXIT_DURATION_IN_MINS}" \
             USE_GLOO_PROCESS_GROUPS=1 \
@@ -95,11 +154,11 @@ run_case() {
 }
 
 if [[ "${CASE_SELECTION}" == "all" || "${CASE_SELECTION}" == "healthy" || "${CASE_SELECTION}" == "healthy_split" ]]; then
-    run_case "a3b_${CASE_LABEL}_ep8_dp2_healthy" none "4 4" 4 8 0 29941
+    run_case "a3b_${CASE_LABEL}_ep8_dp2_healthy" none "4 4" 4 "${CASE_HEALTHY_GLOBAL_BATCH_SIZE}" 0 29941
 fi
 if [[ "${CASE_SELECTION}" == "all" || "${CASE_SELECTION}" == "nep" || "${CASE_SELECTION}" == "stable" ]]; then
-    run_case "a3b_${CASE_LABEL}_ep8_ep4_stable" ep "4 2" 3 6 0 29942
+    run_case "a3b_${CASE_LABEL}_ep8_ep4_stable" ep "4 2" 3 "${CASE_NEP_GLOBAL_BATCH_SIZE}" 0 29942
 fi
 if [[ "${CASE_SELECTION}" == "all" || "${CASE_SELECTION}" == "nep" || "${CASE_SELECTION}" == "split" || "${CASE_SELECTION}" == "healthy_split" ]]; then
-    run_case "a3b_${CASE_LABEL}_ep8_ep4_split" ep "4 2" 3 6 1 29943
+    run_case "a3b_${CASE_LABEL}_ep8_ep4_split" ep "4 2" 3 "${CASE_NEP_GLOBAL_BATCH_SIZE}" 1 29943
 fi

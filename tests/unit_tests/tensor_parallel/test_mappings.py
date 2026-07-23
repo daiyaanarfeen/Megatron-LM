@@ -197,3 +197,62 @@ def test_ReduceScatterToSequenceParallelRegion():
         expected_output = expected_output + 4
     assert torch.equal(output_data[0], expected_output)
     Utils.destroy_model_parallel()
+
+
+def test_all_to_all_burst_callbacks_bracket_forward_and_backward(monkeypatch):
+    events = []
+
+    class FakeGroup:
+        @staticmethod
+        def size():
+            return 2
+
+    class FakeScheduler:
+        def __init__(self):
+            self.depth = 0
+
+        def model_ep_a2a_burst_begin(self):
+            assert self.depth == 0
+            self.depth = 1
+            events.append('begin')
+
+        def model_ep_a2a_burst_end(self):
+            assert self.depth == 1
+            self.depth = 0
+            events.append('end')
+
+    def fake_all_to_all_single(output, input_, **kwargs):
+        events.append('all_to_all')
+        output.copy_(input_)
+
+    monkeypatch.setattr(torch.distributed, 'all_to_all_single', fake_all_to_all_single)
+
+    group = FakeGroup()
+    scheduler = FakeScheduler()
+    input_ = torch.arange(4.0, requires_grad=True)
+    dispatch_tokens = mappings.all_to_all(
+        group,
+        input_,
+        a2a_burst_scheduler=scheduler,
+        a2a_burst_role=(True, False, False, True),
+    )
+    dispatch_probs = mappings.all_to_all(
+        group,
+        dispatch_tokens,
+        a2a_burst_scheduler=scheduler,
+        a2a_burst_role=(False, True, True, False),
+    )
+
+    dispatch_probs.sum().backward()
+
+    assert scheduler.depth == 0
+    assert events == [
+        'begin',
+        'all_to_all',
+        'all_to_all',
+        'end',
+        'begin',
+        'all_to_all',
+        'all_to_all',
+        'end',
+    ]

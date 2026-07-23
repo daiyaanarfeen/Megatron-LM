@@ -1,0 +1,5 @@
+nep_owner_gather:
+  max_ctas: 16
+  min_ctas: 1
+nep_owner_transfer:
+  cga_cluster_size: 1

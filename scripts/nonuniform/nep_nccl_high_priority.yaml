@@ -1,0 +1,4 @@
+nep_owner_transfer:
+  is_high_priority_stream: true
+ep_dp:
+  is_high_priority_stream: true

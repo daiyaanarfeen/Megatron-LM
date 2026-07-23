@@ -12,6 +12,7 @@ from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
     ProcessGroupCollection,
     apply_biased_logits,
+    apply_exact_uniform_routing_logits,
     apply_random_logits,
     apply_router_token_dropping,
     compute_routing_scores_for_aux_loss,
@@ -698,6 +699,9 @@ class TopKRouter(Router):
         if self.config.moe_router_force_load_balancing:
             # Apply force load balancing with random logits for benchmark
             logits = apply_random_logits(logits)
+
+        if self.config.moe_router_force_uniform_routing:
+            logits = apply_exact_uniform_routing_logits(logits, self.topk)
 
         if self.config.moe_router_force_biased is not None:
             # Apply biased logits with shared random bias across all ranks

@@ -1,0 +1,6 @@
+nep_owner_gather:
+  max_ctas: 16
+  min_ctas: 1
+ep_dp:
+  max_ctas: 16
+  min_ctas: 1

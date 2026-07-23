@@ -42,8 +42,15 @@ def parse_iters(path: Path) -> list[dict[str, float]]:
     return rows
 
 
-def summarize_iters(rows: list[dict[str, float]], active_gpus: int) -> dict[str, float]:
-    selected = [row for row in rows if row["iter"] >= 13]
+def summarize_iters(
+    rows: list[dict[str, float]], active_gpus: int, iter_start: int = 13
+) -> dict[str, float]:
+    selected = [row for row in rows if row["iter"] >= iter_start]
+    if not selected:
+        raise ValueError(
+            f"No iterations at or after {iter_start}; available iterations are "
+            f"{[row['iter'] for row in rows]}"
+        )
     avg_ms = sum(row["ms"] for row in selected) / len(selected)
     avg_tflops = sum(row["tflops"] for row in selected) / len(selected)
     gbs = selected[-1]["gbs"]
@@ -202,6 +209,7 @@ def main() -> None:
     parser.add_argument("--nep-log", type=Path, required=True)
     parser.add_argument("--healthy-active-gpus", type=int, default=8)
     parser.add_argument("--nep-active-gpus", type=int, default=6)
+    parser.add_argument("--iter-start", type=int, default=13)
     parser.add_argument("--trace", type=Path, action="append", default=[])
     parser.add_argument("--brief", action="store_true")
     args = parser.parse_args()
@@ -211,7 +219,7 @@ def main() -> None:
         ("nep", args.nep_log, args.nep_active_gpus),
     ):
         rows = parse_iters(path)
-        print(label, summarize_iters(rows, gpus))
+        print(label, summarize_iters(rows, gpus, args.iter_start))
         print(label + "_debug", summarize_debug(path))
 
     for trace in args.trace:

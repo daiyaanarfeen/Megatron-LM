@@ -8,7 +8,11 @@ import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.moe.moe_utils import get_updated_expert_bias, router_gating_linear
+from megatron.core.transformer.moe.moe_utils import (
+    apply_exact_uniform_routing_logits,
+    get_updated_expert_bias,
+    router_gating_linear,
+)
 from megatron.core.transformer.moe.router import Router
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -24,6 +28,76 @@ try:
     HAVE_ROUTER_FUSION = _fused_topk_with_score_function is not None
 except Exception:  # pragma: no cover - defensive
     HAVE_ROUTER_FUSION = False
+
+
+@pytest.mark.internal
+def test_exact_uniform_routing_logits():
+    num_tokens = 4096
+    topk = 6
+    num_experts = 128
+    ep_size = 8
+    tp_size = 2
+    logits = torch.randn(num_tokens, num_experts, requires_grad=True)
+
+    uniform_logits = apply_exact_uniform_routing_logits(logits, topk)
+    selected_experts = uniform_logits.topk(topk, dim=1).indices
+    routing_map = torch.zeros_like(uniform_logits, dtype=torch.bool)
+    routing_map.scatter_(1, selected_experts, True)
+
+    expected_per_source_expert = num_tokens * topk // num_experts
+    source_expert_counts = routing_map.sum(dim=0)
+    torch.testing.assert_close(
+        source_expert_counts,
+        torch.full_like(source_expert_counts, expected_per_source_expert),
+    )
+    torch.testing.assert_close(
+        routing_map.sum(dim=1), torch.full((num_tokens,), topk, dtype=torch.long)
+    )
+
+    num_local_experts = num_experts // ep_size
+    expected_peer_split = num_tokens * topk // ep_size
+    peer_splits = source_expert_counts.view(ep_size, num_local_experts).sum(dim=1)
+    torch.testing.assert_close(
+        peer_splits, torch.full_like(peer_splits, expected_peer_split)
+    )
+
+    # TP2/EP8 gathers counts from all 16 TPxEP source ranks before grouped GEMM.
+    local_expert_m_splits = source_expert_counts[:num_local_experts] * tp_size * ep_size
+    torch.testing.assert_close(
+        local_expert_m_splits,
+        torch.full_like(local_expert_m_splits, expected_per_source_expert * tp_size * ep_size),
+    )
+
+    uniform_logits.sum().backward()
+    torch.testing.assert_close(logits.grad, torch.ones_like(logits))
+
+
+@pytest.mark.internal
+def test_exact_uniform_routing_requires_divisible_assignments():
+    logits = torch.empty(10, 6)
+    with pytest.raises(ValueError, match=r"num_tokens \* topk to be divisible"):
+        apply_exact_uniform_routing_logits(logits, 2)
+
+
+@pytest.mark.internal
+def test_exact_uniform_routing_config_contract():
+    base = dict(num_layers=1, hidden_size=16, num_attention_heads=4)
+    assert not TransformerConfig(**base).moe_router_force_uniform_routing
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        TransformerConfig(
+            **base,
+            moe_router_force_uniform_routing=True,
+            moe_router_force_load_balancing=True,
+        )
+
+    with pytest.raises(ValueError, match="bias-update-rate 0"):
+        TransformerConfig(
+            **base,
+            moe_router_force_uniform_routing=True,
+            moe_router_enable_expert_bias=True,
+            moe_router_score_function="sigmoid",
+        )
 
 
 class TestTop2Router:
@@ -237,6 +311,35 @@ class TestTop2Router:
         assert self.router.weight.grad.norm() > 0
 
         self.router.config.moe_router_force_load_balancing = False
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_force_uniform_routing(self):
+        hidden_states = torch.randn(
+            (32, 2, self.router.config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        hidden_states.requires_grad = True
+        self.router.config.moe_router_force_uniform_routing = True
+
+        scores, routing_map = self.router(hidden_states)
+
+        torch.testing.assert_close(
+            routing_map.sum(dim=1),
+            torch.full((64,), self.router.topk, device="cuda", dtype=torch.long),
+        )
+        torch.testing.assert_close(
+            routing_map.sum(dim=0),
+            torch.full((4,), 32, device="cuda", dtype=torch.long),
+        )
+
+        expert_weights = torch.arange(
+            self.router.num_experts, device="cuda", dtype=scores.dtype
+        )
+        (scores * expert_weights).sum().backward()
+        assert hidden_states.grad is not None
+        assert self.router.weight.grad.norm() > 0
+
+        self.router.config.moe_router_force_uniform_routing = False
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

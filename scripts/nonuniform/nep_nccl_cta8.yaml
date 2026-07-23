@@ -1,0 +1,6 @@
+nep_owner_transfer:
+  min_ctas: 1
+  max_ctas: 8
+ep_dp:
+  min_ctas: 1
+  max_ctas: 8

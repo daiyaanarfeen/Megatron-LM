@@ -49,6 +49,10 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 logger = logging.getLogger(__name__)
 
+_A2A_BURST_DISPATCH_TOKENS = (True, False, False, True)
+_A2A_BURST_DISPATCH_PROBS = (False, True, True, False)
+_A2A_BURST_COMBINE = (True, True, True, True)
+
 
 class MoETokenDispatcher:
     """
@@ -69,6 +73,7 @@ class MoETokenDispatcher:
         self.shared_experts: Optional[SharedExpertMLP] = None
         # Whether to use NCCL stream for A2A communication, otherwise default stream is used.
         self.use_nccl_stream = False  # Will be set to True when shared_experts is set.
+        self._model_ep_a2a_burst_scheduler = None
 
         self.ep_group = pg_collection.ep
         # use pg_collection.expt_tp_group as tensor parallel group in this module.
@@ -84,6 +89,10 @@ class MoETokenDispatcher:
         # as cudagraph outputs when the cuda_graph_modules contains moe_preprocess.
         self.cudagraph_attrs = []
         self.valid_cudagraph_attrs = None
+
+    def set_model_ep_a2a_burst_scheduler(self, scheduler) -> None:
+        """Attach an optional scheduler around native model-EP A2A bursts."""
+        self._model_ep_a2a_burst_scheduler = scheduler
 
     @abstractmethod
     def dispatch_preprocess(
@@ -713,6 +722,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.output_splits,
             self.input_splits,
             use_nccl_stream=self.use_nccl_stream,
+            a2a_burst_scheduler=self._model_ep_a2a_burst_scheduler,
+            a2a_burst_role=(
+                _A2A_BURST_DISPATCH_TOKENS
+                if self._model_ep_a2a_burst_scheduler is not None
+                else None
+            ),
         )
         # Move the shared experts fc1 right after the tokens A2A, to prevent the probs A2A
         # block the launch of fc1 GEMM when CUDA_DEVICE_MAX_CONNECTIONS=1.
@@ -726,6 +741,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.output_splits,
             self.input_splits,
             use_nccl_stream=self.use_nccl_stream,
+            a2a_burst_scheduler=self._model_ep_a2a_burst_scheduler,
+            a2a_burst_role=(
+                _A2A_BURST_DISPATCH_PROBS
+                if self._model_ep_a2a_burst_scheduler is not None
+                else None
+            ),
         )
 
         return global_input_tokens, global_probs
@@ -872,6 +893,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.input_splits,
             self.output_splits,
             use_nccl_stream=self.use_nccl_stream,
+            a2a_burst_scheduler=self._model_ep_a2a_burst_scheduler,
+            a2a_burst_role=(
+                _A2A_BURST_COMBINE
+                if self._model_ep_a2a_burst_scheduler is not None
+                else None
+            ),
         )
         if self.shared_experts is not None:
             self.shared_experts.linear_fc2_forward(permutated_local_input_tokens)
