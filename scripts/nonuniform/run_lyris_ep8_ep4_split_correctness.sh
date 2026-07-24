@@ -36,6 +36,8 @@ CASE_LABEL="${CASE_LABEL:-ep8_ep4}"
 CASE_DISPLAY="${CASE_DISPLAY:-ep8-4}"
 CASE_RUN_NNODES="${CASE_RUN_NNODES:-3}"
 CASE_RUN_NPROC_PER_NODE="${CASE_RUN_NPROC_PER_NODE:-4}"
+CASE_RUN_WORLD_SIZE="${CASE_RUN_WORLD_SIZE:-$((CASE_RUN_NNODES * CASE_RUN_NPROC_PER_NODE))}"
+CASE_USE_DIRECT_SRUN_RANKS="${CASE_USE_DIRECT_SRUN_RANKS:-0}"
 CASE_GLOBAL_BATCH_SIZE="${CASE_GLOBAL_BATCH_SIZE:-24}"
 CASE_SEQ_LENGTH="${CASE_SEQ_LENGTH:-128}"
 CASE_NUM_EXPERTS="${CASE_NUM_EXPERTS:-8}"
@@ -67,7 +69,7 @@ srun --nodes=1 --ntasks=1 --mpi=none "${container_args[@]}" bash -lc "
     python -m black --required-version 26 --check megatron/core/distributed/nonuniform_ep.py tests/unit_tests/distributed/test_nonuniform_ep.py &&
     python -m isort --check-only megatron/core/distributed/nonuniform_ep.py tests/unit_tests/distributed/test_nonuniform_ep.py &&
     python -m py_compile megatron/core/distributed/nonuniform_ep.py tests/unit_tests/distributed/test_nonuniform_ep.py &&
-    python -m pytest -q tests/unit_tests/distributed/test_nonuniform_ep.py tests/unit_tests/tensor_parallel/test_mappings.py -k 'scatter_chunk or scatter_work_defers or split_host_phases_defer_edp_and_scatter or pipelined_host_phases or a2a_scatter_scheduler_coalesces or model_ep_a2a_burst_end or scatter_progress or all_to_all_burst_callbacks'
+    python -m pytest -q tests/unit_tests/distributed/test_nonuniform_ep.py tests/unit_tests/tensor_parallel/test_mappings.py -k 'scatter_chunk or scatter_queue or scatter_work_defers or ready_gate or split_host_phases_defer_edp_and_scatter or pipelined_host_phases or a2a_scatter_scheduler_preserves or model_ep_a2a_burst or scatter_progress or scatter_submission or all_to_all_burst_callbacks'
 "
 
 if [[ "${PREFLIGHT_ONLY:-0}" == "1" ]]; then
@@ -99,6 +101,8 @@ run_case() {
             MASTER_PORT="${master_port}" \
             RUN_NNODES="${CASE_RUN_NNODES}" \
             RUN_NPROC_PER_NODE="${CASE_RUN_NPROC_PER_NODE}" \
+            RUN_WORLD_SIZE="${CASE_RUN_WORLD_SIZE}" \
+            USE_DIRECT_SRUN_RANKS="${CASE_USE_DIRECT_SRUN_RANKS}" \
             RUN_PREFLIGHT_TESTS=0 \
             ENABLE_PYTORCH_PROFILER=0 \
             TRAIN_ITERS=2 \

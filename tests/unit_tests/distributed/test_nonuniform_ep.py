@@ -22,6 +22,7 @@ from megatron.core.distributed.nonuniform_ep import (
     NonuniformEPDistributedDataParallel,
     NonuniformEPNCCLParamAndGradBucketGroup,
     _build_nep_nccl_scatter_chunk_ranges,
+    _configure_nep_edp_ready_gate,
     _ExpertBucketSpec,
     _get_nep_nccl_scatter_chunks,
     _group_expert_bucket_specs_in_backward_order,
@@ -802,13 +803,13 @@ def test_nep_nccl_edp_ready_gate_uses_host_signaled_stream_wait(monkeypatch):
     bucket_group._drain_nep_edp_ready_futures()
 
     assert calls == [
+        ("stream_wait", 11, flag.data_ptr(), 1),
         "submit",
         ("device", 7),
         "device_ready",
         ("barrier", ready_group, True),
         "host_wait",
         ("stream_write", 22, flag.data_ptr(), 1),
-        ("stream_wait", 11, flag.data_ptr(), 1),
         "future_result",
     ]
     assert bucket_group._nep_nccl_scheduler_state["edp_ready_generations"] == {0: 1}
@@ -839,6 +840,63 @@ def test_nep_edp_ready_future_drain_is_bucket_local():
     assert calls == ["first"]
     assert first_group._nep_edp_ready_futures == []
     assert len(second_group._nep_edp_ready_futures) == 1
+
+
+def test_nep_scatter_scheduler_ready_gate_skips_unmatched_edp_barrier(monkeypatch):
+    edp_group = SimpleNamespace(size=lambda: 2)
+    scatter_ready_group = object()
+    state = {}
+    bucket_group = SimpleNamespace(
+        _nep_nccl_scheduler_state=state,
+        _nep_runtime_config={
+            "edp_ready_gate_enabled": False,
+            "is_edp_eligible": True,
+            "edp_group_gloo": edp_group,
+            "nep_owner_scatter_ready_groups_gloo": {0: scatter_ready_group},
+        },
+    )
+    barriers = []
+
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_A2A_SCATTER_SCHEDULER", "1")
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_ASYNC_CHUNK_WINDOW", "1")
+    monkeypatch.setattr(torch, "zeros", lambda *args, **kwargs: torch.empty(1, dtype=torch.int32))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda device: object())
+    monkeypatch.setattr(torch.distributed, "barrier", lambda group: barriers.append(group))
+    monkeypatch.setattr(
+        "megatron.core.distributed.nonuniform_ep.get_cuda_stream_memory_ops", lambda: object()
+    )
+
+    _configure_nep_edp_ready_gate([bucket_group])
+
+    assert barriers == [scatter_ready_group]
+    assert set(state["edp_ready_flags"]) == {0}
+
+
+def test_nep_scatter_descriptor_ready_gate_uses_dedicated_group():
+    bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
+        NonuniformEPNCCLParamAndGradBucketGroup
+    )
+    phase_group = object()
+    scatter_launch_group = object()
+    scatter_ready_group = object()
+    calls = []
+    bucket_group._nep_runtime_config = {
+        "nep_owner_transfer_groups_gloo": {3: phase_group},
+        "nep_owner_scatter_launch_groups_gloo": {3: scatter_launch_group},
+        "nep_owner_scatter_ready_groups_gloo": {3: scatter_ready_group},
+    }
+    bucket_group._prepare_nep_nccl_stream_ready_gate = (
+        lambda slot, group, name: calls.append((slot, group, name)) or "gate"
+    )
+
+    gate = bucket_group._prepare_nep_nccl_scatter_descriptor_ready_gate(
+        {"kind": "all_to_all", "owner_ep_rank": 3, "chunk_index": 2}, 7
+    )
+
+    assert gate == "gate"
+    assert calls == [(7, scatter_ready_group, "scatter_descriptor_owner_3_chunk_2")]
 
 
 def test_nep_nccl_owner_task_orders_scatter_and_defers_native_finish():
@@ -1879,7 +1937,8 @@ def test_nep_split_host_phases_defer_edp_and_scatter(monkeypatch):
             calls.append(("wait_barrier", self.label))
 
     nccl_stream = FakeStream()
-    source_group = object()
+    gather_group = object()
+    scatter_group = object()
     edp_group = SimpleNamespace(size=lambda: 2)
     task = {
         "group": bucket_group,
@@ -1898,7 +1957,8 @@ def test_nep_split_host_phases_defer_edp_and_scatter(monkeypatch):
         "zero_sm_reshard": False,
         "edp_ready_gate_enabled": False,
         "edp_group_gloo": edp_group,
-        "nep_owner_transfer_groups_gloo": {0: source_group},
+        "nep_owner_transfer_groups_gloo": {0: gather_group},
+        "nep_owner_scatter_launch_groups_gloo": {0: scatter_group},
     }
     bucket_group._nep_nccl_owner_task_ready = lambda owner: True
     bucket_group._nep_nccl_owner_transfer_ranks = lambda owner: [0, 4]
@@ -1927,12 +1987,17 @@ def test_nep_split_host_phases_defer_edp_and_scatter(monkeypatch):
         ("scatter", context["owner_ep_rank"])
     )
 
-    barrier_counts = {id(source_group): 0, id(edp_group): 0}
+    barrier_counts = {id(gather_group): 0, id(scatter_group): 0, id(edp_group): 0}
 
     def fake_barrier(group, async_op=False):
         assert async_op
         barrier_counts[id(group)] += 1
-        label = "source" if group is source_group else "edp"
+        if group is gather_group:
+            label = "gather"
+        elif group is scatter_group:
+            label = "scatter"
+        else:
+            label = "edp"
         label = f"{label}_{barrier_counts[id(group)]}"
         calls.append(("submit_barrier", label))
         return FakeWork(label)
@@ -1952,7 +2017,7 @@ def test_nep_split_host_phases_defer_edp_and_scatter(monkeypatch):
         ("prepare", 0),
         ("gather", 0),
         ("record_event", nccl_stream),
-        ("submit_barrier", "source_1"),
+        ("submit_barrier", "gather_1"),
     ]
     assert len(pending) == 1
 
@@ -1961,12 +2026,12 @@ def test_nep_split_host_phases_defer_edp_and_scatter(monkeypatch):
     )
 
     assert calls[5:] == [
-        ("wait_barrier", "source_1"),
+        ("wait_barrier", "gather_1"),
         ("submit_barrier", "edp_1"),
         ("wait_barrier", "edp_1"),
         ("edp_batch", False),
-        ("submit_barrier", "source_2"),
-        ("wait_barrier", "source_2"),
+        ("submit_barrier", "scatter_1"),
+        ("wait_barrier", "scatter_1"),
     ]
     assert pending[0]["phase"] == "scatter_ready"
 
@@ -1994,7 +2059,7 @@ def test_nep_split_host_phases_skip_scatter_rendezvous(monkeypatch):
             "batch_index": 0,
             "contexts": [context],
             "dispatch_stream": object(),
-            "local_transfer_contexts": {0: (context, object())},
+            "local_transfer_contexts": {0: (context, object(), object())},
             "phase": "edp_launched",
         }
     ]
@@ -2051,7 +2116,8 @@ def test_nep_pipelined_host_phases_order_each_context_before_next_gather(monkeyp
             calls.append(("wait_barrier", self.label))
 
     nccl_stream = FakeStream()
-    source_group = object()
+    gather_group = object()
+    scatter_group = object()
     edp_group = SimpleNamespace(size=lambda: 2)
     tasks = [
         {
@@ -2073,7 +2139,8 @@ def test_nep_pipelined_host_phases_order_each_context_before_next_gather(monkeyp
         "zero_sm_reshard": False,
         "edp_ready_gate_enabled": False,
         "edp_group_gloo": edp_group,
-        "nep_owner_transfer_groups_gloo": {0: source_group},
+        "nep_owner_transfer_groups_gloo": {0: gather_group},
+        "nep_owner_scatter_launch_groups_gloo": {0: scatter_group},
     }
     bucket_group._nep_nccl_owner_task_ready = lambda owner: True
     bucket_group._nep_nccl_owner_transfer_ranks = lambda owner: [0, 4]
@@ -2104,12 +2171,17 @@ def test_nep_pipelined_host_phases_order_each_context_before_next_gather(monkeyp
         ("scatter", context["chunk_index"])
     )
 
-    barrier_counts = {id(source_group): 0, id(edp_group): 0}
+    barrier_counts = {id(gather_group): 0, id(scatter_group): 0, id(edp_group): 0}
 
     def fake_barrier(group, async_op=False):
         assert async_op
         barrier_counts[id(group)] += 1
-        label = "source" if group is source_group else "edp"
+        if group is gather_group:
+            label = "gather"
+        elif group is scatter_group:
+            label = "scatter"
+        else:
+            label = "edp"
         label = f"{label}_{barrier_counts[id(group)]}"
         calls.append(("submit_barrier", label))
         return FakeWork(label)
@@ -2130,7 +2202,7 @@ def test_nep_pipelined_host_phases_order_each_context_before_next_gather(monkeyp
         ("prepare", 0),
         ("gather", 0),
         ("record_event", 0, nccl_stream),
-        ("submit_barrier", "source_1"),
+        ("submit_barrier", "gather_1"),
     ]
     assert len(pending) == 1
     assert len(pending[0]["remaining_task_batches"]) == 1
@@ -2138,23 +2210,23 @@ def test_nep_pipelined_host_phases_order_each_context_before_next_gather(monkeyp
     assert bucket_group._finish_nep_nccl_process_group_dispatch_batches(pending)
 
     assert calls[5:] == [
-        ("wait_barrier", "source_1"),
+        ("wait_barrier", "gather_1"),
         ("submit_barrier", "edp_1"),
         ("wait_barrier", "edp_1"),
         ("edp_batch", [0], False),
-        ("submit_barrier", "source_2"),
-        ("wait_barrier", "source_2"),
+        ("submit_barrier", "scatter_1"),
+        ("wait_barrier", "scatter_1"),
         ("scatter", 0),
         ("prepare", 1),
         ("gather", 1),
         ("record_event", 1, nccl_stream),
-        ("submit_barrier", "source_3"),
-        ("wait_barrier", "source_3"),
+        ("submit_barrier", "gather_2"),
+        ("wait_barrier", "gather_2"),
         ("submit_barrier", "edp_2"),
         ("wait_barrier", "edp_2"),
         ("edp_batch", [1], False),
-        ("submit_barrier", "source_4"),
-        ("wait_barrier", "source_4"),
+        ("submit_barrier", "scatter_2"),
+        ("wait_barrier", "scatter_2"),
         ("scatter", 1),
     ]
     assert pending[0]["phase"] == "finished"
@@ -2210,7 +2282,7 @@ def test_nep_pipelined_host_phases_group_disjoint_owner_transfers(monkeypatch):
     ] == [[2, 3]]
 
 
-def test_nep_a2a_scatter_scheduler_coalesces_ordered_owner_waves(monkeypatch):
+def test_nep_a2a_scatter_scheduler_preserves_ordered_owner_waves(monkeypatch):
     bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
         NonuniformEPNCCLParamAndGradBucketGroup
     )
@@ -2254,8 +2326,11 @@ def test_nep_a2a_scatter_scheduler_coalesces_ordered_owner_waves(monkeypatch):
         split_host_phases=True,
     )
 
-    assert launched_batches == [[0, 1, 2, 3]]
-    assert len(pending) == 1
+    assert launched_batches == [[0, 1]]
+    assert [
+        [task["owner_ep_rank"] for task in task_batch]
+        for _, task_batch in pending[0]["remaining_task_batches"]
+    ] == [[2, 3]]
 
 
 def test_nep_post_graph_phases_device_align_gather_edp_and_scatter(monkeypatch):
@@ -2292,6 +2367,7 @@ def test_nep_post_graph_phases_device_align_gather_edp_and_scatter(monkeypatch):
 
     dispatch_stream = object()
     source_group = object()
+    scatter_group = object()
     edp_group = object()
     context = {"group": bucket_group, "owner_ep_rank": 0}
     gather_done_event = FakeEvent()
@@ -2300,7 +2376,7 @@ def test_nep_post_graph_phases_device_align_gather_edp_and_scatter(monkeypatch):
             "batch_index": 0,
             "contexts": [context],
             "dispatch_stream": dispatch_stream,
-            "local_transfer_contexts": {0: (context, source_group)},
+            "local_transfer_contexts": {0: (context, source_group, scatter_group)},
             "local_edp_contexts": {0: (context, edp_group)},
             "gather_barrier_works": [(0, FakeWork("gather"))],
             "gather_done_event": gather_done_event,
@@ -2316,6 +2392,8 @@ def test_nep_post_graph_phases_device_align_gather_edp_and_scatter(monkeypatch):
     def fake_barrier(group, async_op=False):
         assert async_op
         label = "edp" if group is edp_group else "scatter"
+        if label == "scatter":
+            assert group is scatter_group
         calls.append(("submit_barrier", label))
         return FakeWork(label)
 
@@ -2587,7 +2665,7 @@ def test_process_group_dispatch_can_defer_model_ep_fences_until_final_drain(monk
     assert ddp._nep_dispatch_waiting_groups is None
 
 
-def test_model_ep_a2a_burst_end_device_orders_scatter_after_gpu_completion(monkeypatch):
+def test_model_ep_a2a_burst_hooks_submit_before_next_burst_and_queue_after_completion(monkeypatch):
     ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
     calls = []
     events = []
@@ -2610,11 +2688,7 @@ def test_model_ep_a2a_burst_end_device_orders_scatter_after_gpu_completion(monke
 
     ddp._finish_pending_nep_dispatch_host_phases = finish_pending
     ddp._wait_for_nep_dispatch_launch = lambda final=False: calls.append(("wait", final))
-    ddp._submit_nep_scatter_chunk = (
-        lambda after_event=None, force=False, queue_behind_inflight=False: (
-            calls.append(("submit_scatter", after_event, force, queue_behind_inflight)) or True
-        )
-    )
+    ddp._submit_model_ep_aligned_nep_scatter_chunk = lambda: calls.append("submit_aligned") or True
     monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_A2A_SCATTER_SCHEDULER", "1")
     monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: compute_stream)
@@ -2622,7 +2696,7 @@ def test_model_ep_a2a_burst_end_device_orders_scatter_after_gpu_completion(monke
     ddp.model_ep_a2a_burst_begin()
 
     assert ddp._nep_model_ep_a2a_burst_depth == 1
-    assert calls == []
+    assert calls == ["submit_aligned"]
 
     ddp.model_ep_a2a_burst_end()
 
@@ -2630,11 +2704,72 @@ def test_model_ep_a2a_burst_end_device_orders_scatter_after_gpu_completion(monke
     assert ddp._nep_model_ep_a2a_burst_depth == 0
     assert ddp._nep_model_ep_a2a_burst_count == 1
     assert calls == [
+        "submit_aligned",
         ("record_a2a_completion", compute_stream),
         ("finish", False, completion_event),
         ("wait", False),
-        ("submit_scatter", completion_event, False, True),
     ]
+
+
+def test_nep_scatter_queue_preserves_owner_batch_boundaries(monkeypatch):
+    ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
+    calls = []
+    events = []
+
+    class FakeEvent:
+        def __init__(self):
+            self.index = len(events)
+            events.append(self)
+
+        def record(self, stream):
+            calls.append(("record", self.index, stream))
+
+    class FakeScatterStream:
+        def wait_event(self, event):
+            calls.append(("wait", event))
+
+    def prepare(context):
+        train = {"context": context}
+        calls.append(("prepare", context["owner"]))
+        return train
+
+    def mark(train):
+        calls.append(("mark", train["context"]["owner"]))
+
+    group = SimpleNamespace(
+        _prepare_nep_nccl_owner_task_scatter_train=prepare,
+        _mark_nep_nccl_scatter_train_scheduled=mark,
+    )
+    scatter_stream = FakeScatterStream()
+    completion_event = FakeEvent()
+    a2a_completion_event = object()
+    ddp._nep_scatter_stream = scatter_stream
+    ddp._nep_scatter_batches = []
+    ddp._nep_scatter_next_batch_ordinal = 0
+    monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+
+    ddp._queue_nep_scatter_context_batches(
+        [[{"group": group, "owner": 0}], [], [{"group": group, "owner": 4}]],
+        completion_event,
+        "decoder.layers.3.mlp",
+        a2a_completion_event,
+    )
+
+    assert ("wait", a2a_completion_event) in calls
+    assert [batch["module_label"] for batch in ddp._nep_scatter_batches] == [
+        "decoder.layers.3.mlp:owner_batch_0",
+        "decoder.layers.3.mlp:owner_batch_1",
+        "decoder.layers.3.mlp:owner_batch_2",
+    ]
+    assert [
+        [train["context"]["owner"] for train in batch["trains"]]
+        for batch in ddp._nep_scatter_batches
+    ] == [[0], [], [4]]
+    assert ddp._nep_scatter_batches[1]["submission_complete"]
+    assert [batch["schedule_ordinal"] for batch in ddp._nep_scatter_batches] == [0, 1, 2]
+    assert ddp._nep_scatter_batches[-1]["completion_event"] is completion_event
+    assert ("record", 2, scatter_stream) in calls
 
 
 def test_nep_scatter_progress_queues_one_chunk_per_completed_a2a_burst(monkeypatch):
@@ -2671,6 +2806,13 @@ def test_nep_scatter_progress_queues_one_chunk_per_completed_a2a_burst(monkeypat
     group._submit_nep_nccl_owner_all_to_all_scatter = lambda descriptor: calls.append(
         ("submit", descriptor)
     )
+    group._prepare_nep_nccl_scatter_descriptor_ready_gate = (
+        lambda descriptor, slot: calls.append(("prepare_gate", descriptor, slot))
+        or f"gate-{descriptor}"
+    )
+    group._release_nep_nccl_scatter_descriptor_ready_gate = lambda gate: calls.append(
+        ("release_gate", gate)
+    )
     group._order_nep_nccl_owner_all_to_all_scatter_completion = lambda descriptor: calls.append(
         ("order", descriptor)
     )
@@ -2682,7 +2824,7 @@ def test_nep_scatter_progress_queues_one_chunk_per_completed_a2a_burst(monkeypat
     )
     train = {
         "group": group,
-        "context": {"owner_ep_rank": 2, "chunk_index": 5},
+        "context": {"owner_ep_rank": 2, "chunk_index": 5, "buffer_slot": 0},
         "descriptors": ["scatter-0", "scatter-1"],
         "next_descriptor": 0,
         "task_marked": True,
@@ -2695,10 +2837,12 @@ def test_nep_scatter_progress_queues_one_chunk_per_completed_a2a_burst(monkeypat
             "next_train": 0,
             "completion_event": FakeCompletionEvent(),
             "module_label": "decoder.layers.3.mlp",
+            "submission_complete": False,
         }
     ]
     ddp._nep_scatter_inflight_event = None
     ddp._nep_scatter_stream = scatter_stream
+
     monkeypatch.setattr(torch.cuda, "Event", FakeChunkEvent)
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
 
@@ -2706,6 +2850,8 @@ def test_nep_scatter_progress_queues_one_chunk_per_completed_a2a_burst(monkeypat
     assert ddp._submit_nep_scatter_chunk(after_event=first_a2a_event)
 
     assert [call for call in calls if call[0] == "submit"] == [("submit", "scatter-0")]
+    assert calls.index(("prepare_gate", "scatter-0", 0)) < calls.index(("submit", "scatter-0"))
+    assert calls.index(("submit", "scatter-0")) < calls.index(("release_gate", "gate-scatter-0"))
     assert ("wait_a2a", first_a2a_event) in calls
     assert train["next_descriptor"] == 1
     assert len(ddp._nep_scatter_batches) == 1
@@ -2725,56 +2871,29 @@ def test_nep_scatter_progress_queues_one_chunk_per_completed_a2a_burst(monkeypat
     ]
     assert ("wait_a2a", second_a2a_event) in calls
     assert ("finish_train", 2) in calls
-    assert ddp._nep_scatter_batches == []
+    assert len(ddp._nep_scatter_batches) == 1
+    assert ddp._nep_scatter_batches[0]["submission_complete"]
     assert ("record_batch", scatter_stream) in calls
     assert ddp._nep_scatter_inflight_event is events[1]
     assert ("query_chunk", 0, False) in calls
 
-    assert ddp._retire_nep_scatter_chunk(force=True)
-    assert ("finish_chunk", 1) in calls
+    events[1].complete = True
+    assert ddp._submit_nep_scatter_chunk()
+    assert ddp._nep_scatter_batches == []
     assert ddp._nep_scatter_inflight_event is None
 
 
-def test_nep_scatter_progress_after_compute_launch_uses_compute_window(monkeypatch):
+def test_nep_scatter_progress_after_compute_launch_only_retires(monkeypatch):
     ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
     calls = []
     ddp._nep_scatter_batches = [object()]
     ddp._nep_model_ep_a2a_burst_depth = 0
-
-    class FakeComputeDoneEvent:
-        def __init__(self):
-            self.queries = iter((False, False, True))
-
-        def record(self, stream):
-            calls.append(("record_compute_done", stream))
-
-        def query(self):
-            result = next(self.queries)
-            calls.append(("query_compute_done", result))
-            return result
-
-    compute_stream = object()
-
-    def submit_scatter(force=False):
-        calls.append(("submit", force))
-        return True
-
-    ddp._submit_nep_scatter_chunk = submit_scatter
+    ddp._retire_nep_scatter_chunk = lambda: calls.append("retire") or True
     monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_A2A_SCATTER_SCHEDULER", "1")
-    monkeypatch.setattr(torch.cuda, "Event", FakeComputeDoneEvent)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: compute_stream)
 
     ddp._progress_nep_scatter_after_compute_launch()
 
-    assert calls == [
-        ("record_compute_done", compute_stream),
-        ("submit", True),
-        ("query_compute_done", False),
-        ("submit", True),
-        ("query_compute_done", False),
-        ("submit", True),
-        ("query_compute_done", True),
-    ]
+    assert calls == ["retire"]
 
     ddp._nep_model_ep_a2a_burst_depth = 1
     ddp._progress_nep_scatter_after_compute_launch()
@@ -2782,7 +2901,44 @@ def test_nep_scatter_progress_after_compute_launch_uses_compute_window(monkeypat
     ddp._nep_scatter_batches = []
     ddp._progress_nep_scatter_after_compute_launch()
 
-    assert len(calls) == 7
+    assert calls == ["retire"]
+
+
+def test_nep_scatter_submission_requires_matching_model_ep_tickets(monkeypatch):
+    ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
+    ep_group_gloo = object()
+    calls = []
+    ticket = (7, 0, 2, 3, 1, 4)
+    ddp._nonuniform_ep_runtime_config = {"needs_reshard": True, "ep_group_gloo": ep_group_gloo}
+    ddp._nep_scatter_alignment_tensor = None
+    ddp._peek_nep_scatter_ticket = lambda: ("ready", ticket)
+    ddp._submit_nep_scatter_chunk = lambda: calls.append("submit") or True
+
+    def all_reduce(tensor, op, group):
+        calls.append(("align", op, group, tuple(tensor.tolist())))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+
+    assert ddp._submit_model_ep_aligned_nep_scatter_chunk()
+    assert calls[-1] == "submit"
+    expected_payload = (2,) + ticket + (-2,) + tuple(-value for value in ticket)
+    assert calls[0] == ("align", torch.distributed.ReduceOp.MIN, ep_group_gloo, expected_payload)
+
+
+def test_nep_scatter_submission_rejects_different_model_ep_tickets(monkeypatch):
+    ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
+    ddp._nonuniform_ep_runtime_config = {"needs_reshard": True, "ep_group_gloo": object()}
+    ddp._nep_scatter_alignment_tensor = None
+    ddp._peek_nep_scatter_ticket = lambda: ("ready", (7, 0, 2, 3, 1, 4))
+    ddp._submit_nep_scatter_chunk = lambda: pytest.fail("mismatched tickets must not submit")
+
+    def mismatch_ticket(tensor, op, group):
+        tensor[-1] = -5
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", mismatch_ticket)
+
+    with pytest.raises(RuntimeError, match="different tickets"):
+        ddp._submit_model_ep_aligned_nep_scatter_chunk()
 
 
 def test_nep_scatter_chunk_scheduler_marks_ready_before_host_phase_check(monkeypatch):

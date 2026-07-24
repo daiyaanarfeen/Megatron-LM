@@ -24,6 +24,10 @@ CORRECTNESS="${REPO_DIR}/scripts/nonuniform/run_lyris_ep8_ep4_split_correctness.
 IMAGE="${IMAGE:-nvcr.io#nvidia/nemo:26.06}"
 CONTAINER_NAME="${CONTAINER_NAME:-nep_nemo_26_06}"
 RUN_CORRECTNESS="${RUN_CORRECTNESS:-1}"
+RUN_HEALTHY_TIMING="${RUN_HEALTHY_TIMING:-1}"
+RUN_NEP_TIMING="${RUN_NEP_TIMING:-1}"
+RUN_HEALTHY_PROFILE="${RUN_HEALTHY_PROFILE:-1}"
+RUN_NEP_PROFILE="${RUN_NEP_PROFILE:-1}"
 SEQ_LENGTH="${SEQ_LENGTH:-18432}"
 NUM_EXPERTS="${NUM_EXPERTS:-144}"
 MOE_ROUTER_TOPK="${MOE_ROUTER_TOPK:-6}"
@@ -35,13 +39,15 @@ PROFILE_ITERS="${PROFILE_ITERS:-8}"
 CASE_TIMEOUT="${CASE_TIMEOUT:-12m}"
 HYBRID_LAYER_PATTERN="${HYBRID_LAYER_PATTERN:-MEMEM*EMEMEM*E}"
 
-case "${RUN_CORRECTNESS}" in
-    0|1) ;;
-    *)
-        echo "RUN_CORRECTNESS must be 0 or 1" >&2
-        exit 2
-        ;;
-esac
+for toggle in RUN_CORRECTNESS RUN_HEALTHY_TIMING RUN_NEP_TIMING RUN_HEALTHY_PROFILE RUN_NEP_PROFILE; do
+    case "${!toggle}" in
+        0|1) ;;
+        *)
+            echo "${toggle} must be 0 or 1" >&2
+            exit 2
+            ;;
+    esac
+done
 for value in SEQ_LENGTH NUM_EXPERTS MOE_ROUTER_TOPK FULL_MICRO_BATCH_SIZE REDUCED_MICRO_BATCH_SIZE SCATTER_CHUNKS; do
     if ! [[ "${!value}" =~ ^[1-9][0-9]*$ ]]; then
         echo "${value} must be a positive integer" >&2
@@ -127,11 +133,23 @@ run_case() {
     local train_iters="${10}"
     local profile_step_start="${11}"
     local profile_step_end="${12}"
+    local run_selected
     local split_host_phases=0
     local skip_preflight=1
     local profile_ranks
     local master_port=$((30800 + case_index))
     case_index=$((case_index + 1))
+
+    case "${stage}:${mode}" in
+        timing:none) run_selected="${RUN_HEALTHY_TIMING}" ;;
+        timing:ep) run_selected="${RUN_NEP_TIMING}" ;;
+        profile:none) run_selected="${RUN_HEALTHY_PROFILE}" ;;
+        profile:ep) run_selected="${RUN_NEP_PROFILE}" ;;
+    esac
+    if [[ "${run_selected}" != "1" ]]; then
+        echo "[ep16-12-scatter] skipping ${stage}/${label}"
+        return
+    fi
 
     if [[ "${mode}" == "ep" ]]; then
         split_host_phases=1
