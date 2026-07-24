@@ -5380,7 +5380,9 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         )
         return "ready", ticket
 
-    def _consume_model_ep_aligned_nep_scatter_ticket(self) -> bool:
+    def _consume_model_ep_aligned_nep_scatter_ticket(
+        self, after_event: Optional[torch.cuda.Event] = None
+    ) -> bool:
         """Consume the previous burst's ticket agreement and submit its Scatter chunk."""
         alignment_work = self._nep_scatter_alignment_work
         if alignment_work is None:
@@ -5404,7 +5406,7 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 f"minimum={tuple(minimum[1:])}, maximum={tuple(maximum[1:])}"
             )
 
-        return self._submit_nep_scatter_chunk()
+        return self._submit_nep_scatter_chunk(after_event=after_event)
 
     def _launch_model_ep_aligned_nep_scatter_ticket(self) -> None:
         """Launch a nonblocking ticket agreement for the next model-EP boundary."""
@@ -5436,13 +5438,15 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         if self._nep_scatter_alignment_work is None:
             raise RuntimeError("Nonblocking NEP Scatter ticket launch returned no work handle")
 
-    def _submit_model_ep_aligned_nep_scatter_chunk(self) -> bool:
-        """Advance the one-burst ticket pipeline before a native model-EP A2A."""
+    def _submit_model_ep_aligned_nep_scatter_chunk(
+        self, after_event: Optional[torch.cuda.Event] = None
+    ) -> bool:
+        """Advance the ticket pipeline after a native model-EP A2A is enqueued."""
         runtime_config = self._nonuniform_ep_runtime_config
         if not runtime_config.get("needs_reshard", False):
-            return self._submit_nep_scatter_chunk()
+            return self._submit_nep_scatter_chunk(after_event=after_event)
 
-        submitted = self._consume_model_ep_aligned_nep_scatter_ticket()
+        submitted = self._consume_model_ep_aligned_nep_scatter_ticket(after_event=after_event)
         self._launch_model_ep_aligned_nep_scatter_ticket()
         return submitted
 
@@ -5592,12 +5596,11 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         self._retire_nep_scatter_chunk(force=True)
 
     def model_ep_a2a_burst_begin(self) -> None:
-        """Pause Scatter submission before a native model-EP A2A burst."""
+        """Mark a native model-EP A2A burst before its collective is enqueued."""
         if not _nep_a2a_scatter_scheduler_enabled():
             return
         if self._nep_model_ep_a2a_burst_depth != 0:
             raise RuntimeError("Nested model-EP A2A bursts are not supported")
-        self._submit_model_ep_aligned_nep_scatter_chunk()
         self._nep_model_ep_a2a_burst_depth = 1
         _nep_debug_print("model_ep_a2a_burst_begin")
 
@@ -5621,6 +5624,7 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             if not phases_finished:
                 raise RuntimeError("Model-EP A2A burst end did not queue all staged Scatter work")
             self._wait_for_nep_dispatch_launch()
+        self._submit_model_ep_aligned_nep_scatter_chunk(after_event=completion_event)
 
     def _configure_nep_dispatch_boundary_hooks(self) -> None:
         """Launch NCCL reshard pipelines after each MoE dispatch backward."""

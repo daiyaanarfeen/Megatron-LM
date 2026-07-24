@@ -2665,7 +2665,7 @@ def test_process_group_dispatch_can_defer_model_ep_fences_until_final_drain(monk
     assert ddp._nep_dispatch_waiting_groups is None
 
 
-def test_model_ep_a2a_burst_hooks_submit_before_next_burst_and_queue_after_completion(monkeypatch):
+def test_model_ep_a2a_burst_hooks_submit_after_current_burst_completion(monkeypatch):
     ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
     calls = []
     events = []
@@ -2688,7 +2688,9 @@ def test_model_ep_a2a_burst_hooks_submit_before_next_burst_and_queue_after_compl
 
     ddp._finish_pending_nep_dispatch_host_phases = finish_pending
     ddp._wait_for_nep_dispatch_launch = lambda final=False: calls.append(("wait", final))
-    ddp._submit_model_ep_aligned_nep_scatter_chunk = lambda: calls.append("submit_aligned") or True
+    ddp._submit_model_ep_aligned_nep_scatter_chunk = (
+        lambda after_event=None: calls.append(("submit_aligned", after_event)) or True
+    )
     monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_A2A_SCATTER_SCHEDULER", "1")
     monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: compute_stream)
@@ -2696,7 +2698,7 @@ def test_model_ep_a2a_burst_hooks_submit_before_next_burst_and_queue_after_compl
     ddp.model_ep_a2a_burst_begin()
 
     assert ddp._nep_model_ep_a2a_burst_depth == 1
-    assert calls == ["submit_aligned"]
+    assert calls == []
 
     ddp.model_ep_a2a_burst_end()
 
@@ -2704,10 +2706,10 @@ def test_model_ep_a2a_burst_hooks_submit_before_next_burst_and_queue_after_compl
     assert ddp._nep_model_ep_a2a_burst_depth == 0
     assert ddp._nep_model_ep_a2a_burst_count == 1
     assert calls == [
-        "submit_aligned",
         ("record_a2a_completion", compute_stream),
         ("finish", False, completion_event),
         ("wait", False),
+        ("submit_aligned", completion_event),
     ]
 
 
@@ -2913,7 +2915,9 @@ def test_nep_scatter_submission_pipelines_matching_model_ep_tickets(monkeypatch)
     ddp._nep_scatter_alignment_tensor = None
     ddp._nep_scatter_alignment_work = None
     ddp._peek_nep_scatter_ticket = lambda: ("ready", ticket)
-    ddp._submit_nep_scatter_chunk = lambda: calls.append("submit") or True
+    ddp._submit_nep_scatter_chunk = (
+        lambda after_event=None: calls.append(("submit", after_event)) or True
+    )
 
     class FakeWork:
         def __init__(self, index):
@@ -2929,14 +2933,16 @@ def test_nep_scatter_submission_pipelines_matching_model_ep_tickets(monkeypatch)
 
     monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
 
-    assert not ddp._submit_model_ep_aligned_nep_scatter_chunk()
+    first_a2a_event = object()
+    second_a2a_event = object()
+    assert not ddp._submit_model_ep_aligned_nep_scatter_chunk(after_event=first_a2a_event)
     assert [call[0] for call in calls] == ["launch"]
 
-    assert ddp._submit_model_ep_aligned_nep_scatter_chunk()
-    assert [call if isinstance(call, str) else call[:2] for call in calls] == [
+    assert ddp._submit_model_ep_aligned_nep_scatter_chunk(after_event=second_a2a_event)
+    assert [call[:2] for call in calls] == [
         ("launch", 0),
         ("wait", 0),
-        "submit",
+        ("submit", second_a2a_event),
         ("launch", 1),
     ]
     expected_payload = (2,) + ticket + (-2,) + tuple(-value for value in ticket)
@@ -3019,13 +3025,15 @@ def test_nep_scatter_submission_drain_consumes_pending_ticket(monkeypatch):
     ddp._nep_scatter_alignment_tensor = torch.tensor(payload, dtype=torch.int64)
     ddp._nep_scatter_alignment_work = FakeWork()
     ddp._nep_scatter_batches = []
-    ddp._submit_nep_scatter_chunk = lambda force=False: calls.append(("submit", force)) or True
+    ddp._submit_nep_scatter_chunk = (
+        lambda after_event=None, force=False: calls.append(("submit", after_event, force)) or True
+    )
     ddp._retire_nep_scatter_chunk = lambda force=False: calls.append(("retire", force)) or True
     monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_A2A_SCATTER_SCHEDULER", "1")
 
     ddp._drain_nep_scatter_scheduler()
 
-    assert calls == ["wait", ("submit", False), ("retire", True)]
+    assert calls == ["wait", ("submit", None, False), ("retire", True)]
     assert ddp._nep_scatter_alignment_work is None
 
 
