@@ -5255,6 +5255,7 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         self._nep_scatter_inflight_event = None
         self._nep_scatter_next_batch_ordinal = 0
         self._nep_scatter_alignment_tensor = None
+        self._nep_scatter_alignment_work = None
         self._nep_scatter_stream = None
         if self.nonuniform_ep_config.approach == NonuniformEPApproach.NCCL:
             if _nep_a2a_scatter_scheduler_enabled():
@@ -5379,15 +5380,40 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         )
         return "ready", ticket
 
-    def _submit_model_ep_aligned_nep_scatter_chunk(self) -> bool:
-        """Submit one Scatter ticket at the same model-EP boundary on every EP rank."""
-        runtime_config = self._nonuniform_ep_runtime_config
-        if not runtime_config.get("needs_reshard", False):
-            return self._submit_nep_scatter_chunk()
+    def _consume_model_ep_aligned_nep_scatter_ticket(self) -> bool:
+        """Consume the previous burst's ticket agreement and submit its Scatter chunk."""
+        alignment_work = self._nep_scatter_alignment_work
+        if alignment_work is None:
+            return False
 
+        with torch.profiler.record_function("nep_model_ep_scatter_ticket_wait"):
+            alignment_work.wait()
+        self._nep_scatter_alignment_work = None
+
+        alignment_tensor = self._nep_scatter_alignment_tensor
+        if alignment_tensor is None:
+            raise RuntimeError("NEP Scatter ticket completed without its alignment tensor")
+        value_count = alignment_tensor.numel() // 2
+        minimum = alignment_tensor[:value_count].tolist()
+        maximum = (-alignment_tensor[value_count:]).tolist()
+        if minimum[0] != 2 or maximum[0] != 2:
+            return False
+        if minimum[1:] != maximum[1:]:
+            raise RuntimeError(
+                "NEP Scatter ranks reached a model-EP boundary with different tickets: "
+                f"minimum={tuple(minimum[1:])}, maximum={tuple(maximum[1:])}"
+            )
+
+        return self._submit_nep_scatter_chunk()
+
+    def _launch_model_ep_aligned_nep_scatter_ticket(self) -> None:
+        """Launch a nonblocking ticket agreement for the next model-EP boundary."""
+        runtime_config = self._nonuniform_ep_runtime_config
         ep_group_gloo = runtime_config.get("ep_group_gloo")
         if ep_group_gloo is None:
             raise RuntimeError("A2A-gated NEP Scatter requires a model-EP Gloo group")
+        if self._nep_scatter_alignment_work is not None:
+            raise RuntimeError("NEP Scatter launched a ticket before consuming its predecessor")
 
         status, ticket = self._peek_nep_scatter_ticket()
         status_value = {"empty": 0, "busy": 1, "ready": 2}[status]
@@ -5403,20 +5429,22 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         positive.copy_(torch.tensor(local_values, dtype=torch.int64))
         negative.copy_(-positive)
 
-        with torch.profiler.record_function("nep_model_ep_scatter_ticket"):
-            dist.all_reduce(alignment_tensor, op=dist.ReduceOp.MIN, group=ep_group_gloo)
-
-        minimum = positive.tolist()
-        maximum = (-negative).tolist()
-        if minimum[0] != 2 or maximum[0] != 2:
-            return False
-        if minimum[1:] != maximum[1:]:
-            raise RuntimeError(
-                "NEP Scatter ranks reached a model-EP boundary with different tickets: "
-                f"minimum={tuple(minimum[1:])}, maximum={tuple(maximum[1:])}"
+        with torch.profiler.record_function("nep_model_ep_scatter_ticket_launch"):
+            self._nep_scatter_alignment_work = dist.all_reduce(
+                alignment_tensor, op=dist.ReduceOp.MIN, group=ep_group_gloo, async_op=True
             )
+        if self._nep_scatter_alignment_work is None:
+            raise RuntimeError("Nonblocking NEP Scatter ticket launch returned no work handle")
 
-        return self._submit_nep_scatter_chunk()
+    def _submit_model_ep_aligned_nep_scatter_chunk(self) -> bool:
+        """Advance the one-burst ticket pipeline before a native model-EP A2A."""
+        runtime_config = self._nonuniform_ep_runtime_config
+        if not runtime_config.get("needs_reshard", False):
+            return self._submit_nep_scatter_chunk()
+
+        submitted = self._consume_model_ep_aligned_nep_scatter_ticket()
+        self._launch_model_ep_aligned_nep_scatter_ticket()
+        return submitted
 
     def _submit_nep_scatter_chunk(
         self,
@@ -5556,6 +5584,8 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             return
         if self._nep_model_ep_a2a_burst_depth != 0:
             raise RuntimeError("Cannot drain NEP Scatter during a model-EP A2A burst")
+        if self._nonuniform_ep_runtime_config.get("needs_reshard", False):
+            self._consume_model_ep_aligned_nep_scatter_ticket()
         while self._nep_scatter_batches:
             if not self._submit_nep_scatter_chunk(force=True):
                 raise RuntimeError("A2A-gated NEP Scatter drain made no progress")

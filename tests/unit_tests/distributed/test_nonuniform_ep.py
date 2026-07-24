@@ -2904,41 +2904,129 @@ def test_nep_scatter_progress_after_compute_launch_only_retires(monkeypatch):
     assert calls == ["retire"]
 
 
-def test_nep_scatter_submission_requires_matching_model_ep_tickets(monkeypatch):
+def test_nep_scatter_submission_pipelines_matching_model_ep_tickets(monkeypatch):
     ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
     ep_group_gloo = object()
     calls = []
     ticket = (7, 0, 2, 3, 1, 4)
     ddp._nonuniform_ep_runtime_config = {"needs_reshard": True, "ep_group_gloo": ep_group_gloo}
     ddp._nep_scatter_alignment_tensor = None
+    ddp._nep_scatter_alignment_work = None
     ddp._peek_nep_scatter_ticket = lambda: ("ready", ticket)
     ddp._submit_nep_scatter_chunk = lambda: calls.append("submit") or True
 
-    def all_reduce(tensor, op, group):
-        calls.append(("align", op, group, tuple(tensor.tolist())))
+    class FakeWork:
+        def __init__(self, index):
+            self.index = index
+
+        def wait(self):
+            calls.append(("wait", self.index))
+
+    def all_reduce(tensor, op, group, async_op):
+        index = len([call for call in calls if call[0] == "launch"])
+        calls.append(("launch", index, op, group, async_op, tuple(tensor.tolist())))
+        return FakeWork(index)
 
     monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
 
+    assert not ddp._submit_model_ep_aligned_nep_scatter_chunk()
+    assert [call[0] for call in calls] == ["launch"]
+
     assert ddp._submit_model_ep_aligned_nep_scatter_chunk()
-    assert calls[-1] == "submit"
+    assert [call if isinstance(call, str) else call[:2] for call in calls] == [
+        ("launch", 0),
+        ("wait", 0),
+        "submit",
+        ("launch", 1),
+    ]
     expected_payload = (2,) + ticket + (-2,) + tuple(-value for value in ticket)
-    assert calls[0] == ("align", torch.distributed.ReduceOp.MIN, ep_group_gloo, expected_payload)
+    assert calls[0] == (
+        "launch",
+        0,
+        torch.distributed.ReduceOp.MIN,
+        ep_group_gloo,
+        True,
+        expected_payload,
+    )
 
 
 def test_nep_scatter_submission_rejects_different_model_ep_tickets(monkeypatch):
     ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
     ddp._nonuniform_ep_runtime_config = {"needs_reshard": True, "ep_group_gloo": object()}
     ddp._nep_scatter_alignment_tensor = None
+    ddp._nep_scatter_alignment_work = None
     ddp._peek_nep_scatter_ticket = lambda: ("ready", (7, 0, 2, 3, 1, 4))
     ddp._submit_nep_scatter_chunk = lambda: pytest.fail("mismatched tickets must not submit")
 
-    def mismatch_ticket(tensor, op, group):
-        tensor[-1] = -5
+    class FakeWork:
+        def __init__(self, tensor):
+            self.tensor = tensor
+
+        def wait(self):
+            self.tensor[-1] = -5
+
+    def mismatch_ticket(tensor, op, group, async_op):
+        assert async_op
+        return FakeWork(tensor)
 
     monkeypatch.setattr(torch.distributed, "all_reduce", mismatch_ticket)
 
+    assert not ddp._submit_model_ep_aligned_nep_scatter_chunk()
     with pytest.raises(RuntimeError, match="different tickets"):
         ddp._submit_model_ep_aligned_nep_scatter_chunk()
+
+
+def test_nep_scatter_submission_skips_busy_ticket_and_launches_next_agreement(monkeypatch):
+    ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
+    calls = []
+    ddp._nonuniform_ep_runtime_config = {"needs_reshard": True, "ep_group_gloo": object()}
+    ddp._nep_scatter_alignment_tensor = None
+    ddp._nep_scatter_alignment_work = None
+    ddp._peek_nep_scatter_ticket = lambda: ("busy", None)
+    ddp._submit_nep_scatter_chunk = lambda: pytest.fail("busy tickets must not submit")
+
+    class FakeWork:
+        def __init__(self, index):
+            self.index = index
+
+        def wait(self):
+            calls.append(("wait", self.index))
+
+    def all_reduce(tensor, op, group, async_op):
+        index = len([call for call in calls if call[0] == "launch"])
+        calls.append(("launch", index, tuple(tensor.tolist())))
+        return FakeWork(index)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+
+    assert not ddp._submit_model_ep_aligned_nep_scatter_chunk()
+    assert not ddp._submit_model_ep_aligned_nep_scatter_chunk()
+    assert [call[:2] for call in calls] == [("launch", 0), ("wait", 0), ("launch", 1)]
+
+
+def test_nep_scatter_submission_drain_consumes_pending_ticket(monkeypatch):
+    ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
+    calls = []
+    ticket = (7, 0, 2, 3, 1, 4)
+    payload = (2,) + ticket + (-2,) + tuple(-value for value in ticket)
+
+    class FakeWork:
+        def wait(self):
+            calls.append("wait")
+
+    ddp._nonuniform_ep_runtime_config = {"needs_reshard": True}
+    ddp._nep_model_ep_a2a_burst_depth = 0
+    ddp._nep_scatter_alignment_tensor = torch.tensor(payload, dtype=torch.int64)
+    ddp._nep_scatter_alignment_work = FakeWork()
+    ddp._nep_scatter_batches = []
+    ddp._submit_nep_scatter_chunk = lambda force=False: calls.append(("submit", force)) or True
+    ddp._retire_nep_scatter_chunk = lambda force=False: calls.append(("retire", force)) or True
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_A2A_SCATTER_SCHEDULER", "1")
+
+    ddp._drain_nep_scatter_scheduler()
+
+    assert calls == ["wait", ("submit", False), ("retire", True)]
+    assert ddp._nep_scatter_alignment_work is None
 
 
 def test_nep_scatter_chunk_scheduler_marks_ready_before_host_phase_check(monkeypatch):
