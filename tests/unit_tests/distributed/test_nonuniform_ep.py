@@ -2748,6 +2748,7 @@ def test_nep_scatter_queue_preserves_owner_batch_boundaries(monkeypatch):
     ddp._nep_scatter_stream = scatter_stream
     ddp._nep_scatter_batches = []
     ddp._nep_scatter_next_batch_ordinal = 0
+    ddp._nep_scatter_next_layer_ordinal = 0
     monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
 
@@ -2770,6 +2771,8 @@ def test_nep_scatter_queue_preserves_owner_batch_boundaries(monkeypatch):
     ] == [[0], [], [4]]
     assert ddp._nep_scatter_batches[1]["submission_complete"]
     assert [batch["schedule_ordinal"] for batch in ddp._nep_scatter_batches] == [0, 1, 2]
+    assert [batch["layer_ordinal"] for batch in ddp._nep_scatter_batches] == [0, 0, 0]
+    assert ddp._nep_scatter_next_layer_ordinal == 1
     assert ddp._nep_scatter_batches[-1]["completion_event"] is completion_event
     assert ("record", 2, scatter_stream) in calls
 
@@ -2824,10 +2827,17 @@ def test_nep_scatter_progress_queues_one_chunk_per_completed_a2a_burst(monkeypat
     group._finish_nep_nccl_scatter_train_submission = lambda train: calls.append(
         ("finish_train", train["next_descriptor"])
     )
-    train = {
+    first_train = {
         "group": group,
         "context": {"owner_ep_rank": 2, "chunk_index": 5, "buffer_slot": 0},
-        "descriptors": ["scatter-0", "scatter-1"],
+        "descriptors": ["scatter-0"],
+        "next_descriptor": 0,
+        "task_marked": True,
+    }
+    second_train = {
+        "group": group,
+        "context": {"owner_ep_rank": 3, "chunk_index": 5, "buffer_slot": 0},
+        "descriptors": ["scatter-1"],
         "next_descriptor": 0,
         "task_marked": True,
     }
@@ -2835,12 +2845,19 @@ def test_nep_scatter_progress_queues_one_chunk_per_completed_a2a_burst(monkeypat
     ddp._nep_model_ep_a2a_burst_depth = 0
     ddp._nep_scatter_batches = [
         {
-            "trains": [train],
+            "trains": [first_train],
             "next_train": 0,
             "completion_event": FakeCompletionEvent(),
-            "module_label": "decoder.layers.3.mlp",
+            "module_label": "decoder.layers.3.mlp:owner_batch_0",
             "submission_complete": False,
-        }
+        },
+        {
+            "trains": [second_train],
+            "next_train": 0,
+            "completion_event": FakeCompletionEvent(),
+            "module_label": "decoder.layers.3.mlp:owner_batch_1",
+            "submission_complete": False,
+        },
     ]
     ddp._nep_scatter_inflight_event = None
     ddp._nep_scatter_stream = scatter_stream
@@ -2855,8 +2872,9 @@ def test_nep_scatter_progress_queues_one_chunk_per_completed_a2a_burst(monkeypat
     assert calls.index(("prepare_gate", "scatter-0", 0)) < calls.index(("submit", "scatter-0"))
     assert calls.index(("submit", "scatter-0")) < calls.index(("release_gate", "gate-scatter-0"))
     assert ("wait_a2a", first_a2a_event) in calls
-    assert train["next_descriptor"] == 1
-    assert len(ddp._nep_scatter_batches) == 1
+    assert first_train["next_descriptor"] == 1
+    assert len(ddp._nep_scatter_batches) == 2
+    assert ddp._nep_scatter_batches[0]["submission_complete"]
 
     ddp._nep_model_ep_a2a_burst_depth = 1
     assert not ddp._submit_nep_scatter_chunk(after_event=object(), queue_behind_inflight=True)
@@ -2872,7 +2890,7 @@ def test_nep_scatter_progress_queues_one_chunk_per_completed_a2a_burst(monkeypat
         ("submit", "scatter-1"),
     ]
     assert ("wait_a2a", second_a2a_event) in calls
-    assert ("finish_train", 2) in calls
+    assert calls.count(("finish_train", 1)) == 2
     assert len(ddp._nep_scatter_batches) == 1
     assert ddp._nep_scatter_batches[0]["submission_complete"]
     assert ("record_batch", scatter_stream) in calls
@@ -2885,38 +2903,93 @@ def test_nep_scatter_progress_queues_one_chunk_per_completed_a2a_burst(monkeypat
     assert ddp._nep_scatter_inflight_event is None
 
 
-def test_nep_scatter_progress_after_compute_launch_only_retires(monkeypatch):
+def test_nep_scatter_progress_after_compute_launch_advances_aligned_window(monkeypatch):
     ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
     calls = []
-    ddp._nep_scatter_batches = [object()]
     ddp._nep_model_ep_a2a_burst_depth = 0
-    ddp._retire_nep_scatter_chunk = lambda: calls.append("retire") or True
+    ddp._nep_dispatch_pending_host_phases = object()
+    ddp._finish_pending_nep_dispatch_host_phases = (
+        lambda defer_scatter_submission=False: calls.append(("finish", defer_scatter_submission))
+        or True
+    )
+    ddp._wait_for_nep_dispatch_launch = lambda final=False: calls.append(("wait", final))
+    ddp._submit_model_ep_aligned_nep_scatter_chunk = (
+        lambda after_event=None, refresh_current_window=False: calls.append(
+            ("submit", after_event, refresh_current_window)
+        )
+        or 0
+    )
     monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_A2A_SCATTER_SCHEDULER", "1")
 
     ddp._progress_nep_scatter_after_compute_launch()
 
-    assert calls == ["retire"]
+    assert calls == [("finish", False), ("wait", False), ("submit", None, True)]
 
     ddp._nep_model_ep_a2a_burst_depth = 1
     ddp._progress_nep_scatter_after_compute_launch()
+    assert calls == [("finish", False), ("wait", False), ("submit", None, True)]
+
     ddp._nep_model_ep_a2a_burst_depth = 0
-    ddp._nep_scatter_batches = []
+    ddp._nep_dispatch_pending_host_phases = None
     ddp._progress_nep_scatter_after_compute_launch()
 
-    assert calls == ["retire"]
+    assert calls[-1] == ("submit", None, True)
+
+
+def test_nep_scatter_submission_window_spans_owners_but_not_groups_or_layers():
+    ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
+    group_0 = SimpleNamespace(_nep_nccl_group_index=0)
+    group_1 = SimpleNamespace(_nep_nccl_group_index=1)
+
+    def batch(schedule_ordinal, layer_ordinal, group, owner, descriptors, next_descriptor=0):
+        return {
+            "schedule_ordinal": schedule_ordinal,
+            "layer_ordinal": layer_ordinal,
+            "next_train": 0,
+            "submission_complete": False,
+            "trains": [
+                {
+                    "group": group,
+                    "context": {"owner_ep_rank": owner, "chunk_index": 0},
+                    "descriptors": descriptors,
+                    "next_descriptor": next_descriptor,
+                }
+            ],
+        }
+
+    completed = batch(10, 3, group_1, 7, [object()])
+    completed["submission_complete"] = True
+    ddp._nep_scatter_batches = [
+        completed,
+        batch(11, 4, group_0, 0, [object(), object()], next_descriptor=1),
+        batch(12, 4, group_0, 1, [object()]),
+        batch(13, 4, group_1, 0, [object()]),
+        batch(14, 5, group_0, 0, [object()]),
+    ]
+
+    assert ddp._peek_nep_scatter_ticket_window() == (
+        "ready",
+        2,
+        (11, 0, 0, 0, 0, 1),
+        (12, 0, 0, 1, 0, 0),
+    )
 
 
 def test_nep_scatter_submission_pipelines_matching_model_ep_tickets(monkeypatch):
     ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
     ep_group_gloo = object()
     calls = []
-    ticket = (7, 0, 2, 3, 1, 4)
+    first_ticket = (7, 0, 2, 3, 1, 4)
+    last_ticket = (9, 0, 2, 5, 1, 4)
     ddp._nonuniform_ep_runtime_config = {"needs_reshard": True, "ep_group_gloo": ep_group_gloo}
     ddp._nep_scatter_alignment_tensor = None
     ddp._nep_scatter_alignment_work = None
-    ddp._peek_nep_scatter_ticket = lambda: ("ready", ticket)
+    ddp._peek_nep_scatter_ticket_window = lambda: ("ready", 3, first_ticket, last_ticket)
     ddp._submit_nep_scatter_chunk = (
-        lambda after_event=None: calls.append(("submit", after_event)) or True
+        lambda after_event=None, queue_behind_inflight=False: calls.append(
+            ("submit", after_event, queue_behind_inflight)
+        )
+        or True
     )
 
     class FakeWork:
@@ -2938,14 +3011,24 @@ def test_nep_scatter_submission_pipelines_matching_model_ep_tickets(monkeypatch)
     assert not ddp._submit_model_ep_aligned_nep_scatter_chunk(after_event=first_a2a_event)
     assert [call[0] for call in calls] == ["launch"]
 
-    assert ddp._submit_model_ep_aligned_nep_scatter_chunk(after_event=second_a2a_event)
+    assert ddp._submit_model_ep_aligned_nep_scatter_chunk(after_event=second_a2a_event) == 3
     assert [call[:2] for call in calls] == [
         ("launch", 0),
         ("wait", 0),
         ("submit", second_a2a_event),
+        ("submit", None),
+        ("submit", None),
         ("launch", 1),
     ]
-    expected_payload = (2,) + ticket + (-2,) + tuple(-value for value in ticket)
+    assert all(call[2] for call in calls if call[0] == "submit")
+    expected_payload = (
+        (2, 3)
+        + first_ticket
+        + last_ticket
+        + (-2, -3)
+        + tuple(-value for value in first_ticket)
+        + tuple(-value for value in last_ticket)
+    )
     assert calls[0] == (
         "launch",
         0,
@@ -2961,8 +3044,11 @@ def test_nep_scatter_submission_rejects_different_model_ep_tickets(monkeypatch):
     ddp._nonuniform_ep_runtime_config = {"needs_reshard": True, "ep_group_gloo": object()}
     ddp._nep_scatter_alignment_tensor = None
     ddp._nep_scatter_alignment_work = None
-    ddp._peek_nep_scatter_ticket = lambda: ("ready", (7, 0, 2, 3, 1, 4))
-    ddp._submit_nep_scatter_chunk = lambda: pytest.fail("mismatched tickets must not submit")
+    ticket = (7, 0, 2, 3, 1, 4)
+    ddp._peek_nep_scatter_ticket_window = lambda: ("ready", 1, ticket, ticket)
+    ddp._submit_nep_scatter_chunk = lambda **kwargs: pytest.fail(
+        "mismatched windows must not submit"
+    )
 
     class FakeWork:
         def __init__(self, tensor):
@@ -2978,18 +3064,18 @@ def test_nep_scatter_submission_rejects_different_model_ep_tickets(monkeypatch):
     monkeypatch.setattr(torch.distributed, "all_reduce", mismatch_ticket)
 
     assert not ddp._submit_model_ep_aligned_nep_scatter_chunk()
-    with pytest.raises(RuntimeError, match="different tickets"):
+    with pytest.raises(RuntimeError, match="different windows"):
         ddp._submit_model_ep_aligned_nep_scatter_chunk()
 
 
-def test_nep_scatter_submission_skips_busy_ticket_and_launches_next_agreement(monkeypatch):
+def test_nep_scatter_submission_skips_empty_window_and_launches_next_agreement(monkeypatch):
     ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
     calls = []
     ddp._nonuniform_ep_runtime_config = {"needs_reshard": True, "ep_group_gloo": object()}
     ddp._nep_scatter_alignment_tensor = None
     ddp._nep_scatter_alignment_work = None
-    ddp._peek_nep_scatter_ticket = lambda: ("busy", None)
-    ddp._submit_nep_scatter_chunk = lambda: pytest.fail("busy tickets must not submit")
+    ddp._peek_nep_scatter_ticket_window = lambda: ("empty", 0, None, None)
+    ddp._submit_nep_scatter_chunk = lambda **kwargs: pytest.fail("empty windows must not submit")
 
     class FakeWork:
         def __init__(self, index):
@@ -3008,13 +3094,22 @@ def test_nep_scatter_submission_skips_busy_ticket_and_launches_next_agreement(mo
     assert not ddp._submit_model_ep_aligned_nep_scatter_chunk()
     assert not ddp._submit_model_ep_aligned_nep_scatter_chunk()
     assert [call[:2] for call in calls] == [("launch", 0), ("wait", 0), ("launch", 1)]
+    expected_payload = (0, 0) + (-1,) * 12 + (0, 0) + (1,) * 12
+    assert calls[0][2] == expected_payload
 
 
 def test_nep_scatter_submission_drain_consumes_pending_ticket(monkeypatch):
     ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
     calls = []
     ticket = (7, 0, 2, 3, 1, 4)
-    payload = (2,) + ticket + (-2,) + tuple(-value for value in ticket)
+    payload = (
+        (2, 1)
+        + ticket
+        + ticket
+        + (-2, -1)
+        + tuple(-value for value in ticket)
+        + tuple(-value for value in ticket)
+    )
 
     class FakeWork:
         def wait(self):
@@ -3025,15 +3120,19 @@ def test_nep_scatter_submission_drain_consumes_pending_ticket(monkeypatch):
     ddp._nep_scatter_alignment_tensor = torch.tensor(payload, dtype=torch.int64)
     ddp._nep_scatter_alignment_work = FakeWork()
     ddp._nep_scatter_batches = []
+    ddp._peek_nep_scatter_ticket_window = lambda: ("ready", 1, ticket, ticket)
     ddp._submit_nep_scatter_chunk = (
-        lambda after_event=None, force=False: calls.append(("submit", after_event, force)) or True
+        lambda after_event=None, force=False, queue_behind_inflight=False: calls.append(
+            ("submit", after_event, force, queue_behind_inflight)
+        )
+        or True
     )
     ddp._retire_nep_scatter_chunk = lambda force=False: calls.append(("retire", force)) or True
     monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_A2A_SCATTER_SCHEDULER", "1")
 
     ddp._drain_nep_scatter_scheduler()
 
-    assert calls == ["wait", ("submit", None, False), ("retire", True)]
+    assert calls == ["wait", ("submit", None, False, True), ("retire", True)]
     assert ddp._nep_scatter_alignment_work is None
 
 

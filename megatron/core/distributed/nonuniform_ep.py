@@ -5254,6 +5254,7 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         self._nep_scatter_batches = []
         self._nep_scatter_inflight_event = None
         self._nep_scatter_next_batch_ordinal = 0
+        self._nep_scatter_next_layer_ordinal = 0
         self._nep_scatter_alignment_tensor = None
         self._nep_scatter_alignment_work = None
         self._nep_scatter_stream = None
@@ -5352,41 +5353,56 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         self._nep_scatter_inflight_event = None
         return True
 
-    def _peek_nep_scatter_ticket(self) -> tuple:
-        """Return the next deterministic Scatter ticket and whether it is locally ready."""
-        if not self._retire_nep_scatter_chunk():
-            return "busy", None
+    def _peek_nep_scatter_ticket_window(self) -> tuple:
+        """Return the contiguous descriptor window for the next expert bucket group."""
+        first_ticket = None
+        last_ticket = None
+        descriptor_count = 0
+        window_key = None
+        for batch in self._nep_scatter_batches:
+            if batch.get("submission_complete", False):
+                continue
+            for train_index in range(batch["next_train"], len(batch["trains"])):
+                train = batch["trains"][train_index]
+                train_group_index = getattr(train["group"], "_nep_nccl_group_index", -1)
+                train_window_key = (
+                    batch.get("layer_ordinal", batch["schedule_ordinal"]),
+                    train_group_index,
+                )
+                if window_key is None:
+                    window_key = train_window_key
+                elif train_window_key != window_key:
+                    return "ready", descriptor_count, first_ticket, last_ticket
 
-        while self._nep_scatter_batches and self._nep_scatter_batches[0].get(
-            "submission_complete", False
-        ):
-            batch = self._nep_scatter_batches.pop(0)
-            _nep_debug_print(f"retired scheduled Scatter batch module={batch['module_label']}")
+                descriptor_start = (
+                    train["next_descriptor"] if train_index == batch["next_train"] else 0
+                )
+                context = train["context"]
+                for descriptor_index in range(descriptor_start, len(train["descriptors"])):
+                    ticket = (
+                        batch["schedule_ordinal"],
+                        train_index,
+                        train_group_index,
+                        context["owner_ep_rank"],
+                        context["chunk_index"],
+                        descriptor_index,
+                    )
+                    if first_ticket is None:
+                        first_ticket = ticket
+                    last_ticket = ticket
+                    descriptor_count += 1
 
-        if not self._nep_scatter_batches:
-            return "empty", None
-
-        batch = self._nep_scatter_batches[0]
-        train_index = batch["next_train"]
-        train = batch["trains"][train_index]
-        context = train["context"]
-        ticket = (
-            batch["schedule_ordinal"],
-            train_index,
-            getattr(train["group"], "_nep_nccl_group_index", -1),
-            context["owner_ep_rank"],
-            context["chunk_index"],
-            train["next_descriptor"],
-        )
-        return "ready", ticket
+        if first_ticket is None:
+            return "empty", 0, None, None
+        return "ready", descriptor_count, first_ticket, last_ticket
 
     def _consume_model_ep_aligned_nep_scatter_ticket(
         self, after_event: Optional[torch.cuda.Event] = None
-    ) -> bool:
-        """Consume the previous burst's ticket agreement and submit its Scatter chunk."""
+    ) -> int:
+        """Consume one aligned ticket window and submit its descriptors in order."""
         alignment_work = self._nep_scatter_alignment_work
         if alignment_work is None:
-            return False
+            return 0
 
         with torch.profiler.record_function("nep_model_ep_scatter_ticket_wait"):
             alignment_work.wait()
@@ -5399,17 +5415,45 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         minimum = alignment_tensor[:value_count].tolist()
         maximum = (-alignment_tensor[value_count:]).tolist()
         if minimum[0] != 2 or maximum[0] != 2:
-            return False
+            return 0
         if minimum[1:] != maximum[1:]:
             raise RuntimeError(
-                "NEP Scatter ranks reached a model-EP boundary with different tickets: "
+                "NEP Scatter ranks reached an ordered boundary with different windows: "
                 f"minimum={tuple(minimum[1:])}, maximum={tuple(maximum[1:])}"
             )
 
-        return self._submit_nep_scatter_chunk(after_event=after_event)
+        descriptor_count = minimum[1]
+        first_ticket = tuple(minimum[2:8])
+        last_ticket = tuple(minimum[8:14])
+        status, local_count, local_first, local_last = self._peek_nep_scatter_ticket_window()
+        if (
+            status != "ready"
+            or local_count != descriptor_count
+            or local_first != first_ticket
+            or local_last != last_ticket
+        ):
+            raise RuntimeError(
+                "NEP Scatter queue changed after its window agreement: "
+                f"agreed={(descriptor_count, first_ticket, last_ticket)} "
+                f"local={(status, local_count, local_first, local_last)}"
+            )
+        with torch.profiler.record_function(
+            f"nep_submit_scatter_window_g{first_ticket[2]}_n{descriptor_count}"
+        ):
+            for descriptor_index in range(descriptor_count):
+                submitted = self._submit_nep_scatter_chunk(
+                    after_event=after_event if descriptor_index == 0 else None,
+                    queue_behind_inflight=True,
+                )
+                if not submitted:
+                    raise RuntimeError(
+                        "NEP Scatter agreed window could not submit descriptor "
+                        f"{descriptor_index + 1}/{descriptor_count}"
+                    )
+        return descriptor_count
 
     def _launch_model_ep_aligned_nep_scatter_ticket(self) -> None:
-        """Launch a nonblocking ticket agreement for the next model-EP boundary."""
+        """Launch a nonblocking agreement for the next bucket-group window."""
         runtime_config = self._nonuniform_ep_runtime_config
         ep_group_gloo = runtime_config.get("ep_group_gloo")
         if ep_group_gloo is None:
@@ -5417,13 +5461,14 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         if self._nep_scatter_alignment_work is not None:
             raise RuntimeError("NEP Scatter launched a ticket before consuming its predecessor")
 
-        status, ticket = self._peek_nep_scatter_ticket()
+        status, descriptor_count, first_ticket, last_ticket = self._peek_nep_scatter_ticket_window()
         status_value = {"empty": 0, "busy": 1, "ready": 2}[status]
-        local_values = [status_value]
-        local_values.extend(ticket if ticket is not None else (-1,) * 6)
+        local_values = [status_value, descriptor_count]
+        local_values.extend(first_ticket if first_ticket is not None else (-1,) * 6)
+        local_values.extend(last_ticket if last_ticket is not None else (-1,) * 6)
 
         alignment_tensor = self._nep_scatter_alignment_tensor
-        if alignment_tensor is None:
+        if alignment_tensor is None or alignment_tensor.numel() != 2 * len(local_values):
             alignment_tensor = torch.empty(2 * len(local_values), dtype=torch.int64)
             self._nep_scatter_alignment_tensor = alignment_tensor
         positive = alignment_tensor[: len(local_values)]
@@ -5439,15 +5484,20 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             raise RuntimeError("Nonblocking NEP Scatter ticket launch returned no work handle")
 
     def _submit_model_ep_aligned_nep_scatter_chunk(
-        self, after_event: Optional[torch.cuda.Event] = None
-    ) -> bool:
-        """Advance the ticket pipeline after a native model-EP A2A is enqueued."""
+        self, after_event: Optional[torch.cuda.Event] = None, refresh_current_window: bool = False
+    ) -> int:
+        """Advance ordered Scatter windows at a deterministic autograd boundary."""
         runtime_config = self._nonuniform_ep_runtime_config
         if not runtime_config.get("needs_reshard", False):
-            return self._submit_nep_scatter_chunk(after_event=after_event)
+            return int(self._submit_nep_scatter_chunk(after_event=after_event))
 
         submitted = self._consume_model_ep_aligned_nep_scatter_ticket(after_event=after_event)
         self._launch_model_ep_aligned_nep_scatter_ticket()
+        if refresh_current_window:
+            submitted += self._consume_model_ep_aligned_nep_scatter_ticket(
+                after_event=after_event if submitted == 0 else None
+            )
+            self._launch_model_ep_aligned_nep_scatter_ticket()
         return submitted
 
     def _submit_nep_scatter_chunk(
@@ -5464,16 +5514,15 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             return False
 
         batch = self._nep_scatter_batches[0]
-        if batch.get("submission_complete", False):
-            if not predecessor_complete:
+        while batch.get("submission_complete", False):
+            if not predecessor_complete and not queue_behind_inflight:
                 return False
             self._nep_scatter_batches.pop(0)
             _nep_debug_print(f"retired scheduled Scatter batch module={batch['module_label']}")
             if not self._nep_scatter_batches:
                 return True
             batch = self._nep_scatter_batches[0]
-            predecessor_complete = True
-        elif not predecessor_complete and not queue_behind_inflight:
+        if not predecessor_complete and not queue_behind_inflight:
             return False
 
         scatter_stream = self._nep_scatter_stream
@@ -5526,15 +5575,18 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         return True
 
     def _progress_nep_scatter_after_compute_launch(self) -> None:
-        """Retire completed Scatter work without creating an unordered launch site."""
-        if (
-            not _nep_a2a_scatter_scheduler_enabled()
-            or not self._nep_scatter_batches
-            or self._nep_model_ep_a2a_burst_depth != 0
-        ):
+        """Advance one globally agreed Scatter window behind useful graph work."""
+        if not _nep_a2a_scatter_scheduler_enabled() or self._nep_model_ep_a2a_burst_depth != 0:
             return
 
-        self._retire_nep_scatter_chunk()
+        if self._nep_dispatch_pending_host_phases is not None:
+            with torch.profiler.record_function("nep_compute_hook_queue_scatter"):
+                phases_finished = self._finish_pending_nep_dispatch_host_phases(
+                    defer_scatter_submission=False
+                )
+            if phases_finished:
+                self._wait_for_nep_dispatch_launch()
+        self._submit_model_ep_aligned_nep_scatter_chunk(refresh_current_window=True)
 
     def _queue_nep_scatter_context_batches(
         self,
@@ -5549,6 +5601,8 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             raise RuntimeError("A2A-gated NEP Scatter state was not initialized")
 
         scheduled_context_batches = context_batches or [[]]
+        layer_ordinal = self._nep_scatter_next_layer_ordinal
+        self._nep_scatter_next_layer_ordinal += 1
         with torch.cuda.stream(scatter_stream):
             if a2a_completion_event is not None:
                 scatter_stream.wait_event(a2a_completion_event)
@@ -5573,6 +5627,7 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                     "module_label": batch_label,
                     "submission_complete": not trains,
                     "schedule_ordinal": self._nep_scatter_next_batch_ordinal,
+                    "layer_ordinal": layer_ordinal,
                 }
                 self._nep_scatter_next_batch_ordinal += 1
                 if not trains:
