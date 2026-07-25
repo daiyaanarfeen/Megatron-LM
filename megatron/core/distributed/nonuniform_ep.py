@@ -5484,20 +5484,15 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             raise RuntimeError("Nonblocking NEP Scatter ticket launch returned no work handle")
 
     def _submit_model_ep_aligned_nep_scatter_chunk(
-        self, after_event: Optional[torch.cuda.Event] = None, refresh_current_window: bool = False
+        self, after_event: Optional[torch.cuda.Event] = None
     ) -> int:
-        """Advance ordered Scatter windows at a deterministic autograd boundary."""
+        """Advance ordered Scatter windows at a model-EP boundary."""
         runtime_config = self._nonuniform_ep_runtime_config
         if not runtime_config.get("needs_reshard", False):
             return int(self._submit_nep_scatter_chunk(after_event=after_event))
 
         submitted = self._consume_model_ep_aligned_nep_scatter_ticket(after_event=after_event)
         self._launch_model_ep_aligned_nep_scatter_ticket()
-        if refresh_current_window:
-            submitted += self._consume_model_ep_aligned_nep_scatter_ticket(
-                after_event=after_event if submitted == 0 else None
-            )
-            self._launch_model_ep_aligned_nep_scatter_ticket()
         return submitted
 
     def _submit_nep_scatter_chunk(
@@ -5575,18 +5570,15 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         return True
 
     def _progress_nep_scatter_after_compute_launch(self) -> None:
-        """Advance one globally agreed Scatter window behind useful graph work."""
-        if not _nep_a2a_scatter_scheduler_enabled() or self._nep_model_ep_a2a_burst_depth != 0:
+        """Retire Scatter work without launching rank-dependent collectives."""
+        if (
+            not _nep_a2a_scatter_scheduler_enabled()
+            or not self._nep_scatter_batches
+            or self._nep_model_ep_a2a_burst_depth != 0
+        ):
             return
 
-        if self._nep_dispatch_pending_host_phases is not None:
-            with torch.profiler.record_function("nep_compute_hook_queue_scatter"):
-                phases_finished = self._finish_pending_nep_dispatch_host_phases(
-                    defer_scatter_submission=False
-                )
-            if phases_finished:
-                self._wait_for_nep_dispatch_launch()
-        self._submit_model_ep_aligned_nep_scatter_chunk(refresh_current_window=True)
+        self._retire_nep_scatter_chunk()
 
     def _queue_nep_scatter_context_batches(
         self,

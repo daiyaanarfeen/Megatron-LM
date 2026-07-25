@@ -2903,37 +2903,37 @@ def test_nep_scatter_progress_queues_one_chunk_per_completed_a2a_burst(monkeypat
     assert ddp._nep_scatter_inflight_event is None
 
 
-def test_nep_scatter_progress_after_compute_launch_advances_aligned_window(monkeypatch):
+def test_nep_scatter_progress_after_compute_launch_only_retires_work(monkeypatch):
     ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
     calls = []
     ddp._nep_model_ep_a2a_burst_depth = 0
+    ddp._nep_scatter_batches = [object()]
     ddp._nep_dispatch_pending_host_phases = object()
-    ddp._finish_pending_nep_dispatch_host_phases = (
-        lambda defer_scatter_submission=False: calls.append(("finish", defer_scatter_submission))
-        or True
+    ddp._finish_pending_nep_dispatch_host_phases = lambda **kwargs: pytest.fail(
+        "compute hooks must not launch participant-dependent host phases"
     )
-    ddp._wait_for_nep_dispatch_launch = lambda final=False: calls.append(("wait", final))
-    ddp._submit_model_ep_aligned_nep_scatter_chunk = (
-        lambda after_event=None, refresh_current_window=False: calls.append(
-            ("submit", after_event, refresh_current_window)
-        )
-        or 0
+    ddp._wait_for_nep_dispatch_launch = lambda final=False: pytest.fail(
+        "compute hooks must not wait for participant-dependent launches"
     )
+    ddp._submit_model_ep_aligned_nep_scatter_chunk = lambda **kwargs: pytest.fail(
+        "compute hooks must not launch rank-dependent ticket collectives"
+    )
+    ddp._retire_nep_scatter_chunk = lambda force=False: calls.append(("retire", force)) or True
     monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_A2A_SCATTER_SCHEDULER", "1")
 
     ddp._progress_nep_scatter_after_compute_launch()
 
-    assert calls == [("finish", False), ("wait", False), ("submit", None, True)]
+    assert calls == [("retire", False)]
 
     ddp._nep_model_ep_a2a_burst_depth = 1
     ddp._progress_nep_scatter_after_compute_launch()
-    assert calls == [("finish", False), ("wait", False), ("submit", None, True)]
+    assert calls == [("retire", False)]
 
     ddp._nep_model_ep_a2a_burst_depth = 0
-    ddp._nep_dispatch_pending_host_phases = None
+    ddp._nep_scatter_batches = []
     ddp._progress_nep_scatter_after_compute_launch()
 
-    assert calls[-1] == ("submit", None, True)
+    assert calls == [("retire", False)]
 
 
 def test_nep_scatter_submission_window_spans_owners_but_not_groups_or_layers():
