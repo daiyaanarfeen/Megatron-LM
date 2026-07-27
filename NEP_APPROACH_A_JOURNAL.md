@@ -26,6 +26,25 @@ Append a dated entry whenever we do something new: code changes, job submissions
   functional preservation of the performance-only path; no parameter-diagnostic code runs
   when the new opt-in flag is disabled.
 
+## 2026-07-27 - Native optimizer EP32/28 performance validation
+
+- GB200 same-allocation job `2508542` completed `0:0` in `9m42s` on
+  `lyris[0007-0010,0051-0054,0136-0141,0143-0144]`; queued GB300 duplicate `2508544`
+  was cancelled after GB200 allocated.
+- It retained the accepted 14-stage EP32/28 workload: TP2, 224 experts, top-k6,
+  exact-uniform routing, local CUDA graphs, three NEP expert groups, one Scatter chunk,
+  sequence length 18368, healthy EP32 MBS4 and NEP EP32/EP28 MBS `4/1`, with ten
+  sequential same-allocation timing iterations per case. `NONUNIFORM_SKIP_OPTIMIZER_STEP=0`
+  was set for both cases. Logs confirm `use_distributed_optimizer=False`, native Adam setup,
+  and no skipped or NaN iterations.
+- Warmup-excluded iterations 3-10: healthy `680.050 +/- 3.123 ms`; NEP
+  `713.150 +/- 2.603 ms`. Full-owner parity is `95.359%` (NEP `4.867%` slower).
+- The accepted no-op reference `2489678` measured `95.600%` owner parity. The native
+  optimizer changes parity by only `-0.241` percentage points, so there is no material
+  EP32/28 NEP performance regression from regular optimizer compatibility. Results are in
+  `slurm_runs/lyris_a3b_ep32_ep28_adam_ab/` and the outer log
+  `slurm_runs/lyris/coreai_comparch_sysarch-nep.ep32-28-adam-gb200-2508542.out`.
+
 ## 2026-07-27 - Four native DDP buckets regress EP32/EP28 owner parity
 
 - Same-allocation GB300 bucket-sweep job `2507357` completed `0:0` in `15m24s` on `theia[0011-0014,0091-0094,0098,0102-0104,0200,0203-0204,0214]`; the queued GB200 duplicate `2507358` was canceled after GB300 allocated. The wrapper ran ten iterations each in fixed order: healthy-16, NEP-16, healthy-4, NEP-4. Model math, node allocation, segment, image, topology, batch semantics, and the fixed three NEP expert groups were identical; no correctness gate was repeated because the implementation did not change.
