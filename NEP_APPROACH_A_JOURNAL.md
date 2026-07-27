@@ -20,6 +20,11 @@ Append a dated entry whenever we do something new: code changes, job submissions
   - The first attempt, job `2508164`, exposed only a harness error: its gradient-specific
     cross-rank-uniformity assertion was invalid for parameter placement. No training failure
     occurred; the corrected rank-by-rank comparator passed in `2508212`.
+- Default no-op regression job `2508314` then completed `0:0` on GB200. Without setting
+  `NONUNIFORM_SKIP_OPTIMIZER_STEP`, the runner emitted the historical skip flag and the
+  existing two-step stable-versus-split gradient checksum gate passed exactly. This validates
+  functional preservation of the performance-only path; no parameter-diagnostic code runs
+  when the new opt-in flag is disabled.
 
 ## 2026-07-27 - Four native DDP buckets regress EP32/EP28 owner parity
 
