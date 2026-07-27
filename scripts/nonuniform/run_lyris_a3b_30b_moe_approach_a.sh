@@ -73,6 +73,7 @@ EXTRA_MEGATRON_ARGS="${EXTRA_MEGATRON_ARGS:-}"
 HIGH_PRIORITY_STREAM_GROUPS="${HIGH_PRIORITY_STREAM_GROUPS-ep}"
 CUDA_GRAPH_IMPL="${CUDA_GRAPH_IMPL:-none}"
 NONUNIFORM_MODE="${NONUNIFORM_MODE:-ep}"
+NONUNIFORM_SKIP_OPTIMIZER_STEP="${NONUNIFORM_SKIP_OPTIMIZER_STEP:-1}"
 USE_GLOO_PROCESS_GROUPS="${USE_GLOO_PROCESS_GROUPS:-0}"
 SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-0}"
 DISTRIBUTED_TIMEOUT_MINUTES="${DISTRIBUTED_TIMEOUT_MINUTES:-20}"
@@ -87,7 +88,7 @@ LOG_NUM_ZEROS_IN_GRAD="${LOG_NUM_ZEROS_IN_GRAD:-1}"
 LOG_ENERGY="${LOG_ENERGY:-0}"
 MANUAL_GC_INTERVAL="${MANUAL_GC_INTERVAL:-10}"
 
-for toggle in MOE_ROUTER_FORCE_LOAD_BALANCING MOE_ROUTER_FORCE_UNIFORM_ROUTING; do
+for toggle in MOE_ROUTER_FORCE_LOAD_BALANCING MOE_ROUTER_FORCE_UNIFORM_ROUTING NONUNIFORM_SKIP_OPTIMIZER_STEP; do
     case "${!toggle}" in
         0|1) ;;
         *)
@@ -159,6 +160,7 @@ echo "[lyris-a3b] zero_sm=${MEGATRON_NONUNIFORM_EP_ZERO_SM_RESHARD} skip_scatter
 echo "[lyris-a3b] target_chunks=${MEGATRON_NONUNIFORM_EP_NCCL_TARGET_CHUNKS:-auto} scatter_chunks=${MEGATRON_NONUNIFORM_EP_NCCL_SCATTER_CHUNKS} chunk_window=${MEGATRON_NONUNIFORM_EP_NCCL_ASYNC_CHUNK_WINDOW} max_gather_bytes=${MEGATRON_NONUNIFORM_EP_NCCL_MAX_GATHER_BYTES} expert_bucket_groups=${MEGATRON_NONUNIFORM_EP_NCCL_EXPERT_BUCKET_GROUPS} a2a_scatter_scheduler=${MEGATRON_NONUNIFORM_EP_A2A_SCATTER_SCHEDULER}"
 echo "[lyris-a3b] router_topk=${MOE_ROUTER_TOPK} router_force_balance=${MOE_ROUTER_FORCE_LOAD_BALANCING} router_force_uniform=${MOE_ROUTER_FORCE_UNIFORM_ROUTING} router_force_biased=${MOE_ROUTER_FORCE_BIASED:-none}"
 echo "[lyris-a3b] log_params_norm=${LOG_PARAMS_NORM} log_num_zeros_in_grad=${LOG_NUM_ZEROS_IN_GRAD} log_energy=${LOG_ENERGY} manual_gc_interval=${MANUAL_GC_INTERVAL}"
+echo "[lyris-a3b] nonuniform_skip_optimizer_step=${NONUNIFORM_SKIP_OPTIMIZER_STEP}"
 
 container_args=(
     --container-image="${IMAGE}"
@@ -187,7 +189,10 @@ if [[ -n "${HIGH_PRIORITY_STREAM_GROUPS}" ]]; then
     high_priority_stream_args=" --high-priority-stream-groups ${HIGH_PRIORITY_STREAM_GROUPS} "
 fi
 
-nonuniform_args=" --nonuniform-mode ${NONUNIFORM_MODE} --nonuniform-skip-optimizer-step "
+nonuniform_args=" --nonuniform-mode ${NONUNIFORM_MODE} "
+if [[ "${NONUNIFORM_SKIP_OPTIMIZER_STEP}" == "1" ]]; then
+    nonuniform_args+=" --nonuniform-skip-optimizer-step "
+fi
 if [[ "${NONUNIFORM_MODE}" == "ep" ]]; then
     nonuniform_args+=" --nonuniform-ep-ddp-approach nccl --nonuniform-ep-num-tp-cp-per-replica ${NONUNIFORM_EP_TOPOLOGY} "
 elif [[ "${NONUNIFORM_MODE}" != "none" ]]; then

@@ -38,6 +38,8 @@ CASE_RUN_NNODES="${CASE_RUN_NNODES:-3}"
 CASE_RUN_NPROC_PER_NODE="${CASE_RUN_NPROC_PER_NODE:-4}"
 CASE_RUN_WORLD_SIZE="${CASE_RUN_WORLD_SIZE:-$((CASE_RUN_NNODES * CASE_RUN_NPROC_PER_NODE))}"
 CASE_USE_DIRECT_SRUN_RANKS="${CASE_USE_DIRECT_SRUN_RANKS:-0}"
+CASE_SKIP_OPTIMIZER_STEP="${CASE_SKIP_OPTIMIZER_STEP:-1}"
+CASE_TRAIN_ITERS="${CASE_TRAIN_ITERS:-2}"
 CASE_GLOBAL_BATCH_SIZE="${CASE_GLOBAL_BATCH_SIZE:-24}"
 CASE_SEQ_LENGTH="${CASE_SEQ_LENGTH:-128}"
 CASE_NUM_EXPERTS="${CASE_NUM_EXPERTS:-8}"
@@ -89,6 +91,13 @@ run_case() {
     local scatter_chunks="${10}"
     local a2a_scatter_scheduler="${11}"
     local checksum_dir="${ROOT_DIR}/${name}/checksums"
+    local checksum_args="--attention-dropout 0.0 --hidden-dropout 0.0 --cuda-graph-impl local --cuda-graph-modules moe_router --te-rng-tracker --no-load-rng --distributed-timeout-minutes 3"
+
+    if [[ "${CASE_SKIP_OPTIMIZER_STEP}" == "1" ]]; then
+        checksum_args="--nonuniform-log-grad-checksum --nonuniform-grad-checksum-dir ${checksum_dir} ${checksum_args}"
+    else
+        checksum_args="--nonuniform-log-param-checksum --nonuniform-param-checksum-dir ${checksum_dir} ${checksum_args}"
+    fi
 
     echo "[${CASE_DISPLAY}-split-correctness] $(date --iso-8601=seconds) starting ${name}"
     timeout --foreground --signal=TERM --kill-after=45s "${CASE_TIMEOUT}" \
@@ -105,7 +114,8 @@ run_case() {
             USE_DIRECT_SRUN_RANKS="${CASE_USE_DIRECT_SRUN_RANKS}" \
             RUN_PREFLIGHT_TESTS=0 \
             ENABLE_PYTORCH_PROFILER=0 \
-            TRAIN_ITERS=2 \
+            TRAIN_ITERS="${CASE_TRAIN_ITERS}" \
+            NONUNIFORM_SKIP_OPTIMIZER_STEP="${CASE_SKIP_OPTIMIZER_STEP}" \
             GLOBAL_BATCH_SIZE="${CASE_GLOBAL_BATCH_SIZE}" \
             MICRO_BATCH_SIZE=1 \
             NUM_LAYERS="${CASE_NUM_LAYERS}" \
@@ -141,7 +151,7 @@ run_case() {
             MEGATRON_NONUNIFORM_EP_OVERLAP_DEBUG=0 \
             MEGATRON_NONUNIFORM_EP_DEBUG="${debug}" \
             MEGATRON_NONUNIFORM_EP_DEBUG_RANKS="${CASE_DEBUG_RANKS}" \
-            EXTRA_MEGATRON_ARGS="--nonuniform-log-grad-checksum --nonuniform-grad-checksum-dir ${checksum_dir} --attention-dropout 0.0 --hidden-dropout 0.0 --cuda-graph-impl local --cuda-graph-modules moe_router --te-rng-tracker --no-load-rng --distributed-timeout-minutes 3" \
+            EXTRA_MEGATRON_ARGS="${checksum_args}" \
             bash "${RUNNER}"
     echo "[${CASE_DISPLAY}-split-correctness] $(date --iso-8601=seconds) completed ${name}"
 }
@@ -180,33 +190,41 @@ FIELDS = (
     "expert_numel",
 )
 PATTERN = re.compile(
-    r"\[nonuniform-grad-checksum\] iteration=(\S+) rank=(\d+) "
+    r"\[nonuniform-(grad|param)-checksum\] iteration=(\S+) rank=(\d+) "
     + " ".join(rf"{field}=({NUMBER})" for field in FIELDS)
 )
 
 
 def load(checksum_dir, driver_path):
     records = {}
+    checksum_kind = None
     checksum_paths = sorted(Path(checksum_dir).glob("rank_*.log"))
     for path in checksum_paths:
         for match in PATTERN.finditer(path.read_text()):
-            iteration = match.group(1)
-            rank = int(match.group(2))
+            kind = match.group(1)
+            if checksum_kind is not None and checksum_kind != kind:
+                raise RuntimeError(f"Mixed checksum kinds in {checksum_dir}")
+            checksum_kind = kind
+            iteration = match.group(2)
+            rank = int(match.group(3))
             records.setdefault(iteration, {})[rank] = tuple(
-                float(value) for value in match.groups()[2:]
+                float(value) for value in match.groups()[3:]
             )
     if not records:
-        raise RuntimeError(f"No gradient checksums found in {checksum_dir}")
+        raise RuntimeError(f"No checksums found in {checksum_dir}")
     driver_text = Path(driver_path).read_text()
     if len(re.findall(r"number of nan iterations:\s+0", driver_text)) < 2:
         raise RuntimeError(f"Missing two finite iterations in {driver_path}")
-    return driver_text, records
+    return driver_text, records, checksum_kind
 
 
-stable_text, stable = load(sys.argv[1], sys.argv[3])
-split_text, split = load(sys.argv[2], sys.argv[4])
+stable_text, stable, stable_kind = load(sys.argv[1], sys.argv[3])
+split_text, split, split_kind = load(sys.argv[2], sys.argv[4])
 expected_ranks = int(sys.argv[5])
 display = sys.argv[6]
+if stable_kind != split_kind:
+    raise RuntimeError(f"Checksum kind mismatch: {stable_kind} versus {split_kind}")
+skip_optimizer_step = stable_kind == "grad"
 if "submit split_dispatch_gather_owner_barrier" not in split_text:
     raise RuntimeError("Split-host scheduler did not emit its Gather-phase launch marker")
 if "split_host_phases_fallback" in split_text:
@@ -246,6 +264,16 @@ for index, label in enumerate(FIELDS):
         f"relative_delta={relative_delta:.3e} "
         f"stable_spread={stable_spread:.3e} split_spread={split_spread:.3e}"
     )
+    if not skip_optimizer_step:
+        for rank in stable[iteration]:
+            stable_value = stable[iteration][rank][index]
+            split_value = split[iteration][rank][index]
+            if label in exact_fields:
+                if stable_value != split_value:
+                    raise RuntimeError(f"Parameter coverage mismatch for rank={rank} {label}")
+            elif not math.isclose(stable_value, split_value, rel_tol=rtol, abs_tol=atol):
+                raise RuntimeError(f"Parameter checksum mismatch for rank={rank} {label}")
+        continue
     if label in exact_fields:
         if stable_spread != 0.0 or split_spread != 0.0:
             raise RuntimeError(f"Per-rank coverage disagreement for {label}")
@@ -256,6 +284,23 @@ for index, label in enumerate(FIELDS):
             raise RuntimeError(f"Per-rank checksum disagreement for {label}")
         if not math.isclose(stable_median, split_median, rel_tol=rtol, abs_tol=atol):
             raise RuntimeError(f"Gradient checksum mismatch for {label}")
+
+if not skip_optimizer_step:
+    if len(common_iterations) < 2:
+        raise RuntimeError("Expected at least two native optimizer steps")
+    previous_iteration = sorted(common_iterations, key=lambda value: int(value))[-2]
+    changed = any(
+        not math.isclose(
+            stable[previous_iteration][rank][index],
+            stable[iteration][rank][index],
+            rel_tol=1.0e-12,
+            abs_tol=1.0e-12,
+        )
+        for rank in stable[iteration]
+        for index in range(len(FIELDS))
+    )
+    if not changed:
+        raise RuntimeError("Native optimizer did not change the parameter fingerprint")
 
 print(f"[{display}-split-correctness] PASS")
 PY

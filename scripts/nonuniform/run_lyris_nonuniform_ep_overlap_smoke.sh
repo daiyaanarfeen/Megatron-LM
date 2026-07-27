@@ -36,8 +36,17 @@ RUN_ISORT="${RUN_ISORT:-1}"
 RUN_PREFLIGHT_TESTS="${RUN_PREFLIGHT_TESTS:-1}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
 ENABLE_PYTORCH_PROFILER="${ENABLE_PYTORCH_PROFILER:-1}"
+NONUNIFORM_SKIP_OPTIMIZER_STEP="${NONUNIFORM_SKIP_OPTIMIZER_STEP:-1}"
 EXTRA_MEGATRON_ARGS="${EXTRA_MEGATRON_ARGS:-}"
 export FORMAT_SOURCES RUN_ISORT
+
+case "${NONUNIFORM_SKIP_OPTIMIZER_STEP}" in
+    0|1) ;;
+    *)
+        echo "NONUNIFORM_SKIP_OPTIMIZER_STEP must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
 
 mapfile -t allocated_nodes < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
 if ((RUN_NNODES > ${#allocated_nodes[@]})); then
@@ -178,7 +187,9 @@ export ENABLE_PYTORCH_PROFILER
 export PROFILE_STEP_START="${PROFILE_STEP_START:-4}"
 export PROFILE_STEP_END="${PROFILE_STEP_END:-6}"
 export PROFILE_RANKS="${PROFILE_RANKS:-0}"
-export EXTRA_MEGATRON_ARGS="--nonuniform-skip-optimizer-step ${EXTRA_MEGATRON_ARGS}"
+if [[ "${NONUNIFORM_SKIP_OPTIMIZER_STEP}" == "1" ]]; then
+    export EXTRA_MEGATRON_ARGS="--nonuniform-skip-optimizer-step ${EXTRA_MEGATRON_ARGS}"
+fi
 
 if [[ "${USE_DIRECT_SRUN_RANKS}" == "1" ]]; then
     export LAUNCHER_MODE=direct

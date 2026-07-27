@@ -2,6 +2,25 @@
 
 Append a dated entry whenever we do something new: code changes, job submissions, benchmark results, trace analysis, or decisions that change the next step. Keep entries factual and include job IDs, run dirs, and commits when available.
 
+## 2026-07-27 - Native non-distributed optimizer compatibility
+
+- Confirmed the NEP entry point already uses Megatron's original optimizer, scheduler, and
+  `train_step` whenever `--nonuniform-skip-optimizer-step` is absent. NEP finishes its
+  gradient gather/owner all-reduce/scatter before native `finish_grad_sync` returns.
+- Made the runner's benchmark-only skip flag configurable through
+  `NONUNIFORM_SKIP_OPTIMIZER_STEP`, defaulting to `1`; existing performance jobs preserve
+  their no-op optimizer command line and GPU code path.
+- Added opt-in post-native-step parameter fingerprints for correctness jobs only. The
+  production path has no checksum wrapper unless the diagnostic flag is explicitly set.
+- Job `2508212` completed on GB200 using EP `4 2`, TP `2`, exact forced routing, and four
+  native Adam steps for both stable and split Approach A schedules.
+  - Both runs reported zero skipped and zero NaN iterations.
+  - Final dense and expert parameter fingerprints matched stable versus split on every rank.
+  - Fingerprints changed between steps, proving the native optimizer updated parameters.
+  - The first attempt, job `2508164`, exposed only a harness error: its gradient-specific
+    cross-rank-uniformity assertion was invalid for parameter placement. No training failure
+    occurred; the corrected rank-by-rank comparator passed in `2508212`.
+
 ## 2026-07-27 - Four native DDP buckets regress EP32/EP28 owner parity
 
 - Same-allocation GB300 bucket-sweep job `2507357` completed `0:0` in `15m24s` on `theia[0011-0014,0091-0094,0098,0102-0104,0200,0203-0204,0214]`; the queued GB200 duplicate `2507358` was canceled after GB300 allocated. The wrapper ran ten iterations each in fixed order: healthy-16, NEP-16, healthy-4, NEP-4. Model math, node allocation, segment, image, topology, batch semantics, and the fixed three NEP expert groups were identical; no correctness gate was repeated because the implementation did not change.
