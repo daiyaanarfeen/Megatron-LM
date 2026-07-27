@@ -34,6 +34,7 @@ MOE_ROUTER_TOPK="${MOE_ROUTER_TOPK:-6}"
 FULL_MICRO_BATCH_SIZE="${FULL_MICRO_BATCH_SIZE:-4}"
 REDUCED_MICRO_BATCH_SIZE="${REDUCED_MICRO_BATCH_SIZE:-1}"
 SCATTER_CHUNKS="${SCATTER_CHUNKS:-1}"
+DDP_NUM_BUCKETS="${DDP_NUM_BUCKETS:-16}"
 TIMING_ITERS="${TIMING_ITERS:-10}"
 PROFILE_ITERS="${PROFILE_ITERS:-8}"
 CASE_TIMEOUT="${CASE_TIMEOUT:-12m}"
@@ -48,7 +49,7 @@ for toggle in RUN_CORRECTNESS RUN_HEALTHY_TIMING RUN_NEP_TIMING RUN_HEALTHY_PROF
             ;;
     esac
 done
-for value in SEQ_LENGTH NUM_EXPERTS MOE_ROUTER_TOPK FULL_MICRO_BATCH_SIZE REDUCED_MICRO_BATCH_SIZE SCATTER_CHUNKS; do
+for value in SEQ_LENGTH NUM_EXPERTS MOE_ROUTER_TOPK FULL_MICRO_BATCH_SIZE REDUCED_MICRO_BATCH_SIZE SCATTER_CHUNKS DDP_NUM_BUCKETS; do
     if ! [[ "${!value}" =~ ^[1-9][0-9]*$ ]]; then
         echo "${value} must be a positive integer" >&2
         exit 2
@@ -86,7 +87,7 @@ if [[ -n "${CONTAINER_NAME}" ]]; then
 fi
 
 echo "[ep32-28-scatter] job=${SLURM_JOB_ID} nodes=${SLURM_JOB_NODELIST}"
-echo "[ep32-28-scatter] seq=${SEQ_LENGTH} experts=${NUM_EXPERTS} topk=${MOE_ROUTER_TOPK} full_mbs=${FULL_MICRO_BATCH_SIZE} reduced_mbs=${REDUCED_MICRO_BATCH_SIZE} healthy_gbs=${healthy_true_gbs} nep_gbs=${nep_true_gbs} scatter_chunks=${SCATTER_CHUNKS}"
+echo "[ep32-28-scatter] seq=${SEQ_LENGTH} experts=${NUM_EXPERTS} topk=${MOE_ROUTER_TOPK} full_mbs=${FULL_MICRO_BATCH_SIZE} reduced_mbs=${REDUCED_MICRO_BATCH_SIZE} healthy_gbs=${healthy_true_gbs} nep_gbs=${nep_true_gbs} scatter_chunks=${SCATTER_CHUNKS} ddp_buckets=${DDP_NUM_BUCKETS}"
 
 # Populate the named Enroot cache on every allocated node before the A/B cases.
 srun --nodes=16 --ntasks=16 --ntasks-per-node=1 --mpi=none \
@@ -195,7 +196,7 @@ run_case() {
             TRUE_GLOBAL_BATCH_SIZE="${true_global_batch_size}" \
             REPLICA_MICRO_BATCH_SIZES="${replica_micro_batch_sizes}" \
             REPLICA_NUM_MICROBATCHES="1 1" \
-            DDP_NUM_BUCKETS=16 \
+            DDP_NUM_BUCKETS="${DDP_NUM_BUCKETS}" \
             CUDA_GRAPH_IMPL=local \
             PROFILE="${profile}" \
             PROFILE_STEP_START="${profile_step_start}" \

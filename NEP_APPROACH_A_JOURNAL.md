@@ -2,6 +2,15 @@
 
 Append a dated entry whenever we do something new: code changes, job submissions, benchmark results, trace analysis, or decisions that change the next step. Keep entries factual and include job IDs, run dirs, and commits when available.
 
+## 2026-07-27 - Four native DDP buckets regress EP32/EP28 owner parity
+
+- Parameterized `scripts/nonuniform/run_lyris_a3b_ep32_ep28_scatter_progress_ab.sh` with `DDP_NUM_BUCKETS`, preserving its default of `16`, validating the value, and logging it in the run header. The underlying runner already accepted the setting; the wrapper had previously hard-coded `16`.
+- Submitted identical GB200/GB300 candidates. GB200 job `2506439` allocated first on `lyris[0092-0095,0104-0107,0167-0170,0175-0178]`; the still-pending GB300 duplicate `2506438` was canceled. Job `2506439` completed `0:0` in `11m12s`.
+- The test preserved the validated same-allocation 14-stage setup: TP2, 224 experts, top-k6, exact-uniform routing, local CUDA graphs, no optimizer, three NEP expert bucket groups, one Scatter chunk, sequence length 18368, healthy EP32/EP32 MBS4 GBS128, and NEP EP32/EP28 full/reduced MBS `4/1` GBS78. The two-layer exact checksum gate passed before timing.
+- With `DDP_NUM_BUCKETS=4`, Megatron configured target bucket size `243,633,648` FP32 elements (`929.39 MiB`) and produced two actual native dense-DP gradient buckets in both legs. This is separate from the three NEP expert groups.
+- Steady iterations 3-10: healthy `552.725 +/- 3.745 ms`; NEP `588.538 +/- 3.202 ms`. Owner-time parity is `93.915%`, a `6.479%` NEP slowdown and `35.812 ms` gap. The accepted 16-configured-bucket reference job `2489678` measured healthy `675.750 +/- 3.475 ms`, NEP `706.850 +/- 0.896 ms`, `95.600%` parity, and a `31.100 ms` gap. Four configured buckets therefore regress parity by `1.685` percentage points despite improving both raw iteration times on a different allocation.
+- Decision: retain the default 16 configured buckets. The four-bucket result does not justify a 16-node two-bucket experiment: it combines native dense-DP work into still larger collectives, reducing readiness/overlap granularity without addressing the final NEP group-2 EDP/Scatter tail.
+
 ## 2026-07-24 - Burst-aligned Scatter ordering fixes the 14-stage deadlock
 
 - Created and pushed rollback checkpoint `9c3df368e` (`Checkpoint NEP scatter scheduling work`) on personal-fork branch `daiyaanarfeen/nonuniform-approach-a-training-scripts` before changing the launch scheduler. This commit must remain an immutable rollback point.
