@@ -669,7 +669,11 @@ class _CudagraphReplayNode(torch.autograd.Function):
             if user_output_grad.data_ptr() != cudagraph_output_grad.data_ptr():
                 cudagraph_output_grad.copy_(user_output_grad)
 
+        for hook in runner.backward_replay_pre_hooks:
+            hook()
         runner.bwd_graph.replay()
+        for hook in runner.backward_replay_post_hooks:
+            hook()
         runner.status = _GraphStatus.FWD_READY
 
         # Update FP8 scale factors if needed
@@ -705,6 +709,8 @@ class _CudaGraphRunner(torch.nn.Module):
         fwd_graph_input_kwargs: Dict[str, Any],
         func,
         need_backward,
+        backward_replay_pre_hooks=None,
+        backward_replay_post_hooks=None,
     ):
         """Creates a _CudaGraphRunner, which holds a single pair of fwd and bwd cudagraphs, which
         are not created until this runner records its graph creation into
@@ -739,6 +745,12 @@ class _CudaGraphRunner(torch.nn.Module):
 
         self.grad_enabled = need_backward and torch.is_grad_enabled()
         self.func = super(MegatronModule, self.base_module).__call__ if func is None else func
+        self.backward_replay_pre_hooks = (
+            backward_replay_pre_hooks if backward_replay_pre_hooks is not None else []
+        )
+        self.backward_replay_post_hooks = (
+            backward_replay_post_hooks if backward_replay_post_hooks is not None else []
+        )
         self.is_first_layer, self.is_last_layer = _determine_if_first_last_layer_of_this_vp_chunk(
             base_module
         )
@@ -1510,6 +1522,8 @@ class CudaGraphManager(torch.nn.Module):
         self.cudagraph_runners: list[_CudaGraphRunner] = []
         self.custom_cudagraphs_lookup_table: dict = defaultdict(lambda: None)
         self.is_first_microbatch = False
+        self.backward_replay_pre_hooks = []
+        self.backward_replay_post_hooks = []
 
         # Without pipeline parallelism, microbatches execute one at a time.
         # Therefore modules will always execute in the same order, so cudagraphs
@@ -1520,6 +1534,13 @@ class CudaGraphManager(torch.nn.Module):
             # Cudagraph stream capture requires no operations on the default stream prior to the
             # capture, so change to a side stream.
             torch.cuda.set_stream(torch.cuda.Stream())
+
+    def register_backward_replay_hooks(self, pre_hook=None, post_hook=None):
+        """Register host callbacks around each local backward graph replay."""
+        if pre_hook is not None:
+            self.backward_replay_pre_hooks.append(pre_hook)
+        if post_hook is not None:
+            self.backward_replay_post_hooks.append(post_hook)
 
     def call_ddp_preforward_hook(self, module):
         """Call any DDP pre-forward hooks which are used to launch async data parallel
@@ -1578,6 +1599,8 @@ class CudaGraphManager(torch.nn.Module):
                         kwargs,
                         self.func,
                         self.need_backward,
+                        self.backward_replay_pre_hooks,
+                        self.backward_replay_post_hooks,
                     )
                     if self._num_warmup_steps is not None:
                         runner.num_warmup_steps = self._num_warmup_steps
@@ -1598,6 +1621,8 @@ class CudaGraphManager(torch.nn.Module):
                     kwargs,
                     self.func,
                     self.need_backward,
+                    self.backward_replay_pre_hooks,
+                    self.backward_replay_post_hooks,
                 )
                 self.cudagraph_runners.append(runner)
 
