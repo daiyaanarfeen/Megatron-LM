@@ -34,7 +34,7 @@ MOE_ROUTER_TOPK="${MOE_ROUTER_TOPK:-6}"
 FULL_MICRO_BATCH_SIZE="${FULL_MICRO_BATCH_SIZE:-4}"
 REDUCED_MICRO_BATCH_SIZE="${REDUCED_MICRO_BATCH_SIZE:-1}"
 SCATTER_CHUNKS="${SCATTER_CHUNKS:-1}"
-DDP_NUM_BUCKETS="${DDP_NUM_BUCKETS:-16}"
+DDP_BUCKET_SWEEP="${DDP_BUCKET_SWEEP:-${DDP_NUM_BUCKETS:-16}}"
 TIMING_ITERS="${TIMING_ITERS:-10}"
 PROFILE_ITERS="${PROFILE_ITERS:-8}"
 CASE_TIMEOUT="${CASE_TIMEOUT:-12m}"
@@ -49,9 +49,20 @@ for toggle in RUN_CORRECTNESS RUN_HEALTHY_TIMING RUN_NEP_TIMING RUN_HEALTHY_PROF
             ;;
     esac
 done
-for value in SEQ_LENGTH NUM_EXPERTS MOE_ROUTER_TOPK FULL_MICRO_BATCH_SIZE REDUCED_MICRO_BATCH_SIZE SCATTER_CHUNKS DDP_NUM_BUCKETS; do
+for value in SEQ_LENGTH NUM_EXPERTS MOE_ROUTER_TOPK FULL_MICRO_BATCH_SIZE REDUCED_MICRO_BATCH_SIZE SCATTER_CHUNKS; do
     if ! [[ "${!value}" =~ ^[1-9][0-9]*$ ]]; then
         echo "${value} must be a positive integer" >&2
+        exit 2
+    fi
+done
+read -r -a ddp_bucket_sweep <<< "${DDP_BUCKET_SWEEP}"
+if (( ${#ddp_bucket_sweep[@]} == 0 )); then
+    echo "DDP_BUCKET_SWEEP must contain at least one positive integer" >&2
+    exit 2
+fi
+for ddp_num_buckets in "${ddp_bucket_sweep[@]}"; do
+    if ! [[ "${ddp_num_buckets}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "DDP_BUCKET_SWEEP must contain only positive integers" >&2
         exit 2
     fi
 done
@@ -87,7 +98,7 @@ if [[ -n "${CONTAINER_NAME}" ]]; then
 fi
 
 echo "[ep32-28-scatter] job=${SLURM_JOB_ID} nodes=${SLURM_JOB_NODELIST}"
-echo "[ep32-28-scatter] seq=${SEQ_LENGTH} experts=${NUM_EXPERTS} topk=${MOE_ROUTER_TOPK} full_mbs=${FULL_MICRO_BATCH_SIZE} reduced_mbs=${REDUCED_MICRO_BATCH_SIZE} healthy_gbs=${healthy_true_gbs} nep_gbs=${nep_true_gbs} scatter_chunks=${SCATTER_CHUNKS} ddp_buckets=${DDP_NUM_BUCKETS}"
+echo "[ep32-28-scatter] seq=${SEQ_LENGTH} experts=${NUM_EXPERTS} topk=${MOE_ROUTER_TOPK} full_mbs=${FULL_MICRO_BATCH_SIZE} reduced_mbs=${REDUCED_MICRO_BATCH_SIZE} healthy_gbs=${healthy_true_gbs} nep_gbs=${nep_true_gbs} scatter_chunks=${SCATTER_CHUNKS} ddp_bucket_sweep=${DDP_BUCKET_SWEEP}"
 
 # Populate the named Enroot cache on every allocated node before the A/B cases.
 srun --nodes=16 --ntasks=16 --ntasks-per-node=1 --mpi=none \
@@ -140,6 +151,7 @@ run_case() {
     local train_iters="${10}"
     local profile_step_start="${11}"
     local profile_step_end="${12}"
+    local ddp_num_buckets="${13}"
     local run_selected
     local split_host_phases=0
     local skip_preflight=1
@@ -196,7 +208,7 @@ run_case() {
             TRUE_GLOBAL_BATCH_SIZE="${true_global_batch_size}" \
             REPLICA_MICRO_BATCH_SIZES="${replica_micro_batch_sizes}" \
             REPLICA_NUM_MICROBATCHES="1 1" \
-            DDP_NUM_BUCKETS="${DDP_NUM_BUCKETS}" \
+            DDP_NUM_BUCKETS="${ddp_num_buckets}" \
             CUDA_GRAPH_IMPL=local \
             PROFILE="${profile}" \
             PROFILE_STEP_START="${profile_step_start}" \
@@ -248,22 +260,25 @@ run_pair() {
     local train_iters="$3"
     local profile_step_start="$4"
     local profile_step_end="$5"
+    local ddp_num_buckets="$6"
 
     run_case \
         "${stage}" \
-        "a3b_repeat14_ep32_ep32_mbs${FULL_MICRO_BATCH_SIZE}_healthy" \
+        "a3b_repeat14_ep32_ep32_mbs${FULL_MICRO_BATCH_SIZE}_healthy_b${ddp_num_buckets}" \
         none "16 16" 16 64 "${healthy_true_gbs}" \
         "${FULL_MICRO_BATCH_SIZE} ${FULL_MICRO_BATCH_SIZE}" \
-        "${profile}" "${train_iters}" "${profile_step_start}" "${profile_step_end}"
+        "${profile}" "${train_iters}" "${profile_step_start}" "${profile_step_end}" "${ddp_num_buckets}"
     run_case \
         "${stage}" \
-        "a3b_repeat14_ep32_ep28_mbs${FULL_MICRO_BATCH_SIZE}_${REDUCED_MICRO_BATCH_SIZE}_weighted" \
+        "a3b_repeat14_ep32_ep28_mbs${FULL_MICRO_BATCH_SIZE}_${REDUCED_MICRO_BATCH_SIZE}_weighted_b${ddp_num_buckets}" \
         ep "16 14" 15 60 "${nep_true_gbs}" \
         "${FULL_MICRO_BATCH_SIZE} ${REDUCED_MICRO_BATCH_SIZE}" \
-        "${profile}" "${train_iters}" "${profile_step_start}" "${profile_step_end}"
+        "${profile}" "${train_iters}" "${profile_step_start}" "${profile_step_end}" "${ddp_num_buckets}"
 }
 
-run_pair timing 0 "${TIMING_ITERS}" 6 7
-run_pair profile 1 "${PROFILE_ITERS}" 5 7
+for ddp_num_buckets in "${ddp_bucket_sweep[@]}"; do
+    run_pair timing 0 "${TIMING_ITERS}" 6 7 "${ddp_num_buckets}"
+    run_pair profile 1 "${PROFILE_ITERS}" 5 7 "${ddp_num_buckets}"
+done
 
 echo "[ep32-28-scatter] complete root=${ROOT_DIR}"
