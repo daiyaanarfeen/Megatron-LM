@@ -156,7 +156,6 @@ def _initialize_model_parallel(*args, **kwargs):
         tensor_model_parallel_size=megatron_args.tensor_model_parallel_size,
         context_parallel_size=megatron_args.context_parallel_size,
         num_tp_cp_per_replica=nep_topology,
-        enable_edp_ready_gate=megatron_args.nonuniform_ep_ddp_approach == "nccl",
         expert_tensor_parallel_size=megatron_args.expert_tensor_parallel_size,
         num_moe_experts=megatron_args.num_experts,
         nccl_communicator_config_path=megatron_args.nccl_communicator_config_path,
