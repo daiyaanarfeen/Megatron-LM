@@ -895,9 +895,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             use_nccl_stream=self.use_nccl_stream,
             a2a_burst_scheduler=self._model_ep_a2a_burst_scheduler,
             a2a_burst_role=(
-                _A2A_BURST_COMBINE
-                if self._model_ep_a2a_burst_scheduler is not None
-                else None
+                _A2A_BURST_COMBINE if self._model_ep_a2a_burst_scheduler is not None else None
             ),
         )
         if self.shared_experts is not None:

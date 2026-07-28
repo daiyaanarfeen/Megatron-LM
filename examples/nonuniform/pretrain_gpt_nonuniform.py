@@ -20,6 +20,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+import megatron.training.training as training_module
 import pretrain_gpt as gpt
 from megatron.core import parallel_state
 from megatron.core.distributed.nonuniform_common import (
@@ -32,8 +33,6 @@ from megatron.core.distributed.nonuniform_ep import (
     NonuniformEPDistributedDataParallel,
     initialize_nonuniform_ep_process_groups,
 )
-import megatron.training.training as training_module
-
 
 _EP_CONFIG_CACHE = {}
 _ORIGINAL_INITIALIZE_MODEL_PARALLEL = parallel_state.initialize_model_parallel
@@ -49,20 +48,10 @@ def _load_json_arg(value: Optional[str], path: Optional[str], default=None):
     return default
 
 
-
-
-
-
-
-
-
-
 def _build_ep_runtime_config(args):
     registered_runtime_config = get_nonuniform_ep_runtime_config()
     placement = _load_json_arg(
-        args.nonuniform_ep_placement_json,
-        args.nonuniform_ep_placement_path,
-        None,
+        args.nonuniform_ep_placement_json, args.nonuniform_ep_placement_path, None
     )
     if placement is None:
         return dict(registered_runtime_config) if registered_runtime_config is not None else None
@@ -89,9 +78,7 @@ def _build_ep_runtime_config(args):
         'local_ep_size': local_ep_size,
         'min_ep_size': min_ep_size,
         'num_replicas': max(1, parallel_state.get_data_parallel_world_size()),
-        'dp_size': max(
-            1, parallel_state.get_data_parallel_world_size(with_context_parallel=True)
-        ),
+        'dp_size': max(1, parallel_state.get_data_parallel_world_size(with_context_parallel=True)),
         'ep_group': ep_group,
         'edp_group': edp_group,
         'ep_rank': ep_rank,
@@ -102,9 +89,7 @@ def _build_ep_runtime_config(args):
 
 def _create_gloo_process_groups_arg(args):
     return getattr(
-        args,
-        "enable_gloo_process_groups",
-        getattr(args, "use_gloo_process_groups", True),
+        args, "enable_gloo_process_groups", getattr(args, "use_gloo_process_groups", True)
     )
 
 
@@ -112,7 +97,6 @@ def _initialize_model_parallel(*args, **kwargs):
     """Initialize the nonuniform EP topology before model construction."""
     megatron_args = gpt.get_args()
     nep_topology = megatron_args.nonuniform_ep_num_tp_cp_per_replica
-
 
     if megatron_args.nonuniform_mode != "ep" or nep_topology is None:
         return _ORIGINAL_INITIALIZE_MODEL_PARALLEL(*args, **kwargs)
@@ -170,9 +154,7 @@ def _initialize_model_parallel(*args, **kwargs):
 
 def _build_ep_config(args) -> NonuniformEPConfig:
     expert_owner = _load_json_arg(
-        args.nonuniform_ep_expert_owner_json,
-        args.nonuniform_ep_expert_owner_path,
-        None,
+        args.nonuniform_ep_expert_owner_json, args.nonuniform_ep_expert_owner_path, None
     )
     if expert_owner is not None:
         expert_owner = {int(expert): int(owner) for expert, owner in expert_owner.items()}
@@ -214,11 +196,7 @@ def _install_opt_in_ddp(args):
 
     class NonuniformEPDDP(NonuniformEPDistributedDataParallel):
         def __init__(self, *ddp_args, **kwargs):
-            super().__init__(
-                *ddp_args,
-                nonuniform_ep_config=_get_ep_config(args),
-                **kwargs,
-            )
+            super().__init__(*ddp_args, nonuniform_ep_config=_get_ep_config(args), **kwargs)
 
     training_module.DDP = NonuniformEPDDP
     parallel_state.initialize_model_parallel = _initialize_model_parallel
@@ -238,9 +216,7 @@ def _add_nonuniform_args(parser):
         help="Opt into nonuniform EP training.",
     )
     group.add_argument("--nonuniform-ep-min-size", type=int, default=None)
-    group.add_argument(
-        "--nonuniform-ep-num-tp-cp-per-replica", nargs="+", type=int, default=None
-    )
+    group.add_argument("--nonuniform-ep-num-tp-cp-per-replica", nargs="+", type=int, default=None)
     group.add_argument("--nonuniform-ep-placement-json", default=None)
     group.add_argument("--nonuniform-ep-placement-path", default=None)
     group.add_argument("--nonuniform-ep-expert-owner-json", default=None)
@@ -257,10 +233,7 @@ def _add_nonuniform_args(parser):
 
 if __name__ == "__main__":
     _MAIN_ENTRY_TIME = gpt.time.time()
-    gpt.set_startup_timestamps(
-        program_start=gpt._PROGRAM_START_TIME,
-        main_entry=_MAIN_ENTRY_TIME,
-    )
+    gpt.set_startup_timestamps(program_start=gpt._PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
 
     gpt.train_valid_test_datasets_provider.is_distributed = True
     pretrain, store = gpt.inprocess_restart.maybe_wrap_for_inprocess_restart(gpt.pretrain)

@@ -485,12 +485,7 @@ class _AllToAll(torch.autograd.Function):
         backward_burst_role = None
         if ctx.a2a_burst_role is not None:
             forward_begin, forward_end, backward_begin, backward_end = ctx.a2a_burst_role
-            backward_burst_role = (
-                backward_begin,
-                backward_end,
-                forward_begin,
-                forward_end,
-            )
+            backward_burst_role = (backward_begin, backward_end, forward_begin, forward_end)
         return (
             None,
             _AllToAll.apply(
