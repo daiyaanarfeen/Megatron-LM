@@ -1873,6 +1873,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 if submission_window == 1
                 else ("dispatch", stream_slot % submission_window)
             )
+        elif _nep_end_iteration_scatter_enabled():
+            stream_key = ("end_iteration", stream_slot % _get_nep_nccl_async_chunk_window())
         else:
             stream_key = stream_slot
         if state is not None:
@@ -1899,6 +1901,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             + owner_ep_rank * max(1, layout["num_chunks"])
             + chunk_index
         )
+        if _nep_end_iteration_scatter_enabled():
+            return task_ordinal
         return task_ordinal % buffer_slots
 
     def _flush_nep_nccl_pending_scatters(
@@ -4857,6 +4861,123 @@ def _configure_nep_nccl_task_scheduler(
     state["pending_owner_tasks"] = []
 
 
+def _configure_nep_end_iteration_scatter_buffers(
+    bucket_groups: List[NonuniformEPNCCLParamAndGradBucketGroup],
+) -> None:
+    """Preallocate one persistent Gather/Scatter buffer set per iteration task."""
+    if not bucket_groups or not _nep_end_iteration_scatter_enabled():
+        return
+
+    state = bucket_groups[0]._get_nep_nccl_shared_buffer_state()
+    cache = state["gather_buf_cache"]
+    slots = set()
+    scatter_chunks = _get_nep_nccl_scatter_chunks()
+    for task in state["task_sequence"]:
+        group = task["group"]
+        owner_ep_rank = task["owner_ep_rank"]
+        chunk_index = task["chunk_index"]
+        chunk_start = task["chunk_start"]
+        chunk_end = task["chunk_end"]
+        chunk_size = chunk_end - chunk_start
+        slot = group._get_nep_nccl_task_buffer_slot(owner_ep_rank, chunk_index)
+        if slot in slots:
+            raise RuntimeError(f"End-of-iteration NEP buffer slot {slot} is not unique")
+        slots.add(slot)
+
+        dtype = group.buckets[0].grad_data.dtype
+        device = group.buckets[0].grad_data.device
+        group._get_nep_nccl_cached_tensor(
+            cache,
+            ("owner_layout_gather", slot, chunk_size, dtype, device),
+            chunk_size,
+            dtype,
+            device,
+        )
+
+        ep_rank = group._nep_runtime_config["ep_rank"]
+        source_ranks = group._nep_nccl_owner_source_ranks(owner_ep_rank)
+        transfer_ranks = group._nep_nccl_owner_transfer_ranks(owner_ep_rank)
+        remote_source_ranks = [rank for rank in source_ranks if rank != owner_ep_rank]
+        if ep_rank not in transfer_ranks or not remote_source_ranks:
+            continue
+
+        if ep_rank in remote_source_ranks:
+            gather_input_numel = group._nep_nccl_owner_source_payload_numel(
+                owner_ep_rank, ep_rank, chunk_start, chunk_end
+            )
+            group._get_nep_nccl_cached_tensor(
+                cache,
+                ("owner_layout_a2a_gather_input", slot, gather_input_numel, dtype, device),
+                gather_input_numel,
+                dtype,
+                device,
+            )
+        if ep_rank == owner_ep_rank:
+            gather_output_numel = sum(
+                group._nep_nccl_owner_source_payload_numel(
+                    owner_ep_rank, source_ep_rank, chunk_start, chunk_end
+                )
+                for source_ep_rank in remote_source_ranks
+            )
+            group._get_nep_nccl_cached_tensor(
+                cache,
+                ("owner_layout_a2a_gather_output", slot, gather_output_numel, dtype, device),
+                gather_output_numel,
+                dtype,
+                device,
+            )
+
+        for scatter_chunk_index, (scatter_start, scatter_end) in enumerate(
+            group._nep_nccl_scatter_chunk_ranges(
+                owner_ep_rank, chunk_start, chunk_end, scatter_chunks
+            )
+        ):
+            if ep_rank == owner_ep_rank:
+                scatter_input_numel = sum(
+                    group._nep_nccl_owner_source_payload_numel(
+                        owner_ep_rank, destination_ep_rank, scatter_start, scatter_end
+                    )
+                    for destination_ep_rank in remote_source_ranks
+                )
+                group._get_nep_nccl_cached_tensor(
+                    cache,
+                    (
+                        "owner_layout_a2a_scatter_input",
+                        slot,
+                        chunk_index,
+                        scatter_chunk_index,
+                        scatter_input_numel,
+                        dtype,
+                        device,
+                    ),
+                    scatter_input_numel,
+                    dtype,
+                    device,
+                )
+            elif ep_rank in remote_source_ranks:
+                scatter_output_numel = group._nep_nccl_owner_source_payload_numel(
+                    owner_ep_rank, ep_rank, scatter_start, scatter_end
+                )
+                group._get_nep_nccl_cached_tensor(
+                    cache,
+                    (
+                        "owner_layout_a2a_scatter_output",
+                        slot,
+                        chunk_index,
+                        scatter_chunk_index,
+                        scatter_output_numel,
+                        dtype,
+                        device,
+                    ),
+                    scatter_output_numel,
+                    dtype,
+                    device,
+                )
+
+    state["end_iteration_scatter_buffer_slots"] = len(slots)
+    _nep_debug_print(f"preallocated end-of-iteration Scatter buffers slots={len(slots)}")
+
+
 def _configure_nep_edp_ready_gate(
     bucket_groups: List[NonuniformEPNCCLParamAndGradBucketGroup],
 ) -> None:
@@ -5126,6 +5247,7 @@ def build_nonuniform_ep_nccl_bucket_groups(
         bucket_groups, "_nep_nccl_scheduler_state", "_nep_nccl_group_index", "_nep_nccl_ready"
     )
     _configure_nep_nccl_task_scheduler(bucket_groups)
+    _configure_nep_end_iteration_scatter_buffers(bucket_groups)
     _configure_nep_edp_ready_gate(bucket_groups)
     _configure_nep_zero_sm_buffers(bucket_groups)
     return bucket_groups
@@ -5783,45 +5905,14 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         completion_event: torch.cuda.Event,
         module_label: str,
     ) -> None:
-        """Preserve post-EDP owner payloads while deferring every Scatter launch."""
-        staged_context_batches = []
-        scatter_stream = self._nep_scatter_stream
-        if scatter_stream is None:
-            raise RuntimeError("End-of-iteration NEP Scatter stream was not initialized")
-
-        with torch.cuda.stream(scatter_stream):
-            for contexts in context_batches:
-                staged_contexts = []
-                for context in contexts:
-                    group = context["group"]
-                    staged_context = context
-                    if group._nep_runtime_config["ep_rank"] == context["owner_ep_rank"]:
-                        group._order_nep_nccl_owner_edp_before_scatter(context)
-                        with torch.profiler.record_function(
-                            "nep_end_iteration_scatter_stage_owner"
-                        ):
-                            staged_context = dict(context)
-                            staged_context["chunk"] = context["chunk"].clone()
-                        _nep_debug_chunk_checksum(
-                            "staged_after_edp "
-                            f"group={getattr(group, '_nep_nccl_group_index', -1)} "
-                            f"owner={context['owner_ep_rank']} "
-                            f"chunk={context['chunk_index']}",
-                            [staged_context],
-                        )
-                        copy_done = torch.cuda.Event()
-                        copy_done.record(scatter_stream)
-                        state = group._get_nep_nccl_shared_buffer_state()
-                        state["buffer_slot_events"].setdefault(
-                            context["buffer_slot_key"], []
-                        ).append(copy_done)
-                    group._mark_nep_nccl_task_started(
-                        context["owner_ep_rank"], context["chunk_index"]
-                    )
-                    staged_contexts.append(staged_context)
-                staged_context_batches.append(staged_contexts)
+        """Retain persistent task buffers until the end-of-iteration Scatter drain."""
+        for contexts in context_batches:
+            for context in contexts:
+                context["group"]._mark_nep_nccl_task_started(
+                    context["owner_ep_rank"], context["chunk_index"]
+                )
         self._nep_end_iteration_scatter_context_batches.append(
-            (staged_context_batches, completion_event, module_label)
+            (context_batches, completion_event, module_label)
         )
 
     def _materialize_next_nep_end_iteration_scatter_batch(self) -> bool:

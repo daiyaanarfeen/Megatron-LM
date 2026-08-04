@@ -465,6 +465,30 @@ def test_nep_nccl_owner_tasks_use_bounded_distinct_stream_slots(monkeypatch):
     assert next_group_slots == [2, 3, 0, 1, 2, 3]
 
 
+def test_nep_end_iteration_scatter_uses_persistent_task_slots(monkeypatch):
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_END_ITERATION_SCATTER", "1")
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_ASYNC_CHUNK_WINDOW", "2")
+    bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
+        NonuniformEPNCCLParamAndGradBucketGroup
+    )
+    bucket_group._nep_nccl_owner_layout = {"min_ep_size": 3, "num_chunks": 2}
+
+    first_group_slots = [
+        bucket_group._get_nep_nccl_task_buffer_slot(owner_ep_rank, chunk_index)
+        for owner_ep_rank in range(3)
+        for chunk_index in range(2)
+    ]
+    bucket_group._nep_nccl_group_index = 1
+    second_group_slots = [
+        bucket_group._get_nep_nccl_task_buffer_slot(owner_ep_rank, chunk_index)
+        for owner_ep_rank in range(3)
+        for chunk_index in range(2)
+    ]
+
+    assert first_group_slots == list(range(6))
+    assert second_group_slots == list(range(6, 12))
+
+
 @pytest.mark.parametrize(
     ("target_chunks", "max_gather_bytes", "expected_chunks", "expected_chunk_numel"),
     ((2, 1 << 30, 2, 40), (4, 1 << 30, 4, 20), (4, 64, 5, 16)),
@@ -2179,78 +2203,31 @@ def test_nep_end_iteration_scatter_skips_rendezvous_and_defers_contexts(monkeypa
     assert pending[0]["phase"] == "finished"
 
 
-def test_nep_end_iteration_scatter_stages_owner_payload_before_slot_reuse(monkeypatch):
-    monkeypatch.delenv("MEGATRON_NONUNIFORM_EP_DEBUG_CHUNK_CHECKSUM", raising=False)
+def test_nep_end_iteration_scatter_retains_persistent_payload_without_clone(monkeypatch):
     ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
     calls = []
-    scatter_stream = object()
-    staged_chunk = object()
-    slot_key = (0, 8, "dtype", "device")
-    state = {"buffer_slot_events": {}}
-
-    class FakeStreamContext:
-        def __enter__(self):
-            return None
-
-        def __exit__(self, exc_type, exc_value, traceback):
-            return False
-
-    class FakeChunk:
-        def clone(self):
-            calls.append("clone")
-            return staged_chunk
-
-    class FakeEvent:
-        def record(self, stream):
-            calls.append(("record", stream))
-
-    owner_group = SimpleNamespace(
-        _nep_runtime_config={"ep_rank": 0},
-        _order_nep_nccl_owner_edp_before_scatter=lambda context: calls.append(
-            ("order_edp", context)
+    chunk = object()
+    context = {
+        "group": SimpleNamespace(
+            _mark_nep_nccl_task_started=lambda owner, chunk_index: calls.append(
+                (owner, chunk_index)
+            )
         ),
-        _get_nep_nccl_shared_buffer_state=lambda: state,
-        _mark_nep_nccl_task_started=lambda owner, chunk: calls.append(("mark_owner", owner, chunk)),
-    )
-    follower_group = SimpleNamespace(
-        _nep_runtime_config={"ep_rank": 1},
-        _mark_nep_nccl_task_started=lambda owner, chunk: calls.append(
-            ("mark_follower", owner, chunk)
-        ),
-    )
-    owner_context = {
-        "group": owner_group,
         "owner_ep_rank": 0,
         "chunk_index": 1,
-        "chunk": FakeChunk(),
-        "buffer_slot_key": slot_key,
-    }
-    follower_context = {
-        "group": follower_group,
-        "owner_ep_rank": 0,
-        "chunk_index": 1,
-        "chunk": object(),
-        "buffer_slot_key": slot_key,
+        "chunk": chunk,
     }
     completion_event = object()
-    ddp._nep_scatter_stream = scatter_stream
     ddp._nep_end_iteration_scatter_context_batches = []
-    monkeypatch.setattr(torch.cuda, "stream", lambda stream: FakeStreamContext())
-    monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
 
-    ddp._defer_nep_scatter_context_batches_to_iteration_end(
-        [[owner_context, follower_context]], completion_event, "layer"
-    )
+    ddp._defer_nep_scatter_context_batches_to_iteration_end([[context]], completion_event, "layer")
 
-    staged_batches, saved_completion, label = ddp._nep_end_iteration_scatter_context_batches[0]
-    assert staged_batches[0][0] is not owner_context
-    assert staged_batches[0][0]["chunk"] is staged_chunk
-    assert staged_batches[0][1] is follower_context
+    saved_batches, saved_completion, label = ddp._nep_end_iteration_scatter_context_batches[0]
+    assert saved_batches == [[context]]
+    assert saved_batches[0][0]["chunk"] is chunk
     assert saved_completion is completion_event
     assert label == "layer"
-    assert calls[:2] == [("order_edp", owner_context), "clone"]
-    assert state["buffer_slot_events"][slot_key]
-    assert ("record", scatter_stream) in calls
+    assert calls == [(0, 1)]
 
 
 def test_nep_pipelined_host_phases_order_each_context_before_next_gather(monkeypatch):

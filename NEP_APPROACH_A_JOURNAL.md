@@ -1,5 +1,15 @@
 ## 2026-08-04
 
+### Persistent per-task buffers for end-of-iteration Scatter
+
+- Checkpointed the clone-staging implementation as commit `611894855` before changing buffer lifetime.
+- End-of-iteration mode now assigns every deterministic `(expert bucket group, owner, chunk)` task a unique persistent buffer slot instead of mapping tasks through the bounded modulo window. Gather and Scatter staging tensors are preallocated from the task sequence once and reused across iterations; CUDA stream count remains bounded independently. Removed the per-iteration owner `chunk.clone()` and slot-release event.
+- Focused container preflight passed Black/isort, compilation, and 38 selected unit tests. EP8/EP4 job `2580284` passed exact checksum comparison with zero dense/expert relative delta and zero rank spread.
+- EP16/EP12 same-allocation GB200 job `2580366` passed its EP16 correctness gate and completed timing plus all-rank profiles. Owner-rank steady means (iterations 3-12): healthy `546.730 +/- 2.868 ms`, NEP `579.900 +/- 3.950 ms`; overhead `33.170 ms` or `6.067%`, parity `94.280%`. The previous clone-staging run was `23.513%` slower.
+- Rank 0's trace has zero `nep_end_iteration_scatter_stage_owner` and zero legacy Scatter-rendezvous scopes. Fully exposed Scatter residency is `16.422 ms`; total reshard residency is `53.250 ms`. The profiled backward-span delta is `40.706 ms`, including `16.039 ms` more GPU idle and `22.383 ms` more NCCL union.
+- Memory is the intended cost: rank-0 allocated memory after warmup is `60,884 MiB` for NEP versus `26,628 MiB` healthy, approximately `34,256 MiB` (`33.45 GiB`) additional persistent storage; 48 task slots were preallocated.
+- Artifacts: `slurm_runs/lyris/coreai_comparch_sysarch-nep.ep16-persistent-gb200-2580366.out`, `slurm_runs/lyris_a3b_ep16_ep12_end_scatter_persistent_gb200/`, and `/tmp/ep16_end_scatter_persistent_analysis.json`.
+
 ### Fully exposed end-of-iteration Scatter
 
 - Added opt-in `MEGATRON_NONUNIFORM_EP_END_ITERATION_SCATTER=1`, mutually exclusive with the A2A-aware Scatter scheduler. Gather and device-ordered EDP still launch during backward, but no Scatter collective or Scatter-specific host rendezvous is submitted there. Owner results are staged before reusable Gather slots are released, then every Scatter is submitted in canonical layer/group/owner/chunk order from `finish_grad_sync` after a global backward-complete CUDA fence.
