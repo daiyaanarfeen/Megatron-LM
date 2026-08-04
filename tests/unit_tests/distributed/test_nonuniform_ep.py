@@ -2146,6 +2146,113 @@ def test_nep_split_host_phases_skip_scatter_rendezvous(monkeypatch):
     assert pending[0]["phase"] == "finished"
 
 
+def test_nep_end_iteration_scatter_skips_rendezvous_and_defers_contexts(monkeypatch):
+    bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
+        NonuniformEPNCCLParamAndGradBucketGroup
+    )
+    context = {"group": bucket_group, "owner_ep_rank": 0}
+    pending = [
+        {
+            "batch_index": 0,
+            "contexts": [context],
+            "dispatch_stream": object(),
+            "local_transfer_contexts": {0: (context, object(), None)},
+            "phase": "edp_launched",
+        }
+    ]
+    context_batches = []
+    monkeypatch.setattr(
+        torch.distributed,
+        "barrier",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("scatter barrier")),
+    )
+    bucket_group._start_nep_nccl_owner_task_scatter = lambda unused: (_ for _ in ()).throw(
+        AssertionError("scatter submission")
+    )
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_END_ITERATION_SCATTER", "1")
+
+    assert bucket_group._finish_nep_nccl_process_group_dispatch_batches(
+        pending, scatter_context_batches=context_batches
+    )
+
+    assert context_batches == [[context]]
+    assert pending[0]["phase"] == "finished"
+
+
+def test_nep_end_iteration_scatter_stages_owner_payload_before_slot_reuse(monkeypatch):
+    monkeypatch.delenv("MEGATRON_NONUNIFORM_EP_DEBUG_CHUNK_CHECKSUM", raising=False)
+    ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
+    calls = []
+    scatter_stream = object()
+    staged_chunk = object()
+    slot_key = (0, 8, "dtype", "device")
+    state = {"buffer_slot_events": {}}
+
+    class FakeStreamContext:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+    class FakeChunk:
+        def clone(self):
+            calls.append("clone")
+            return staged_chunk
+
+    class FakeEvent:
+        def record(self, stream):
+            calls.append(("record", stream))
+
+    owner_group = SimpleNamespace(
+        _nep_runtime_config={"ep_rank": 0},
+        _order_nep_nccl_owner_edp_before_scatter=lambda context: calls.append(
+            ("order_edp", context)
+        ),
+        _get_nep_nccl_shared_buffer_state=lambda: state,
+        _mark_nep_nccl_task_started=lambda owner, chunk: calls.append(("mark_owner", owner, chunk)),
+    )
+    follower_group = SimpleNamespace(
+        _nep_runtime_config={"ep_rank": 1},
+        _mark_nep_nccl_task_started=lambda owner, chunk: calls.append(
+            ("mark_follower", owner, chunk)
+        ),
+    )
+    owner_context = {
+        "group": owner_group,
+        "owner_ep_rank": 0,
+        "chunk_index": 1,
+        "chunk": FakeChunk(),
+        "buffer_slot_key": slot_key,
+    }
+    follower_context = {
+        "group": follower_group,
+        "owner_ep_rank": 0,
+        "chunk_index": 1,
+        "chunk": object(),
+        "buffer_slot_key": slot_key,
+    }
+    completion_event = object()
+    ddp._nep_scatter_stream = scatter_stream
+    ddp._nep_end_iteration_scatter_context_batches = []
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: FakeStreamContext())
+    monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
+
+    ddp._defer_nep_scatter_context_batches_to_iteration_end(
+        [[owner_context, follower_context]], completion_event, "layer"
+    )
+
+    staged_batches, saved_completion, label = ddp._nep_end_iteration_scatter_context_batches[0]
+    assert staged_batches[0][0] is not owner_context
+    assert staged_batches[0][0]["chunk"] is staged_chunk
+    assert staged_batches[0][1] is follower_context
+    assert saved_completion is completion_event
+    assert label == "layer"
+    assert calls[:2] == [("order_edp", owner_context), "clone"]
+    assert state["buffer_slot_events"][slot_key]
+    assert ("record", scatter_stream) in calls
+
+
 def test_nep_pipelined_host_phases_order_each_context_before_next_gather(monkeypatch):
     bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
         NonuniformEPNCCLParamAndGradBucketGroup
@@ -2382,6 +2489,57 @@ def test_nep_a2a_scatter_scheduler_preserves_ordered_owner_waves(monkeypatch):
 
     bucket_group._start_nep_nccl_split_host_phase_batch = start_batch
     monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_A2A_SCATTER_SCHEDULER", "1")
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_ASYNC_CHUNK_WINDOW", "16")
+
+    pending = bucket_group._start_nep_nccl_process_group_dispatch_batch(
+        state,
+        force_ready=True,
+        async_op=True,
+        compute_ready_event=compute_ready_event,
+        split_host_phases=True,
+    )
+
+    assert launched_batches == [[0, 1]]
+    assert [
+        [task["owner_ep_rank"] for task in task_batch]
+        for _, task_batch in pending[0]["remaining_task_batches"]
+    ] == [[2, 3]]
+
+
+def test_nep_end_iteration_scatter_preserves_ordered_owner_waves(monkeypatch):
+    bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
+        NonuniformEPNCCLParamAndGradBucketGroup
+    )
+    compute_ready_event = object()
+    launched_batches = []
+
+    class FakeStream:
+        def wait_event(self, event):
+            assert event is compute_ready_event
+
+    tasks = [
+        {
+            "group": bucket_group,
+            "owner_ep_rank": owner,
+            "chunk_index": 0,
+            "chunk_start": 0,
+            "chunk_end": 8,
+        }
+        for owner in range(4)
+    ]
+    state = {"task_sequence": tasks, "task_next_index": 0}
+    transfer_ranks = {0: [0, 6], 1: [1, 7], 2: [2, 6], 3: [3, 7]}
+    bucket_group._nep_nccl_owner_task_ready = lambda owner: True
+    bucket_group._nep_nccl_owner_transfer_ranks = lambda owner: transfer_ranks[owner]
+    bucket_group._get_nep_nccl_task_buffer_slot = lambda owner, chunk: owner
+    bucket_group._get_nep_nccl_comm_stream = lambda slot: FakeStream()
+
+    def start_batch(task_batch, dispatch_stream, batch_index):
+        launched_batches.append([task["owner_ep_rank"] for task in task_batch])
+        return {"batch_index": batch_index, "phase": "edp_launched"}
+
+    bucket_group._start_nep_nccl_split_host_phase_batch = start_batch
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_END_ITERATION_SCATTER", "1")
     monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_ASYNC_CHUNK_WINDOW", "16")
 
     pending = bucket_group._start_nep_nccl_process_group_dispatch_batch(
@@ -3277,6 +3435,77 @@ def test_nep_scatter_submission_drain_queues_all_chunks_before_one_wait(monkeypa
         ("submit", None, False, True),
         ("submit", None, False, True),
         ("retire", True),
+    ]
+
+
+def test_nep_end_iteration_scatter_materializes_canonical_order():
+    ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
+    calls = []
+    group_0 = SimpleNamespace(_nep_nccl_group_index=0)
+    group_1 = SimpleNamespace(_nep_nccl_group_index=1)
+    contexts = [
+        {"group": group_1, "owner_ep_rank": 0, "chunk_index": 1},
+        {"group": group_0, "owner_ep_rank": 2, "chunk_index": 0},
+        {"group": group_0, "owner_ep_rank": 1, "chunk_index": 1},
+        {"group": group_0, "owner_ep_rank": 1, "chunk_index": 0},
+    ]
+    completion_event = object()
+    ddp._nep_end_iteration_scatter_context_batches = [
+        ([contexts[:2], contexts[2:]], completion_event, "decoder.layers.1.mlp")
+    ]
+    ddp._queue_nep_scatter_context_batches = lambda *args, **kwargs: calls.append((args, kwargs))
+
+    assert ddp._materialize_next_nep_end_iteration_scatter_batch()
+    assert not ddp._materialize_next_nep_end_iteration_scatter_batch()
+
+    queued = calls[0][0][0][0]
+    assert [
+        (context["group"]._nep_nccl_group_index, context["owner_ep_rank"], context["chunk_index"])
+        for context in queued
+    ] == [(0, 1, 0), (0, 1, 1), (0, 2, 0), (1, 0, 1)]
+    assert calls[0][0][1:] == (completion_event, "decoder.layers.1.mlp")
+    assert calls[0][1] == {"a2a_completion_event": None, "tasks_already_marked": True}
+    assert not ddp._nep_end_iteration_scatter_context_batches
+
+
+def test_nep_end_iteration_scatter_drain_fences_then_submits_every_chunk(monkeypatch):
+    ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
+    calls = []
+    ddp._nonuniform_ep_runtime_config = {"needs_reshard": True}
+    ddp._nep_model_ep_a2a_burst_depth = 0
+    ddp._nep_scatter_backward_complete = True
+    ddp._nep_scatter_batches = []
+
+    materialized = iter((True, False))
+
+    def materialize():
+        calls.append("materialize")
+        result = next(materialized)
+        if result:
+            ddp._nep_scatter_batches.extend([object(), object()])
+        return result
+
+    def submit(after_event=None, force=False, queue_behind_inflight=False):
+        calls.append(("submit", queue_behind_inflight))
+        ddp._nep_scatter_batches.pop(0)
+        return True
+
+    ddp._materialize_next_nep_end_iteration_scatter_batch = materialize
+    ddp._submit_nep_scatter_chunk = submit
+    ddp._retire_nep_scatter_chunk = lambda force=False: calls.append(("retire", force)) or True
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("synchronize"))
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_A2A_SCATTER_SCHEDULER", "0")
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_END_ITERATION_SCATTER", "1")
+
+    ddp._drain_nep_scatter_scheduler()
+
+    assert calls == [
+        "synchronize",
+        "materialize",
+        ("submit", True),
+        ("submit", True),
+        ("retire", True),
+        "materialize",
     ]
 
 

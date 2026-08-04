@@ -31,6 +31,8 @@ REFERENCE_APPROACH="${REFERENCE_APPROACH:-nccl}"
 SPLIT_APPROACH="${SPLIT_APPROACH:-nccl}"
 REFERENCE_A2A_SCATTER_SCHEDULER="${REFERENCE_A2A_SCATTER_SCHEDULER:-0}"
 SPLIT_A2A_SCATTER_SCHEDULER="${SPLIT_A2A_SCATTER_SCHEDULER:-1}"
+REFERENCE_END_ITERATION_SCATTER="${REFERENCE_END_ITERATION_SCATTER:-0}"
+SPLIT_END_ITERATION_SCATTER="${SPLIT_END_ITERATION_SCATTER:-0}"
 SPLIT_PARALLEL_GATHER_WINDOW="${SPLIT_PARALLEL_GATHER_WINDOW:-1}"
 SPLIT_BUCKET_READY_GATHER="${SPLIT_BUCKET_READY_GATHER:-0}"
 SPLIT_DEVICE_ORDERED_EDP="${SPLIT_DEVICE_ORDERED_EDP:-0}"
@@ -75,7 +77,7 @@ srun --nodes=1 --ntasks=1 --mpi=none "${container_args[@]}" bash -lc "
     python -m black --required-version 26 --check megatron/core/distributed/nonuniform_ep.py tests/unit_tests/distributed/test_nonuniform_ep.py &&
     python -m isort --check-only megatron/core/distributed/nonuniform_ep.py tests/unit_tests/distributed/test_nonuniform_ep.py &&
     python -m py_compile megatron/core/distributed/nonuniform_ep.py tests/unit_tests/distributed/test_nonuniform_ep.py &&
-    python -m pytest -q tests/unit_tests/distributed/test_nonuniform_ep.py tests/unit_tests/tensor_parallel/test_mappings.py -k 'bucket_ready_gather or scatter_chunk or scatter_queue or scatter_work_defers or ready_gate or split_host_phases_defer_edp_and_scatter or pipelined_host_phases or a2a_scatter_scheduler_preserves or model_ep_a2a_burst or scatter_progress or scatter_submission or all_to_all_burst_callbacks'
+    python -m pytest -q tests/unit_tests/distributed/test_nonuniform_ep.py tests/unit_tests/tensor_parallel/test_mappings.py -k 'bucket_ready_gather or scatter_chunk or scatter_queue or scatter_work_defers or ready_gate or split_host_phases_defer_edp_and_scatter or pipelined_host_phases or a2a_scatter_scheduler_preserves or model_ep_a2a_burst or scatter_progress or scatter_submission or end_iteration_scatter or all_to_all_burst_callbacks'
 "
 
 if [[ "${PREFLIGHT_ONLY:-0}" == "1" ]]; then
@@ -95,6 +97,7 @@ run_case() {
     local scatter_chunks="${10}"
     local device_ordered_edp="${13}"
     local edp_ready_gate="${14}"
+    local end_iteration_scatter="${15}"
     local a2a_scatter_scheduler="${11}"
     local bucket_ready_gather="${12}"
     local checksum_dir="${ROOT_DIR}/${name}/checksums"
@@ -151,8 +154,9 @@ run_case() {
             MEGATRON_NONUNIFORM_EP_BUCKET_READY_GATHER="${bucket_ready_gather}" \
             MEGATRON_NONUNIFORM_EP_POST_GRAPH_PHASES=0 \
             MEGATRON_NONUNIFORM_EP_POST_GRAPH_HOST_PHASES="${post_graph_host_phases}" \
-            MEGATRON_NONUNIFORM_EP_DEFER_MODEL_EP_FENCE="${a2a_scatter_scheduler}" \
+            MEGATRON_NONUNIFORM_EP_DEFER_MODEL_EP_FENCE="$((a2a_scatter_scheduler || end_iteration_scatter))" \
             MEGATRON_NONUNIFORM_EP_A2A_SCATTER_SCHEDULER="${a2a_scatter_scheduler}" \
+            MEGATRON_NONUNIFORM_EP_END_ITERATION_SCATTER="${end_iteration_scatter}" \
             MEGATRON_NONUNIFORM_EP_PARALLEL_GATHER_WINDOW="${SPLIT_PARALLEL_GATHER_WINDOW}" \
             MEGATRON_NONUNIFORM_EP_NCCL_TARGET_CHUNKS="${target_chunks}" \
             MEGATRON_NONUNIFORM_EP_NCCL_SCATTER_CHUNKS="${scatter_chunks}" \
@@ -166,8 +170,8 @@ run_case() {
     echo "[${CASE_DISPLAY}-split-correctness] $(date --iso-8601=seconds) completed ${name}"
 }
 
-run_case "${STABLE_NAME}" "${REFERENCE_SPLIT_HOST_PHASES}" 0 29931 "${SPLIT_TARGET_CHUNKS}" "${SPLIT_ASYNC_CHUNK_WINDOW}" "${REFERENCE_APPROACH}" "${REFERENCE_EXPERT_BUCKET_GROUPS}" "${REFERENCE_POST_GRAPH_HOST_PHASES}" "${REFERENCE_SCATTER_CHUNKS}" "${REFERENCE_A2A_SCATTER_SCHEDULER}" 0 0 0
-run_case "${SPLIT_NAME}" 1 1 29932 "${SPLIT_TARGET_CHUNKS}" "${SPLIT_ASYNC_CHUNK_WINDOW}" "${SPLIT_APPROACH}" "${SPLIT_EXPERT_BUCKET_GROUPS}" "${SPLIT_POST_GRAPH_HOST_PHASES}" "${SPLIT_SCATTER_CHUNKS}" "${SPLIT_A2A_SCATTER_SCHEDULER}" "${SPLIT_BUCKET_READY_GATHER}" "${SPLIT_DEVICE_ORDERED_EDP}" "${SPLIT_EDP_READY_GATE}"
+run_case "${STABLE_NAME}" "${REFERENCE_SPLIT_HOST_PHASES}" 0 29931 "${SPLIT_TARGET_CHUNKS}" "${SPLIT_ASYNC_CHUNK_WINDOW}" "${REFERENCE_APPROACH}" "${REFERENCE_EXPERT_BUCKET_GROUPS}" "${REFERENCE_POST_GRAPH_HOST_PHASES}" "${REFERENCE_SCATTER_CHUNKS}" "${REFERENCE_A2A_SCATTER_SCHEDULER}" 0 0 0 "${REFERENCE_END_ITERATION_SCATTER}"
+run_case "${SPLIT_NAME}" 1 1 29932 "${SPLIT_TARGET_CHUNKS}" "${SPLIT_ASYNC_CHUNK_WINDOW}" "${SPLIT_APPROACH}" "${SPLIT_EXPERT_BUCKET_GROUPS}" "${SPLIT_POST_GRAPH_HOST_PHASES}" "${SPLIT_SCATTER_CHUNKS}" "${SPLIT_A2A_SCATTER_SCHEDULER}" "${SPLIT_BUCKET_READY_GATHER}" "${SPLIT_DEVICE_ORDERED_EDP}" "${SPLIT_EDP_READY_GATE}" "${SPLIT_END_ITERATION_SCATTER}"
 
 python3 - \
     "${ROOT_DIR}/${STABLE_NAME}/checksums" \

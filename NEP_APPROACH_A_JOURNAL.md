@@ -1,3 +1,14 @@
+## 2026-08-04
+
+### Fully exposed end-of-iteration Scatter
+
+- Added opt-in `MEGATRON_NONUNIFORM_EP_END_ITERATION_SCATTER=1`, mutually exclusive with the A2A-aware Scatter scheduler. Gather and device-ordered EDP still launch during backward, but no Scatter collective or Scatter-specific host rendezvous is submitted there. Owner results are staged before reusable Gather slots are released, then every Scatter is submitted in canonical layer/group/owner/chunk order from `finish_grad_sync` after a global backward-complete CUDA fence.
+- Fixed two correctness issues found during staged validation: continued split-host batches initially entered the legacy host barrier, and materializing all deferred layers at once reused packed Scatter buffers. The final implementation uses the device-ordered path for every split-host batch and materializes/drains one layer at a time.
+- Focused unit tests passed (`5 passed, 112 deselected`). EP12/EP8 distributed correctness job `2579372` completed with exact full/reduced checksum agreement and zero rank spread.
+- EP16 A/B profile job `2579701` completed on GB200 using the 14-stage `MEMEM*EMEMEM*E` workload. Owner-rank steady timing (iterations 3-12) was healthy `551.910 +/- 5.465 ms` versus NEP `681.680 +/- 2.373 ms`: `129.770 ms` or `23.513%` slowdown, `80.963%` parity.
+- Rank 0's NEP trace contains no legacy `nep_split_wait_scatter_launch` markers. Deferred Scatter submission occurs in the final drain and has zero useful-compute overlap by construction. Scatter NCCL kernel union is about `16.071 ms`; the larger end-to-end gap also contains serialized staging/copyback and host/GPU idle in the final drain.
+- Artifacts: `slurm_runs/lyris/coreai_comparch_sysarch-nep.ep16-end-scatter-profile-gb200-2579701.out` and `slurm_runs/lyris_a3b_ep16_ep12_end_scatter_profile_gb200/`.
+
 ## 2026-08-03
 
 ### Minimal device-ordered Gather/EDP validation
