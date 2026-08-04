@@ -165,7 +165,7 @@ def parse_int_list(value: Any) -> tuple[int, ...]:
     """Parse a profiler string/list containing integer ranks or splits."""
     if isinstance(value, str):
         value = ast.literal_eval(value)
-    return tuple(int(item) for item in value)
+    return tuple(int(item) for item in value if item is not Ellipsis)
 
 
 def parse_trace(

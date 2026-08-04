@@ -1,6 +1,166 @@
+## 2026-08-03
+
+### Minimal device-ordered Gather/EDP validation
+
+- Added opt-in `MEGATRON_NONUNIFORM_EP_DEVICE_ORDERED_EDP`: split-host batches enqueue native Megatron EDP on the Gather dispatch stream, giving Gather -> EDP a CUDA device dependency while retaining each EDP participant's deterministic bucket order. The existing model-EP-aware Scatter launch rendezvous and chunk scheduler remain unchanged.
+- Focused preflight in GB300 job `2569279`: 32 tests passed. Its stable and device-ordered EP8/EP4 distributed cases both completed two finite iterations without timeout; all 12 ranks matched every dense/expert gradient fingerprint exactly. The parent job's nonzero status was only a stale wrapper marker assertion, corrected and replayed to `[ep8-4-split-correctness] PASS` against the completed artifacts.
+- Same-allocation EP16 job `2569373` completed on GB200 without timeout: healthy EP16/EP16 versus NEP EP16/EP12, TP2, 14-stage `MEMEM*EMEMEM*E`, sequence length 18432, 144 experts, top-k 6, full MBS4, reduced MBS1, DDP buckets16, NEP expert groups8, Scatter chunks4, forced uniform routing, no optimizer step.
+- Unprofiled steady-state mean (iterations 3-12): healthy `550.570 ms`; NEP `577.180 ms`; owner parity `95.390%`; NEP overhead `26.610 ms` (`4.833%` of healthy). This is a small improvement over gather-only job `2568648` (`95.092%`, `28.420 ms`).
+- Rank 0's trace has 12 `nep_split_wait_scatter_launch` scopes and no Gather/EDP host-wait scopes. Owner backward span is `281.852 -> 322.652 ms`; NCCL union contributes `+31.491 ms`, lost NCCL/non-NCCL overlap `+6.674 ms`, and non-NCCL union `+2.592 ms`. Gather (`11.045 ms`) and NEP EDP (`33.602 ms`) are fully exposed to non-NCCL work; Scatter is `0.726/2.955 ms` exposed. Thus the contract works but same-stream Gather -> EDP does not improve overlap.
+- Artifacts: `slurm_runs/lyris_a3b_ep16_ep12_device_ordered_gb200/`; trace analysis at `profile/trace_analysis.json`.
+
+### Immediate EDP revert and EP16 gather-only profile
+
+- Removed the immediate EDP enqueue implementation after isolation showed it caused the EP16 cross-communicator NCCL launch-order timeout. Retained AccumulateGrad bucket-ready Gather and the ordered deferred EDP host phase.
+- EP8/EP4 exact-correctness validation job `2568518` completed on GB300. Every aggregate, dense, and expert gradient checksum matched the stable reference exactly (`relative_delta=0`, rank spread effectively zero).
+- EP16 same-allocation job `2568648` completed on GB200: healthy EP16/EP16 and NEP EP16/EP12, TP2, 14-stage `MEMEM*EMEMEM*E`, sequence length 18432, 144 experts, top-k 6, full MBS4, reduced MBS1, DDP buckets16, NEP expert groups8, Scatter chunks4, forced uniform routing, no optimizer step.
+- Unprofiled steady-state mean (iterations 3-12): healthy `550.680 ms`; NEP `579.100 ms`; owner parity `95.092%`; NEP overhead `28.420 ms` (`5.161%`).
+- All-rank profile (steps 5-6) full-step span: healthy `568.037 ms`, NEP `611.553 ms`, gap `43.516 ms`. Backward explains `34.726 ms`: NCCL union `+28.203 ms`, lost NCCL/non-NCCL overlap `+3.699 ms`, non-NCCL union `+2.602 ms`, idle `+0.222 ms`.
+- NEP backward reshard exposure on owner rank: Gather `10.674/10.674 ms` exposed, expert EDP `34.065/34.065 ms` exposed, Scatter `0.855/3.065 ms` exposed (72.3% hidden); combined reshard only 4.6% overlapped with useful compute.
+- Model-EP matched service changed only `45.643 -> 47.212 ms`, but owner residency changed `54.559 -> 71.543 ms` because participant waiting increased `9.637 -> 25.196 ms`. Thus delayed participant readiness, not model-EP transfer service, accounts for most model-EP inflation.
+- Analysis artifact: `slurm_runs/lyris_a3b_ep16_ep12_gather_profile_gb200/trace_analysis.json`.
+
 # NEP Approach A Journal
 
 Append a dated entry whenever we do something new: code changes, job submissions, benchmark results, trace analysis, or decisions that change the next step. Keep entries factual and include job IDs, run dirs, and commits when available.
+
+## 2026-08-03 - EP12/EP8 slot-lifetime fix and EP32 same-bucket benchmark
+
+- EP12/EP8 diagnostics showed Gather plus EDP were exact across ranks before Scatter, localizing the
+  corruption to deferred Scatter/copyback. The async owner-buffer window reused slots while deferred
+  local-owner copies still referenced them. The fix records a CUDA completion event per reused slot,
+  completes local-owner copies without changing scheduler cardinality, and waits on those events before
+  slot reuse.
+- Intermediate-scale job `2567647` passed 32 focused preflight tests and both EP12/EP8 distributed
+  cases. Every gradient checksum field matched exactly and the wrapper reported
+  `[ep12-8-slotfix5-split-correctness] PASS`.
+- For a controlled EP32 comparison, retained `DDP_NUM_BUCKETS=16` and changed NEP from three to seven
+  expert EDP groups. Healthy and NEP therefore both use four dense plus seven expert all-reduce buckets
+  (11 total). Enabled bucket-ready Gather and immediate native EDP enqueue for NEP.
+- Same-allocation GB200 job `2567828` completed healthy EP32/EP32 and NEP EP32/EP28 timing cases on 16
+  contiguous, segment-4 nodes. Warmup-excluded iterations 3-10 were `553.300 +/- 4.081 ms` healthy and
+  `597.137 +/- 2.138 ms` NEP. Owner-rank parity was `92.659%`; NEP overhead was `43.837 ms` or `7.923%`.
+  Logs are under `slurm_runs/lyris_a3b_ep32_ep28_same_buckets_gb200/timing`.
+
+## 2026-08-03 - Bucket-ready Gather and immediate native EDP enqueue
+
+- Added opt-in `MEGATRON_NONUNIFORM_EP_BUCKET_READY_GATHER`. On the last microbatch, an expert
+  bucket now marks its dispatch boundary ready directly from native parameter `AccumulateGrad`
+  counts, instead of waiting for the `BaseMoELayer` full-backward hook.
+- Fix-1 preflight job `2565364` passed 31 focused tests plus Black, isort, and compile checks.
+  Distributed EP8/EP4 job `2565391` then completed both stable and bucket-ready split cases; all
+  12-rank gradient checksum fields matched exactly and the wrapper reported `PASS`.
+- Added opt-in `MEGATRON_NONUNIFORM_EP_IMMEDIATE_EDP_ENQUEUE`. The split scheduler records the
+  Gather completion event, queues the existing device-readiness wait, and immediately invokes
+  native Megatron DDP `start_grad_sync()` on the same dispatch stream. Its host worker waits for
+  Gather device completion and the EDP Gloo rendezvous before releasing the queued stream wait.
+  Scatter remains deferred and ordered after the native EDP work handle.
+- Fix-2 preflight job `2565894` passed 32 focused tests, including deferred and immediate EDP
+  variants, plus Black, isort, and compile checks. Distributed GB300 job `2566135` completed stable
+  and immediate-EDP EP8/EP4 cases on `theia[0114-0115,0125]`; all gradient checksum fields matched
+  exactly (`relative_delta=0`) and the wrapper reported `PASS`. Debug output showed the EDP stream
+  wait and native DDP submission before the readiness worker completed its Gather event wait.
+
+## 2026-08-03 - Root cause of three-bucket NEP EDP overlap loss
+
+- The corrected job `2563690` loses EDP hidden time almost entirely in bucket 2. Healthy per-bucket
+  hidden time is `6.210`, `6.160`, and `4.767 ms`; parallel NEP is `5.864`, `5.859`, and
+  `0.000 ms`. Bucket 2 therefore explains `4.767 ms` of the total `5.413 ms` reduction.
+- Across owner ranks, healthy submits bucket-2 EDP at `233.473 ms` and its kernel starts at
+  `233.556 ms` from backward start. NEP records Gather at `245.058 ms`, its kernel starts at
+  `257.429 ms`, Gather ends at `258.361 ms`, and EDP is not submitted until `273.335 ms`.
+- The code path explains both delays. NEP requires the `BaseMoELayer` full-backward boundary before
+  `_launch_nep_dispatch_boundary_tasks`, while native DDP launches from parameter `AccumulateGrad`
+  readiness. Its Gather stream then waits on the full-boundary `compute_ready_event`, placing the
+  final Gather after the final model-EP work instead of at native bucket readiness.
+- Split host phases do not submit EDP when Gather completes. They are progressed only when
+  `_wait_for_nep_dispatch_launch` runs at a later MoE pre-hook or final drain. For bucket 2 this
+  leaves `14.974 ms` on average between Gather completion and EDP host submission; the subsequent
+  record-to-kernel gap is only `0.093 ms`, proving that this part is host scheduling, not NCCL skew.
+- Replaying the same NEP EDP durations at healthy launch offsets increases modeled hidden time from
+  `11.724` to `15.696 ms`, recovering `3.972 ms` (`73.4%`) of the hidden-time deficit. The primary
+  cause is therefore late NEP readiness/submission, not lack of useful backward work.
+- A complete fix must launch Gather from bucket parameter readiness and progress EDP as soon as its
+  Gather dependency is satisfied. Progressing EDP earlier without moving Gather earlier can recover
+  little because the final Gather itself is already behind the useful overlap window.
+
+## 2026-08-03 - Three-bucket healthy versus parallel-NEP EDP control
+
+- Parameterized the EP16/EP12 runner's `DDP_NUM_BUCKETS`, preserving `16` as its default. Setting
+  it to `6` resolves to a target bucket size of `182,163,104` elements and produces exactly three
+  native healthy expert-DP buckets, matching NEP's three owner EDP groups.
+- Submitted same-allocation all-rank healthy/parallel-NEP profiles on GB200 (`2563689`) and GB300
+  (`2563690`). GB300 allocated first on contiguous nodes
+  `theia[0021,0023,0027,0030,0114,0116,0120,0122]`; the pending GB200 duplicate was canceled.
+  Job `2563690` completed `0:0` in `8m24s`.
+- Both trace legs contain exactly three EDP all-reduces per step. Healthy payloads are
+  `184,590,336`, `184,590,336`, and `169,623,552` elements (`538,804,224` total). NEP payloads are
+  three times `239,468,544` elements (`718,405,632` total), because an EP12 owner holds 12 experts
+  while a healthy EP16 rank holds 9.
+- Across full-replica owners, healthy EDP averages `25.932 ms` residency, `17.137 ms` useful-compute
+  overlap, and `8.795 ms` exposure. Parallel NEP averages `33.827 ms` residency, `11.724 ms`
+  overlap, and `22.104 ms` exposure. With bucket count and allocation controlled, NEP therefore
+  adds `7.895 ms` EDP residency and `13.309 ms` EDP exposure on average.
+
+## 2026-08-03 - Bounded parallel owner-Gather submission
+
+- Added an opt-in `MEGATRON_NONUNIFORM_EP_PARALLEL_GATHER_WINDOW`; its default value of `1`
+  preserves the existing single ordered dispatch stream. A value of `2` starts at most two
+  independent owner waves on separate CUDA streams and joins their completion events before the
+  direct-Scatter completion boundary. Focused container validation passed Black, isort, Python
+  compilation, and `30` tests (`88` deselected).
+- EP8/EP4 job `2562618` passed exact gradient checksums, but its Gather process groups are disjoint
+  pairs and form only one owner wave, so it could not test this change. Its serial/parallel timing
+  difference was treated as allocation drift rather than evidence.
+- EP16/EP12 GB200 job `2562746` completed `0:0` on contiguous nodes `lyris[0217-0224]`. This is the
+  smallest tested topology with three overlapping owner waves (`[0,12]`, `[4,12]`, `[8,12]`). The
+  exact two-iteration gradient checksum gate matched all fields with zero relative delta.
+- Same-allocation timing, iterations 4-10: serial `580.500 +/- 2.839 ms`, parallel-two
+  `579.043 +/- 2.399 ms`, and serial repeat `578.914 +/- 3.887 ms`. Parallel-two is `0.664 ms`
+  (`0.115%`) faster than the midpoint of the two serial legs, which is below run variance and is
+  not a measurable iteration-time improvement.
+- All-rank profiles show that the bound works as designed. On shared follower rank 12, the second
+  wave is submitted about `0.9 ms` after the first instead of about `99 ms`; participant kernel
+  start spread for `[4,12]` falls from `6.392` to `1.338 ms`. The third wave remains around `98 ms`
+  behind the first because window two intentionally admits only the first two waves; its start
+  spread falls from `13.940` to `7.113 ms` through earlier downstream progress.
+- Parallel submission introduces real collective contention: average rank-12 summed Gather kernel
+  residency rises from `7.428` to `10.136 ms` (`+36.5%`) while `3.202 ms` runs concurrently. The
+  union still decreases from `7.428` to `6.934 ms` (`-0.494 ms`). Gather overlap with native
+  model-EP changes only from `2.466` to `2.548 ms`, and full-replica model-EP matched service is
+  unchanged (`47.480` versus `47.397 ms`), so there is no evidence that this window penalizes
+  Megatron model-EP A2As. The bounded experiment fixes launch skew, but bandwidth sharing and the
+  still-serialized third wave leave too little critical-path gain to improve iteration time.
+
+## 2026-07-30 - Backward-complete Scatter drain
+
+- Confirmed that owner Gather already uses `dist.all_to_all_single(..., async_op=True)` in the
+  overlap path. The long owner-side Gather kernels observed in traces are device-side NCCL
+  participant waits when follower ranks arrive later; only EDP for the same owner chunk depends
+  on the Gather output. Independent backward compute has no data dependency on its completion.
+- Confirmed that `MEGATRON_NONUNIFORM_EP_NCCL_SCATTER_CHUNKS` partitions Scatter descriptors
+  after the corresponding whole owner EDP operation. It does not partition Gather or EDP into a
+  per-chunk `Gather -> EDP -> Scatter` pipeline. During backward, those Scatter descriptors are
+  submitted through model-EP A2A windows; the old final drain incorrectly synchronized each
+  remaining descriptor before submitting the next one.
+- Added an explicit backward-complete scheduler state. Final drain now consumes any outstanding
+  ordered-window ticket once, queues every remaining Scatter descriptor behind the preceding
+  Scatter stream dependency, and performs one final completion wait. The next backward clears
+  the completed state before its first model-EP A2A burst.
+- GB300 job `2538157` failed in container preflight because four unit-test doubles constructed via
+  `__new__` lacked the new state attribute. State reads now default to backward-active for such
+  partial objects; real DDP instances initialize the field explicitly.
+- Corrected GB300 job `2538213` completed `0:0` on `theia[0235,0246,0249]`. Containerized Black,
+  isort, compile, and focused unit preflight passed. The two-iteration EP8/EP4 checksum comparison
+  used four Scatter chunks and matched stable versus scheduled gradients exactly for every dense
+  and expert checksum field, with effectively zero cross-rank spread.
+
+## 2026-07-28 - Topology-contiguous EP32/EP28 all-rank A/B profiles
+
+- Submitted job `2519225` with Slurm `--contiguous` on one exclusive 16-node GB200 allocation (`lyris[0019,0024,0029-0030,0096-0099,0199-0201,0206,0239,0241,0243,0245]`). It completed `0:0` and ran the healthy and NEP timing legs followed by their all-rank PyTorch profile legs in that same allocation. The topology is TP2, healthy EP32/EP32, NEP EP32/EP28, 224 experts, top-k6, exact-uniform routing, 14 stages, local CUDA graphs, 16 configured native DDP buckets, three NEP expert groups, one Scatter chunk, sequence length 18368, and no optimizer.
+- Warmup-excluded timing iterations 3-10 averaged `668.763 ms` healthy and `705.150 ms` NEP. Owner-time parity is `94.840%`; the NEP gap is `36.388 ms`. This is the valid performance result because it has no profiler instrumentation and removes separate-allocation placement as a confounder.
+- Both all-rank trace sets exported successfully: 64 healthy traces under `slurm_runs/lyris_a3b_ep32_ep28_contiguous_ab/profile/a3b_repeat14_ep32_ep32_mbs4_healthy_b16/2519225/torch_profile/` and 60 NEP traces under `slurm_runs/lyris_a3b_ep32_ep28_contiguous_ab/profile/a3b_repeat14_ep32_ep28_mbs4_1_weighted_b16/2519225/torch_profile/`. Analysis is `/tmp/ep32_ep28_contiguous_2519225.json`.
+- In the profiled steady steps, rank-0 full-step spans are `676.911 ms` healthy and `731.656 ms` NEP (`92.518%`). Profiling therefore makes the NEP ratio worse by about `2.32` points relative to the no-profiler measurement; it does not explain prior apparently favorable NEP profile comparisons from other allocations.
 
 ## 2026-07-27 - Native non-distributed optimizer compatibility
 

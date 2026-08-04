@@ -71,6 +71,25 @@ def _nep_debug_print(message: str) -> None:
     print(f"[NEP_DEBUG rank={rank}] {message}", flush=True)
 
 
+def _nep_debug_chunk_checksum(label: str, contexts: List[dict]) -> None:
+    """Synchronously log owner-layout chunks for targeted correctness debugging."""
+    if os.getenv("MEGATRON_NONUNIFORM_EP_DEBUG_CHUNK_CHECKSUM", "0").lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    rank = dist.get_rank()
+    rank_filter = os.getenv("MEGATRON_NONUNIFORM_EP_DEBUG_RANKS")
+    if rank_filter and rank not in {
+        int(part) for part in rank_filter.replace(",", " ").split() if part.strip()
+    }:
+        return
+    values = [float(context["chunk"].float().sum().item()) for context in contexts]
+    print(f"[NEP_CHUNK_CHECKSUM rank={rank}] {label} values={values}", flush=True)
+
+
 def _nep_overlap_debug_enabled() -> bool:
     return os.getenv("MEGATRON_NONUNIFORM_EP_OVERLAP_DEBUG", "0").lower() in (
         "1",
@@ -91,6 +110,24 @@ def _nep_zero_sm_reshard_enabled() -> bool:
 
 def _nep_edp_ready_gate_enabled() -> bool:
     return os.getenv("MEGATRON_NONUNIFORM_EP_EDP_READY_GATE", "1").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _nep_bucket_ready_gather_enabled() -> bool:
+    return os.getenv("MEGATRON_NONUNIFORM_EP_BUCKET_READY_GATHER", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _nep_device_ordered_edp_enabled() -> bool:
+    return os.getenv("MEGATRON_NONUNIFORM_EP_DEVICE_ORDERED_EDP", "0").lower() in (
         "1",
         "true",
         "yes",
@@ -333,6 +370,16 @@ def _get_nep_nccl_async_chunk_window() -> int:
     if chunk_window <= 0:
         raise RuntimeError("MEGATRON_NONUNIFORM_EP_NCCL_ASYNC_CHUNK_WINDOW must be positive")
     return chunk_window
+
+
+def _get_nep_parallel_gather_submission_window() -> int:
+    value = os.getenv("MEGATRON_NONUNIFORM_EP_PARALLEL_GATHER_WINDOW")
+    if value is None:
+        return 1
+    submission_window = int(value)
+    if submission_window <= 0:
+        raise RuntimeError("MEGATRON_NONUNIFORM_EP_PARALLEL_GATHER_WINDOW must be positive")
+    return submission_window
 
 
 def _get_nep_nccl_expert_bucket_group_count() -> int:
@@ -1567,6 +1614,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             state = self._nep_nccl_buffer_state
         state.setdefault("gather_buf_cache", {})
         state.setdefault("buffer_slot_handles", {})
+        state.setdefault("buffer_slot_events", {})
         return state
 
     def _order_nep_nccl_buffer_slot(self, slot_key: tuple) -> None:
@@ -1576,6 +1624,9 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         handles = slot_handles.pop(slot_key, [])
         for work in handles:
             _nep_block_current_stream(work)
+
+        for event in state["buffer_slot_events"].pop(slot_key, []):
+            torch.cuda.current_stream().wait_event(event)
 
     def _record_nep_nccl_work(
         self, work, buffer_slot_key: Optional[tuple] = None, block_current_stream: bool = True
@@ -1799,7 +1850,12 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if self._nep_runtime_config.get("zero_sm_reshard", False) and not self.is_first_batch:
             stream_key = "zero_sm"
         elif self._nep_dispatch_boundary_launch and not self.is_first_batch:
-            stream_key = "dispatch"
+            submission_window = _get_nep_parallel_gather_submission_window()
+            stream_key = (
+                "dispatch"
+                if submission_window == 1
+                else ("dispatch", stream_slot % submission_window)
+            )
         else:
             stream_key = stream_slot
         if state is not None:
@@ -2883,6 +2939,9 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             return
 
         kind = descriptor["kind"]
+        if kind == "completed_local":
+            descriptor["submitted"] = True
+            return
         if kind == "local":
             descriptor["submitted"] = True
             return
@@ -2944,6 +3003,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             raise RuntimeError("NEP Scatter copyback was queued before collective completion")
 
         kind = descriptor["kind"]
+        if kind == "completed_local":
+            return
         if kind == "local":
             self._copy_nep_nccl_owner_chunk_to_local_grads(
                 descriptor["owner_ep_rank"],
@@ -3124,6 +3185,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             f"edp_rank={edp_group.rank()}"
         )
         native_group = self._get_nep_nccl_native_edp_bucket_group(contexts)
+        _nep_debug_chunk_checksum(f"before_edp group={group_index} owner={owner_ep_rank}", contexts)
         with torch.profiler.record_function("nep_native_ddp_start_grad_sync"):
             native_group.start_grad_sync()
         native_state = {
@@ -3177,6 +3239,12 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 raise RuntimeError("NEP Scatter reached an owner without an EDP Work handle")
             with torch.profiler.record_function("nep_native_ddp_order_scatter_stream"):
                 _nep_block_current_stream(native_group.grad_reduce_handle)
+            _nep_debug_chunk_checksum(
+                "after_edp "
+                f"group={getattr(self, '_nep_nccl_group_index', -1)} "
+                f"owner={context['owner_ep_rank']}",
+                native_state["contexts"],
+            )
         elif native_group.grad_reduce_handle is not None:
             raise RuntimeError("Synchronous NEP native DDP left an outstanding reduction")
         native_state["scatter_dependency_ordered"] = True
@@ -3374,18 +3442,32 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         for scatter_chunk_index, (scatter_start, scatter_end) in enumerate(scatter_ranges):
             local_start = scatter_start - context["chunk_start"]
             local_end = scatter_end - context["chunk_start"]
-            descriptors.append(
-                self._prepare_nep_nccl_owner_all_to_all_scatter(
-                    context["owner_ep_rank"],
-                    context["chunk_index"],
-                    scatter_start,
-                    scatter_end,
-                    context["chunk"][local_start:local_end],
-                    context["buffer_slot_key"],
-                    async_op=context["async_op"],
-                    scatter_chunk_index=scatter_chunk_index,
-                )
+            descriptor = self._prepare_nep_nccl_owner_all_to_all_scatter(
+                context["owner_ep_rank"],
+                context["chunk_index"],
+                scatter_start,
+                scatter_end,
+                context["chunk"][local_start:local_end],
+                context["buffer_slot_key"],
+                async_op=context["async_op"],
+                scatter_chunk_index=scatter_chunk_index,
             )
+            if (
+                _nep_a2a_scatter_scheduler_enabled()
+                and descriptor is not None
+                and descriptor["kind"] == "local"
+            ):
+                self._submit_nep_nccl_owner_all_to_all_scatter(descriptor)
+                self._order_nep_nccl_owner_all_to_all_scatter_completion(descriptor)
+                self._finish_nep_nccl_owner_all_to_all_scatter(descriptor)
+                copy_done = torch.cuda.Event()
+                copy_done.record(torch.cuda.current_stream())
+                state = self._get_nep_nccl_shared_buffer_state()
+                state["buffer_slot_events"].setdefault(context["buffer_slot_key"], []).append(
+                    copy_done
+                )
+                descriptor["kind"] = "completed_local"
+            descriptors.append(descriptor)
         return {
             "group": self,
             "context": context,
@@ -3646,6 +3728,19 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             raise RuntimeError(
                 "Split NEP host phases require the device EDP readiness gate to be disabled"
             )
+        if _nep_device_ordered_edp_enabled():
+            with torch.cuda.stream(dispatch_stream):
+                self._start_nep_nccl_owner_edp_reduce_batch(contexts, use_device_readiness=False)
+            return {
+                "batch_index": batch_index,
+                "contexts": contexts,
+                "dispatch_stream": dispatch_stream,
+                "local_transfer_contexts": local_transfer_contexts,
+                "local_edp_contexts": local_edp_contexts,
+                "gather_barrier_works": [],
+                "gather_done_event": gather_done_event,
+                "phase": "edp_launched",
+            }
         gather_barrier_works = []
         for owner, (_, source_group_gloo, _) in local_transfer_contexts.items():
             _nep_debug_print(
@@ -3689,9 +3784,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             state["task_next_index"] += 1
         if not ready_tasks:
             return []
-
-        dispatch_stream = self._get_nep_nccl_comm_stream(0)
-        dispatch_stream.wait_event(compute_ready_event)
 
         owner_order = []
         owner_transfer_ranks = {}
@@ -3755,17 +3847,26 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             split_host_phases = False
 
         if split_host_phases:
-            pending_host_phases = [
-                self._start_nep_nccl_split_host_phase_batch(
-                    task_batches[0], dispatch_stream, batch_index=0
+            submission_window = min(_get_nep_parallel_gather_submission_window(), len(task_batches))
+            remaining_task_batches = list(
+                enumerate(task_batches[submission_window:], start=submission_window)
+            )
+            pending_host_phases = []
+            for batch_index, task_batch in enumerate(task_batches[:submission_window]):
+                dispatch_stream = self._get_nep_nccl_comm_stream(batch_index)
+                dispatch_stream.wait_event(compute_ready_event)
+                pending = self._start_nep_nccl_split_host_phase_batch(
+                    task_batch, dispatch_stream, batch_index=batch_index
                 )
-            ]
+                pending["submission_slot"] = batch_index
+                pending_host_phases.append(pending)
             if continue_host_phase_batches:
-                pending_host_phases[0]["remaining_task_batches"] = list(
-                    enumerate(task_batches[1:], start=1)
-                )
+                for pending in pending_host_phases:
+                    pending["remaining_task_batches"] = remaining_task_batches
             return pending_host_phases
 
+        dispatch_stream = self._get_nep_nccl_comm_stream(0)
+        dispatch_stream.wait_event(compute_ready_event)
         pending_host_phases = []
         for batch_index, task_batch in enumerate(task_batches):
             contexts = []
@@ -3989,6 +4090,10 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 with torch.cuda.stream(dispatch_stream):
                     for context in contexts:
                         context["group"]._start_nep_nccl_owner_task_scatter(context)
+            if _get_nep_parallel_gather_submission_window() > 1:
+                completion_event = torch.cuda.Event()
+                completion_event.record(dispatch_stream)
+                pending["completion_event"] = completion_event
             pending["phase"] = "finished"
 
             remaining_task_batches = pending.get("remaining_task_batches")
@@ -3997,6 +4102,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 next_pending = self._start_nep_nccl_split_host_phase_batch(
                     next_task_batch, dispatch_stream, next_batch_index
                 )
+                next_pending["submission_slot"] = pending.get("submission_slot", 0)
                 next_pending["remaining_task_batches"] = remaining_task_batches
                 pending.clear()
                 pending.update(next_pending)
@@ -4304,8 +4410,13 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             if param not in self.per_param_grad_ready_counts:
                 self.per_param_grad_ready_counts[param] = 0
             self.per_param_grad_ready_counts[param] += 1
+            bucket_ready = (
+                self.per_param_grad_ready_counts == self.golden_per_param_grad_ready_counts
+            )
             if not self.is_first_batch:
                 if self._nep_dispatch_boundary_launch:
+                    if bucket_ready and _nep_bucket_ready_gather_enabled():
+                        self._nep_dispatch_boundary_ready = True
                     callback = self._nep_dispatch_boundary_callback
                     if self._nep_dispatch_boundary_ready and callback is not None:
                         callback(
@@ -4314,7 +4425,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                         )
                 else:
                     self._try_start_nep_nccl_ready_tasks(force_ready=False, async_op_override=True)
-                if self.per_param_grad_ready_counts == self.golden_per_param_grad_ready_counts:
+                if bucket_ready:
                     assert len(self.per_param_grad_ready_counts) == len(self.params)
                     _nep_debug_print(
                         "register_grad_ready bucket_ready "
@@ -5258,6 +5369,7 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         self._nep_scatter_alignment_tensor = None
         self._nep_scatter_alignment_work = None
         self._nep_scatter_stream = None
+        self._nep_scatter_backward_complete = False
         if self.nonuniform_ep_config.approach == NonuniformEPApproach.NCCL:
             if _nep_a2a_scatter_scheduler_enabled():
                 if runtime_config.get("zero_sm_reshard", False):
@@ -5454,6 +5566,8 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
 
     def _launch_model_ep_aligned_nep_scatter_ticket(self) -> None:
         """Launch a nonblocking agreement for the next bucket-group window."""
+        if getattr(self, "_nep_scatter_backward_complete", False):
+            raise RuntimeError("NEP Scatter cannot poll for a new window after backward completes")
         runtime_config = self._nonuniform_ep_runtime_config
         ep_group_gloo = runtime_config.get("ep_group_gloo")
         if ep_group_gloo is None:
@@ -5630,15 +5744,17 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 )
 
     def _drain_nep_scatter_scheduler(self) -> None:
-        """Submit and retire every remaining Scatter chunk before final gradient sync."""
+        """Queue all remaining Scatter chunks, then wait once before final gradient sync."""
         if not _nep_a2a_scatter_scheduler_enabled():
             return
+        if not self._nep_scatter_backward_complete:
+            raise RuntimeError("NEP Scatter drain requires a completed backward pass")
         if self._nep_model_ep_a2a_burst_depth != 0:
             raise RuntimeError("Cannot drain NEP Scatter during a model-EP A2A burst")
         if self._nonuniform_ep_runtime_config.get("needs_reshard", False):
             self._consume_model_ep_aligned_nep_scatter_ticket()
         while self._nep_scatter_batches:
-            if not self._submit_nep_scatter_chunk(force=True):
+            if not self._submit_nep_scatter_chunk(queue_behind_inflight=True):
                 raise RuntimeError("A2A-gated NEP Scatter drain made no progress")
         self._retire_nep_scatter_chunk(force=True)
 
@@ -5646,6 +5762,14 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         """Mark a native model-EP A2A burst before its collective is enqueued."""
         if not _nep_a2a_scatter_scheduler_enabled():
             return
+        if getattr(self, "_nep_scatter_backward_complete", False):
+            if (
+                self._nep_scatter_batches
+                or self._nep_scatter_inflight_event is not None
+                or self._nep_scatter_alignment_work is not None
+            ):
+                raise RuntimeError("A new backward pass started before NEP Scatter drained")
+            self._nep_scatter_backward_complete = False
         if self._nep_model_ep_a2a_burst_depth != 0:
             raise RuntimeError("Nested model-EP A2A bursts are not supported")
         self._nep_model_ep_a2a_burst_depth = 1
@@ -5891,6 +6015,15 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
 
     def _launch_nep_dispatch_boundary_tasks(self, groups: tuple, module_label: str) -> bool:
         """Submit a layer batch after dispatch and all local source grads are ready."""
+        waiting_groups = self._nep_dispatch_waiting_groups
+        if waiting_groups is None:
+            self._nep_dispatch_waiting_groups = groups
+            self._nep_dispatch_waiting_module_label = module_label
+        elif waiting_groups != groups:
+            raise RuntimeError(
+                "NEP dispatch boundary became ready before the prior boundary was consumed: "
+                f"waiting={self._nep_dispatch_waiting_module_label} ready={module_label}"
+            )
         if any(group._nep_dispatch_boundary_launched for group in groups):
             return True
         if any(group._nep_dispatch_boundary_launching for group in groups):
@@ -6082,7 +6215,16 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             return False
 
         if scatter_context_batches is None:
-            completion_event.record(boundary_group._get_nep_nccl_comm_stream(0))
+            completion_stream = boundary_group._get_nep_nccl_comm_stream(0)
+            if _get_nep_parallel_gather_submission_window() > 1:
+                for pending in host_phases:
+                    phase_completion_event = pending.get("completion_event")
+                    if phase_completion_event is None:
+                        raise RuntimeError(
+                            "Parallel NEP Gather phase is missing its completion event"
+                        )
+                    completion_stream.wait_event(phase_completion_event)
+            completion_event.record(completion_stream)
         else:
             self._queue_nep_scatter_context_batches(
                 scatter_context_batches, completion_event, module_label, scatter_after_event
@@ -6182,6 +6324,8 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             self._nep_dispatch_waiting_module_label = None
 
         if final:
+            self._nep_scatter_backward_complete = True
+            _nep_debug_print("NEP Scatter scheduler received backward-complete signal")
             self._drain_nep_scatter_scheduler()
 
             inflight_events = getattr(self, "_nep_dispatch_inflight_completion_events", None)

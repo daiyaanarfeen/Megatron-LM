@@ -31,6 +31,10 @@ REFERENCE_APPROACH="${REFERENCE_APPROACH:-nccl}"
 SPLIT_APPROACH="${SPLIT_APPROACH:-nccl}"
 REFERENCE_A2A_SCATTER_SCHEDULER="${REFERENCE_A2A_SCATTER_SCHEDULER:-0}"
 SPLIT_A2A_SCATTER_SCHEDULER="${SPLIT_A2A_SCATTER_SCHEDULER:-1}"
+SPLIT_PARALLEL_GATHER_WINDOW="${SPLIT_PARALLEL_GATHER_WINDOW:-1}"
+SPLIT_BUCKET_READY_GATHER="${SPLIT_BUCKET_READY_GATHER:-0}"
+SPLIT_DEVICE_ORDERED_EDP="${SPLIT_DEVICE_ORDERED_EDP:-0}"
+SPLIT_EDP_READY_GATE="${SPLIT_EDP_READY_GATE:-0}"
 CASE_NUM_LAYERS="${CASE_NUM_LAYERS:-2}"
 CASE_LABEL="${CASE_LABEL:-ep8_ep4}"
 CASE_DISPLAY="${CASE_DISPLAY:-ep8-4}"
@@ -71,7 +75,7 @@ srun --nodes=1 --ntasks=1 --mpi=none "${container_args[@]}" bash -lc "
     python -m black --required-version 26 --check megatron/core/distributed/nonuniform_ep.py tests/unit_tests/distributed/test_nonuniform_ep.py &&
     python -m isort --check-only megatron/core/distributed/nonuniform_ep.py tests/unit_tests/distributed/test_nonuniform_ep.py &&
     python -m py_compile megatron/core/distributed/nonuniform_ep.py tests/unit_tests/distributed/test_nonuniform_ep.py &&
-    python -m pytest -q tests/unit_tests/distributed/test_nonuniform_ep.py tests/unit_tests/tensor_parallel/test_mappings.py -k 'scatter_chunk or scatter_queue or scatter_work_defers or ready_gate or split_host_phases_defer_edp_and_scatter or pipelined_host_phases or a2a_scatter_scheduler_preserves or model_ep_a2a_burst or scatter_progress or scatter_submission or all_to_all_burst_callbacks'
+    python -m pytest -q tests/unit_tests/distributed/test_nonuniform_ep.py tests/unit_tests/tensor_parallel/test_mappings.py -k 'bucket_ready_gather or scatter_chunk or scatter_queue or scatter_work_defers or ready_gate or split_host_phases_defer_edp_and_scatter or pipelined_host_phases or a2a_scatter_scheduler_preserves or model_ep_a2a_burst or scatter_progress or scatter_submission or all_to_all_burst_callbacks'
 "
 
 if [[ "${PREFLIGHT_ONLY:-0}" == "1" ]]; then
@@ -89,7 +93,10 @@ run_case() {
     local expert_bucket_groups="$8"
     local post_graph_host_phases="$9"
     local scatter_chunks="${10}"
+    local device_ordered_edp="${13}"
+    local edp_ready_gate="${14}"
     local a2a_scatter_scheduler="${11}"
+    local bucket_ready_gather="${12}"
     local checksum_dir="${ROOT_DIR}/${name}/checksums"
     local checksum_args="--attention-dropout 0.0 --hidden-dropout 0.0 --cuda-graph-impl local --cuda-graph-modules moe_router --te-rng-tracker --no-load-rng --distributed-timeout-minutes 3"
 
@@ -135,15 +142,18 @@ run_case() {
             NCCL_LAUNCH_ORDER_IMPLICIT=1 \
             TORCH_NCCL_BLOCKING_WAIT=0 \
             MEGATRON_NONUNIFORM_EP_ZERO_SM_RESHARD=0 \
-            MEGATRON_NONUNIFORM_EP_EDP_READY_GATE=0 \
+            MEGATRON_NONUNIFORM_EP_EDP_READY_GATE="${edp_ready_gate}" \
+            MEGATRON_NONUNIFORM_EP_DEVICE_ORDERED_EDP="${device_ordered_edp}" \
             MEGATRON_NONUNIFORM_EP_HOST_EDP_READY_GATE=0 \
             MEGATRON_NONUNIFORM_EP_SAME_COMM_READY=0 \
             MEGATRON_NONUNIFORM_EP_DEFER_HOST_LAUNCH=0 \
             MEGATRON_NONUNIFORM_EP_SPLIT_HOST_PHASES="${split_host_phases}" \
+            MEGATRON_NONUNIFORM_EP_BUCKET_READY_GATHER="${bucket_ready_gather}" \
             MEGATRON_NONUNIFORM_EP_POST_GRAPH_PHASES=0 \
             MEGATRON_NONUNIFORM_EP_POST_GRAPH_HOST_PHASES="${post_graph_host_phases}" \
             MEGATRON_NONUNIFORM_EP_DEFER_MODEL_EP_FENCE="${a2a_scatter_scheduler}" \
             MEGATRON_NONUNIFORM_EP_A2A_SCATTER_SCHEDULER="${a2a_scatter_scheduler}" \
+            MEGATRON_NONUNIFORM_EP_PARALLEL_GATHER_WINDOW="${SPLIT_PARALLEL_GATHER_WINDOW}" \
             MEGATRON_NONUNIFORM_EP_NCCL_TARGET_CHUNKS="${target_chunks}" \
             MEGATRON_NONUNIFORM_EP_NCCL_SCATTER_CHUNKS="${scatter_chunks}" \
             MEGATRON_NONUNIFORM_EP_NCCL_ASYNC_CHUNK_WINDOW="${async_chunk_window}" \
@@ -156,8 +166,8 @@ run_case() {
     echo "[${CASE_DISPLAY}-split-correctness] $(date --iso-8601=seconds) completed ${name}"
 }
 
-run_case "${STABLE_NAME}" "${REFERENCE_SPLIT_HOST_PHASES}" 0 29931 "${SPLIT_TARGET_CHUNKS}" "${SPLIT_ASYNC_CHUNK_WINDOW}" "${REFERENCE_APPROACH}" "${REFERENCE_EXPERT_BUCKET_GROUPS}" "${REFERENCE_POST_GRAPH_HOST_PHASES}" "${REFERENCE_SCATTER_CHUNKS}" "${REFERENCE_A2A_SCATTER_SCHEDULER}"
-run_case "${SPLIT_NAME}" 1 1 29932 "${SPLIT_TARGET_CHUNKS}" "${SPLIT_ASYNC_CHUNK_WINDOW}" "${SPLIT_APPROACH}" "${SPLIT_EXPERT_BUCKET_GROUPS}" "${SPLIT_POST_GRAPH_HOST_PHASES}" "${SPLIT_SCATTER_CHUNKS}" "${SPLIT_A2A_SCATTER_SCHEDULER}"
+run_case "${STABLE_NAME}" "${REFERENCE_SPLIT_HOST_PHASES}" 0 29931 "${SPLIT_TARGET_CHUNKS}" "${SPLIT_ASYNC_CHUNK_WINDOW}" "${REFERENCE_APPROACH}" "${REFERENCE_EXPERT_BUCKET_GROUPS}" "${REFERENCE_POST_GRAPH_HOST_PHASES}" "${REFERENCE_SCATTER_CHUNKS}" "${REFERENCE_A2A_SCATTER_SCHEDULER}" 0 0 0
+run_case "${SPLIT_NAME}" 1 1 29932 "${SPLIT_TARGET_CHUNKS}" "${SPLIT_ASYNC_CHUNK_WINDOW}" "${SPLIT_APPROACH}" "${SPLIT_EXPERT_BUCKET_GROUPS}" "${SPLIT_POST_GRAPH_HOST_PHASES}" "${SPLIT_SCATTER_CHUNKS}" "${SPLIT_A2A_SCATTER_SCHEDULER}" "${SPLIT_BUCKET_READY_GATHER}" "${SPLIT_DEVICE_ORDERED_EDP}" "${SPLIT_EDP_READY_GATE}"
 
 python3 - \
     "${ROOT_DIR}/${STABLE_NAME}/checksums" \
@@ -225,8 +235,13 @@ display = sys.argv[6]
 if stable_kind != split_kind:
     raise RuntimeError(f"Checksum kind mismatch: {stable_kind} versus {split_kind}")
 skip_optimizer_step = stable_kind == "grad"
-if "submit split_dispatch_gather_owner_barrier" not in split_text:
-    raise RuntimeError("Split-host scheduler did not emit its Gather-phase launch marker")
+launch_markers = (
+    "submit split_dispatch_gather_owner_barrier",
+    "before stream_ready_device_wait gate=edp",
+    "before native_ddp_owner_group",
+)
+if not any(marker in split_text for marker in launch_markers):
+    raise RuntimeError("Split-host scheduler did not emit a Gather/EDP launch marker")
 if "split_host_phases_fallback" in split_text:
     raise RuntimeError("Split-host scheduler fell back to the stable inline path")
 
