@@ -5953,10 +5953,11 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             with torch.profiler.record_function("nep_end_iteration_scatter_global_fence"):
                 torch.cuda.synchronize()
             while self._materialize_next_nep_end_iteration_scatter_batch():
-                while self._nep_scatter_batches:
-                    if not self._submit_nep_scatter_chunk(queue_behind_inflight=True):
-                        raise RuntimeError("End-of-iteration NEP Scatter drain made no progress")
-                self._retire_nep_scatter_chunk(force=True)
+                pass
+            while self._nep_scatter_batches:
+                if not self._submit_nep_scatter_chunk(queue_behind_inflight=True):
+                    raise RuntimeError("End-of-iteration NEP Scatter drain made no progress")
+            self._retire_nep_scatter_chunk(force=True)
             return
         if self._nonuniform_ep_runtime_config.get("needs_reshard", False):
             self._consume_model_ep_aligned_nep_scatter_ticket()

@@ -1,5 +1,13 @@
 ## 2026-08-04
 
+### Batched single-chunk end-of-iteration Scatter
+
+- Changed the persistent-buffer final drain to materialize every deferred layer first, enqueue every Scatter descriptor in canonical order without intermediate retirement, and perform one final retirement/wait. Set the EP16 wrapper default to one Scatter chunk per task; the process-group boundaries still require separate collectives for distinct owner/participant sets.
+- Focused container preflight passed Black/isort, compilation, and 38 selected unit tests. EP8/EP4 correctness jobs `2580583` (GB200) and `2580584` (GB300) independently passed exact checksum comparison with zero dense/expert relative delta and zero rank spread.
+- Same-allocation GB300 EP16/EP12 job `2580681` completed all timing and all-rank profile stages. Owner-rank steady means (iterations 3-12): healthy `523.750 +/- 3.720 ms`, NEP `539.590 +/- 3.672 ms`; overhead `15.840 ms` or `3.024%`, parity `97.065%`. This improves on persistent-buffer job `2580366` at `6.067%` slowdown and `94.280%` parity.
+- Rank 0 dropped from 294 Scatter submission markers per profiled step to 78. Mean submission span fell from about `28.58 ms` to `7.50 ms`, and marker CPU sum fell from about `9.68 ms` to `5.11 ms`. Owner Scatter NCCL residency fell from `16.422 ms` to `2.279 ms`; Gather and EDP residency in the new trace were `2.473 ms` and `6.620 ms` respectively.
+- Artifacts: `slurm_runs/lyris/coreai_comparch_sysarch-nep.ep16-allscatter-gb300-2580681.out`, `slurm_runs/lyris_a3b_ep16_ep12_end_scatter_allsubmit_gb300/`, and `/tmp/ep16_end_scatter_allsubmit_analysis.json`.
+
 ### Persistent per-task buffers for end-of-iteration Scatter
 
 - Checkpointed the clone-staging implementation as commit `611894855` before changing buffer lifetime.

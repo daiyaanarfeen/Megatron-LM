@@ -3453,7 +3453,7 @@ def test_nep_end_iteration_scatter_drain_fences_then_submits_every_chunk(monkeyp
     ddp._nep_scatter_backward_complete = True
     ddp._nep_scatter_batches = []
 
-    materialized = iter((True, False))
+    materialized = iter((True, True, False))
 
     def materialize():
         calls.append("materialize")
@@ -3479,10 +3479,13 @@ def test_nep_end_iteration_scatter_drain_fences_then_submits_every_chunk(monkeyp
     assert calls == [
         "synchronize",
         "materialize",
+        "materialize",
+        "materialize",
+        ("submit", True),
+        ("submit", True),
         ("submit", True),
         ("submit", True),
         ("retire", True),
-        "materialize",
     ]
 
 
