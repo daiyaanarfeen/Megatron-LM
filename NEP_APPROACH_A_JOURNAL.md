@@ -1,5 +1,33 @@
 ## 2026-08-05
 
+### Exact healthy/NEP expert-bucket A/B at EP8 and EP16
+
+- Created rollback branch `rollback/nep-pre-iso-buckets-20260805` at
+  `25a669587`. Exact NEP expert-bucket partitioning is isolated in commit
+  `10280070f`; same-module split buckets are coalesced at one dispatch
+  boundary by `66fe95ff7` (format-only follow-up `f25e6d71d`).
+- The first four-layer/eight-group gate exposed the same-module dispatch bug
+  and was fixed without weakening the existing ordering guard. Corrected job
+  `2587329` passed all 12-rank dense/expert gradient checksums with zero
+  relative delta. Six-layer/11-group gate `2587642` also passed exactly and
+  exercised every group `0..10`.
+- EP8 jobs `2587391`/`2587395` were intentionally discarded after trace
+  inspection showed healthy used 11 expert buckets while NEP was configured
+  for eight. Corrected same-allocation jobs `2587681` (timing) and `2587683`
+  (all-rank profile) used 11 expert buckets in both legs. Iterations 3-10:
+  healthy `911.525 +/- 13.702 ms`, NEP `930.000 +/- 10.724 ms`; gap
+  `18.475 ms`, slowdown `2.027%`, owner parity `98.013%`. Both profiled steps
+  contain exactly 11 expert-DP all-reduces; all 16 healthy and 12 NEP rank
+  traces were exported.
+- EP16 same-allocation job `2587403` completed timing and all-rank profiles.
+  Iterations 3-10: healthy `549.700 +/- 2.709 ms`, NEP
+  `572.413 +/- 3.049 ms`; gap `22.713 ms`, slowdown `4.132%`, owner parity
+  `96.032%`. Both profiled steps contain exactly eight expert-DP all-reduces
+  in each leg; all 32 healthy and 28 NEP rank traces were exported.
+- Final artifacts are under `slurm_runs/lyris_iso_bucket_ep8_11/` and
+  `slurm_runs/lyris_iso_bucket_ep16/`. The implementation remains cleanly
+  reversible either to the named rollback branch or commit-by-commit.
+
 ### Final-drain GPU-idle attribution
 
 - Reanalyzed rank 0 from EP16/EP12 all-rank profile job `2580681`. The additional backward idle is concentrated after native backward: NEP averages `16.343 ms` idle versus healthy `5.972 ms`, a `10.371 ms` delta.
