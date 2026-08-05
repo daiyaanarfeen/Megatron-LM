@@ -1,5 +1,43 @@
 ## 2026-08-05
 
+### One Gather bucket per native EDP bucket
+
+- Checkpointed the accepted two-level implementation before this change as commit `f12e1d456`
+  (`Checkpoint two-level NEP gather scheduling`). The implementation change is limited to
+  `megatron/core/distributed/nonuniform_ep.py`; the only other code change is focused unit coverage
+  in `tests/unit_tests/distributed/test_nonuniform_ep.py`. Scatter scheduling was not changed.
+- Restricted `MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP` to exactly `1`, giving each of
+  the eight native expert-DDP buckets exactly one Gather bucket. Gather remains on the shared
+  canonical Gather stream. Its completion event is consumed by a new shared canonical EDP stream,
+  where native Megatron `start_grad_sync()` is submitted. This preserves Gather -> own EDP and EDP
+  communicator order without a CPU wait, while removing the old same-stream dependency that also
+  forced later Gather work behind earlier EDP work.
+- GB200 preflight job `2591046` passed Black, isort, compilation, and 10 focused tests. Initial
+  smoke jobs `2591115`/`2591123` were canceled before training after direct submission accidentally
+  selected the wrapper's NeMo 25.09 default. Corrected GB200 EP8/EP4 job `2591135` completed two
+  iterations; every one of its 12 checksum files is byte-identical to the accepted stable baseline
+  from job `2569279`. The duplicate pending GB300 job `2591138` was canceled after GB200 started.
+- Same-allocation GB200 EP16 A/B job `2591175` completed on
+  `lyris[0248-0251,0282,0285-0287]`; the pending duplicate GB300 job `2591180` was canceled. Clean
+  iterations 3-8 averaged healthy `557.567 +/- 6.221 ms` and NEP `575.733 +/- 3.616 ms`: an
+  `18.167 ms` gap, `3.258%` slowdown, and `96.845%` owner parity. The prior implementation's
+  profiler-free A/B gap was `26.600 ms` and parity was `95.396%`, although that control used a
+  different allocation.
+- The all-rank trace has exactly eight owner Gathers and eight native EDP all-reduces per profiled
+  step. Each EDP starts only after its own Gather event, and all EDP operations retain canonical
+  order. Owner EDP residency is `33.943 ms`; `28.979 ms` (`85.37%`) overlaps some other GPU work,
+  leaving `4.964 ms` exposed. The non-double-counted useful subset is `18.611 ms`, including
+  `3.698 ms` of native compute and `14.913 ms` of model-EP communication; another `9.379 ms`
+  overlaps required NEP staging on the Gather stream.
+- Gather residency is `5.177 ms` and is fully exposed in this trace. This is not residual
+  same-stream serialization: the next bucket is not ready while the preceding EDP runs. The early
+  bucket-ready points are tens of milliseconds apart, and even the closest later Gather starts
+  about `0.95 ms` after the preceding EDP has completed. End-of-iteration Scatter remains fully
+  exposed at `6.449 ms`. Profiled full-step means are healthy `573.509 ms` and NEP `594.160 ms`.
+- Artifacts are under `slurm_runs/lyris_onegather_ep8_correct_r2_gb200/` and
+  `slurm_runs/lyris_onegather_ep16_ab_gb200/`; aggregate trace analysis is
+  `/tmp/nep_onegather_ep16_analysis.json`.
+
 ### Two-level Gather Scatter coalescing
 
 - Kept the two-level Gather/EDP behavior unchanged, but restored one end-of-iteration Scatter

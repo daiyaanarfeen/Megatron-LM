@@ -407,8 +407,8 @@ def _get_nep_nccl_gather_buckets_per_edp() -> Optional[int]:
     if value in (None, ""):
         return None
     gather_bucket_count = int(value)
-    if gather_bucket_count <= 0:
-        raise RuntimeError("MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP must be positive")
+    if gather_bucket_count != 1:
+        raise RuntimeError("MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP must be 1")
     return gather_bucket_count
 
 
@@ -1891,6 +1891,25 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             stream_key = ("end_iteration", stream_slot % _get_nep_nccl_async_chunk_window())
         else:
             stream_key = stream_slot
+        if state is not None:
+            streams = state.setdefault("comm_streams", {})
+            stream = streams.get(stream_key)
+            if stream is None:
+                stream = torch.cuda.Stream(device=torch.cuda.current_device())
+                streams[stream_key] = stream
+            self._nep_nccl_streams[stream_key] = stream
+            return stream
+
+        stream = self._nep_nccl_streams.get(stream_key)
+        if stream is None:
+            stream = torch.cuda.Stream(device=torch.cuda.current_device())
+            self._nep_nccl_streams[stream_key] = stream
+        return stream
+
+    def _get_nep_nccl_ordered_edp_stream(self) -> torch.cuda.Stream:
+        """Return the shared stream that preserves native EDP bucket order."""
+        stream_key = "edp"
+        state = getattr(self, "_nep_nccl_scheduler_state", None)
         if state is not None:
             streams = state.setdefault("comm_streams", {})
             stream = streams.get(stream_key)
@@ -4078,7 +4097,9 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 raise RuntimeError("Two-level NEP Gather requires device-ordered EDP")
             if _get_nep_parallel_gather_submission_window() != 1:
                 raise RuntimeError("Two-level NEP Gather requires one Gather submission stream")
-            with torch.cuda.stream(dispatch_stream):
+            edp_stream = self._get_nep_nccl_ordered_edp_stream()
+            edp_stream.wait_event(gather_done_event)
+            with torch.cuda.stream(edp_stream):
                 complete_context_batches = self._start_nep_nccl_owner_edp_reduce_batch(
                     contexts, use_device_readiness=False
                 )
@@ -4117,6 +4138,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                         "batch_index": batch_index,
                         "contexts": complete_contexts,
                         "dispatch_stream": dispatch_stream,
+                        "edp_stream": edp_stream,
                         "local_transfer_contexts": {},
                         "local_edp_contexts": {},
                         "gather_barrier_works": [],

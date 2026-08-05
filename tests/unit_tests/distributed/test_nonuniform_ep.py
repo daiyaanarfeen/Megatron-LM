@@ -596,16 +596,20 @@ def test_nep_two_level_gather_bucket_count_is_opt_in(monkeypatch):
     monkeypatch.delenv("MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP", raising=False)
     assert _get_nep_nccl_gather_buckets_per_edp() is None
 
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP", "1")
+    assert _get_nep_nccl_gather_buckets_per_edp() == 1
+
     monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP", "2")
-    assert _get_nep_nccl_gather_buckets_per_edp() == 2
+    with pytest.raises(RuntimeError, match="GATHER_BUCKETS_PER_EDP must be 1"):
+        _get_nep_nccl_gather_buckets_per_edp()
 
     monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP", "0")
-    with pytest.raises(RuntimeError, match="GATHER_BUCKETS_PER_EDP must be positive"):
+    with pytest.raises(RuntimeError, match="GATHER_BUCKETS_PER_EDP must be 1"):
         _get_nep_nccl_gather_buckets_per_edp()
 
 
 def test_nep_two_level_gather_stages_until_original_edp_bucket_is_complete(monkeypatch):
-    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP", "2")
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP", "1")
     first_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
         NonuniformEPNCCLParamAndGradBucketGroup
     )
@@ -631,7 +635,7 @@ def test_nep_two_level_gather_stages_until_original_edp_bucket_is_complete(monke
 
 
 def test_nep_two_level_gather_launches_one_native_edp_after_final_context(monkeypatch):
-    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP", "2")
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP", "1")
     calls = []
     first_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
         NonuniformEPNCCLParamAndGradBucketGroup
@@ -675,7 +679,7 @@ def test_nep_two_level_gather_launches_one_native_edp_after_final_context(monkey
 
 
 def test_nep_two_level_gather_coalesces_one_scatter_per_edp_bucket(monkeypatch):
-    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP", "2")
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP", "1")
     monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_SCATTER_CHUNKS", "1")
     calls = []
     first_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
@@ -813,7 +817,7 @@ def test_nep_two_level_scatter_batch_combines_and_splits_payloads():
 
 
 def test_nep_two_level_gather_rejects_duplicate_context(monkeypatch):
-    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP", "2")
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP", "1")
     bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
         NonuniformEPNCCLParamAndGradBucketGroup
     )
@@ -831,7 +835,7 @@ def test_nep_two_level_gather_rejects_duplicate_context(monkeypatch):
 
 
 def test_nep_two_level_gather_queues_out_of_order_ready_group(monkeypatch):
-    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP", "2")
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP", "1")
     ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
     calls = []
     first_group = SimpleNamespace(
@@ -861,14 +865,13 @@ def test_nep_two_level_gather_queues_out_of_order_ready_group(monkeypatch):
 
 
 def test_nep_two_level_gather_split_phase_submits_edp_after_final_gather(monkeypatch):
-    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP", "2")
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP", "1")
     monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_DEVICE_ORDERED_EDP", "1")
     calls = []
     bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
         NonuniformEPNCCLParamAndGradBucketGroup
     )
     bucket_group._nep_nccl_edp_bucket_index = 0
-    prior_context = {"group": bucket_group, "owner_ep_rank": 0, "chunk_index": 0}
 
     class FakeStreamContext:
         def __enter__(self):
@@ -881,7 +884,13 @@ def test_nep_two_level_gather_split_phase_submits_edp_after_final_gather(monkeyp
         def record(self, stream):
             calls.append(("record", stream))
 
+    class FakeEDPStream:
+        def wait_event(self, event):
+            calls.append(("edp_wait", event))
+
     dispatch_stream = object()
+    edp_stream = FakeEDPStream()
+    bucket_group._get_nep_nccl_ordered_edp_stream = lambda: edp_stream
     bucket_group._prepare_nep_nccl_owner_task_context = lambda owner, chunk, start, end, async_op: {
         "group": bucket_group,
         "owner_ep_rank": owner,
@@ -898,7 +907,7 @@ def test_nep_two_level_gather_split_phase_submits_edp_after_final_gather(monkeyp
 
     def start_edp(contexts, use_device_readiness):
         calls.append(("edp", use_device_readiness))
-        return [[prior_context, contexts[0]]]
+        return [contexts]
 
     bucket_group._start_nep_nccl_owner_edp_reduce_batch = start_edp
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: FakeStreamContext())
@@ -918,12 +927,13 @@ def test_nep_two_level_gather_split_phase_submits_edp_after_final_gather(monkeyp
         batch_index=0,
     )
 
-    assert calls == ["gather", ("record", dispatch_stream), ("edp", False)]
+    assert calls[:2] == ["gather", ("record", dispatch_stream)]
+    assert calls[2][0] == "edp_wait"
+    assert calls[3] == ("edp", False)
     assert len(pending) == 1
     assert pending[0]["phase"] == "edp_launched"
-    scatter_contexts = pending[0]["contexts"][0]["scatter_contexts"]
-    assert scatter_contexts[0] is prior_context
-    assert scatter_contexts[1]["group"] is bucket_group
+    assert pending[0]["edp_stream"] is edp_stream
+    assert pending[0]["contexts"][0]["group"] is bucket_group
 
 
 def test_nep_two_level_gather_staged_phase_advances_queued_batch():
@@ -1158,6 +1168,38 @@ def test_nep_nccl_process_group_dispatch_tasks_share_one_ordered_stream(monkeypa
     assert first is second
     assert created_streams == [(0, first)]
     assert bucket_group._nep_nccl_scheduler_state["comm_streams"] == {"dispatch": first}
+
+
+def test_nep_nccl_edp_uses_distinct_shared_ordered_stream(monkeypatch):
+    bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
+        NonuniformEPNCCLParamAndGradBucketGroup
+    )
+    bucket_group._nep_runtime_config = {"zero_sm_reshard": False}
+    bucket_group._nep_dispatch_boundary_launch = True
+    bucket_group.is_first_batch = False
+    bucket_group._nep_nccl_scheduler_state = {}
+    bucket_group._nep_nccl_streams = {}
+    created_streams = []
+
+    def make_stream(device):
+        stream = object()
+        created_streams.append((device, stream))
+        return stream
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "Stream", make_stream)
+
+    gather_stream = bucket_group._get_nep_nccl_comm_stream(0)
+    first_edp_stream = bucket_group._get_nep_nccl_ordered_edp_stream()
+    second_edp_stream = bucket_group._get_nep_nccl_ordered_edp_stream()
+
+    assert first_edp_stream is second_edp_stream
+    assert first_edp_stream is not gather_stream
+    assert created_streams == [(0, gather_stream), (0, first_edp_stream)]
+    assert bucket_group._nep_nccl_scheduler_state["comm_streams"] == {
+        "dispatch": gather_stream,
+        "edp": first_edp_stream,
+    }
 
 
 def test_nep_nccl_parallel_gather_window_uses_bounded_dispatch_streams(monkeypatch):
