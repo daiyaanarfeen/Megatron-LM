@@ -1,3 +1,13 @@
+## 2026-08-05
+
+### Final-drain GPU-idle attribution
+
+- Reanalyzed rank 0 from EP16/EP12 all-rank profile job `2580681`. The additional backward idle is concentrated after native backward: NEP averages `16.343 ms` idle versus healthy `5.972 ms`, a `10.371 ms` delta.
+- The NEP final drain itself averages about `9.97 ms` idle: descriptor materialization after the global fence contributes `3.27 ms`, serialized host submission of 72 descriptors contributes about `4.10 ms`, and retirement/native-DDP finalization before the post-train TP kernel contributes about `2.56 ms`. Pre-drain idle is close to healthy.
+- The global `torch.cuda.synchronize()` lasts about `1.94 ms` but overlaps active dense-DP GPU work and directly contributes only about `0.03 ms` idle. The problem is that descriptor preparation cannot begin until after this fence; six layer batches then take about `3.56 ms` of host time while issuing only about `0.29 ms` of GPU work.
+- Scatter submission is still host-serialized despite removing intermediate waits. Rank 0 traverses 72 descriptors; each participating group launch plus nonparticipant bookkeeping advances at roughly one group per `1.2 ms`, while most rank-0 Scatter kernels last only about `0.21 ms`. Rank-0 collective record-to-kernel delay is only `0.07-0.13 ms`, and paired rank 12 launches earlier and waits in NCCL, proving rank-0 host launch cadence rather than participant readiness or transfer bandwidth is the limiting factor.
+- After the final Scatter, the GPU is mostly idle for `2.35-2.77 ms` while the host retires the completion event, walks six native `finish_grad_sync()` handles, completes Python bookkeeping, and reaches the next native post-backward launch.
+
 ## 2026-08-04
 
 ### Batched single-chunk end-of-iteration Scatter
