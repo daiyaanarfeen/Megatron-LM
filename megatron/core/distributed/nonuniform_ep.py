@@ -4698,7 +4698,7 @@ def _expert_slot_module_key(slot_key: Tuple[str, ...]) -> Tuple[str, ...]:
 def _partition_expert_bucket_specs(
     grouped_specs: List[Tuple[Tuple[str, ...], List[_ExpertBucketSpec]]], target_group_count: int
 ) -> List[List[Tuple[Tuple[str, ...], List[_ExpertBucketSpec]]]]:
-    """Partition backward-ordered slots without splitting an MoE module."""
+    """Partition backward-ordered slots, splitting modules only to reach the target."""
     if not grouped_specs:
         return []
 
@@ -4713,14 +4713,18 @@ def _partition_expert_bucket_specs(
             module_blocks.append((module_key, []))
         module_blocks[-1][1].append(grouped_spec)
 
-    group_count = min(target_group_count, len(module_blocks))
-    base_size, remainder = divmod(len(module_blocks), group_count)
+    split_units = module_blocks
+    if target_group_count > len(module_blocks):
+        split_units = [(None, [grouped_spec]) for grouped_spec in grouped_specs]
+
+    group_count = min(target_group_count, len(split_units))
+    base_size, remainder = divmod(len(split_units), group_count)
     partitions = []
     start = 0
     for group_index in range(group_count):
         block_count = base_size + (1 if group_index < remainder else 0)
         partition = []
-        for _, module_specs in module_blocks[start : start + block_count]:
+        for _, module_specs in split_units[start : start + block_count]:
             partition.extend(module_specs)
         partitions.append(partition)
         start += block_count

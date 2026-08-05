@@ -397,6 +397,21 @@ def test_nep_nccl_partition_does_not_split_moe_module_slots():
             assert previous == partition_index
 
 
+def test_nep_nccl_partition_splits_module_slots_to_reach_larger_target():
+    grouped_specs = [
+        ((f"decoder.layers.{layer}.mlp.experts.{slot}",), [])
+        for layer in range(4, 0, -1)
+        for slot in ("linear_fc2.weight", "linear_fc1.weight")
+    ]
+
+    partitions = _partition_expert_bucket_specs(grouped_specs, 6)
+
+    assert [len(partition) for partition in partitions] == [2, 2, 1, 1, 1, 1]
+    assert [slot_key for partition in partitions for slot_key, _ in partition] == [
+        slot_key for slot_key, _ in grouped_specs
+    ]
+
+
 def test_nep_nccl_buffer_slot_reuse_does_not_block_host():
     bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
         NonuniformEPNCCLParamAndGradBucketGroup
