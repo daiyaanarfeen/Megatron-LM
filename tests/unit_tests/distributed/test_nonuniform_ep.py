@@ -1378,10 +1378,7 @@ def test_nep_bucket_ready_gather_coalesces_groups_from_same_module(monkeypatch):
     for group, param in groups:
         group.register_grad_ready(param)
 
-    assert calls == [
-        (dispatch_groups, "layer.0.mlp"),
-        (dispatch_groups, "layer.0.mlp"),
-    ]
+    assert calls == [(dispatch_groups, "layer.0.mlp"), (dispatch_groups, "layer.0.mlp")]
 
 
 def test_nep_combined_group_waits_for_all_constituent_modules():
