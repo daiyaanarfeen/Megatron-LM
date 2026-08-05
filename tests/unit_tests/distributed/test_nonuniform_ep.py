@@ -1347,6 +1347,43 @@ def test_nep_bucket_ready_gather_launches_from_accumulate_grad(monkeypatch):
     assert calls == [((bucket_group,), "bucket.0")]
 
 
+def test_nep_bucket_ready_gather_coalesces_groups_from_same_module(monkeypatch):
+    groups = []
+    calls = []
+    for _ in range(2):
+        param = object()
+        group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
+            NonuniformEPNCCLParamAndGradBucketGroup
+        )
+        group.ddp_config = SimpleNamespace(overlap_grad_reduce=True)
+        group.is_last_microbatch = True
+        group.is_first_batch = False
+        group.param_to_bucket = {param: object()}
+        group.params = [param]
+        group.per_param_grad_ready_counts = {}
+        group.golden_per_param_grad_ready_counts = {param: 1}
+        group._nep_dispatch_boundary_launch = True
+        group._nep_dispatch_boundary_ready = False
+        group._nep_dispatch_boundary_module_label = "layer.0.mlp"
+        groups.append((group, param))
+
+    dispatch_groups = tuple(group for group, _ in groups)
+    for group, _ in groups:
+        group._nep_dispatch_boundary_groups = dispatch_groups
+        group._nep_dispatch_boundary_callback = lambda callback_groups, label: calls.append(
+            (callback_groups, label)
+        )
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_BUCKET_READY_GATHER", "1")
+
+    for group, param in groups:
+        group.register_grad_ready(param)
+
+    assert calls == [
+        (dispatch_groups, "layer.0.mlp"),
+        (dispatch_groups, "layer.0.mlp"),
+    ]
+
+
 def test_nep_combined_group_waits_for_all_constituent_modules():
     ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
     calls = []

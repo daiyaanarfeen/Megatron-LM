@@ -6039,13 +6039,14 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 attach_scheduler(self)
 
             module_groups.sort(key=lambda group: group._nep_nccl_group_index)
+            dispatch_groups = tuple(module_groups)
             for bucket_group in module_groups:
                 assigned_groups.setdefault(bucket_group, set()).add(module_name)
                 bucket_group._nep_dispatch_boundary_launch = True
                 bucket_group._nep_dispatch_boundary_callback = (
                     self._launch_nep_dispatch_boundary_tasks
                 )
-                bucket_group._nep_dispatch_boundary_groups = (bucket_group,)
+                bucket_group._nep_dispatch_boundary_groups = dispatch_groups
                 bucket_group._nep_dispatch_boundary_module_label = module_name
                 bucket_group._nep_dispatch_boundary_required_modules.add(module_name)
 
