@@ -402,6 +402,20 @@ def _get_nep_nccl_expert_bucket_group_count() -> int:
     return group_count
 
 
+def _get_nep_nccl_gather_buckets_per_edp() -> Optional[int]:
+    value = os.getenv("MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP")
+    if value in (None, ""):
+        return None
+    gather_bucket_count = int(value)
+    if gather_bucket_count <= 0:
+        raise RuntimeError("MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP must be positive")
+    return gather_bucket_count
+
+
+def _nep_two_level_gather_enabled() -> bool:
+    return _get_nep_nccl_gather_buckets_per_edp() is not None
+
+
 def _nep_block_current_stream(work) -> None:
     """Order later CUDA work after a NCCL work item without a CPU wait when supported."""
     if work is None:
@@ -2954,6 +2968,179 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             "work": None,
         }
 
+    def _prepare_nep_nccl_owner_all_to_all_scatter_batch(
+        self, contexts: List[dict]
+    ) -> Optional[dict]:
+        """Pack one Scatter collective for all Gather buckets in an EDP bucket."""
+        if not contexts:
+            return None
+        if len(contexts) == 1:
+            context = contexts[0]
+            return context["group"]._prepare_nep_nccl_owner_all_to_all_scatter(
+                context["owner_ep_rank"],
+                context["chunk_index"],
+                context["chunk_start"],
+                context["chunk_end"],
+                context["chunk"],
+                context["buffer_slot_key"],
+                async_op=context["async_op"],
+            )
+
+        contexts = sorted(
+            contexts,
+            key=lambda context: (
+                getattr(context["group"], "_nep_nccl_group_index", -1),
+                context["chunk_index"],
+            ),
+        )
+        owner_ep_rank = contexts[0]["owner_ep_rank"]
+        if any(context["owner_ep_rank"] != owner_ep_rank for context in contexts):
+            raise RuntimeError("Two-level NEP Scatter cannot combine different owner ranks")
+        if any(context["async_op"] != contexts[0]["async_op"] for context in contexts):
+            raise RuntimeError("Two-level NEP Scatter contexts disagree on async mode")
+
+        representative = contexts[0]["group"]
+        cfg = representative._nep_runtime_config
+        if cfg.get("zero_sm_reshard", False):
+            raise RuntimeError("Two-level NEP Scatter does not support zero-SM reshard")
+        ep_rank = cfg["ep_rank"]
+        source_ranks = representative._nep_nccl_owner_source_ranks(owner_ep_rank)
+        transfer_ranks = representative._nep_nccl_owner_transfer_ranks(owner_ep_rank)
+        for context in contexts[1:]:
+            group = context["group"]
+            if group._nep_nccl_owner_source_ranks(owner_ep_rank) != source_ranks:
+                raise RuntimeError("Two-level NEP Scatter contexts disagree on source ranks")
+            if group._nep_nccl_owner_transfer_ranks(owner_ep_rank) != transfer_ranks:
+                raise RuntimeError("Two-level NEP Scatter contexts disagree on transfer ranks")
+        if ep_rank not in transfer_ranks:
+            return None
+
+        remote_source_ranks = [rank for rank in source_ranks if rank != owner_ep_rank]
+        total_chunk_numel = sum(context["chunk"].numel() for context in contexts)
+        if not remote_source_ranks:
+            return {
+                "kind": "local",
+                "owner_ep_rank": owner_ep_rank,
+                "chunk_index": 0,
+                "chunk_start": 0,
+                "chunk_end": total_chunk_numel,
+                "scatter_contexts": contexts,
+            }
+
+        transfer_group, _, transfer_size, transfer_source_ranks = (
+            representative._get_nep_nccl_transfer_group_info(owner_ep_rank)
+        )
+        owner_transfer_rank = transfer_source_ranks.index(owner_ep_rank)
+        remote_transfer_ranks = [transfer_source_ranks.index(rank) for rank in remote_source_ranks]
+        dtype = contexts[0]["chunk"].dtype
+        device = contexts[0]["chunk"].device
+        if any(
+            context["chunk"].dtype != dtype or context["chunk"].device != device
+            for context in contexts
+        ):
+            raise RuntimeError("Two-level NEP Scatter contexts disagree on dtype or device")
+
+        edp_bucket_index = representative._nep_nccl_edp_bucket_index
+        cache = representative._get_nep_nccl_shared_buffer_state()["gather_buf_cache"]
+        empty = representative._get_nep_nccl_cached_tensor(
+            cache, ("empty", dtype, device), 0, dtype, device
+        )
+        cache_prefix = (edp_bucket_index, owner_ep_rank, dtype, device)
+
+        input_split_sizes = [0] * transfer_size
+        if ep_rank == owner_ep_rank:
+            destination_numels = {}
+            for destination_transfer_rank in remote_transfer_ranks:
+                destination_ep_rank = transfer_source_ranks[destination_transfer_rank]
+                destination_numel = sum(
+                    context["group"]._nep_nccl_owner_source_payload_numel(
+                        owner_ep_rank,
+                        destination_ep_rank,
+                        context["chunk_start"],
+                        context["chunk_end"],
+                    )
+                    for context in contexts
+                )
+                destination_numels[destination_ep_rank] = destination_numel
+                input_split_sizes[destination_transfer_rank] = destination_numel
+            scatter_input_numel = sum(destination_numels.values())
+            scatter_input = representative._get_nep_nccl_cached_tensor(
+                cache,
+                ("owner_layout_a2a_scatter_input_edp",) + cache_prefix,
+                scatter_input_numel,
+                dtype,
+                device,
+            )
+            scatter_offset = 0
+            for destination_ep_rank in remote_source_ranks:
+                for context in contexts:
+                    group = context["group"]
+                    destination_numel = group._nep_nccl_owner_source_payload_numel(
+                        owner_ep_rank,
+                        destination_ep_rank,
+                        context["chunk_start"],
+                        context["chunk_end"],
+                    )
+                    group._pack_nep_nccl_scatter_payload(
+                        owner_ep_rank,
+                        destination_ep_rank,
+                        context["chunk_start"],
+                        context["chunk_end"],
+                        context["chunk"],
+                        scatter_input[scatter_offset : scatter_offset + destination_numel],
+                    )
+                    scatter_offset += destination_numel
+        else:
+            scatter_input = empty
+
+        output_split_sizes = [0] * transfer_size
+        if ep_rank in remote_source_ranks:
+            scatter_output_numel = sum(
+                context["group"]._nep_nccl_owner_source_payload_numel(
+                    owner_ep_rank, ep_rank, context["chunk_start"], context["chunk_end"]
+                )
+                for context in contexts
+            )
+            output_split_sizes[owner_transfer_rank] = scatter_output_numel
+            scatter_output = representative._get_nep_nccl_cached_tensor(
+                cache,
+                ("owner_layout_a2a_scatter_output_edp",) + cache_prefix,
+                scatter_output_numel,
+                dtype,
+                device,
+            )
+        else:
+            scatter_output = empty
+
+        return {
+            "kind": "all_to_all",
+            "owner_ep_rank": owner_ep_rank,
+            "chunk_index": 0,
+            "chunk_start": 0,
+            "chunk_end": total_chunk_numel,
+            "buffer_slot_key": (
+                "two_level_scatter",
+                edp_bucket_index,
+                owner_ep_rank,
+                dtype,
+                device,
+            ),
+            "async_op": contexts[0]["async_op"],
+            "ep_rank": ep_rank,
+            "group_index": representative._nep_nccl_group_index,
+            "chunk_size": total_chunk_numel,
+            "source_ranks": source_ranks,
+            "remote_source_ranks": remote_source_ranks,
+            "transfer_source_ranks": transfer_source_ranks,
+            "transfer_group": transfer_group,
+            "scatter_input": scatter_input,
+            "scatter_output": scatter_output,
+            "input_split_sizes": input_split_sizes,
+            "output_split_sizes": output_split_sizes,
+            "scatter_contexts": contexts,
+            "work": None,
+        }
+
     def _submit_nep_nccl_owner_all_to_all_scatter(self, descriptor: Optional[dict]) -> None:
         """Launch one prepared Scatter descriptor without ordering copyback."""
         if descriptor is None:
@@ -3027,26 +3214,39 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if kind == "completed_local":
             return
         if kind == "local":
-            self._copy_nep_nccl_owner_chunk_to_local_grads(
-                descriptor["owner_ep_rank"],
-                descriptor["chunk_start"],
-                descriptor["chunk_end"],
-                descriptor["chunk"],
-            )
+            scatter_contexts = descriptor.get("scatter_contexts")
+            if scatter_contexts is None:
+                self._copy_nep_nccl_owner_chunk_to_local_grads(
+                    descriptor["owner_ep_rank"],
+                    descriptor["chunk_start"],
+                    descriptor["chunk_end"],
+                    descriptor["chunk"],
+                )
+            else:
+                for context in scatter_contexts:
+                    context["group"]._copy_nep_nccl_owner_chunk_to_local_grads(
+                        context["owner_ep_rank"],
+                        context["chunk_start"],
+                        context["chunk_end"],
+                        context["chunk"],
+                    )
             return
         if kind == "native":
             return
         if kind != "all_to_all":
             raise RuntimeError(f"Unknown NEP Scatter descriptor kind: {kind}")
 
-        if descriptor["ep_rank"] == descriptor["owner_ep_rank"]:
+        scatter_contexts = descriptor.get("scatter_contexts")
+        if scatter_contexts is None and descriptor["ep_rank"] == descriptor["owner_ep_rank"]:
             self._copy_nep_nccl_owner_chunk_to_local_grads(
                 descriptor["owner_ep_rank"],
                 descriptor["chunk_start"],
                 descriptor["chunk_end"],
                 descriptor["chunk"],
             )
-        elif descriptor["ep_rank"] in descriptor["remote_source_ranks"]:
+        elif (
+            scatter_contexts is None and descriptor["ep_rank"] in descriptor["remote_source_ranks"]
+        ):
             self._copy_nep_nccl_scatter_payload_to_local_grads(
                 descriptor["owner_ep_rank"],
                 descriptor["ep_rank"],
@@ -3054,6 +3254,35 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 descriptor["chunk_end"],
                 descriptor["scatter_output"],
             )
+        elif scatter_contexts is not None and descriptor["ep_rank"] == descriptor["owner_ep_rank"]:
+            for context in scatter_contexts:
+                context["group"]._copy_nep_nccl_owner_chunk_to_local_grads(
+                    context["owner_ep_rank"],
+                    context["chunk_start"],
+                    context["chunk_end"],
+                    context["chunk"],
+                )
+        elif (
+            scatter_contexts is not None
+            and descriptor["ep_rank"] in descriptor["remote_source_ranks"]
+        ):
+            scatter_offset = 0
+            for context in scatter_contexts:
+                group = context["group"]
+                source_numel = group._nep_nccl_owner_source_payload_numel(
+                    context["owner_ep_rank"],
+                    descriptor["ep_rank"],
+                    context["chunk_start"],
+                    context["chunk_end"],
+                )
+                group._copy_nep_nccl_scatter_payload_to_local_grads(
+                    context["owner_ep_rank"],
+                    descriptor["ep_rank"],
+                    context["chunk_start"],
+                    context["chunk_end"],
+                    descriptor["scatter_output"][scatter_offset : scatter_offset + source_numel],
+                )
+                scatter_offset += source_numel
         _nep_debug_print(
             "after ep_all_to_all_owner_scatter "
             f"group={descriptor['group_index']} owner={descriptor['owner_ep_rank']} "
@@ -3098,7 +3327,10 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             contexts = [contexts]
         if not contexts:
             raise RuntimeError("NEP native DDP requires at least one owner context")
-        contexts = sorted(contexts, key=lambda context: context["chunk_index"])
+        contexts = sorted(
+            contexts,
+            key=lambda context: (context["group"]._nep_nccl_group_index, context["chunk_index"]),
+        )
 
         cfg = self._nep_runtime_config
         owner_ep_rank = contexts[0]["owner_ep_rank"]
@@ -3116,7 +3348,9 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             )
 
         scaling_factors = {
-            entry["bucket"].gradient_scaling_factor for entry in self._nep_nccl_entries
+            entry["bucket"].gradient_scaling_factor
+            for context in contexts
+            for entry in context["group"]._nep_nccl_entries
         }
         if len(scaling_factors) != 1:
             raise RuntimeError(
@@ -3138,11 +3372,11 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     offset=0,
                     numel_unpadded=context["chunk"].numel(),
                     gradient_scaling_factor=gradient_scaling_factor,
-                    bucket_id=context["chunk_index"],
+                    bucket_id=bucket_index,
                     param_index_map={},
                     params_with_extra_main_grads=[],
                 )
-                for context in contexts
+                for bucket_index, context in enumerate(contexts)
             ]
             native_ddp_config = _nep_owner_ddp_config(self.ddp_config)
             native_group = _ParamAndGradBucketGroup(
@@ -3169,7 +3403,10 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         """Launch one native EDP group after all of its Gather chunks are ready."""
         if not contexts:
             return
-        contexts = sorted(contexts, key=lambda context: context["chunk_index"])
+        contexts = sorted(
+            contexts,
+            key=lambda context: (context["group"]._nep_nccl_group_index, context["chunk_index"]),
+        )
         cfg = self._nep_runtime_config
         owner_ep_rank = contexts[0]["owner_ep_rank"]
         if any(context["owner_ep_rank"] != owner_ep_rank for context in contexts):
@@ -3291,21 +3528,83 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 grouped_context["native_edp_started"] = False
         native_states.clear()
 
-    def _start_nep_nccl_owner_edp_reduce_batch(
-        self, contexts: List[dict], use_device_readiness: bool = True
-    ) -> None:
-        """Launch one native EDP group per logical expert bucket and owner."""
-        context_batches = {}
+    def _stage_nep_nccl_owner_edp_contexts(self, contexts: List[dict]) -> List[List[dict]]:
+        """Return complete owner/EDP buckets while retaining partial Gather buckets."""
+        if not _nep_two_level_gather_enabled():
+            context_batches = {}
+            for context in contexts:
+                group = context["group"]
+                key = (id(group), context["owner_ep_rank"])
+                context_batches.setdefault(key, []).append(context)
+            return list(context_batches.values())
+
+        state = getattr(self, "_nep_nccl_scheduler_state", None)
+        if state is None:
+            raise RuntimeError("Two-level NEP Gather requires the shared task scheduler")
+        pending = state["pending_edp_contexts"]
+        expected = state["expected_edp_contexts"]
+        touched_keys = []
         for context in contexts:
             group = context["group"]
-            if group._nep_runtime_config["ep_rank"] != context["owner_ep_rank"]:
-                continue
-            key = (id(group), context["owner_ep_rank"])
-            context_batches.setdefault(key, []).append(context)
-        for context_batch in context_batches.values():
-            context_batch[0]["group"]._start_nep_nccl_owner_edp_reduce_contexts(
-                context_batch, use_device_readiness=use_device_readiness
-            )
+            edp_bucket_index = group._nep_nccl_edp_bucket_index
+            key = (edp_bucket_index, context["owner_ep_rank"])
+            context_key = (group._nep_nccl_group_index, context["chunk_index"])
+            bucket_contexts = pending.setdefault(key, {})
+            if context_key in bucket_contexts:
+                raise RuntimeError(
+                    "NEP Gather context was staged twice for "
+                    f"EDP bucket {edp_bucket_index}, owner {context['owner_ep_rank']}, "
+                    f"context {context_key}"
+                )
+            bucket_contexts[context_key] = context
+            if key not in touched_keys:
+                touched_keys.append(key)
+
+        complete_batches = []
+        for key in touched_keys:
+            bucket_contexts = pending[key]
+            expected_count = expected[key]
+            if len(bucket_contexts) > expected_count:
+                raise RuntimeError(
+                    f"NEP EDP bucket {key} received {len(bucket_contexts)} Gather contexts; "
+                    f"expected {expected_count}"
+                )
+            if len(bucket_contexts) == expected_count:
+                complete_batches.append(
+                    [bucket_contexts[context_key] for context_key in sorted(bucket_contexts)]
+                )
+                del pending[key]
+        return complete_batches
+
+    def _start_nep_nccl_owner_edp_reduce_batch(
+        self, contexts: List[dict], use_device_readiness: bool = True
+    ) -> List[List[dict]]:
+        """Launch one native EDP group per original expert bucket and owner."""
+        context_batches = self._stage_nep_nccl_owner_edp_contexts(contexts)
+        for context_batch in context_batches:
+            group = context_batch[0]["group"]
+            if group._nep_runtime_config["ep_rank"] == context_batch[0]["owner_ep_rank"]:
+                group._start_nep_nccl_owner_edp_reduce_contexts(
+                    context_batch, use_device_readiness=use_device_readiness
+                )
+        return context_batches
+
+    def _coalesce_nep_nccl_scatter_contexts(self, contexts: List[dict]) -> dict:
+        """Represent one original EDP bucket as one Scatter scheduling unit."""
+        if not contexts:
+            raise RuntimeError("Cannot build a two-level NEP Scatter from no contexts")
+        if len(contexts) == 1:
+            return contexts[0]
+        contexts = sorted(
+            contexts,
+            key=lambda context: (
+                getattr(context["group"], "_nep_nccl_group_index", -1),
+                context["chunk_index"],
+            ),
+        )
+        scatter_context = dict(contexts[0])
+        scatter_context["scatter_contexts"] = tuple(contexts)
+        return scatter_context
 
     def _start_nep_nccl_dispatch_boundary_task(self, context: dict) -> None:
         """Enqueue one ordered zero-SM task at a post-dispatch backward boundary."""
@@ -3433,6 +3732,17 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         )
         self._synchronize_first_batch_zero_sm_phase(owner_ep_rank, "gather")
 
+        if _nep_two_level_gather_enabled():
+            if not self.is_first_batch:
+                raise RuntimeError(
+                    "Steady-state two-level NEP Gather must launch from AccumulateGrad"
+                )
+            complete_context_batches = self._start_nep_nccl_owner_edp_reduce_batch([context])
+            for context_batch in complete_context_batches:
+                scatter_context = self._coalesce_nep_nccl_scatter_contexts(context_batch)
+                scatter_context["group"]._start_nep_nccl_owner_task_scatter(scatter_context)
+            return
+
         self._start_nep_nccl_owner_edp_reduce(context)
         if defer_scatter:
             state = getattr(self, "_nep_nccl_scheduler_state", None)
@@ -3456,23 +3766,41 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 "the all-to-all reshard path"
             )
 
-        scatter_ranges = self._nep_nccl_scatter_chunk_ranges(
-            context["owner_ep_rank"], context["chunk_start"], context["chunk_end"], scatter_chunks
-        )
-        descriptors = []
-        for scatter_chunk_index, (scatter_start, scatter_end) in enumerate(scatter_ranges):
-            local_start = scatter_start - context["chunk_start"]
-            local_end = scatter_end - context["chunk_start"]
-            descriptor = self._prepare_nep_nccl_owner_all_to_all_scatter(
+        scatter_contexts = context.get("scatter_contexts")
+        if scatter_contexts is not None:
+            if scatter_chunks != 1:
+                raise RuntimeError(
+                    "Two-level NEP Gather currently requires "
+                    "MEGATRON_NONUNIFORM_EP_NCCL_SCATTER_CHUNKS=1"
+                )
+            descriptors = [
+                self._prepare_nep_nccl_owner_all_to_all_scatter_batch(list(scatter_contexts))
+            ]
+        else:
+            scatter_ranges = self._nep_nccl_scatter_chunk_ranges(
                 context["owner_ep_rank"],
-                context["chunk_index"],
-                scatter_start,
-                scatter_end,
-                context["chunk"][local_start:local_end],
-                context["buffer_slot_key"],
-                async_op=context["async_op"],
-                scatter_chunk_index=scatter_chunk_index,
+                context["chunk_start"],
+                context["chunk_end"],
+                scatter_chunks,
             )
+            descriptors = []
+            for scatter_chunk_index, (scatter_start, scatter_end) in enumerate(scatter_ranges):
+                local_start = scatter_start - context["chunk_start"]
+                local_end = scatter_end - context["chunk_start"]
+                descriptors.append(
+                    self._prepare_nep_nccl_owner_all_to_all_scatter(
+                        context["owner_ep_rank"],
+                        context["chunk_index"],
+                        scatter_start,
+                        scatter_end,
+                        context["chunk"][local_start:local_end],
+                        context["buffer_slot_key"],
+                        async_op=context["async_op"],
+                        scatter_chunk_index=scatter_chunk_index,
+                    )
+                )
+
+        for descriptor in descriptors:
             if (
                 _nep_a2a_scatter_scheduler_enabled()
                 and descriptor is not None
@@ -3488,7 +3816,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     copy_done
                 )
                 descriptor["kind"] = "completed_local"
-            descriptors.append(descriptor)
         return {
             "group": self,
             "context": context,
@@ -3504,7 +3831,14 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if self.is_first_batch:
             raise RuntimeError("A2A-gated Scatter scheduling is not supported on the first batch")
         context = train["context"]
-        self._mark_nep_nccl_task_started(context["owner_ep_rank"], context["chunk_index"])
+        scatter_contexts = context.get("scatter_contexts")
+        if scatter_contexts is None:
+            self._mark_nep_nccl_task_started(context["owner_ep_rank"], context["chunk_index"])
+        else:
+            for task_context in scatter_contexts:
+                task_context["group"]._mark_nep_nccl_task_started(
+                    task_context["owner_ep_rank"], task_context["chunk_index"]
+                )
         train["task_marked"] = True
 
     def _finish_nep_nccl_scatter_train_submission(self, train: dict) -> None:
@@ -3519,7 +3853,14 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             torch.cuda.current_stream().synchronize()
             dist.barrier(group=task_group_gloo)
         if not train["task_marked"]:
-            self._mark_nep_nccl_task_started(context["owner_ep_rank"], context["chunk_index"])
+            scatter_contexts = context.get("scatter_contexts")
+            if scatter_contexts is None:
+                self._mark_nep_nccl_task_started(context["owner_ep_rank"], context["chunk_index"])
+            else:
+                for task_context in scatter_contexts:
+                    task_context["group"]._mark_nep_nccl_task_started(
+                        task_context["owner_ep_rank"], task_context["chunk_index"]
+                    )
             train["task_marked"] = True
 
     def _start_nep_nccl_owner_task_scatter(self, context: dict) -> None:
@@ -3528,18 +3869,35 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             if self._nep_runtime_config["ep_rank"] == owner_ep_rank:
                 self._order_nep_nccl_owner_edp_before_scatter(context)
                 with torch.profiler.record_function("nep_benchmark_skip_scatter_owner_copy"):
-                    self._copy_nep_nccl_owner_chunk_to_local_grads(
-                        owner_ep_rank,
-                        context["chunk_start"],
-                        context["chunk_end"],
-                        context["chunk"],
-                    )
+                    scatter_contexts = context.get("scatter_contexts")
+                    if scatter_contexts is None:
+                        self._copy_nep_nccl_owner_chunk_to_local_grads(
+                            owner_ep_rank,
+                            context["chunk_start"],
+                            context["chunk_end"],
+                            context["chunk"],
+                        )
+                    else:
+                        for task_context in scatter_contexts:
+                            task_context["group"]._copy_nep_nccl_owner_chunk_to_local_grads(
+                                owner_ep_rank,
+                                task_context["chunk_start"],
+                                task_context["chunk_end"],
+                                task_context["chunk"],
+                            )
             _nep_debug_print(
                 "benchmark skip ep_all_to_all_owner_scatter "
                 f"group={getattr(self, '_nep_nccl_group_index', -1)} "
                 f"owner={owner_ep_rank} chunk={context['chunk_index']}"
             )
-            self._mark_nep_nccl_task_started(owner_ep_rank, context["chunk_index"])
+            scatter_contexts = context.get("scatter_contexts")
+            if scatter_contexts is None:
+                self._mark_nep_nccl_task_started(owner_ep_rank, context["chunk_index"])
+            else:
+                for task_context in scatter_contexts:
+                    task_context["group"]._mark_nep_nccl_task_started(
+                        owner_ep_rank, task_context["chunk_index"]
+                    )
             return
 
         train = self._prepare_nep_nccl_owner_task_scatter_train(context)
@@ -3685,7 +4043,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
 
     def _start_nep_nccl_split_host_phase_batch(
         self, task_batch: List[dict], dispatch_stream: torch.cuda.Stream, batch_index: int
-    ) -> dict:
+    ):
         """Launch one Gather batch and its pair-scoped host rendezvous."""
         contexts = []
         with torch.cuda.stream(dispatch_stream):
@@ -3714,6 +4072,59 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             gather_done_event.record(dispatch_stream)
             for context in contexts:
                 context["gather_done_event"] = gather_done_event
+
+        if _nep_two_level_gather_enabled():
+            if not _nep_device_ordered_edp_enabled():
+                raise RuntimeError("Two-level NEP Gather requires device-ordered EDP")
+            if _get_nep_parallel_gather_submission_window() != 1:
+                raise RuntimeError("Two-level NEP Gather requires one Gather submission stream")
+            with torch.cuda.stream(dispatch_stream):
+                complete_context_batches = self._start_nep_nccl_owner_edp_reduce_batch(
+                    contexts, use_device_readiness=False
+                )
+
+            complete_keys = {
+                (
+                    context_batch[0]["group"]._nep_nccl_edp_bucket_index,
+                    context_batch[0]["owner_ep_rank"],
+                )
+                for context_batch in complete_context_batches
+            }
+            staged_contexts = [
+                context
+                for context in contexts
+                if (context["group"]._nep_nccl_edp_bucket_index, context["owner_ep_rank"])
+                not in complete_keys
+            ]
+            pending = []
+            if staged_contexts:
+                pending.append(
+                    {
+                        "batch_index": batch_index,
+                        "contexts": staged_contexts,
+                        "dispatch_stream": dispatch_stream,
+                        "gather_done_event": gather_done_event,
+                        "phase": "gather_staged",
+                    }
+                )
+            complete_contexts = [
+                self._coalesce_nep_nccl_scatter_contexts(context_batch)
+                for context_batch in complete_context_batches
+            ]
+            if complete_contexts:
+                pending.append(
+                    {
+                        "batch_index": batch_index,
+                        "contexts": complete_contexts,
+                        "dispatch_stream": dispatch_stream,
+                        "local_transfer_contexts": {},
+                        "local_edp_contexts": {},
+                        "gather_barrier_works": [],
+                        "gather_done_event": gather_done_event,
+                        "phase": "edp_launched",
+                    }
+                )
+            return pending
 
         local_transfer_contexts = {}
         for context in contexts:
@@ -3882,11 +4293,19 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 pending = self._start_nep_nccl_split_host_phase_batch(
                     task_batch, dispatch_stream, batch_index=batch_index
                 )
-                pending["submission_slot"] = batch_index
-                pending_host_phases.append(pending)
+                if isinstance(pending, list):
+                    for pending_phase in pending:
+                        pending_phase["submission_slot"] = batch_index
+                    pending_host_phases.extend(pending)
+                else:
+                    pending["submission_slot"] = batch_index
+                    pending_host_phases.append(pending)
             if continue_host_phase_batches:
-                for pending in pending_host_phases:
-                    pending["remaining_task_batches"] = remaining_task_batches
+                if _nep_two_level_gather_enabled():
+                    pending_host_phases[-1]["remaining_task_batches"] = remaining_task_batches
+                else:
+                    for pending in pending_host_phases:
+                        pending["remaining_task_batches"] = remaining_task_batches
             return pending_host_phases
 
         dispatch_stream = self._get_nep_nccl_comm_stream(0)
@@ -4028,6 +4447,31 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             phase = pending.get("phase", "gather_launched")
             if phase == "finished":
                 continue
+            if phase == "gather_staged":
+                pending["phase"] = "finished"
+                remaining_task_batches = pending.get("remaining_task_batches")
+                if remaining_task_batches:
+                    next_batch_index, next_task_batch = remaining_task_batches.pop(0)
+                    next_pending = self._start_nep_nccl_split_host_phase_batch(
+                        next_task_batch, dispatch_stream, next_batch_index
+                    )
+                    if not isinstance(next_pending, list) or not next_pending:
+                        raise RuntimeError(
+                            "Two-level NEP Gather produced no phase record for a queued batch"
+                        )
+                    for pending_phase in next_pending:
+                        pending_phase["submission_slot"] = pending.get("submission_slot", 0)
+                    next_pending[-1]["remaining_task_batches"] = remaining_task_batches
+                    pending_index = pending_host_phases.index(pending)
+                    pending_host_phases[pending_index : pending_index + 1] = next_pending
+                    return self._finish_nep_nccl_process_group_dispatch_batches(
+                        pending_host_phases,
+                        device_align_phases=device_align_phases,
+                        finish_all_phases=finish_all_phases,
+                        defer_scatter_submission=defer_scatter_submission,
+                        scatter_context_batches=scatter_context_batches,
+                    )
+                continue
 
             if phase == "gather_launched":
                 for owner, work in pending["gather_barrier_works"]:
@@ -4131,10 +4575,19 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 next_pending = self._start_nep_nccl_split_host_phase_batch(
                     next_task_batch, dispatch_stream, next_batch_index
                 )
-                next_pending["submission_slot"] = pending.get("submission_slot", 0)
-                next_pending["remaining_task_batches"] = remaining_task_batches
-                pending.clear()
-                pending.update(next_pending)
+                if isinstance(next_pending, list):
+                    if not next_pending:
+                        raise RuntimeError("Two-level NEP Gather produced no phase record")
+                    for pending_phase in next_pending:
+                        pending_phase["submission_slot"] = pending.get("submission_slot", 0)
+                    next_pending[-1]["remaining_task_batches"] = remaining_task_batches
+                    pending_index = pending_host_phases.index(pending)
+                    pending_host_phases[pending_index : pending_index + 1] = next_pending
+                else:
+                    next_pending["submission_slot"] = pending.get("submission_slot", 0)
+                    next_pending["remaining_task_batches"] = remaining_task_batches
+                    pending.clear()
+                    pending.update(next_pending)
                 return self._finish_nep_nccl_process_group_dispatch_batches(
                     pending_host_phases,
                     device_align_phases=device_align_phases,
@@ -4491,9 +4944,12 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 raise RuntimeError("NEP reset found deferred scatters that were not flushed")
             if state.get("pending_owner_tasks"):
                 raise RuntimeError("NEP reset found host-gated owner tasks that were not flushed")
+            if state.get("pending_edp_contexts"):
+                raise RuntimeError("NEP reset found incomplete two-level Gather buckets")
             state["task_next_index"] = 0
             state["pending_scatters"] = []
             state["pending_owner_tasks"] = []
+            state["pending_edp_contexts"] = {}
 
 
 def _coalesce_nep_nccl_bucket_groups_for_edp_order(
@@ -4842,12 +5298,32 @@ def _configure_nep_nccl_task_scheduler(
             bucket_group._nep_nccl_scheduler_state = state
             bucket_group._nep_nccl_group_index = index
 
+    edp_groups = {}
+    for bucket_group in bucket_groups:
+        edp_bucket_index = getattr(
+            bucket_group, "_nep_nccl_edp_bucket_index", bucket_group._nep_nccl_group_index
+        )
+        edp_groups.setdefault(edp_bucket_index, []).append(bucket_group)
+
+    shared_native_groups = {}
+    shared_native_states = []
+    expected_edp_contexts = {}
     task_sequence = []
     for bucket_group in bucket_groups:
+        if _nep_two_level_gather_enabled():
+            bucket_group._nep_nccl_native_edp_bucket_groups = shared_native_groups
+            bucket_group._nep_nccl_active_native_edp_states = shared_native_states
         layout = bucket_group._get_nep_nccl_owner_layout()
         bucket_group._nep_nccl_task_count = layout["min_ep_size"] * layout["num_chunks"]
         bucket_group._nep_nccl_ready = bucket_group._nep_nccl_task_count == 0
+        edp_bucket_index = getattr(
+            bucket_group, "_nep_nccl_edp_bucket_index", bucket_group._nep_nccl_group_index
+        )
         for owner_ep_rank in range(layout["min_ep_size"]):
+            expected_edp_contexts[(edp_bucket_index, owner_ep_rank)] = (
+                expected_edp_contexts.get((edp_bucket_index, owner_ep_rank), 0)
+                + layout["num_chunks"]
+            )
             for chunk_index, (chunk_start, chunk_end) in enumerate(layout["chunk_ranges"]):
                 task_sequence.append(
                     {
@@ -4863,6 +5339,19 @@ def _configure_nep_nccl_task_scheduler(
     state["task_next_index"] = 0
     state["pending_scatters"] = []
     state["pending_owner_tasks"] = []
+    state["edp_groups"] = {
+        edp_bucket_index: tuple(
+            sorted(
+                groups,
+                key=lambda group: getattr(
+                    group, "_nep_nccl_gather_bucket_index", group._nep_nccl_group_index
+                ),
+            )
+        )
+        for edp_bucket_index, groups in edp_groups.items()
+    }
+    state["expected_edp_contexts"] = expected_edp_contexts
+    state["pending_edp_contexts"] = {}
 
 
 def _configure_nep_end_iteration_scatter_buffers(
@@ -4876,6 +5365,7 @@ def _configure_nep_end_iteration_scatter_buffers(
     cache = state["gather_buf_cache"]
     slots = set()
     scatter_chunks = _get_nep_nccl_scatter_chunks()
+    two_level_scatter_tasks = {}
     for task in state["task_sequence"]:
         group = task["group"]
         owner_ep_rank = task["owner_ep_rank"]
@@ -4931,6 +5421,11 @@ def _configure_nep_end_iteration_scatter_buffers(
                 device,
             )
 
+        if _nep_two_level_gather_enabled():
+            edp_bucket_index = group._nep_nccl_edp_bucket_index
+            two_level_scatter_tasks.setdefault((edp_bucket_index, owner_ep_rank), []).append(task)
+            continue
+
         for scatter_chunk_index, (scatter_start, scatter_end) in enumerate(
             group._nep_nccl_scatter_chunk_ranges(
                 owner_ep_rank, chunk_start, chunk_end, scatter_chunks
@@ -4973,6 +5468,53 @@ def _configure_nep_end_iteration_scatter_buffers(
                         dtype,
                         device,
                     ),
+                    scatter_output_numel,
+                    dtype,
+                    device,
+                )
+
+    if two_level_scatter_tasks:
+        if scatter_chunks != 1:
+            raise RuntimeError(
+                "Two-level NEP Gather currently requires "
+                "MEGATRON_NONUNIFORM_EP_NCCL_SCATTER_CHUNKS=1"
+            )
+        for (edp_bucket_index, owner_ep_rank), tasks in two_level_scatter_tasks.items():
+            representative = tasks[0]["group"]
+            dtype = representative.buckets[0].grad_data.dtype
+            device = representative.buckets[0].grad_data.device
+            ep_rank = representative._nep_runtime_config["ep_rank"]
+            source_ranks = representative._nep_nccl_owner_source_ranks(owner_ep_rank)
+            transfer_ranks = representative._nep_nccl_owner_transfer_ranks(owner_ep_rank)
+            if ep_rank not in transfer_ranks:
+                continue
+            remote_source_ranks = [rank for rank in source_ranks if rank != owner_ep_rank]
+            cache_prefix = (edp_bucket_index, owner_ep_rank, dtype, device)
+            if ep_rank == owner_ep_rank:
+                scatter_input_numel = sum(
+                    task["group"]._nep_nccl_owner_source_payload_numel(
+                        owner_ep_rank, destination_ep_rank, task["chunk_start"], task["chunk_end"]
+                    )
+                    for destination_ep_rank in remote_source_ranks
+                    for task in tasks
+                )
+                representative._get_nep_nccl_cached_tensor(
+                    cache,
+                    ("owner_layout_a2a_scatter_input_edp",) + cache_prefix,
+                    scatter_input_numel,
+                    dtype,
+                    device,
+                )
+            elif ep_rank in remote_source_ranks:
+                scatter_output_numel = sum(
+                    task["group"]._nep_nccl_owner_source_payload_numel(
+                        owner_ep_rank, ep_rank, task["chunk_start"], task["chunk_end"]
+                    )
+                    for task in tasks
+                )
+                representative._get_nep_nccl_cached_tensor(
+                    cache,
+                    ("owner_layout_a2a_scatter_output_edp",) + cache_prefix,
                     scatter_output_numel,
                     dtype,
                     device,
@@ -5169,10 +5711,28 @@ def build_nonuniform_ep_nccl_bucket_groups(
     # then combine adjacent slots so one native DDP readiness unit spans useful
     # backward compute from several MoE layers.
     ordered_grouped_specs = _group_expert_bucket_specs_in_backward_order(specs)
-    grouped_partitions = _partition_expert_bucket_specs(
+    edp_partitions = _partition_expert_bucket_specs(
         ordered_grouped_specs, _get_nep_nccl_expert_bucket_group_count()
     )
-    for group_index, grouped_partition in enumerate(grouped_partitions):
+    gather_buckets_per_edp = _get_nep_nccl_gather_buckets_per_edp()
+    grouped_partitions = []
+    for edp_bucket_index, edp_partition in enumerate(edp_partitions):
+        gather_partitions = (
+            [edp_partition]
+            if gather_buckets_per_edp is None
+            else _partition_expert_bucket_specs(edp_partition, gather_buckets_per_edp)
+        )
+        for gather_bucket_index, gather_partition in enumerate(gather_partitions):
+            grouped_partitions.append(
+                (edp_bucket_index, gather_bucket_index, len(gather_partitions), gather_partition)
+            )
+
+    for group_index, (
+        edp_bucket_index,
+        gather_bucket_index,
+        gather_bucket_count,
+        grouped_partition,
+    ) in enumerate(grouped_partitions):
         buckets = []
         entries = []
         slot_keys = []
@@ -5237,6 +5797,9 @@ def build_nonuniform_ep_nccl_bucket_groups(
             slot_keys=tuple(slot_keys),
             slot_numels=tuple(slot_numels),
         )
+        bucket_group._nep_nccl_edp_bucket_index = edp_bucket_index
+        bucket_group._nep_nccl_gather_bucket_index = gather_bucket_index
+        bucket_group._nep_nccl_gather_bucket_count = gather_bucket_count
         bucket_groups.append(bucket_group)
 
     for buffer in buffers:
@@ -5523,6 +6086,22 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         self._nep_scatter_stream = None
         self._nep_scatter_backward_complete = False
         if self.nonuniform_ep_config.approach == NonuniformEPApproach.NCCL:
+            if _nep_two_level_gather_enabled():
+                required_modes = {
+                    "MEGATRON_NONUNIFORM_EP_BUCKET_READY_GATHER": (
+                        _nep_bucket_ready_gather_enabled()
+                    ),
+                    "MEGATRON_NONUNIFORM_EP_DEVICE_ORDERED_EDP": (
+                        _nep_device_ordered_edp_enabled()
+                    ),
+                    "MEGATRON_NONUNIFORM_EP_SPLIT_HOST_PHASES": (_nep_split_host_phases_enabled()),
+                    "MEGATRON_NONUNIFORM_EP_END_ITERATION_SCATTER": (
+                        _nep_end_iteration_scatter_enabled()
+                    ),
+                }
+                missing_modes = [name for name, enabled in required_modes.items() if not enabled]
+                if missing_modes:
+                    raise RuntimeError("Two-level NEP Gather requires " + ", ".join(missing_modes))
             if _nep_a2a_scatter_scheduler_enabled() and _nep_end_iteration_scatter_enabled():
                 raise RuntimeError(
                     "A2A-gated and end-of-iteration NEP Scatter modes are mutually exclusive"
@@ -5912,9 +6491,16 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         """Retain persistent task buffers until the end-of-iteration Scatter drain."""
         for contexts in context_batches:
             for context in contexts:
-                context["group"]._mark_nep_nccl_task_started(
-                    context["owner_ep_rank"], context["chunk_index"]
-                )
+                scatter_contexts = context.get("scatter_contexts")
+                if scatter_contexts is None:
+                    context["group"]._mark_nep_nccl_task_started(
+                        context["owner_ep_rank"], context["chunk_index"]
+                    )
+                else:
+                    for task_context in scatter_contexts:
+                        task_context["group"]._mark_nep_nccl_task_started(
+                            task_context["owner_ep_rank"], task_context["chunk_index"]
+                        )
         self._nep_end_iteration_scatter_context_batches.append(
             (context_batches, completion_event, module_label)
         )
@@ -6044,9 +6630,13 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 assigned_groups.setdefault(bucket_group, set()).add(module_name)
                 bucket_group._nep_dispatch_boundary_launch = True
                 bucket_group._nep_dispatch_boundary_callback = (
-                    self._launch_nep_dispatch_boundary_tasks
+                    self._launch_and_release_nep_two_level_gather
+                    if _nep_two_level_gather_enabled()
+                    else self._launch_nep_dispatch_boundary_tasks
                 )
-                bucket_group._nep_dispatch_boundary_groups = dispatch_groups
+                bucket_group._nep_dispatch_boundary_groups = (
+                    (bucket_group,) if _nep_two_level_gather_enabled() else dispatch_groups
+                )
                 bucket_group._nep_dispatch_boundary_module_label = module_name
                 bucket_group._nep_dispatch_boundary_required_modules.add(module_name)
 
@@ -6168,6 +6758,8 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             or not all(group.is_last_microbatch for group in groups)
         ):
             return
+        if _nep_two_level_gather_enabled():
+            return
 
         for group in groups:
             ready_modules = getattr(group, "_nep_dispatch_boundary_ready_modules", None)
@@ -6225,6 +6817,22 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 "NEP dispatch boundary reached its launch point before gradients were ready: "
                 f"module={module_label}"
             )
+
+    def _launch_and_release_nep_two_level_gather(self, groups: tuple, module_label: str) -> None:
+        """Submit one ready Gather group and release its host boundary immediately."""
+        if len(groups) != 1:
+            raise RuntimeError("Two-level NEP Gather callbacks must contain exactly one group")
+        state = groups[0]._nep_nccl_scheduler_state
+        task_index = state["task_next_index"]
+        if task_index >= len(state["task_sequence"]):
+            return
+        next_group = state["task_sequence"][task_index]["group"]
+        if not next_group._nep_dispatch_boundary_ready:
+            return
+        next_label = next_group._nep_dispatch_boundary_module_label or module_label
+        if not self._launch_nep_dispatch_boundary_tasks((next_group,), next_label):
+            return
+        self._wait_for_nep_dispatch_launch()
 
     def _launch_nep_dispatch_boundary_tasks(self, groups: tuple, module_label: str) -> bool:
         """Submit a layer batch after dispatch and all local source grads are ready."""
@@ -6300,9 +6908,15 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         )
         try:
             launch_start = time.perf_counter()
+            state = None
+            first_task_index = None
+            if _nep_two_level_gather_enabled():
+                state = groups[0]._nep_nccl_scheduler_state
+                first_task_index = state["task_next_index"]
             pending_host_phases = groups[0]._try_start_nep_nccl_ready_tasks(
                 force_ready=False, async_op_override=True, compute_ready_event=compute_ready_event
             )
+            last_task_index = state["task_next_index"] if state is not None else None
             launch_ms = (time.perf_counter() - launch_start) * 1000.0
 
             if completion_event is None:
@@ -6321,11 +6935,27 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                         f"module={module_label}, groups={not_started}"
                     )
                 completion_event.record(groups[0]._get_nep_nccl_comm_stream(0))
-            for group in groups:
+            launched_groups = groups
+            if _nep_two_level_gather_enabled():
+                assert state is not None
+                assert first_task_index is not None
+                assert last_task_index is not None
+                launched_groups = tuple(
+                    dict.fromkeys(
+                        task["group"]
+                        for task in state["task_sequence"][first_task_index:last_task_index]
+                    )
+                )
+                if not launched_groups:
+                    raise RuntimeError(
+                        "Two-level NEP Gather callback did not advance the canonical task prefix"
+                    )
+            for group in launched_groups:
                 group._nep_dispatch_boundary_launched = True
             _nep_debug_print(
                 f"after dispatch_backward_boundary_launched module={module_label} "
-                f"groups={group_indices} split={bool(pending_host_phases)} "
+                f"groups={[group._nep_nccl_group_index for group in launched_groups]} "
+                f"split={bool(pending_host_phases)} "
                 f"launch_ms={launch_ms:.3f}"
             )
             return completion_event
@@ -6442,16 +7072,18 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                         )
                     completion_stream.wait_event(phase_completion_event)
             completion_event.record(completion_stream)
-        elif end_iteration_scatter:
+        elif end_iteration_scatter and scatter_context_batches:
             self._defer_nep_scatter_context_batches_to_iteration_end(
                 scatter_context_batches, completion_event, module_label
             )
+        elif end_iteration_scatter:
+            completion_event.record(boundary_group._get_nep_nccl_comm_stream(0))
         else:
             self._queue_nep_scatter_context_batches(
                 scatter_context_batches, completion_event, module_label, scatter_after_event
             )
         not_ready = [group._nep_nccl_group_index for group in groups if not group._nep_nccl_ready]
-        if not_ready:
+        if not_ready and not (_nep_two_level_gather_enabled() and not scatter_context_batches):
             raise RuntimeError(
                 "Split NEP host phases did not schedule every layer bucket group: "
                 f"module={module_label}, groups={not_ready}"

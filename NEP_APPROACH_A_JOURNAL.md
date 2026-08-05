@@ -1,5 +1,29 @@
 ## 2026-08-05
 
+### Two-level Gather Scatter coalescing
+
+- Kept the two-level Gather/EDP behavior unchanged, but restored one end-of-iteration Scatter
+  collective per original EDP bucket. Gather sub-bucket payloads are packed destination-major into
+  one all-to-all descriptor and split back into their original gradient views after receipt. The
+  one-level Scatter path remains unchanged.
+- Focused validation job `2590284` passed Black, isort, compilation, and 52 selected unit tests.
+  The first distributed smoke (`2590242`) exposed incomplete nested-context readiness bookkeeping;
+  the corrected GB200 EP8/EP4 smoke (`2590315`) completed two iterations and produced checksum files
+  byte-identical to the previously accepted two-level implementation.
+- Same-allocation all-rank EP16 profile job `2590395` completed healthy EP16/EP16 and NEP EP16/EP12
+  cases. The fix reduced Scatter count from 12 to 8, Scatter owner residency from `16.815 ms` to
+  `7.384 ms`, and NEP backward span from `320.302 ms` to `304.513 ms`. Transfer payload
+  (`179,601,408` elements) and matched Scatter service (`1.351 ms`) were unchanged; the remaining
+  Scatter residency is participant-arrival wait in the fully exposed final drain.
+- Profiler step 5 was an NEP outlier (`619.373 ms`), while step 6 measured `591.222 ms` versus
+  healthy `565.619 ms` (`95.67%` owner parity). A profiler-free same-allocation control (`2590526`)
+  removed that ambiguity: iterations 3-12 were healthy `551.170 +/- 2.176 ms` and NEP
+  `577.770 +/- 2.095 ms`, a `26.600 ms` gap, `4.826%` slowdown, and `95.396%` owner parity.
+- Artifacts are under `slurm_runs/lyris_twolevel_scatterfix_ep8_r2_gb200/`,
+  `slurm_runs/lyris_twolevel_scatterfix_ep16_profile_gb200/`, and
+  `slurm_runs/lyris_twolevel_scatterfix_ep16_timing_gb200/`. Trace analysis is
+  `/tmp/nep_scatterfix_ep16_analysis.json`.
+
 ### Exact healthy/NEP expert-bucket A/B at EP8 and EP16
 
 - Created rollback branch `rollback/nep-pre-iso-buckets-20260805` at
