@@ -1,5 +1,50 @@
 ## 2026-08-05
 
+### EP32 evaluation and EP8 all-rank traces for one-Gather NEP
+
+- Evaluated implementation commit `2cced4ddc` without changing source or benchmark wrappers. The
+  EP32 configuration is the existing 14-stage TP2 healthy EP32/EP32 versus NEP EP32/EP28 workload:
+  sequence length `18368`, 224 experts, top-k 6, full/reduced MBS `4/1`, true GBS `128/78`, local
+  CUDA graphs, 16 DDP buckets, seven expert EDP buckets, forced-uniform routing, no optimizer,
+  end-of-iteration Scatter, and exactly one Gather per EDP bucket.
+- Submitted GB200/GB300 profile A/B jobs `2591468`/`2591469`; both allocated simultaneously, so the
+  GB300 duplicate was canceled and the same-hardware GB200 control retained. Job `2591468` completed
+  `0:0` on 16 contiguous-requested segment-4 nodes with 64 healthy and 60 NEP traces. Its unprofiled
+  iterations 3-8 measured healthy `691.983 +/- 9.740 ms` and NEP `705.067 +/- 2.649 ms`, apparently
+  `98.144%` parity, but this result is not the accepted control: healthy expert-EDP participant wait
+  was `46.35-56.75 ms` in both traced steps and the healthy mean was about 23 ms slower than the
+  previous reproducible EP32 control while NEP was unchanged.
+- The first run still validates scale-level ordering. Each step has exactly seven Gather, seven
+  native EDP, and seven Scatter operations. Owner EDP residency is `45.083 ms`; `38.109 ms`
+  (`84.53%`) overlaps other GPU work, leaving `6.973 ms` exposed. Gather is `5.862 ms` and Scatter
+  is `14.616 ms`, both fully exposed in the traced steps. Scatter service is only `2.970 ms`; its
+  `12.764 ms` owner participant wait dominates residency. Native model-EP matched service changes
+  from `157.406` to `166.830 ms`, while the final model-EP milestone retains only `5.25 ms` lag.
+  Profiled owner spans are `690.831` and `727.194 ms`; profiler overhead makes this ratio worse than
+  the unprofiled timing and is used only for attribution.
+- Submitted timing-only replication jobs `2591665`/`2591669`; both again allocated simultaneously,
+  so the GB300 duplicate was canceled. GB200 job `2591665` completed `0:0` on a different 16-node
+  allocation. Iterations 3-10 were healthy `668.837 +/- 10.240 ms` and NEP
+  `702.212 +/- 6.125 ms`: a `33.375 ms` gap, `4.990%` slowdown, and `95.247%` owner parity. The
+  healthy mean reproduces prior controlled job `2519225` (`668.763 ms`), so this replication is the
+  accepted EP32 performance result rather than the first allocation's inflated parity.
+- For the requested EP8 traces, submitted GB200/GB300 jobs `2591726`/`2591727`; both started in the
+  same scheduler cycle and the GB300 duplicate was canceled at the five-minute check. GB200 job
+  `2591726` completed `0:0` using the analogous 14-stage TP2 healthy EP8/EP8 versus NEP EP8/EP4
+  workload: sequence length `16384`, 128 experts, top-k 6, MBS `4/1`, one microbatch per replica,
+  16 DDP buckets, 11 expert EDP buckets, forced-uniform routing, local CUDA graphs, no optimizer,
+  end-of-iteration Scatter, and one Gather per EDP bucket.
+- All 16 healthy and 12 NEP rank traces landed. Each NEP step contains exactly 11 Gather, 11 EDP,
+  and 11 Scatter operations. Profiled owner spans are healthy `482.547 ms` and NEP `531.014 ms`
+  (`90.873%` profile parity); backward spans are `241.861` and `283.762 ms`. NEP Gather/EDP/Scatter
+  residency is `18.774/18.653/5.631 ms`; EDP overlaps `7.132 ms` of non-NCCL work and `6.809 ms`
+  of model-EP communication. Native model-EP matched service is stable at `39.559/39.601 ms`.
+- EP32 artifacts are under `slurm_runs/lyris_onegather_ep32_ab_gb200/` and
+  `slurm_runs/lyris_onegather_ep32_timing_r2_gb200/`; structured analysis is
+  `slurm_runs/lyris_onegather_ep32_ab_gb200/trace_analysis_2591468.json`. EP8 traces and analysis
+  are under `slurm_runs/lyris_onegather_ep8_profile_gb200/`, with the summary in
+  `trace_analysis_2591726.json`.
+
 ### One Gather bucket per native EDP bucket
 
 - Checkpointed the accepted two-level implementation before this change as commit `f12e1d456`
