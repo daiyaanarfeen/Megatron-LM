@@ -3021,7 +3021,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
     def _prepare_nep_nccl_owner_all_to_all_scatter_batch(
         self, contexts: List[dict]
     ) -> Optional[dict]:
-        """Pack one Scatter collective for all Gather buckets in an EDP bucket."""
+        """Pack one Scatter collective for multiple contexts owned by one rank."""
         if not contexts:
             return None
         if len(contexts) == 1:
@@ -3090,12 +3090,19 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         ):
             raise RuntimeError("Two-level NEP Scatter contexts disagree on dtype or device")
 
-        edp_bucket_index = representative._nep_nccl_edp_bucket_index
+        edp_bucket_indices = tuple(
+            sorted({context["group"]._nep_nccl_edp_bucket_index for context in contexts})
+        )
+        scatter_bucket_key = (
+            edp_bucket_indices[0]
+            if len(edp_bucket_indices) == 1
+            else ("end_iteration", edp_bucket_indices)
+        )
         cache = representative._get_nep_nccl_shared_buffer_state()["gather_buf_cache"]
         empty = representative._get_nep_nccl_cached_tensor(
             cache, ("empty", dtype, device), 0, dtype, device
         )
-        cache_prefix = (edp_bucket_index, owner_ep_rank, dtype, device)
+        cache_prefix = (scatter_bucket_key, owner_ep_rank, dtype, device)
 
         input_split_sizes = [0] * transfer_size
         if ep_rank == owner_ep_rank:
@@ -3170,7 +3177,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             "chunk_end": total_chunk_numel,
             "buffer_slot_key": (
                 "two_level_scatter",
-                edp_bucket_index,
+                scatter_bucket_key,
                 owner_ep_rank,
                 dtype,
                 device,
@@ -3824,7 +3831,17 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if _nep_benchmark_skip_scatter_enabled():
             raise RuntimeError("Skipped NEP Scatter cannot be prepared as a chunk train")
 
-        self._order_nep_nccl_owner_edp_before_scatter(context)
+        scatter_contexts = context.get("scatter_contexts")
+        ordered_native_states = set()
+        for task_context in scatter_contexts or (context,):
+            native_state = task_context.get("native_edp_state")
+            if native_state is not None and id(native_state) in ordered_native_states:
+                continue
+            task_group = task_context.get("group", self)
+            task_group._order_nep_nccl_owner_edp_before_scatter(task_context)
+            if native_state is not None:
+                ordered_native_states.add(id(native_state))
+
         cfg = self._nep_runtime_config
         scatter_chunks = _get_nep_nccl_scatter_chunks()
         if cfg.get("zero_sm_reshard", False) and scatter_chunks != 1:
@@ -3833,7 +3850,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 "the all-to-all reshard path"
             )
 
-        scatter_contexts = context.get("scatter_contexts")
         if scatter_contexts is not None:
             if scatter_chunks != 1:
                 raise RuntimeError(
@@ -6593,24 +6609,45 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         )
 
     def _materialize_next_nep_end_iteration_scatter_batch(self) -> bool:
-        """Prepare one deferred layer after all backward GPU work completes."""
+        """Pack every deferred EDP bucket into one Scatter per owner."""
         if not self._nep_end_iteration_scatter_context_batches:
             return False
-        context_batches, completion_event, module_label = (
-            self._nep_end_iteration_scatter_context_batches.pop(0)
-        )
-        contexts = [context for batch in context_batches for context in batch]
-        contexts.sort(
-            key=lambda context: (
-                context["group"]._nep_nccl_group_index,
-                context["owner_ep_rank"],
-                context["chunk_index"],
+
+        deferred_batches = self._nep_end_iteration_scatter_context_batches
+        self._nep_end_iteration_scatter_context_batches = []
+        contexts_by_owner = {}
+        completion_events = []
+        for context_batches, completion_event, _ in deferred_batches:
+            completion_events.append(completion_event)
+            for context_batch in context_batches:
+                for context in context_batch:
+                    task_contexts = context.get("scatter_contexts") or (context,)
+                    for task_context in task_contexts:
+                        contexts_by_owner.setdefault(task_context["owner_ep_rank"], []).append(
+                            task_context
+                        )
+
+        packed_contexts = []
+        for owner_ep_rank in sorted(contexts_by_owner):
+            owner_contexts = contexts_by_owner[owner_ep_rank]
+            owner_contexts.sort(
+                key=lambda context: (
+                    context["group"]._nep_nccl_edp_bucket_index,
+                    context["group"]._nep_nccl_group_index,
+                    context["chunk_index"],
+                )
             )
-        )
+            packed_contexts.append(
+                owner_contexts[0]["group"]._coalesce_nep_nccl_scatter_contexts(owner_contexts)
+            )
+        if not packed_contexts:
+            raise RuntimeError("Deferred NEP Scatter drain has no contexts")
+
+        self._nep_end_iteration_scatter_completion_events = completion_events[:-1]
         self._queue_nep_scatter_context_batches(
-            [contexts],
-            completion_event,
-            module_label,
+            [packed_contexts],
+            completion_events[-1],
+            "end_iteration_scatter",
             a2a_completion_event=None,
             tasks_already_marked=True,
         )
@@ -6634,6 +6671,11 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             while self._nep_scatter_batches:
                 if not self._submit_nep_scatter_chunk(queue_behind_inflight=True):
                     raise RuntimeError("End-of-iteration NEP Scatter drain made no progress")
+            for completion_event in getattr(
+                self, "_nep_end_iteration_scatter_completion_events", ()
+            ):
+                completion_event.record(self._nep_scatter_stream)
+            self._nep_end_iteration_scatter_completion_events = []
             self._retire_nep_scatter_chunk(force=True)
             return
         if self._nonuniform_ep_runtime_config.get("needs_reshard", False):

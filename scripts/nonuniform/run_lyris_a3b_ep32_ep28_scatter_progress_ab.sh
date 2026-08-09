@@ -33,6 +33,8 @@ NUM_EXPERTS="${NUM_EXPERTS:-224}"
 MOE_ROUTER_TOPK="${MOE_ROUTER_TOPK:-6}"
 FULL_MICRO_BATCH_SIZE="${FULL_MICRO_BATCH_SIZE:-4}"
 REDUCED_MICRO_BATCH_SIZE="${REDUCED_MICRO_BATCH_SIZE:-1}"
+FULL_NUM_MICROBATCHES="${FULL_NUM_MICROBATCHES:-1}"
+REDUCED_NUM_MICROBATCHES="${REDUCED_NUM_MICROBATCHES:-1}"
 SCATTER_CHUNKS="${SCATTER_CHUNKS:-1}"
 CASE_A2A_SCATTER_SCHEDULER="${CASE_A2A_SCATTER_SCHEDULER:-1}"
 CASE_END_ITERATION_SCATTER="${CASE_END_ITERATION_SCATTER:-0}"
@@ -65,7 +67,7 @@ if ((CASE_A2A_SCATTER_SCHEDULER && CASE_END_ITERATION_SCATTER)); then
     echo "A2A-scheduled and end-of-iteration Scatter are mutually exclusive" >&2
     exit 2
 fi
-for value in SEQ_LENGTH NUM_EXPERTS MOE_ROUTER_TOPK FULL_MICRO_BATCH_SIZE REDUCED_MICRO_BATCH_SIZE SCATTER_CHUNKS NEP_EXPERT_BUCKET_GROUPS; do
+for value in SEQ_LENGTH NUM_EXPERTS MOE_ROUTER_TOPK FULL_MICRO_BATCH_SIZE REDUCED_MICRO_BATCH_SIZE FULL_NUM_MICROBATCHES REDUCED_NUM_MICROBATCHES SCATTER_CHUNKS NEP_EXPERT_BUCKET_GROUPS; do
     if ! [[ "${!value}" =~ ^[1-9][0-9]*$ ]]; then
         echo "${value} must be a positive integer" >&2
         exit 2
@@ -100,8 +102,8 @@ if ((local_sequence_length * REDUCED_MICRO_BATCH_SIZE * MOE_ROUTER_TOPK % NUM_EX
     exit 2
 fi
 
-healthy_true_gbs=$((32 * FULL_MICRO_BATCH_SIZE))
-nep_true_gbs=$((16 * FULL_MICRO_BATCH_SIZE + 14 * REDUCED_MICRO_BATCH_SIZE))
+healthy_true_gbs=$((32 * FULL_MICRO_BATCH_SIZE * FULL_NUM_MICROBATCHES))
+nep_true_gbs=$((16 * FULL_MICRO_BATCH_SIZE * FULL_NUM_MICROBATCHES + 14 * REDUCED_MICRO_BATCH_SIZE * REDUCED_NUM_MICROBATCHES))
 
 container_args=(
     --container-image="${IMAGE}"
@@ -114,7 +116,7 @@ if [[ -n "${CONTAINER_NAME}" ]]; then
 fi
 
 echo "[ep32-28-scatter] job=${SLURM_JOB_ID} nodes=${SLURM_JOB_NODELIST}"
-echo "[ep32-28-scatter] seq=${SEQ_LENGTH} experts=${NUM_EXPERTS} topk=${MOE_ROUTER_TOPK} full_mbs=${FULL_MICRO_BATCH_SIZE} reduced_mbs=${REDUCED_MICRO_BATCH_SIZE} healthy_gbs=${healthy_true_gbs} nep_gbs=${nep_true_gbs} scatter_chunks=${SCATTER_CHUNKS} ddp_bucket_sweep=${DDP_BUCKET_SWEEP} nep_expert_bucket_groups=${NEP_EXPERT_BUCKET_GROUPS}"
+echo "[ep32-28-scatter] seq=${SEQ_LENGTH} experts=${NUM_EXPERTS} topk=${MOE_ROUTER_TOPK} full_mbs=${FULL_MICRO_BATCH_SIZE} reduced_mbs=${REDUCED_MICRO_BATCH_SIZE} full_num_microbatches=${FULL_NUM_MICROBATCHES} reduced_num_microbatches=${REDUCED_NUM_MICROBATCHES} healthy_gbs=${healthy_true_gbs} nep_gbs=${nep_true_gbs} scatter_chunks=${SCATTER_CHUNKS} ddp_bucket_sweep=${DDP_BUCKET_SWEEP} nep_expert_bucket_groups=${NEP_EXPERT_BUCKET_GROUPS}"
 
 # Populate the named Enroot cache on every allocated node before the A/B cases.
 srun --nodes=16 --ntasks=16 --ntasks-per-node=1 --mpi=none \
@@ -167,6 +169,7 @@ run_case() {
     local train_iters="${10}"
     local profile_step_start="${11}"
     local profile_step_end="${12}"
+    local replica_num_microbatches="${FULL_NUM_MICROBATCHES} ${FULL_NUM_MICROBATCHES}"
     local ddp_num_buckets="${13}"
     local run_selected
     local split_host_phases=0
@@ -188,6 +191,7 @@ run_case() {
 
     if [[ "${mode}" == "ep" ]]; then
         split_host_phases=1
+        replica_num_microbatches="${FULL_NUM_MICROBATCHES} ${REDUCED_NUM_MICROBATCHES}"
     fi
     if ((preflight_done == 0)); then
         skip_preflight=0
@@ -224,7 +228,7 @@ run_case() {
             GLOBAL_BATCH_SIZE="${true_global_batch_size}" \
             TRUE_GLOBAL_BATCH_SIZE="${true_global_batch_size}" \
             REPLICA_MICRO_BATCH_SIZES="${replica_micro_batch_sizes}" \
-            REPLICA_NUM_MICROBATCHES="1 1" \
+            REPLICA_NUM_MICROBATCHES="${replica_num_microbatches}" \
             DDP_NUM_BUCKETS="${ddp_num_buckets}" \
             CUDA_GRAPH_IMPL=local \
             PROFILE="${profile}" \
@@ -243,6 +247,7 @@ run_case() {
             NCCL_DEBUG=WARN \
             MOE_ROUTER_FORCE_LOAD_BALANCING=0 \
             MOE_ROUTER_FORCE_UNIFORM_ROUTING=1 \
+            MOE_ROUTER_ENABLE_EXPERT_BIAS=0 \
             MEGATRON_NONUNIFORM_EP_ZERO_SM_RESHARD=0 \
             MEGATRON_NONUNIFORM_EP_EDP_READY_GATE=0 \
             MEGATRON_NONUNIFORM_EP_BUCKET_READY_GATHER=1 \

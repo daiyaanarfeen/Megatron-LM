@@ -84,6 +84,7 @@ MOE_ROUTER_FORCE_LOAD_BALANCING="${MOE_ROUTER_FORCE_LOAD_BALANCING:-1}"
 MOE_ROUTER_FORCE_UNIFORM_ROUTING="${MOE_ROUTER_FORCE_UNIFORM_ROUTING:-0}"
 MOE_ROUTER_FORCE_BIASED="${MOE_ROUTER_FORCE_BIASED:-}"
 MOE_ROUTER_TOPK="${MOE_ROUTER_TOPK:-6}"
+MOE_ROUTER_ENABLE_EXPERT_BIAS="${MOE_ROUTER_ENABLE_EXPERT_BIAS:-1}"
 LOG_PARAMS_NORM="${LOG_PARAMS_NORM:-1}"
 LOG_NUM_ZEROS_IN_GRAD="${LOG_NUM_ZEROS_IN_GRAD:-1}"
 LOG_ENERGY="${LOG_ENERGY:-0}"
@@ -211,7 +212,7 @@ echo "[lyris-a3b] run_nodes=${RUN_NODELIST}"
 echo "[lyris-a3b] direct=${USE_DIRECT_SRUN_RANKS} world=${RUN_WORLD_SIZE} true_gbs=${TRUE_GLOBAL_BATCH_SIZE} replica_mbs='${REPLICA_MICRO_BATCH_SIZES}' replica_num_microbatches='${REPLICA_NUM_MICROBATCHES}'"
 echo "[lyris-a3b] zero_sm=${MEGATRON_NONUNIFORM_EP_ZERO_SM_RESHARD} benchmark_phase_limit=${MEGATRON_NONUNIFORM_EP_BENCHMARK_PHASE_LIMIT} skip_scatter=${MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_SCATTER} skip_owner_grad_check=${MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_OWNER_GRAD_CHECK} cuda_connections=${CUDA_DEVICE_MAX_CONNECTIONS} nccl_implicit_order=${NCCL_LAUNCH_ORDER_IMPLICIT} torch_nccl_blocking_wait=${TORCH_NCCL_BLOCKING_WAIT}"
 echo "[lyris-a3b] target_chunks=${MEGATRON_NONUNIFORM_EP_NCCL_TARGET_CHUNKS:-auto} scatter_chunks=${MEGATRON_NONUNIFORM_EP_NCCL_SCATTER_CHUNKS} chunk_window=${MEGATRON_NONUNIFORM_EP_NCCL_ASYNC_CHUNK_WINDOW} max_gather_bytes=${MEGATRON_NONUNIFORM_EP_NCCL_MAX_GATHER_BYTES} expert_bucket_groups=${MEGATRON_NONUNIFORM_EP_NCCL_EXPERT_BUCKET_GROUPS} a2a_scatter_scheduler=${MEGATRON_NONUNIFORM_EP_A2A_SCATTER_SCHEDULER}"
-echo "[lyris-a3b] router_topk=${MOE_ROUTER_TOPK} router_force_balance=${MOE_ROUTER_FORCE_LOAD_BALANCING} router_force_uniform=${MOE_ROUTER_FORCE_UNIFORM_ROUTING} router_force_biased=${MOE_ROUTER_FORCE_BIASED:-none}"
+echo "[lyris-a3b] router_topk=${MOE_ROUTER_TOPK} router_force_balance=${MOE_ROUTER_FORCE_LOAD_BALANCING} router_force_uniform=${MOE_ROUTER_FORCE_UNIFORM_ROUTING} router_force_biased=${MOE_ROUTER_FORCE_BIASED:-none} router_expert_bias=${MOE_ROUTER_ENABLE_EXPERT_BIAS}"
 echo "[lyris-a3b] log_params_norm=${LOG_PARAMS_NORM} log_num_zeros_in_grad=${LOG_NUM_ZEROS_IN_GRAD} log_energy=${LOG_ENERGY} manual_gc_interval=${MANUAL_GC_INTERVAL}"
 echo "[lyris-a3b] nonuniform_skip_optimizer_step=${NONUNIFORM_SKIP_OPTIMIZER_STEP}"
 
@@ -282,6 +283,16 @@ if [[ -n "${MOE_ROUTER_FORCE_BIASED}" ]]; then
     moe_router_benchmark_args+=" --moe-router-force-biased=${MOE_ROUTER_FORCE_BIASED} "
 fi
 
+moe_router_expert_bias_args=""
+case "${MOE_ROUTER_ENABLE_EXPERT_BIAS}" in
+    0) ;;
+    1) moe_router_expert_bias_args=" --moe-router-enable-expert-bias " ;;
+    *)
+        echo "MOE_ROUTER_ENABLE_EXPERT_BIAS must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
+
 diagnostic_logging_args=""
 if [[ "${LOG_PARAMS_NORM}" == "1" ]]; then
     diagnostic_logging_args+=" --log-params-norm "
@@ -320,7 +331,7 @@ options=" \
     --moe-grouped-gemm \
     --moe-aux-loss-coeff 1e-4 \
     --moe-router-topk-scaling-factor 2.5 \
-    --moe-router-enable-expert-bias \
+    ${moe_router_expert_bias_args} \
     --moe-router-dtype fp32 \
     --moe-router-load-balancing-type seq_aux_loss \
     ${moe_router_benchmark_args} \

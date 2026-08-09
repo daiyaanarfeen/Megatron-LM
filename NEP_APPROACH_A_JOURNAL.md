@@ -1,5 +1,49 @@
 ## 2026-08-09
 
+### Router-statistics removal and packed end-of-iteration Scatter
+
+- Created rollback checkpoint commit `2c81b9d58` before changing the performance path.
+  Changes after that checkpoint are limited to the NEP implementation, its focused tests, and the
+  two active EP32 benchmark/runner scripts.
+- Added an overrideable `MOE_ROUTER_ENABLE_EXPERT_BIAS` runner toggle whose default remains
+  enabled. The EP32 A/B wrapper explicitly disables it, removing the downstream 1,344-element
+  router expert-bias all-reduce without changing model routing.
+- Changed only deferred end-of-iteration Scatter materialization. Deferred contexts from all EDP
+  buckets are grouped owner-major into one packed Scatter context per owner. Every native EDP
+  dependency and every original module-completion event is retained. Gather and EDP bucket
+  construction, launch ordering, and the normal A2A-scheduled Scatter path are unchanged.
+- Formatter/static checks passed. Focused one-node job `2637875` passed 5 tests; after fixing a
+  test-only compatibility fallback, full scheduler preflight job `2637940` passed 43 tests.
+  EP8/EP4 correctness job `2637974` passed exact reference-versus-packed gradient checks on all
+  fields and ranks with relative delta zero.
+- EP16/EP12 intermediate timing gate `2638017` completed successfully. Steady-state iterations
+  4-8 were `547.740 ms` healthy and `564.140 ms` NEP, or `97.093%` owner-time parity. Both
+  cases had router expert-bias statistics disabled.
+- Same-allocation EP32/EP28 timing/profile job `2638156` completed successfully. Steady-state
+  iterations 4-8 were `564.420 ms` healthy and `563.100 ms` NEP, or `100.234%` parity.
+  Rank-0 Scatter fell from the prior seven-call, roughly 16 ms behavior to one kernel averaging
+  `0.574 ms`. Reduced follower rank 28 executes seven kernels averaging `3.698 ms`, instead of
+  49 kernels. Rank 0 still has seven Gather and seven EDP calls, confirming those paths were not
+  coalesced. No 1,344-element router-statistics collective exists in either trace.
+- A direct full-replica MBS increase from 4 to 5 was attempted in job `2638252`. Healthy MBS5
+  completed at `690.060 ms` over iterations 4-8, but NEP full-replica ranks OOMed on iteration 2:
+  the vocab cross-entropy float conversion requested 22.42 GiB with 13.31 GiB free after NEP
+  buffers and CUDA-graph pools. MBS5 is therefore not a viable apples-to-apples NEP point at this
+  sequence length and graph policy.
+- Parameterized the previously hardcoded replica gradient-accumulation counts in the EP32 wrapper.
+  Defaults remain `1 1`. A first allocation, job `2638318`, was canceled before measurement
+  after its live header exposed an invalid healthy `2 1` mapping. The wrapper now passes
+  healthy `2 2` and NEP `2 1` explicitly; no implementation code changed for this correction.
+- Corrected higher-accumulation job `2638340` completed successfully at MBS `4/1`, accumulation
+  `2/1`, healthy true GBS 256, and NEP weighted true GBS 142. Steady-state iterations 4-8 were
+  `1096.560 ms` healthy and `1098.020 ms` NEP, or `99.867%` parity. Rank-0 Scatter remains
+  one kernel averaging `0.610 ms`; rank-28 Scatter remains seven kernels averaging `3.698 ms`.
+  Gather and EDP remain seven calls, the router-statistics collective remains absent, and native
+  TP/model-EP calls double as expected for two full-replica microbatches.
+- Profile roots are
+  `slurm_runs/lyris_a3b_ep32_ep28_routeroff_packedscatter_20260809` and
+  `slurm_runs/lyris_a3b_ep32_ep28_ga2_1_routeroff_packedscatter_retry_20260809`.
+
 ### EP32 deferred-Scatter and full iteration-gap attribution
 
 - Compared corrected end-of-iteration EP32/EP28 job `2601769` directly with same-policy EP16/EP12
