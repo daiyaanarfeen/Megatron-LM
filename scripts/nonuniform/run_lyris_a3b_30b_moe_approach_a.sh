@@ -22,7 +22,8 @@ export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-32}"
 export NCCL_LAUNCH_ORDER_IMPLICIT="${NCCL_LAUNCH_ORDER_IMPLICIT:-1}"
 export TORCH_NCCL_BLOCKING_WAIT="${TORCH_NCCL_BLOCKING_WAIT:-0}"
 export MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_SCATTER="${MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_SCATTER:-0}"
-export MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_OWNER_GRAD_CHECK="${MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_OWNER_GRAD_CHECK:-0}"
+export MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_OWNER_GRAD_CHECK="${MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_OWNER_GRAD_CHECK:-1}"
+export MEGATRON_NONUNIFORM_EP_BENCHMARK_PHASE_LIMIT="${MEGATRON_NONUNIFORM_EP_BENCHMARK_PHASE_LIMIT:-scatter}"
 export NVTE_FWD_LAYERNORM_SM_MARGIN="${NVTE_FWD_LAYERNORM_SM_MARGIN:-16}"
 export NVTE_BWD_LAYERNORM_SM_MARGIN="${NVTE_BWD_LAYERNORM_SM_MARGIN:-16}"
 export NVTE_FUSED_ATTN="${NVTE_FUSED_ATTN:-0}"
@@ -87,6 +88,7 @@ LOG_PARAMS_NORM="${LOG_PARAMS_NORM:-1}"
 LOG_NUM_ZEROS_IN_GRAD="${LOG_NUM_ZEROS_IN_GRAD:-1}"
 LOG_ENERGY="${LOG_ENERGY:-0}"
 MANUAL_GC_INTERVAL="${MANUAL_GC_INTERVAL:-10}"
+NVLINK_SEGMENT_NODES="${NVLINK_SEGMENT_NODES:-}"
 
 for toggle in MOE_ROUTER_FORCE_LOAD_BALANCING MOE_ROUTER_FORCE_UNIFORM_ROUTING NONUNIFORM_SKIP_OPTIMIZER_STEP; do
     case "${!toggle}" in
@@ -130,6 +132,57 @@ if ((RUN_WORLD_SIZE > RUN_NNODES * GPUS_PER_NODE)); then
     echo "RUN_WORLD_SIZE=${RUN_WORLD_SIZE} exceeds the ${RUN_NNODES} x ${GPUS_PER_NODE} GPU launch capacity" >&2
     exit 2
 fi
+
+job_segment_nodes=""
+if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    if job_record="$(scontrol show job "${SLURM_JOB_ID}" 2>/dev/null)" && \
+        [[ "${job_record}" =~ SegmentSize=([1-9][0-9]*) ]]; then
+        job_segment_nodes="${BASH_REMATCH[1]}"
+    fi
+fi
+if [[ -n "${NVLINK_SEGMENT_NODES}" && ! "${NVLINK_SEGMENT_NODES}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NVLINK_SEGMENT_NODES must be a positive integer" >&2
+    exit 2
+fi
+if [[ -n "${NVLINK_SEGMENT_NODES}" && -n "${job_segment_nodes}" && \
+    "${NVLINK_SEGMENT_NODES}" != "${job_segment_nodes}" ]]; then
+    echo "Expected ${NVLINK_SEGMENT_NODES}-node NVLink segments, but SLURM reports SegmentSize=${job_segment_nodes}" >&2
+    exit 2
+fi
+segment_nodes="${job_segment_nodes:-${NVLINK_SEGMENT_NODES}}"
+if [[ -z "${segment_nodes}" ]]; then
+    echo "Unable to determine the SLURM segment size; set NVLINK_SEGMENT_NODES" >&2
+    exit 2
+fi
+
+read -r -a replica_tp_cp_counts <<< "${NONUNIFORM_EP_TOPOLOGY}"
+rank_offset=0
+for replica_index in "${!replica_tp_cp_counts[@]}"; do
+    replica_tp_cp="${replica_tp_cp_counts[replica_index]}"
+    if ! [[ "${replica_tp_cp}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "NONUNIFORM_EP_TOPOLOGY must contain only positive integers" >&2
+        exit 2
+    fi
+    replica_ranks=$((replica_tp_cp * TENSOR_MODEL_PARALLEL_SIZE * CONTEXT_PARALLEL_SIZE))
+    if ((replica_ranks % GPUS_PER_NODE != 0 || rank_offset % GPUS_PER_NODE != 0)); then
+        echo "Replica ${replica_index} is not aligned to whole ${GPUS_PER_NODE}-GPU nodes" >&2
+        exit 2
+    fi
+    replica_start_node=$((rank_offset / GPUS_PER_NODE))
+    replica_end_node=$(((rank_offset + replica_ranks - 1) / GPUS_PER_NODE))
+    replica_start_segment=$((replica_start_node / segment_nodes))
+    replica_end_segment=$((replica_end_node / segment_nodes))
+    if ((replica_start_segment != replica_end_segment)); then
+        echo "Replica ${replica_index} ranks ${rank_offset}-$((rank_offset + replica_ranks - 1)) span NVLink segments ${replica_start_segment}-${replica_end_segment}" >&2
+        exit 2
+    fi
+    echo "[lyris-a3b] replica=${replica_index} ranks=${rank_offset}-$((rank_offset + replica_ranks - 1)) nodes=${replica_start_node}-${replica_end_node} segment=${replica_start_segment}"
+    rank_offset=$((rank_offset + replica_ranks))
+done
+if ((rank_offset != RUN_WORLD_SIZE)); then
+    echo "Topology ${NONUNIFORM_EP_TOPOLOGY} maps to ${rank_offset} ranks, not RUN_WORLD_SIZE=${RUN_WORLD_SIZE}" >&2
+    exit 2
+fi
 run_nodes=("${allocated_nodes[@]:0:RUN_NNODES}")
 RUN_NODELIST=$(IFS=,; echo "${run_nodes[*]}")
 
@@ -156,7 +209,7 @@ echo "[lyris-a3b] job=${SLURM_JOB_ID} nodes=${SLURM_JOB_NODELIST} image=${IMAGE}
 echo "[lyris-a3b] topology=${NONUNIFORM_EP_TOPOLOGY} experts=${NUM_EXPERTS} mbs=${MICRO_BATCH_SIZE} gbs=${GLOBAL_BATCH_SIZE} seq=${SEQ_LENGTH} buckets=${DDP_NUM_BUCKETS} pattern=${HYBRID_LAYER_PATTERN}"
 echo "[lyris-a3b] run_nodes=${RUN_NODELIST}"
 echo "[lyris-a3b] direct=${USE_DIRECT_SRUN_RANKS} world=${RUN_WORLD_SIZE} true_gbs=${TRUE_GLOBAL_BATCH_SIZE} replica_mbs='${REPLICA_MICRO_BATCH_SIZES}' replica_num_microbatches='${REPLICA_NUM_MICROBATCHES}'"
-echo "[lyris-a3b] zero_sm=${MEGATRON_NONUNIFORM_EP_ZERO_SM_RESHARD} skip_scatter=${MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_SCATTER} skip_owner_grad_check=${MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_OWNER_GRAD_CHECK} cuda_connections=${CUDA_DEVICE_MAX_CONNECTIONS} nccl_implicit_order=${NCCL_LAUNCH_ORDER_IMPLICIT} torch_nccl_blocking_wait=${TORCH_NCCL_BLOCKING_WAIT}"
+echo "[lyris-a3b] zero_sm=${MEGATRON_NONUNIFORM_EP_ZERO_SM_RESHARD} benchmark_phase_limit=${MEGATRON_NONUNIFORM_EP_BENCHMARK_PHASE_LIMIT} skip_scatter=${MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_SCATTER} skip_owner_grad_check=${MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_OWNER_GRAD_CHECK} cuda_connections=${CUDA_DEVICE_MAX_CONNECTIONS} nccl_implicit_order=${NCCL_LAUNCH_ORDER_IMPLICIT} torch_nccl_blocking_wait=${TORCH_NCCL_BLOCKING_WAIT}"
 echo "[lyris-a3b] target_chunks=${MEGATRON_NONUNIFORM_EP_NCCL_TARGET_CHUNKS:-auto} scatter_chunks=${MEGATRON_NONUNIFORM_EP_NCCL_SCATTER_CHUNKS} chunk_window=${MEGATRON_NONUNIFORM_EP_NCCL_ASYNC_CHUNK_WINDOW} max_gather_bytes=${MEGATRON_NONUNIFORM_EP_NCCL_MAX_GATHER_BYTES} expert_bucket_groups=${MEGATRON_NONUNIFORM_EP_NCCL_EXPERT_BUCKET_GROUPS} a2a_scatter_scheduler=${MEGATRON_NONUNIFORM_EP_A2A_SCATTER_SCHEDULER}"
 echo "[lyris-a3b] router_topk=${MOE_ROUTER_TOPK} router_force_balance=${MOE_ROUTER_FORCE_LOAD_BALANCING} router_force_uniform=${MOE_ROUTER_FORCE_UNIFORM_ROUTING} router_force_biased=${MOE_ROUTER_FORCE_BIASED:-none}"
 echo "[lyris-a3b] log_params_norm=${LOG_PARAMS_NORM} log_num_zeros_in_grad=${LOG_NUM_ZEROS_IN_GRAD} log_energy=${LOG_ENERGY} manual_gc_interval=${MANUAL_GC_INTERVAL}"

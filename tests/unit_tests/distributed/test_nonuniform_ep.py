@@ -24,9 +24,11 @@ from megatron.core.distributed.nonuniform_ep import (
     _build_nep_nccl_scatter_chunk_ranges,
     _configure_nep_edp_ready_gate,
     _ExpertBucketSpec,
+    _get_nep_benchmark_phase_limit,
     _get_nep_nccl_gather_buckets_per_edp,
     _get_nep_nccl_scatter_chunks,
     _group_expert_bucket_specs_in_backward_order,
+    _nep_benchmark_phase_enabled,
     _nep_benchmark_skip_owner_grad_check_enabled,
     _nep_owner_ddp_config,
     _partition_expert_bucket_specs,
@@ -93,6 +95,38 @@ def test_nep_benchmark_skip_owner_grad_check_is_opt_in(monkeypatch):
     assert native_config.bucket_size == 94_486_908
     assert config.check_for_nan_in_grad
     assert config.check_for_large_grads
+
+
+@pytest.mark.parametrize(
+    ("phase_limit", "expected"),
+    [
+        ("none", [False, False, False]),
+        ("gather", [True, False, False]),
+        ("edp", [True, True, False]),
+        ("scatter", [True, True, True]),
+    ],
+)
+def test_nep_benchmark_phase_limit_is_cumulative(monkeypatch, phase_limit, expected):
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_BENCHMARK_PHASE_LIMIT", phase_limit)
+
+    assert _get_nep_benchmark_phase_limit() == phase_limit
+    assert [
+        _nep_benchmark_phase_enabled(phase) for phase in ("gather", "edp", "scatter")
+    ] == expected
+
+
+def test_nep_benchmark_phase_limit_defaults_to_full_path(monkeypatch):
+    monkeypatch.delenv("MEGATRON_NONUNIFORM_EP_BENCHMARK_PHASE_LIMIT", raising=False)
+
+    assert _get_nep_benchmark_phase_limit() == "scatter"
+    assert all(_nep_benchmark_phase_enabled(phase) for phase in ("gather", "edp", "scatter"))
+
+
+def test_nep_benchmark_phase_limit_rejects_unknown_phase(monkeypatch):
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_BENCHMARK_PHASE_LIMIT", "invalid")
+
+    with pytest.raises(RuntimeError, match="BENCHMARK_PHASE_LIMIT must be one of"):
+        _get_nep_benchmark_phase_limit()
 
 
 class _FakeDenseBucketGroup:
@@ -676,6 +710,63 @@ def test_nep_two_level_gather_launches_one_native_edp_after_final_context(monkey
 
     assert complete == [[first_context, second_context]]
     assert calls == [(0, [10, 11], False)]
+
+
+def test_nep_benchmark_phase_limit_controls_native_edp_launch(monkeypatch):
+    bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
+        NonuniformEPNCCLParamAndGradBucketGroup
+    )
+    context = {"group": bucket_group, "owner_ep_rank": 0, "chunk_index": 0}
+    launches = []
+    bucket_group._nep_runtime_config = {"ep_rank": 0}
+    bucket_group._stage_nep_nccl_owner_edp_contexts = lambda contexts: [contexts]
+    bucket_group._start_nep_nccl_owner_edp_reduce_contexts = (
+        lambda contexts, use_device_readiness: launches.append((contexts, use_device_readiness))
+    )
+
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_BENCHMARK_PHASE_LIMIT", "gather")
+    bucket_group._nep_benchmark_phase_index = 1
+    assert bucket_group._start_nep_nccl_owner_edp_reduce_batch(
+        [context], use_device_readiness=False
+    ) == [[context]]
+    assert launches == []
+
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_BENCHMARK_PHASE_LIMIT", "edp")
+    bucket_group._nep_benchmark_phase_index = 2
+    assert bucket_group._start_nep_nccl_owner_edp_reduce_batch(
+        [context], use_device_readiness=False
+    ) == [[context]]
+    assert launches == [([context], False)]
+
+
+@pytest.mark.parametrize(("phase_limit", "orders"), [("gather", 0), ("edp", 1)])
+def test_nep_benchmark_truncated_contexts_preserve_task_lifecycle(monkeypatch, phase_limit, orders):
+    first_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
+        NonuniformEPNCCLParamAndGradBucketGroup
+    )
+    second_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
+        NonuniformEPNCCLParamAndGradBucketGroup
+    )
+    calls = []
+    for index, group in enumerate((first_group, second_group)):
+        group._order_nep_nccl_owner_edp_before_scatter = lambda context, index=index: calls.append(
+            ("order", index, context["chunk_index"])
+        )
+        group._mark_nep_nccl_task_started = lambda owner, chunk, index=index: calls.append(
+            ("mark", index, owner, chunk)
+        )
+    contexts = [
+        {"group": first_group, "owner_ep_rank": 0, "chunk_index": 1},
+        {"group": second_group, "owner_ep_rank": 0, "chunk_index": 2},
+    ]
+    coalesced = {**contexts[0], "scatter_contexts": tuple(contexts)}
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_BENCHMARK_PHASE_LIMIT", phase_limit)
+    first_group._nep_benchmark_phase_index = ("none", "gather", "edp", "scatter").index(phase_limit)
+
+    first_group._finish_nep_nccl_benchmark_contexts([coalesced])
+
+    assert sum(call[0] == "order" for call in calls) == orders
+    assert [call for call in calls if call[0] == "mark"] == [("mark", 0, 0, 1), ("mark", 1, 0, 2)]
 
 
 def test_nep_two_level_gather_coalesces_one_scatter_per_edp_bucket(monkeypatch):

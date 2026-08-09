@@ -1,3 +1,211 @@
+## 2026-08-09
+
+### EP32 deferred-Scatter and full iteration-gap attribution
+
+- Compared corrected end-of-iteration EP32/EP28 job `2601769` directly with same-policy EP16/EP12
+  job `2601425`. EP32 rank 0 moves only `59.867M` float elements across seven Scatter operations,
+  versus EP16's `179.601M` elements across eight, yet rank-0 Scatter residency is
+  `16.275 ms` versus `4.317 ms`. The increase is therefore not payload or NVLink bandwidth.
+- The difference is process-group fan-in and rendezvous order. EP16 follower rank 12 services three
+  owner groups (`0/4/8`) round-robin for `3 x 8 = 24` calls per step. EP32 follower rank 28
+  services seven (`0/4/8/12/16/20/24`) for `7 x 7 = 49` calls. Rank 28's 49 local kernels total
+  only `3.827 ms` but span about `31.16 ms`; the seven kernels matching rank 0 total only
+  `0.455 ms`, while rank 0 is resident for `16.275 ms`. Rank 0 launches early and waits inside
+  NCCL while rank 28 advances through the other owner groups.
+- The end-of-iteration implementation makes this scale with the full owner count. It synchronizes
+  once, sorts deferred contexts by bucket-group then owner, and submits every context through one
+  Scatter stream with device-ordered completion/copyback. Rank 0 traverses 96 host Scatter scopes
+  at EP16 (12 owners x 8 buckets) versus 196 at EP32 (28 x 7); the submission-scope span rises
+  from about `7.95` to `11.63 ms`. This host expansion plus seven-way follower rendezvous explains
+  why smaller EP32 payloads nevertheless have longer owner kernels.
+- Exact rank-0 step accounting is `574.521 ms` healthy versus `611.654 ms` NEP, a `37.133 ms`
+  delta. The pre-backward section is `+2.761 ms`, the backward section is actually
+  `-6.542 ms`, and the post-backward tail is `+40.914 ms`; almost all slowdown is therefore in
+  finalization after backward.
+- The post-backward `+40.914 ms` closes as: new exposed Scatter union `+16.275 ms`; the subsequent
+  1,344-element TP-DP-CP router expert-bias all-reduce grows from `1.088` to `13.773 ms`
+  (`+12.685 ms`) because follower rank 28 arrives last; tail GPU-idle gaps grow from `2.778` to
+  `13.982 ms` (`+11.204 ms`); and other tail work contributes about `+0.750 ms`. Rank 28 spends
+  only `0.104 ms` in that router-statistics all-reduce after arriving, while rank 0 spends
+  `13.773 ms` waiting. The raw Gather/EDP/Scatter exposure sum omits both this downstream
+  rendezvous and intervals where no target kernel is resident, so it is not an additive measure
+  of iteration overhead.
+
+## 2026-08-06
+
+### Causal Gather/EDP/Scatter overhead decomposition
+
+- Started a controlled EP8/EP4 experiment to separate profiler-free iteration overhead from
+  collective residency. Added benchmark-only cumulative phase limits `none`, `gather`, `edp`, and
+  `scatter`; the default remains the complete Scatter path. The phase is resolved once during DDP
+  construction and cached per expert bucket group so the full path does not repeatedly read the
+  environment. Truncated modes are restricted to the current one-Gather-per-EDP-bucket scheduler
+  and cannot be combined with the older skip-Scatter benchmark.
+- The lean profiler-free experiment has six launches on one allocation: healthy before, cumulative
+  `none`/Gather/EDP/Scatter NEP cases, and healthy after. The two healthy brackets provide a reported
+  linear drift correction at each intervening launch. Its additive decomposition is non-collective
+  NEP control = `T_none - T_healthy`, Gather = `T_gather - T_none`, EDP =
+  `T_edp - T_gather`, and Scatter = `T_scatter - T_edp`. Two all-rank profiles, healthy and full
+  NEP, measure owner residency, participant-arrival wait, participant-matched service time, payload
+  bandwidth, and overlap with any other GPU work; profile spans are not used for iteration overhead.
+- Exact pinned Black `24.4.2`, Python compilation, shell syntax, and whitespace checks passed.
+  Added focused tests for cumulative phase selection, native EDP launch suppression, and task/native
+  DDP lifecycle completion when a benchmark truncates before Scatter. The in-job gate passed all 10
+  focused tests. Initially submitted GB200/GB300 backfill jobs `2600277`/`2600278` plus priority
+  copies `2600280`/`2600281`; GB200 job `2600277` started first on `lyris[0273-0276]`, and all three
+  duplicates were canceled. Stopped `2600277` after its first five timing launches when the
+  experiment was reduced from 15 to eight launches. Lean GB200/GB300 jobs `2600476`/`2600477` were
+  then submitted; GB200 `2600476` started immediately on `lyris[0104-0107]`, and the queued GB300
+  duplicate was canceled.
+- Lean GB200 job `2600476` completed all six profiler-free timing cases and both all-rank profiles.
+  Clean iterations 3-10 measured healthy pre/post at `480.562 +/- 3.833 ms` and
+  `477.788 +/- 3.765 ms`; NEP `none`/Gather/EDP/Scatter measured
+  `474.212 +/- 3.606`, `480.700 +/- 3.547`, `509.163 +/- 3.414`, and
+  `519.925 +/- 3.294 ms`. The healthy bracket moved by only `-2.775 ms` over five launch
+  intervals. Correcting each intervening case with that reported linear drift gives a
+  `41.583 ms` full NEP overhead and `92.015%` iteration parity. The additive causal components are
+  non-collective NEP control `-5.795 ms`, Gather `+7.043 ms`, EDP `+29.017 ms`, and Scatter
+  `+11.318 ms`; closure error is zero by construction.
+- The two profiles are used only for operation timing and scheduling attribution. Every expected
+  participant has exactly 11 operations per traced step: Gather/Scatter on ranks 0-7 and EDP on
+  ranks 0-3 plus 8-11. Participant-matched service, excluding early-participant wait, is
+  `5.209 ms` mean / `5.320 ms` critical for Gather, `17.650 / 18.259 ms` for EDP, and
+  `5.806 / 5.858 ms` for Scatter. Gather owner residency is `17.318 ms`, of which `12.109 ms` is
+  participant-arrival wait; EDP owner residency is `17.623 ms` with no owner wait; Scatter owner
+  residency is `5.605 ms` with only `0.043 ms` wait. Healthy EDP is `9.814 ms` mean matched service,
+  `10.731 ms` owner residency, and `1.101 ms` wait.
+- On full-NEP rank 0, Gather is `17.297 ms` resident and has no same-rank overlap, EDP is
+  `18.226 ms` resident with `12.707 ms` (`69.75%`) overlapped by other GPU work and `5.519 ms`
+  exposed, and Scatter is `5.607 ms` resident and fully exposed. These residency values are not
+  additive iteration overheads: the cumulative timing deltas measure each phase's total critical-
+  path effect, including induced scheduling/interference, while matched service and residency show
+  how long the actual collectives run and wait.
+- Structured artifacts are
+  `slurm_runs/lyris_ep8_phase_decomp_lean_gb200/phase_decomposition_2600476.json` and
+  `phase_decomposition_2600476.md`; the launch manifest and all timing/profile outputs are under the
+  same root.
+- Follow-up trace inspection found that rank 0's Gather participant wait was not overlapped locally
+  because synthetic owner `start_grad_sync()` inherited synchronous gradient validation. In the
+  traced long bucket, `nep_native_ddp_start_grad_sync` contained a `62.438 ms`
+  `cudaStreamSynchronize` spanning Gather. The EDP stream waits on Gather, and native validation
+  immediately reads its norm on the host, so the autograd thread cannot enqueue later backward work.
+  This is host serialization, not intrinsic Gather transfer time.
+- Disabled this owner-layout validation by default for future benchmark runs using
+  `MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_OWNER_GRAD_CHECK=1`. Changed only active wrapper defaults
+  and overrides in the shared runner plus EP8 batch-ratio, EP8 phase-decomposition, EP16/EP12, and
+  EP32/EP28 wrappers. The flag remains overrideable with an explicit `0`; native non-owner DDP
+  validation is unchanged. Shell syntax and whitespace checks pass.
+- Recomputed the same rank-0 overlap chart for historical EP16 job `2591175`, which still had
+  owner validation enabled. Healthy EDP was `70.792 ms` resident, `57.268 ms` overlapped, and
+  `13.524 ms` locally exposed. NEP Gather/EDP/Scatter local exposure was
+  `5.177/4.964/6.449 ms`, totaling `16.591 ms`, or `3.067 ms` more than healthy. These are
+  rank-local intervals and include participant waiting; they do not represent globally additive
+  iteration overhead. A future post-disable profile is required to measure the corrected overlap.
+- Computed the analogous historical EP32 chart from all-rank profile job `2591468`, also with
+  owner validation enabled. Healthy rank-0 EDP was `116.181 ms` resident, `96.885 ms`
+  overlapped, and `19.296 ms` locally exposed; its `51.548 ms` participant wait is the known
+  abnormal healthy-control skew that disqualifies this job's timing parity. NEP local
+  Gather/EDP/Scatter exposure was `5.862/6.973/14.616 ms`, totaling `27.452 ms`, or
+  `8.156 ms` more than that skewed healthy trace. Gather service/wait was `2.445/3.417 ms`;
+  Scatter service/wait was `2.970/12.764 ms`. Accepted profiler-free EP32 performance remains
+  timing-only replication `2591665`: `668.837 ms` healthy, `702.212 ms` NEP, and `95.247%`
+  parity.
+- The EP32 Scatter increase over EP16 is primarily a placement/path difference, with additional
+  arrival skew. EP16's owner-transfer pair is ranks `[0,12]`: at four GPUs per node, rank 12 is on
+  node index 3 and remains within the first four-node segment. EP32 uses ranks `[0,28]`, placing
+  rank 28 on node index 7 across the segment-4 boundary. EP32 transfers only `59.867M` float
+  elements versus EP16's `179.601M`, but matched service rises from `1.369` to `2.970 ms`;
+  effective payload rate falls from about `524.7` to `80.6 GB/s`. Participant wait also rises
+  from `10.138` to `12.764 ms`. Thus the `14.616` versus `6.449 ms` owner residency is not
+  caused by greater EP32 payload; the transfer crosses a slower inter-segment path and its follower
+  arrives later.
+- Corrected the EP32 placement bug rather than accepting cross-segment transfers as an inherent
+  scale cost. `NonuniformEPRankGenerator` assigns each topology entry one contiguous rank block of
+  `entry * TP * CP` ranks. At TP2 and four GPUs/node, EP8 topology `4 4` occupies two nodes per
+  replica, EP16 `8 8` occupies four, and EP32 `16 16` occupies eight. The old EP32
+  `--segment=4` request therefore split every healthy full replica and the NEP full replica across
+  two NVLink segments. EP8 and EP16 already fit wholly within their four-node segments.
+- Changed only the EP32 wrapper's allocation geometry from `--segment=4` to `--segment=8`.
+  Added a shared launch-time invariant check that reads SLURM's reported `SegmentSize`, verifies it
+  against each wrapper's declared expectation, maps every contiguous replica rank block to nodes,
+  and aborts if any replica crosses a segment boundary or is not whole-node aligned. The active EP8,
+  EP16, and EP32 profile wrappers now declare expected segment sizes `4`, `4`, and `8`.
+  Shell syntax, whitespace, positive EP8/EP16/EP32 layouts, and the negative old EP32/segment-4
+  layout all passed; SLURM `--test-only` accepted all three corrected requests.
+- Submitted profile-only healthy/NEP reruns with all-rank PyTorch traces: EP8 job `2601426`,
+  EP16 job `2601425`, and EP32 job `2601427`. Controller records confirm `SegmentSize=4`,
+  `4`, and `8`, respectively. All three initially queued on `Priority` with unknown start
+  times. The historical EP32 job `2591468` remains useful for identifying the placement bug but is
+  no longer a valid same-NVLink-domain Scatter comparison.
+- Jobs `2601426`/`2601425`/`2601427` all started before the first five-minute poll and
+  completed successfully with exit `0:0` in `6:54`/`6:33`/`6:53`. The launch guard printed
+  the expected contiguous placements: EP8 healthy `nodes 0-1 / 2-3` and NEP `0-1 / 2` in
+  segment 0; EP16 healthy `0-3 / 4-7` and NEP `0-3 / 4-6` in segments 0/1; EP32 healthy
+  `0-7 / 8-15` and NEP `0-7 / 8-14` in segments 0/1.
+- All-rank trace collection is complete: 28 EP8 files (16 healthy + 12 NEP), 60 EP16 files
+  (32 + 28), and 124 EP32 files (64 + 60). Trace roots are
+  `slurm_runs/lyris_a3b_ep8_ep4_segmentfix_profile_20260806`,
+  `slurm_runs/lyris_a3b_ep16_ep12_segmentfix_profile_20260806`, and
+  `slurm_runs/lyris_a3b_ep32_ep28_segment8_profile_20260806`. Structured EP8 and EP16 outputs
+  are `trace_analysis_2601426.json` and `trace_analysis_2601425.json` under their roots.
+- The mean owner-rank spans for traced steps 5-6 were healthy/NEP
+  `491.763/513.995 ms` at EP8, `563.283/591.550 ms` at EP16, and approximately
+  `564.4/575.1 ms` at EP32 from the corresponding logged profiler steps. Profiled parity is
+  therefore `95.675%`, `95.221%`, and `98.139%`. These are profile-run comparisons, not
+  replacements for longer profiler-free timing.
+- Rank-0 overlap with any other GPU work, reported as residency/overlap/exposed, was:
+  EP8 Gather `5.793/3.057/2.736 ms`, EDP `19.985/18.206/1.779 ms`, Scatter
+  `5.608/0/5.608 ms`; EP16 Gather `1.303/0/1.303 ms`, EDP
+  `33.913/28.141/5.772 ms`, Scatter `4.317/0/4.317 ms`; EP32 Gather
+  `4.907/0/4.907 ms`, EDP `23.197/21.265/1.932 ms`, Scatter
+  `1.836/1.529/0.307 ms`.
+- Correction to the cross-scale overlap chart: EP32 did not use end-of-iteration Scatter. Its
+  wrapper defaulted to `MEGATRON_NONUNIFORM_EP_A2A_SCATTER_SCHEDULER=1` and
+  `MEGATRON_NONUNIFORM_EP_END_ITERATION_SCATTER=0`; EP8 and EP16 used scheduler `0` and
+  end-of-iteration Scatter `1`. The EP32 trace correspondingly shows seven Scatter kernels
+  interleaved through the backward span, rather than one final exposed train. Its reported
+  `1.529 ms` overlap is primarily current-iteration expert GEMMs (`1.012/1.110 ms` in the two
+  traced steps) plus dense-DP all-reduce (`0.418/0.480 ms`). It must not be described as
+  end-of-iteration Scatter overlap or compared directly with EP8/EP16 Scatter exposure.
+- EP8 Gather's `3.057 ms` overlap is almost entirely concurrent native EDP all-reduce
+  (`3.065/3.036 ms` by traced step), not backward compute. Its eleven expert buckets are emitted
+  in separate-enough host batches that later Gather kernels run while the preceding EDP kernel is
+  resident; for example, EDP `310.532-311.952 ms` overlaps Gather
+  `310.771-311.392 ms`. EP16 and EP32 group some simultaneously ready Gather contexts into one
+  dispatch batch. The split-host path enqueues every Gather in that batch before launching its EDP
+  batch: EP16's paired Gathers finish at `500.009/500.267 ms` before EDP starts at
+  `500.302 ms`, and EP32's final paired Gathers finish at `527.317/527.459 ms` before EDP starts
+  at `527.473 ms`. Therefore those runs show no Gather/EDP concurrency.
+- The corrected same-domain EP32 run no longer exhibits the apparent Scatter scaling regression.
+  Versus historical cross-segment job `2591468`, owner Scatter residency is `1.836 ms` instead
+  of `14.616 ms`, and participant-matched service is `1.908 ms` instead of `2.970 ms`.
+  This is not a single-factor placement A/B because the new run also has the previously requested
+  owner-gradient validation disabled. The defensible conclusions are that the historical trace is
+  invalid for same-domain scale attribution and that Scatter is small in the corrected accepted
+  configuration. The new Gather's `4.907 ms` residency is mostly participant arrival wait
+  (`4.392 ms`); its matched transfer service is only `0.515 ms`.
+- Submitted corrected apples-to-apples EP32 profile rerun `2601769` with explicit
+  `MEGATRON_NONUNIFORM_EP_A2A_SCATTER_SCHEDULER=0` and
+  `MEGATRON_NONUNIFORM_EP_END_ITERATION_SCATTER=1`, matching the EP8/EP16 policy. The same
+  allocation contains healthy EP32/EP32 and NEP EP32/EP28, uses `SegmentSize=8`, 16 DDP buckets,
+  seven expert buckets, and writes all-rank traces under
+  `slurm_runs/lyris_a3b_ep32_ep28_segment8_end_scatter_profile_20260806`. It initially entered
+  `PENDING` because a valid 16-node block was unavailable; SLURM reported no scheduled start time.
+- Job `2601769` started at `13:32:22`, passed the placement guard with healthy replicas on node
+  indices `0-7` and `8-15`, and completed `0:0` in `7:14`. It produced all expected traces:
+  64 healthy and 60 NEP. The only error-labelled messages were the image's known nonfatal Triton
+  optional-kernel fallback; there was no Python, NCCL, timeout, or training failure.
+- Corrected rank-0 owner spans for profiler steps 5-6 are `574.521 ms` healthy and `611.654 ms`
+  NEP: `93.929%` parity, or `6.463%` slowdown. The earlier `98.139%` EP32 profile row used the
+  A2A-scheduled Scatter policy and is superseded for the apples-to-apples EP8/EP16/EP32 chart.
+- Corrected rank-0 residency/overlap-with-any-other-GPU-work/exposure is healthy EDP
+  `60.009/49.086/10.923 ms`; NEP Gather `0.643/0/0.643 ms`, EDP
+  `22.681/20.733/1.948 ms`, and Scatter `16.275/0/16.275 ms`. Each NEP phase has exactly seven
+  operations per traced step. This directly validates the intended policy: end-of-iteration
+  Scatter is fully exposed, unlike the interleaved scheduler-mode trace. Gather transfer itself is
+  now short; the dominant directly observed NEP phase exposure on rank 0 is the final Scatter
+  train.
+
 ## 2026-08-05
 
 ### EP32 evaluation and EP8 all-rank traces for one-Gather NEP

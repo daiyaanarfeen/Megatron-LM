@@ -5,7 +5,7 @@
 #SBATCH --account=coreai_comparch_sysarch
 #SBATCH --partition=gb200-backfill
 #SBATCH --nodes=16
-#SBATCH --segment=4
+#SBATCH --segment=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --exclusive
 #SBATCH --mem=0
@@ -206,6 +206,7 @@ run_case() {
             RUN_NNODES="${run_nodes}" \
             RUN_WORLD_SIZE="${world_size}" \
             GPUS_PER_NODE=4 \
+            NVLINK_SEGMENT_NODES=8 \
             USE_DIRECT_SRUN_RANKS=1 \
             TRAIN_ITERS="${train_iters}" \
             LR_WSD_DECAY_ITERS="$((train_iters / 2))" \
@@ -262,7 +263,7 @@ run_case() {
             MEGATRON_NONUNIFORM_EP_NCCL_EXPERT_BUCKET_GROUPS="${NEP_EXPERT_BUCKET_GROUPS}" \
             MEGATRON_NONUNIFORM_EP_NCCL_MAX_GATHER_BYTES=8589934592 \
             MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_SCATTER=0 \
-            MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_OWNER_GRAD_CHECK=0 \
+            MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_OWNER_GRAD_CHECK="${MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_OWNER_GRAD_CHECK:-1}" \
             MEGATRON_NONUNIFORM_EP_OVERLAP_DEBUG=0 \
             DISTRIBUTED_TIMEOUT_MINUTES=5 \
             EXIT_DURATION_IN_MINS=11 \

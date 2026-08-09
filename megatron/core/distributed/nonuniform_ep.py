@@ -246,6 +246,29 @@ def _nep_benchmark_skip_owner_grad_check_enabled() -> bool:
     )
 
 
+_NEP_BENCHMARK_PHASES = ("none", "gather", "edp", "scatter")
+
+
+def _get_nep_benchmark_phase_limit() -> str:
+    """Return the last NEP collective phase enabled for causal benchmarks."""
+    phase = os.getenv("MEGATRON_NONUNIFORM_EP_BENCHMARK_PHASE_LIMIT", "scatter").lower()
+    if phase not in _NEP_BENCHMARK_PHASES:
+        raise RuntimeError(
+            "MEGATRON_NONUNIFORM_EP_BENCHMARK_PHASE_LIMIT must be one of "
+            + ", ".join(_NEP_BENCHMARK_PHASES)
+        )
+    return phase
+
+
+def _nep_benchmark_phase_enabled(phase: str) -> bool:
+    """Return whether a collective phase is within the benchmark phase limit."""
+    if phase not in _NEP_BENCHMARK_PHASES[1:]:
+        raise RuntimeError(f"Unknown NEP benchmark phase: {phase}")
+    return _NEP_BENCHMARK_PHASES.index(phase) <= _NEP_BENCHMARK_PHASES.index(
+        _get_nep_benchmark_phase_limit()
+    )
+
+
 def _nep_owner_ddp_config(
     ddp_config: DistributedDataParallelConfig,
 ) -> DistributedDataParallelConfig:
@@ -1573,6 +1596,9 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         slot_numels: Optional[Tuple[int, ...]] = None,
     ) -> None:
         self._nep_runtime_config = runtime_config
+        self._nep_benchmark_phase_index = runtime_config.get(
+            "benchmark_phase_index", len(_NEP_BENCHMARK_PHASES) - 1
+        )
         self._nep_config = nonuniform_ep_config
         self._nep_nccl_entries = entries or []
         if slot_keys is None:
@@ -1634,6 +1660,11 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         self._nep_dispatch_boundary_module_label = None
         self._nep_dispatch_boundary_required_modules = set()
         self._nep_dispatch_boundary_ready_modules = set()
+
+    def _nep_benchmark_phase_enabled(self, phase: str) -> bool:
+        """Check cached causal-benchmark state without a hot-path environment read."""
+        phase_limit = getattr(self, "_nep_benchmark_phase_index", len(_NEP_BENCHMARK_PHASES) - 1)
+        return _NEP_BENCHMARK_PHASES.index(phase) <= phase_limit
 
     def _get_nep_nccl_shared_buffer_state(self) -> dict:
         state = getattr(self, "_nep_nccl_scheduler_state", None)
@@ -3600,6 +3631,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
     ) -> List[List[dict]]:
         """Launch one native EDP group per original expert bucket and owner."""
         context_batches = self._stage_nep_nccl_owner_edp_contexts(contexts)
+        if not self._nep_benchmark_phase_enabled("edp"):
+            return context_batches
         for context_batch in context_batches:
             group = context_batch[0]["group"]
             if group._nep_runtime_config["ep_rank"] == context_batch[0]["owner_ep_rank"]:
@@ -3624,6 +3657,17 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         scatter_context = dict(contexts[0])
         scatter_context["scatter_contexts"] = tuple(contexts)
         return scatter_context
+
+    def _finish_nep_nccl_benchmark_contexts(self, contexts: List[dict]) -> None:
+        """Finish task bookkeeping when a causal benchmark truncates before Scatter."""
+        for context in contexts:
+            task_contexts = context.get("scatter_contexts") or (context,)
+            if self._nep_benchmark_phase_enabled("edp"):
+                task_contexts[0]["group"]._order_nep_nccl_owner_edp_before_scatter(task_contexts[0])
+            for task_context in task_contexts:
+                task_context["group"]._mark_nep_nccl_task_started(
+                    task_context["owner_ep_rank"], task_context["chunk_index"]
+                )
 
     def _start_nep_nccl_dispatch_boundary_task(self, context: dict) -> None:
         """Enqueue one ordered zero-SM task at a post-dispatch backward boundary."""
@@ -3740,15 +3784,16 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             self._start_nep_nccl_dispatch_boundary_task(context)
             return
 
-        self._start_nep_nccl_owner_all_to_all_gather(
-            owner_ep_rank,
-            chunk_index,
-            chunk_start,
-            chunk_end,
-            chunk,
-            buffer_slot_key,
-            async_op=async_op,
-        )
+        if self._nep_benchmark_phase_enabled("gather"):
+            self._start_nep_nccl_owner_all_to_all_gather(
+                owner_ep_rank,
+                chunk_index,
+                chunk_start,
+                chunk_end,
+                chunk,
+                buffer_slot_key,
+                async_op=async_op,
+            )
         self._synchronize_first_batch_zero_sm_phase(owner_ep_rank, "gather")
 
         if _nep_two_level_gather_enabled():
@@ -3759,7 +3804,10 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             complete_context_batches = self._start_nep_nccl_owner_edp_reduce_batch([context])
             for context_batch in complete_context_batches:
                 scatter_context = self._coalesce_nep_nccl_scatter_contexts(context_batch)
-                scatter_context["group"]._start_nep_nccl_owner_task_scatter(scatter_context)
+                if self._nep_benchmark_phase_enabled("scatter"):
+                    scatter_context["group"]._start_nep_nccl_owner_task_scatter(scatter_context)
+                else:
+                    self._finish_nep_nccl_benchmark_contexts([scatter_context])
             return
 
         self._start_nep_nccl_owner_edp_reduce(context)
@@ -4076,17 +4124,18 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 )
                 if context is not None:
                     contexts.append(context)
-            for context in contexts:
-                group = context["group"]
-                group._start_nep_nccl_owner_all_to_all_gather(
-                    context["owner_ep_rank"],
-                    context["chunk_index"],
-                    context["chunk_start"],
-                    context["chunk_end"],
-                    context["chunk"],
-                    context["buffer_slot_key"],
-                    async_op=True,
-                )
+            if self._nep_benchmark_phase_enabled("gather"):
+                for context in contexts:
+                    group = context["group"]
+                    group._start_nep_nccl_owner_all_to_all_gather(
+                        context["owner_ep_rank"],
+                        context["chunk_index"],
+                        context["chunk_start"],
+                        context["chunk_end"],
+                        context["chunk"],
+                        context["buffer_slot_key"],
+                        async_op=True,
+                    )
             gather_done_event = torch.cuda.Event()
             gather_done_event.record(dispatch_stream)
             for context in contexts:
@@ -4574,12 +4623,15 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                         )
 
                 pending["phase"] = "scatter_ready"
-                if defer_scatter_submission:
+                if defer_scatter_submission and self._nep_benchmark_phase_enabled("scatter"):
                     continue
             else:
                 raise RuntimeError(f"Unknown split NEP host phase: {pending['phase']}")
 
-            if scatter_context_batches is not None:
+            if not self._nep_benchmark_phase_enabled("scatter"):
+                with torch.cuda.stream(dispatch_stream):
+                    self._finish_nep_nccl_benchmark_contexts(contexts)
+            elif scatter_context_batches is not None:
                 scatter_context_batches.append(list(contexts))
             else:
                 with torch.cuda.stream(dispatch_stream):
@@ -6046,6 +6098,12 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
     ):
         self.nonuniform_ep_config = nonuniform_ep_config or NonuniformEPConfig()
         runtime_config = _get_runtime_config(self.nonuniform_ep_config)
+        benchmark_phase_limit = "scatter"
+        if self.nonuniform_ep_config.approach == NonuniformEPApproach.NCCL:
+            benchmark_phase_limit = _get_nep_benchmark_phase_limit()
+            runtime_config["benchmark_phase_index"] = _NEP_BENCHMARK_PHASES.index(
+                benchmark_phase_limit
+            )
         if ddp_config.use_distributed_optimizer:
             raise RuntimeError(
                 "NonuniformEPDistributedDataParallel currently supports only "
@@ -6108,6 +6166,13 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         self._nep_scatter_stream = None
         self._nep_scatter_backward_complete = False
         if self.nonuniform_ep_config.approach == NonuniformEPApproach.NCCL:
+            if benchmark_phase_limit != "scatter":
+                if not _nep_two_level_gather_enabled():
+                    raise RuntimeError("Truncated NEP benchmark phases require two-level Gather")
+                if _nep_benchmark_skip_scatter_enabled():
+                    raise RuntimeError(
+                        "NEP benchmark phase limit cannot be combined with skip-Scatter mode"
+                    )
             if _nep_two_level_gather_enabled():
                 required_modes = {
                     "MEGATRON_NONUNIFORM_EP_BUCKET_READY_GATHER": (
