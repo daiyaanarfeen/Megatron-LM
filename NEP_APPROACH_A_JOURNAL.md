@@ -1,5 +1,37 @@
 ## 2026-08-09
 
+### Audit of the apparent EP32 zero-overhead result
+
+- Per request, performed no rerun. Audited the existing unprofiled timing logs and all 124 rank
+  traces from job `2638156`. The timing logs contain iteration totals for iterations 1-8; the
+  profiler contains GPU detail only for steady-state steps 5-6. Forward/backward claims therefore
+  apply only to those two traced steps, while total-iteration statistics cover iterations 3-8.
+- Unprofiled iterations 3-8 averaged `564.650 +/- 5.313 ms` healthy and
+  `563.233 +/- 4.435 ms` NEP (`100.252%` parity). Individual ordinal deltas ranged from
+  `-9.7 ms` to `+6.6 ms`, so the runs are equal in mean but not iteration-by-iteration.
+- Defined forward as first model GPU work through the first GEMM launched by
+  `LinearWithGradAccumulationAndAsyncCommunicationBackward`; backward ends at the final embedding
+  gradient kernel. On rank 0, healthy/NEP forward spans were `260.685/264.723 ms` in step 5 and
+  `259.307/259.138 ms` in step 6. Backward spans were `301.527/287.117 ms` and
+  `299.935/295.635 ms`. The phases are not individually identical: NEP forward averages
+  `+1.935 ms`, backward `-9.355 ms`, and the post-backward tail `+9.199 ms`.
+- Mutually exclusive rank-0 interval means close exactly to the profiler step. Healthy is
+  `423.846 ms` compute/local-only, `109.075 ms` NCCL-only, `25.794 ms` overlap, and
+  `14.564 ms` GPU-idle (`573.279 ms` total). NEP is `432.974/107.547/16.537/17.979 ms`
+  (`575.038 ms` total). Total non-NCCL residency is effectively identical
+  (`449.640` healthy versus `449.512 ms` NEP); the larger NEP compute-only number is lost overlap,
+  not more compute.
+- Rank-0 NEP Gather/EDP/Scatter residency is `0.470/22.309/0.574 ms`; exposed against every other
+  GPU operation is `0.470/1.981/0.574 ms`, or `3.024 ms` total. Across full-replica owners 0-27,
+  mean exposed time is `1.574/1.972/1.794 ms`; maxima observed on any owner/step are
+  `4.805/2.033/4.067 ms`. Reduced owners show about `64.8 ms` exposed EDP residency because they
+  arrive early and wait; that local wait is not the full-owner critical-path metric.
+- The healthy EDP control is a confounder. For the rank-0/rank-32 pair, healthy EDP residency is
+  `34.224 ms`: `20.509 ms` matched service plus `13.786 ms` participant-arrival wait. NEP EDP
+  is `22.309 ms`: `22.311 ms` matched service and effectively no owner wait, despite a larger
+  payload. Thus the healthy-control arrival delay offsets new exposed reshard work in this trace.
+- Conclusion: job `2638156` demonstrates same-allocation mean parity and no compute-kernel
+  regression, but it does not prove NEP has intrinsically zero overhead. Its near-zero total delta
 ### Router-statistics removal and packed end-of-iteration Scatter
 
 - Created rollback checkpoint commit `2c81b9d58` before changing the performance path.
