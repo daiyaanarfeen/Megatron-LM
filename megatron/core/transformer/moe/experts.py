@@ -350,6 +350,13 @@ class TEGroupedMLP(MegatronModule):
                     return False
                 return True
 
+        if self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu:
+            try:
+                from transformer_engine.pytorch.ops import ScaledSReLU  # noqa: F401
+            except ImportError:
+                return False
+            return True
+
         return False
 
     def _make_fused_ops(self) -> torch.nn.Module:
@@ -422,10 +429,13 @@ class TEGroupedMLP(MegatronModule):
                 )
             else:
                 op = te.pytorch.ops.ScaledClampedQGeGLU(glu_interleave_size=glu_interleave)
+        elif self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu:
+            op = te.pytorch.ops.ScaledSReLU()
         else:
             raise RuntimeError(
-                "_make_fused_ops expected SwiGLU or quick_gelu with gated_linear_unit; "
-                "call _is_fused_impl_supported() before constructing fused ops."
+                "_make_fused_ops expected SwiGLU, quick_gelu with gated_linear_unit, or "
+                "weighted squared-ReLU; call _is_fused_impl_supported() before constructing "
+                "fused ops."
             )
         ops.append(op)
 

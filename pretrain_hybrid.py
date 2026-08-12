@@ -88,6 +88,14 @@ _ORIGINAL_INITIALIZE_MODEL_PARALLEL = parallel_state.initialize_model_parallel
 _ORIGINAL_GET_MEGATRON_OPTIMIZER = training_module.get_megatron_optimizer
 _ORIGINAL_GET_OPTIMIZER_PARAM_SCHEDULER = training_module.get_optimizer_param_scheduler
 _ORIGINAL_TRAIN_STEP = training_module.train_step
+_ORIGINAL_LOGICAL_AND_ACROSS_MODEL_PARALLEL_GROUP = (
+    training_module.logical_and_across_model_parallel_group
+)
+_ORIGINAL_REDUCE_MAX_STAT_ACROSS_MODEL_PARALLEL_GROUP = (
+    training_module.reduce_max_stat_across_model_parallel_group
+)
+_ORIGINAL_TRACK_MOE_METRICS = training_module.track_moe_metrics
+_LOCAL_ITERATION_EVENTS = []
 
 
 def get_batch(data_iterator, vp_stage=None):
@@ -151,6 +159,10 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
 
         num_tokens = loss_mask.sum().clone().detach().to(torch.int)
         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
+
+    if args.nonuniform_disable_nongrad_sync_collectives:
+        # Keep a local loss value for stdout without the reporting-only DP all-reduce.
+        report = {'lm loss': loss.clone().detach().view(1)}
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
@@ -440,10 +452,10 @@ def _initialize_model_parallel(*args, **kwargs):
                 f"num_tp_cp={num_tp_cp}, TP*CP={tp_cp}, ETP={etp}"
             )
         ep_size = num_tp_cp * tp_cp // etp
-        if megatron_args.num_experts % ep_size != 0:
+        if megatron_args.num_experts < ep_size:
             raise RuntimeError(
-                f"num_experts ({megatron_args.num_experts}) must be divisible by "
-                f"local EP size {ep_size}"
+                "Nonuniform EP currently requires at least one logical expert per local EP "
+                f"rank; got num_experts={megatron_args.num_experts}, local_ep_size={ep_size}"
             )
 
     runtime_config = initialize_nonuniform_ep_process_groups(
@@ -593,12 +605,34 @@ def _train_step_without_optimizer_step(*args, **kwargs):
     if optimizer is None:
         return _ORIGINAL_TRAIN_STEP(*args, **kwargs)
 
+    benchmark_args = get_args()
+    track_local_time = (
+        benchmark_args.nonuniform_log_local_iteration_times and dist.get_rank() == 0
+    )
+    timing_stream = torch.cuda.current_stream() if track_local_time else None
+    start_event = torch.cuda.Event(enable_timing=True) if track_local_time else None
+    if start_event is not None:
+        start_event.record(timing_stream)
     original_step = optimizer.step
     optimizer.step = _no_op_optimizer_step_for_nonuniform_benchmark
     try:
         result = _ORIGINAL_TRAIN_STEP(*args, **kwargs)
-        benchmark_args = get_args()
         iteration = args[7] if len(args) > 7 else kwargs.get('iteration')
+        if track_local_time:
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record(timing_stream)
+            _LOCAL_ITERATION_EVENTS.append((iteration, start_event, end_event))
+            if iteration is not None and iteration >= benchmark_args.train_iters - 1:
+                torch.cuda.synchronize()
+                samples = [
+                    (sample_iteration, sample_start.elapsed_time(sample_end))
+                    for sample_iteration, sample_start, sample_end in _LOCAL_ITERATION_EVENTS
+                ]
+                print(
+                    '[nonuniform-local-iteration-times] '
+                    f'rank=0 source=cuda_event samples={json.dumps(samples)}',
+                    flush=True,
+                )
         if (
             benchmark_args.nonuniform_log_grad_checksum
             and iteration is not None
@@ -615,12 +649,27 @@ def _install_nonuniform_ep_ddp(args):
     training_module.train_step = _ORIGINAL_TRAIN_STEP
     training_module.get_megatron_optimizer = _ORIGINAL_GET_MEGATRON_OPTIMIZER
     training_module.get_optimizer_param_scheduler = _ORIGINAL_GET_OPTIMIZER_PARAM_SCHEDULER
+    training_module.logical_and_across_model_parallel_group = (
+        _ORIGINAL_LOGICAL_AND_ACROSS_MODEL_PARALLEL_GROUP
+    )
+    training_module.reduce_max_stat_across_model_parallel_group = (
+        _ORIGINAL_REDUCE_MAX_STAT_ACROSS_MODEL_PARALLEL_GROUP
+    )
+    training_module.track_moe_metrics = _ORIGINAL_TRACK_MOE_METRICS
     if args.nonuniform_skip_optimizer_step:
         training_module.get_megatron_optimizer = _get_no_op_optimizer_for_nonuniform_benchmark
         training_module.get_optimizer_param_scheduler = (
             _get_no_op_param_scheduler_for_nonuniform_benchmark
         )
         training_module.train_step = _train_step_without_optimizer_step
+    if args.nonuniform_disable_nongrad_sync_collectives:
+        args.log_throughput = False
+        args.log_progress = False
+        training_module.logical_and_across_model_parallel_group = lambda value: value
+        training_module.reduce_max_stat_across_model_parallel_group = lambda value: value
+        training_module.track_moe_metrics = (
+            lambda *unused_args, **unused_kwargs: training_module.clear_aux_losses_tracker()
+        )
     if args.nonuniform_mode == "none":
         set_nonuniform_ep_runtime_config(None)
         training_module.DDP = _ORIGINAL_DDP
@@ -693,6 +742,19 @@ def _add_nonuniform_args(parser):
         type=str,
         default=None,
         help='Also write each local gradient fingerprint to a per-rank file.',
+    )
+    group.add_argument(
+        '--nonuniform-disable-nongrad-sync-collectives',
+        action='store_true',
+        help=(
+            'Disable reporting-only DP loss, MoE metric, and no-op optimizer '
+            'status collectives for communication-isolated benchmarks.'
+        ),
+    )
+    group.add_argument(
+        '--nonuniform-log-local-iteration-times',
+        action='store_true',
+        help='Log rank-0 train-step wall times after the final benchmark iteration.',
     )
     return parser
 

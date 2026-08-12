@@ -41,8 +41,9 @@ TIMING_ITERS="${TIMING_ITERS:-12}"
 PROFILE_ITERS="${PROFILE_ITERS:-8}"
 CASE_TIMEOUT="${CASE_TIMEOUT:-12m}"
 HYBRID_LAYER_PATTERN="${HYBRID_LAYER_PATTERN:-MEMEM*EMEMEM*E}"
+DISABLE_NONGRAD_SYNC_COLLECTIVES="${DISABLE_NONGRAD_SYNC_COLLECTIVES:-0}"
 
-for toggle in RUN_CORRECTNESS RUN_HEALTHY_TIMING RUN_NEP_TIMING RUN_HEALTHY_PROFILE RUN_NEP_PROFILE; do
+for toggle in RUN_CORRECTNESS RUN_HEALTHY_TIMING RUN_NEP_TIMING RUN_HEALTHY_PROFILE RUN_NEP_PROFILE DISABLE_NONGRAD_SYNC_COLLECTIVES; do
     case "${!toggle}" in
         0|1) ;;
         *)
@@ -144,6 +145,9 @@ run_case() {
     local profile_step_end="${12}"
     local run_selected
     local split_host_phases=0
+    local extra_megatron_args="--calculate-per-token-loss --moe-router-bias-update-rate 0.0"
+    local exit_duration_in_mins=11
+    local log_interval=1
     local skip_preflight=1
     local profile_ranks
     local master_port=$((30800 + case_index))
@@ -167,6 +171,11 @@ run_case() {
         skip_preflight=0
     fi
     profile_ranks="$(seq -s ' ' 0 "$((world_size - 1))")"
+    if [[ "${DISABLE_NONGRAD_SYNC_COLLECTIVES}" == "1" ]]; then
+        extra_megatron_args="--moe-router-bias-update-rate 0.0 --no-check-for-nan-in-loss-and-grad --rerun-mode disabled --nonuniform-disable-nongrad-sync-collectives --nonuniform-log-local-iteration-times"
+        exit_duration_in_mins=0
+        log_interval=50
+    fi
 
     echo "[ep16-12-scatter] $(date --iso-8601=seconds) starting ${stage}/${label}"
     timeout --foreground --signal=TERM --kill-after=45s "${CASE_TIMEOUT}" \
@@ -209,7 +218,8 @@ run_case() {
             LOG_NUM_ZEROS_IN_GRAD=0 \
             LOG_ENERGY=0 \
             MANUAL_GC_INTERVAL=1000 \
-            EXTRA_MEGATRON_ARGS="--calculate-per-token-loss --moe-router-bias-update-rate 0.0" \
+            LOG_INTERVAL="${log_interval}" \
+            EXTRA_MEGATRON_ARGS="${extra_megatron_args}" \
             HIGH_PRIORITY_STREAM_GROUPS=ep \
             CUDA_DEVICE_MAX_CONNECTIONS=32 \
             NCCL_LAUNCH_ORDER_IMPLICIT=1 \
@@ -217,6 +227,7 @@ run_case() {
             NCCL_DEBUG=WARN \
             MOE_ROUTER_FORCE_LOAD_BALANCING=0 \
             MOE_ROUTER_FORCE_UNIFORM_ROUTING=1 \
+            MOE_ROUTER_ENABLE_EXPERT_BIAS=0 \
             MEGATRON_NONUNIFORM_EP_ZERO_SM_RESHARD=0 \
             MEGATRON_NONUNIFORM_EP_EDP_READY_GATE=0 \
             MEGATRON_NONUNIFORM_EP_BUCKET_READY_GATHER=1 \
@@ -241,7 +252,7 @@ run_case() {
             MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_OWNER_GRAD_CHECK="${MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_OWNER_GRAD_CHECK:-1}" \
             MEGATRON_NONUNIFORM_EP_OVERLAP_DEBUG=0 \
             DISTRIBUTED_TIMEOUT_MINUTES=5 \
-            EXIT_DURATION_IN_MINS=11 \
+            EXIT_DURATION_IN_MINS="${exit_duration_in_mins}" \
             USE_GLOO_PROCESS_GROUPS=1 \
             SKIP_PREFLIGHT="${skip_preflight}" \
             bash "${RUNNER}"

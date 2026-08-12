@@ -1,3 +1,638 @@
+## 2026-08-12
+
+### Static-capacity benchmark preflight
+
+- Before submitting the eight-node EP16/EP12 benchmark, checked the exact model path rather than
+  changing its architecture silently. The workload uses squared-ReLU routed experts, while
+  `moe_expert_rank_capacity_factor` requires `use_transformer_engine_op_fuser` and the current
+  `TEGroupedMLP` op-fuser implementation accepts only SwiGLU or quick-GeGLU. Enabling the two
+  flags as-is would therefore fail `TEGroupedMLP._is_fused_impl_supported()` during model build.
+- Submitted one bounded five-minute, one-node container inspection as Slurm job `2673159` across
+  `gb200-backfill,gb300-backfill` to check whether the Transformer Engine version in
+  `nvcr.io/nvidia/nemo:26.06` exposes a squared-ReLU-compatible basic op that would make exact-model
+  support a small extension. No model, NEP implementation, or shared runner changes were made.
+- Job `2673159` completed on GB200 (`lyris0243`): the image has Transformer Engine
+  `2.16.0+b9d690e0`, whose op-fuser API exposes `ScaledSReLU`. Submitted bounded job `2673189` to
+  verify that its value and input-gradient/scale-gradient semantics exactly match Megatron
+  `weighted_squared_relu_impl` before changing the expert fuser.
+- Job `2673189` completed on GB200 and showed exact equality to
+  `relu(x)^2 * scale` for forward, input gradient, and scale gradient (all maximum absolute
+  differences `0.0`). Added only two production branches in `experts.py`: advertise op-fuser
+  support for weighted squared-ReLU when `ScaledSReLU` exists, and select that activation in the
+  existing three-op `GroupedLinear -> activation -> GroupedLinear` sequence. Added one focused
+  mock test; the new test and existing quick-GeGLU neighbor test both pass in the 26.06 image.
+- Submitted bounded EP8/EP4 two-iteration correctness smoke `2673295` on one four-node GB200
+  segment (12 active ranks on the first three nodes) before the full EP16/EP12 benchmark. The
+  full benchmark has a separate wrapper and leaves the prior dynamic-capacity wrapper untouched.
+- Smoke `2673295` reached model initialization but failed before training on the existing
+  split-host-phase configuration assertion because the temporary smoke wrapper omitted
+  `MEGATRON_NONUNIFORM_EP_EDP_READY_GATE=0`; this was not a ScaledSReLU or static-capacity failure.
+  The full wrapper already had the correct value. Corrected only that temporary-wrapper toggle and
+  submitted the identical smoke as `2673346`.
+- Corrected smoke `2673346` completed two finite EP8/EP4 iterations with zero skipped/NaN
+  iterations and no over-budget message or dynamic-path rerun. Submitted full NEP-only EP16/EP12
+  job `2673396`; it started immediately on GB200 nodes `lyris[0025-0032]`, segment size four. A
+  GB300 `--test-only` query estimated 2026-08-13, so GB200 was the faster queue. The full run uses
+  ten iterations, profiles steps 5-6 on all 28 ranks, and leaves steps 8-10 as clean timing.
+
+### Static-capacity NEP result
+
+- Full job `2673396` completed successfully: original 128-expert a3b/30b architecture,
+  EP16/EP12, TP2, CP1, top-k 6, sequence length 8192, MBS1 per replica, GBS14, Flex/HybridEP,
+  no optimizer step, capacity factor 1.5, and TE op fuser. All ten iterations were finite with zero
+  skipped/NaN iterations; there was no over-budget message and no dropless fallback rerun.
+- Clean post-profile iterations 8-10 were `641.0`, `654.7`, and `667.0 ms`, mean `654.23 ms`
+  (`139.53 TFLOP/s/GPU`). The prior dynamic-capacity NEP mean was `812.73 ms`, so iteration time
+  fell `19.50%` and throughput rose `24.23%`. The prior healthy mean was `663.47 ms`; the static
+  result is effectively at parity (`101.41%` owner-time parity). Because the healthy/dynamic
+  comparator came from another allocation and static capacity requires the op fuser, the apparent
+  1.4% advantage over healthy is not evidence that NEP is intrinsically faster.
+- Across both profiled iterations and all 28 ranks (56 rank-steps), there were **zero**
+  `cudaStreamSynchronize` calls nested in `HybridEPDispatch`, versus 46 such dispatch syncs per
+  profiled step on each sampled rank in the old dynamic path. Other unrelated `.item()`/grad-check
+  stream synchronizations remain; only the targeted dynamic HybridEP sizing synchronization is gone.
+- The overflow-status path performs exactly one world-group all-reduce of three int32 values per
+  iteration. Its NCCL kernel residency averages `2.20 ms` per rank and reaches `3.93 ms`; it has
+  zero overlap with any other GPU work. Participant host launch spread is about `2.56 ms`, and the
+  immediately following first `.item()` blocks for `8.91-8.98 ms` on average (maximum `10.22 ms`).
+  Thus it introduces a real, fully exposed post-backward tail of roughly `9-10 ms` per iteration
+  (`~1.4-1.6%` here), but it does not interfere with backward or native Megatron NCCL. The static
+  path still recovers all practical performance despite this new tail.
+- Artifacts are under
+  `slurm_runs/lyris_a3b_30b_original_128e_ep16_ep12_static_capacity_no_optimizer/`
+  `a3b_30b_original_128e_ep16_ep12_static_cf1p5_noopt_i10/2673396/`; the consolidated result is
+  `benchmark_analysis_2673396.json`, with all 28 traces in `torch_profile/`.
+- Ran repository-pinned isort 5.13.2, Black 24.4.2, Ruff 0.9.10, and `git diff --check` on the two
+  edited Python files; all checks pass. Cancelled pending GPU-only style job `2673500` before it
+  received resources.
+
+
+### Status and revised distributed-optimizer plan
+
+- The static-capacity/HybridEP synchronization-removal task is **tentatively complete** as of the
+  user's 2026-08-12 review. Job `2673396` is the accepted result. The independent `9-10 ms`
+  overflow-status tail remains documented and deferred; it is not being treated as eliminated.
+- The next task is native Megatron distributed-optimizer compatibility for NEP Approach A. The
+  revised design starts from capabilities that now exist: exact uneven logical-expert ownership,
+  fixed virtual Flex slots without dummy parameters, persistent owner-layout Gather/EDP/Scatter
+  metadata, regular-optimizer correctness, and the static-capacity HybridEP path.
+- Proposed implementation, pending user approval:
+  1. Commit/push the accepted state as an immutable rollback point and freeze the regular-optimizer
+     path. Initially support BF16 Adam, one distributed-optimizer instance, NCCL Approach A, and
+     Flex/HybridEP; explicitly reject FSDP, optimizer offload, and quantized parameter formats.
+  2. Keep native Megatron handling for every dense/non-expert buffer. For expert parameters, build
+     persistent fixed-width owner-layout `ParamAndGradBuffer` objects from the existing logical
+     owner/slot maps. Create optimizer-visible proxy parameters only for real logical experts;
+     virtual slots remain padding and receive no parameter, optimizer state, or checkpoint entry.
+  3. Gather physical expert gradients into those owner buffers, then use the native
+     `_ParamAndGradBucketGroup` distributed-optimizer reduce-scatter on the existing owner EDP
+     groups. Native `DistributedOptimizer` updates its normal local shards. In this mode, omit the
+     regular path's post-EDP gradient Scatter because physical ranks no longer perform local expert
+     optimizer updates.
+  4. Reuse native parameter all-gather after the optimizer step to reconstruct each owner buffer,
+     then use the existing owner-transfer groups to scatter updated parameters back to physical
+     expert holders. Bring this up synchronously first, then connect completion to the existing
+     forward pre-hook lifecycle so parameter all-gather/scatter can overlap without changing
+     collective order.
+  5. Add only a narrow optimizer-factory extension for DDP wrappers to provide alternate expert
+     optimizer parameters/buffers; do not modify Adam or DistributedOptimizer update math. Keep
+     changes concentrated in `nonuniform_ep.py`, the optimizer factory hook, the two opt-in
+     entrypoints, focused tests, and one runner. Any broader core change requires another review.
+  6. Validate incrementally: layout-only tests; EP8/EP4 2-4-layer BF16 Adam correctness without
+     overlap; the same case with grad-reduce and param-gather overlap; then non-divisible EP8/EP6
+     with Flex. Compare logical gradients, DistOpt shards, Adam moments/steps, and post-step physical
+     parameters against a healthy/native reference, including virtual-slot exclusion, clipping,
+     zeroing, and multiple iterations.
+  7. Add same-topology save/reload and fully-reshardable healthy-to-NEP/NEP-to-healthy checkpoint
+     tests using stable logical-expert names before scaling performance tests.
+  8. Run same-allocation profiled A/B gates at EP8, EP16/EP12, then EP32/EP28. Require no measurable
+     regression in the existing non-distributed path, no duplicate native collectives or new host
+     synchronization, and at least 95% owner-time parity with the matched healthy DistOpt baseline.
+     The final original a3b/30b test restores its native overlap flags and combines DistOpt with the
+     accepted static-capacity Flex path; CUDA-graph validation follows only after the non-graph path
+     passes.
+
+### Why HybridEP synchronizes and available static-capacity path
+
+- The current workload leaves `moe_expert_rank_capacity_factor=None` and does not pad expert input.
+  HybridEP therefore does not know the data-dependent number of tokens each rank will receive. Its
+  dynamic dispatch reads the produced count through pinned host memory so it can size the permuted
+  output/handle, which inserts `cudaStreamSynchronize`. Full activation recomputation invokes this
+  forward dispatch again inside `CheckpointFunctionBackward`, explaining why it appears in backward.
+- Megatron already exposes a no-per-dispatch-sync path: a non-None
+  `moe_expert_rank_capacity_factor` computes a static rank receive budget and makes HybridEP call
+  `dispatch_with_permute(..., non_blocking=True)`. It requires the Transformer Engine op fuser.
+  Over-budget traffic is detected and `PagedStashRunner` retries the iteration in dynamic dropless
+  mode, preserving correctness but adding one small overflow-status all-reduce per successful step
+  and an expensive rerun on overflow. The factor must be calibrated from all-rank peak receive
+  counts; forced random load balancing is not exactly uniform, so a factor of exactly one is unsafe.
+- Padding every expert to a fixed expert capacity also makes the count static, but changes GEMM
+  shapes/work and can drop tokens, so it is a poor performance-parity experiment. The recommended
+  first test is the existing rank-capacity path on matched healthy/NEP A/B runs, verify zero overflow
+  and disappearance of `HybridEPDispatch` stream synchronizations, then decide whether to replace
+  its per-step overflow collective with a leaner high-water-mark/static-budget mechanism.
+
+### Backward-compute versus HybridEP synchronization clarification
+
+- Recomputed the full backward/recompute wall span from the first to final
+  `CheckpointFunctionBackward` layer scope on the existing EP16/EP12 traces. In profiler step 6,
+  rank 0 spans `624.129 ms` and reduced rank 16 spans `664.320 ms`, a `40.191 ms` wall-time gap.
+  This is close to the late EDP/dense-DP record arrival (`44-49 ms`), but it is not pure compute.
+- Rank-16 summed expert GEMM service exceeds rank 0 by only `4.114 ms` in step 6, and grouped
+  expert-backward CPU scope time by `5.400 ms`. The anomalous layer-31 scope instead grows
+  `20.137 ms`, of which `19.814 ms` is one blocking `cudaStreamSynchronize` in dynamic-size
+  `HybridEPDispatch`. Thus that layer's wall-time regression is almost exactly the synchronization.
+- In profiler step 5, reduced rank 16's full backward span is actually `5.352 ms` shorter than rank
+  0 even though its expert GEMM sum is `4.001 ms` higher, because rank 0 incurs a `42.976 ms`
+  synchronization in another HybridEP dispatch and rank 16 catches up. This rules out a stable
+  tens-of-milliseconds increase in reduced-rank arithmetic as the explanation.
+- Correct interpretation: backward *wall time* grows because the blocking dynamic-sizing boundary
+  waits for outstanding GPU/model-EP work and prevents later backward work from being submitted.
+  The synchronize does not make already-enqueued kernels slower; it exposes readiness skew and
+  loses host-side enqueue/overlap opportunity. The current traces show GPU work running during the
+  wait, so the wait duration is not itself GPU idle and cannot be added directly to kernel time.
+
+## 2026-08-11
+
+### Non-divisible EP expert-placement design comparison
+
+- The current EP32/EP28 workaround changes a true 128-expert model to 224 active experts because
+  224 is the first common multiple of 32 and 28 at or above 128. This is a 75% architecture and
+  expert-parameter increase, not harmless padding, and it also reduces tokens per active expert.
+- **Per-replica physical padding:** keep the router and healthy replica at 128 logical experts, but
+  give the EP28 replica 140 physical slots (five per rank), comprising 128 true experts and 12
+  permanently unroutable dummy experts. A balanced placement has 16 ranks with five true experts
+  and 12 ranks with four true plus one dummy. The logical router must remain 128-wide because its
+  dense-DP parameters must have identical shapes across replicas; therefore this still requires an
+  explicit logical-to-physical expert-slot map and zero padding inside token dispatch.
+  - Advantage: equal physical slots per reduced rank retain most existing all-to-all reshape,
+    grouped-expert, and fixed owner-layout assumptions. A padded five-slot owner layout can also
+    preserve the current fixed-size Gather/EDP/Scatter scheduler.
+  - Cost: 9.375% extra reduced-replica expert capacity and, on the simplest fixed-size reshard path,
+    9.375% extra expert-gradient EDP/staging volume. For the six-layer `2688-1856-2688` workload,
+    the 12 dummies add 718,405,632 replica-wide parameters. Each dummy-bearing GPU adds six dummy
+    experts, or 59,867,136 parameters: 114.2 MiB of BF16 weights alone and roughly 1.0 GiB when
+    BF16 weights plus FP32 gradients/master weights/Adam moments are resident. Dummy zero-token
+    descriptors can also add grouped-GEMM launch/bookkeeping overhead. Checkpoint and optimizer
+    paths must exclude or explicitly discard dummy state, and routing/loss/statistics must never
+    expose the dummy IDs.
+  - It does not remove active-work imbalance: the same 16 EP28 ranks still process five real
+    experts while 12 process four. It only regularizes physical tensor shapes.
+- **True uneven ownership:** retain exactly 128 experts. On EP28, 16 ranks hold five and 12 hold
+  four; EP32 remains four per rank. This has no dummy parameter, optimizer-state, routing-metadata,
+  or padded-gradient traffic and preserves a direct logical-expert checkpoint mapping.
+  - Cost: replace scalar `experts_per_rank`/`experts_per_owner` arithmetic with rank counts,
+    prefix offsets, owner expert-ID lists, and per-owner chunk ranges. Standard all-to-all dispatch
+    must form rank splits from those offsets instead of reshaping the expert axis uniformly. The
+    NEP owner scheduler and Gather/EDP/Scatter packing must support four- and five-expert owner
+    payloads. DeepEP/HybridEP and inference fused paths currently assume uniform local expert
+    counts and should initially be rejected unless their APIs gain ragged ownership support.
+  - Active load remains imbalanced by construction: under uniform routing, five-expert ranks
+    receive about 25% more expert tokens/traffic than four-expert ranks. That is equally true for
+    the padding design because dummy experts receive no tokens.
+- Minimum production-quality scope for either design is five core library files
+  (`nonuniform_common.py`, `nonuniform_ep.py`, `moe_layer.py`, `token_dispatcher.py`, and
+  `experts.py`) plus the `pretrain_hybrid.py` integration, three focused unit-test modules, and one
+  small distributed correctness/performance runner. Physical padding is estimated at roughly
+  300-500 core LOC because it retains fixed physical widths; true uneven ownership is roughly
+  500-800 core LOC because 24 current `experts_per_owner` references and the all-to-all layout must
+  become ragged. These are source-reading estimates, not committed diffs. Full Flex/DeepEP and
+  inference support adds at least two more production modules and may require backend changes.
+- **Recommendation:** implement true uneven ownership for the long-term path, initially scoped to
+  the standard training all-to-all dispatcher and current TE grouped-MLP workload. It is more
+  invasive but is semantically clean, avoids permanent memory/communication waste, and is a better
+  foundation for checkpoint and distributed-optimizer support. Retain physical padding only as a
+  fallback if ragged dispatcher or backend constraints prove prohibitive. Validate first on a
+  small non-divisible topology such as true 16 experts with EP8/EP6 before EP32/EP28.
+
+
+### Requirement update: Flex dispatcher plus distributed optimizer
+
+- Requiring Flex dispatcher support materially changes the earlier recommendation. Current Flex
+  code reshapes routing metadata as `EP * num_local_experts`, DeepEP derives destinations from one
+  global expert count, and HybridEP initializes every rank with one `num_local_experts` value.
+  Pure four/five-expert ragged ownership therefore cannot be passed through the current fused
+  backends without changing DeepEP/HybridEP APIs and kernels to consume per-rank expert counts and
+  prefix offsets.
+- Requiring DistOpt does not make real trainable dummy experts attractive. DistOpt would otherwise
+  allocate/shard meaningless dummy optimizer state and would need dummy checkpoint semantics. Its
+  hard NEP problem is independent of divisibility: owner-layout gradients and parameters must be
+  presented through native Megatron buffers, updated parameters must be scattered back to their
+  physical holders, and synthetic owner slots must map to real follower parameters.
+- The revised recommendation is a hybrid: retain exactly 128 logical/trainable experts with
+  uneven four/five ownership, but expose 140 **virtual dispatch slots** to Flex on EP28. Pad the
+  128-column router map with 12 permanently zero columns, let DeepEP/HybridEP see five slots per
+  rank, remove zero dummy slots from `tokens_per_expert` before grouped expert compute, and create
+  no dummy expert weights or optimizer state. The owner gradient/parameter layout can similarly
+  use fixed five-slot buffers with the unused slot represented as native buffer padding if fixed
+  shapes materially simplify DistOpt; this trades at most 9.375% owner-layout communication for
+  compatibility without adding model parameters.
+- If constrained to the two literal choices, physical padding is the practical Flex-compatible
+  choice, but dummy experts should be frozen and excluded from DistOpt/checkpoints. Implementing
+  pure uneven ownership end to end would require external fused-backend work. The virtual-padding
+  refinement preserves Flex compatibility while retaining the main semantic and memory benefits
+  of uneven ownership.
+- Expected production scope rises from six files to roughly eight to ten: the existing placement,
+  MoE, dispatcher, NEP, expert-checkpoint, and entrypoint files plus DistOpt/DDP buffer integration.
+  The design goal is to adapt owner-layout buffers to native DistOpt and avoid modifying optimizer
+  algorithms themselves. Validation must cover Flex routing/combine with zero dummy traffic,
+  one real DistOpt step with matching healthy/NEP parameters on owners and followers, optimizer
+  state/checkpoint reload, and performance parity on a small EP8/EP6 non-divisible case before
+  EP32/EP28.
+
+
+### EP8/EP6 virtual-slot implementation (regular optimizer + Flex scope)
+
+- Scoped this cycle exactly to the recommended expert handling plus the existing regular
+  non-distributed optimizer; distributed-optimizer support is deliberately not included.
+- Added balanced logical owner rows for non-divisible expert counts. For the validation point,
+  16 true experts over minimum EP6 map to owner counts `[3, 3, 3, 3, 2, 2]`; the EP8 replica
+  maps two true experts to every rank and offloads owner-slot 2 to EP ranks 6 and 7.
+- No dummy expert module, parameter, or optimizer state is created. Flex receives fixed virtual
+  slots instead. The logical EP6 layout first has width three, but the installed HybridEP backend
+  requires the expert-slot count in its six-rank NVLink domain to be divisible by four, so the
+  adapter exposes four virtual slots per rank (24 physical dispatch columns): 16 true slots and
+  eight permanently masked zero slots. EP8 exposes two slots per rank (16 true columns). Token
+  counts for virtual slots are removed before grouped expert compute.
+- The NEP owner gradient layout now uses fixed `ceil(16/6)=3` communication slots with explicit
+  logical-expert-to-owner-slot maps. Unused owner slots remain zero buffer positions, while
+  Gather/EDP/Scatter pack and unpack only true logical experts.
+- Added focused unit coverage for exact EP8/EP6 placement, gather-map ownership, fixed virtual
+  slots, and zeroed Flex routing/probability columns.
+- Added `scripts/nonuniform/run_lyris_ep8_ep6_flex_regular_optimizer.sh`. It runs a four-iteration,
+  two-layer, true-16-expert EP8/EP6 case using Flex/HybridEP, native Adam (no DistOpt), dummy data,
+  forced load balancing, and rank-0/reduced-owner PyTorch profiles. Post-run checks require exact
+  logical placement, no dummy parameter storage, finite and changing parameter fingerprints, and
+  cross-replica equality of logical-expert parameter aggregates after every optimizer step.
+- Local `py_compile` and wrapper `bash -n` checks passed. Full isort/Black/pytest checks are staged
+  as the job preflight because the login-node Python environment has neither `uv`, PyTorch, nor
+  pytest.
+- Standard DeepEP cannot exercise EP6 in the installed backend because its switch-rank path accepts
+  only EP sizes 2, 4, 8, and 16. HybridEP accepts EP6 once the adapter supplies the virtual width
+  four described above.
+- Unequal local expert-tensor shapes consume different initialization RNG streams on EP8 versus
+  EP6. Added a one-time startup synchronization using the existing Approach-A owner layout and
+  process groups so each logical expert begins from the same parameter values on both replicas;
+  this adds no per-iteration communication.
+- Final integration job `2662984` completed successfully on four GB200 nodes (14 active ranks,
+  segment 4). Its in-allocation preflight passed six focused tests (137 deselected), Black/isort,
+  `py_compile`, and shell syntax checks. All four training iterations completed with Flex/HybridEP,
+  `use_distributed_optimizer=False`, native Adam updates, mock data, and forced load balancing.
+- The verifier passed exact EP8/EP6 placement, all-rank finite and changing checksums, matching
+  logical-expert and dense parameter aggregates after every optimizer step (integer counts exact;
+  floating checks within 2e-6), and absence of dummy parameter storage. EP8 ranks each held
+  2,097,152 expert parameters; EP6 ranks 0-3 each held
+  3,145,728 and ranks 4-5 each held 2,097,152, totaling the same 16-expert model in both replicas.
+  PyTorch traces were collected for healthy owner rank 0 and reduced owner rank 8 at
+  `slurm_runs/lyris_ep8_ep6_flex_regular_optimizer/`
+  `ep8_ep6_n16_flex_hybridep_adam_2662984/torch_profile/`.
+
+
+### Original a3b/30b EP16/EP12 Flex benchmark
+
+- Ran the full original `examples/training_scripts/a3b_30b_moe_1t.sh` architecture with its
+  complete hybrid pattern (`MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME`), hidden
+  size 2688, FFN 1856, 32 attention heads / 2 query groups, 64 Mamba heads, sequence length 8192,
+  128 true experts, top-k 6, and a 3712-wide shared expert.
+- NEP topology was EP16/EP12 with TP2 (`NONUNIFORM_EP_TOPOLOGY="8 6"`), CP1, ETP1, 28 active
+  ranks on seven nodes inside an eight-node, two-segment allocation. Each replica remained wholly
+  inside its own four-node NVLink segment. Both replicas used MBS1 and one microbatch, for true
+  GBS14. The run used mock data, forced load balancing, Flex/HybridEP, and PyTorch profiler ranks
+  0 and 16.
+- Non-divisible placement retained exactly 128 trainable experts. EP16 held 8 true experts/rank;
+  EP12 held `[11] * 8 + [10] * 4`. HybridEP used 11 slots/rank on EP12 (132 physical dispatch
+  slots: 128 true plus four masked virtual slots), with no dummy parameters.
+- Memory/path qualification attempts:
+  - `2663248`: local CUDA graphs, no recompute, regular Adam; first-backward Mamba Triton
+    autotuning OOM.
+  - `2663344`: graphs disabled, no recompute, regular Adam; the same first-backward autotuning OOM.
+  - `2663376`: full uniform recompute, graphs disabled, regular Adam; forward/backward completed,
+    but the first optimizer step OOMed while allocating Adam state. The full TP2 model therefore
+    does not fit regular Adam in 184 GiB, independently of the already-passing small EP8/EP6
+    regular-optimizer compatibility test.
+  - `2663442`: no optimizer step, local graphs, no recompute; two iterations completed, then the
+    Flex/HybridEP graph path hit an illegal memory access.
+  - `2663480`: no optimizer step, graphs disabled, no recompute; profiler-era memory growth caused
+    an iteration-3 forward OOM.
+- Final job `2663516` used graphs disabled, full uniform one-layer recomputation, and intentionally
+  skipped the optimizer step. Its distributed training step (`2663516.2`) completed with exit 0.
+  All four iterations were finite with zero skipped/NaN iterations; the final post-startup iteration
+  was 752.5 ms and 121.3 TFLOP/s/GPU. Non-divisible startup synchronization completed, and nonzero
+  profiler traces were written for ranks 0 and 16 (about 36.6 MB compressed each).
+- The outer batch record is `FAILED 1:0` only because its post-run verifier searched for the stale
+  config field name `num_moe_experts`; runtime emits `num_experts`. Correcting that one verifier
+  regex and rerunning the exact verifier against the existing artifacts produced PASS, so training
+  was not rerun.
+- Wrapper: `scripts/nonuniform/run_lyris_a3b_128e_ep16_ep12_flex_no_optimizer.sh`.
+  Driver log and traces are under
+  `slurm_runs/lyris_a3b_30b_original_128e_ep16_ep12_flex_no_optimizer/`
+  `a3b_30b_original_128e_ep16_ep12_flex_hybridep_noopt_i4/2663516/`.
+
+
+### Full-original healthy EP16 control and direct comparison
+
+- No existing healthy artifact matched the newly run full original model, so job `2663871` ran a
+  dedicated healthy EP16/EP16 control. It requested the exact same eight GB200 nodes used by NEP
+  job `2663516` (`lyris[0038,0042,0052-0053,0123-0126]`) and the same segment size four, image,
+  full architecture, Flex/HybridEP backend, MBS1, one microbatch per replica, recomputation,
+  profiler window, no-optimizer mode, forced load balancing, and diagnostics. Only the intended
+  control dimensions changed: standard healthy mode, EP16/EP16, 32 ranks, and proportionally
+  scaled GBS16 versus NEP EP16/EP12, 28 ranks, and GBS14.
+- Healthy job `2663871` completed `0:0` in `4m43s`; all four iterations were finite with zero
+  skipped/NaN iterations, its verifier passed, and valid profiler traces were produced for ranks 0
+  and 16. Both healthy and NEP emitted HybridEP timeout diagnostics during profiler-perturbed
+  iterations, so those iterations are excluded from timing.
+- The sole clean post-profiler iteration was `624.7 ms`, `146.1 TFLOP/s/GPU` healthy versus
+  `752.5 ms`, `121.3 TFLOP/s/GPU` NEP. NEP therefore adds `127.8 ms` (`20.458%` latency), reaches
+  `83.017%` owner-time parity, and reaches `83.025%` per-GPU TFLOP/s parity.
+- This is an exact configuration/node comparison but only one clean timing sample per case; it is
+  sufficient to show a large regression, not to estimate a low-variance mean. A longer paired A/B
+  would be required before treating `83.0%` as a precise steady-state parity value.
+- Healthy wrapper: `scripts/nonuniform/run_lyris_a3b_128e_ep16_healthy_flex_no_optimizer.sh`.
+  Healthy artifacts are under
+  `slurm_runs/lyris_a3b_30b_original_128e_ep16_healthy_flex_no_optimizer/`
+  `a3b_30b_original_128e_ep16_ep16_flex_hybridep_noopt_i4/2663871/`.
+
+
+### Full-original post-warmup A/B and overhead attribution
+
+- Job `2664083` ran healthy EP16/EP16 and NEP EP16/EP12 sequentially in one allocation on the
+  same eight GB200 nodes and segment-four placement used by the earlier controls. Both retained the
+  exact full original architecture, MBS1, proportional GBS16/14, Flex/HybridEP, full recomputation,
+  graphs disabled, and no optimizer step. Iterations 1-4 were warmup, profiler start/end 5/7
+  captured iterations 5-6 (the profiler end is exclusive), iteration 7 exported the traces, and
+  iterations 8-10 were clean timing samples.
+- This confirms that the prior iteration-4 comparison was post-warmup rather than a first-use
+  sample. In the new healthy leg, iterations 1-2 took `107573/54139 ms`, then iterations 3-4 were
+  already stable at `685.6/694.2 ms`; NEP similarly fell from `109539/55277 ms` to
+  `806.1/865.6 ms` before profiling began.
+- Clean iterations 8-10 measured healthy `663.467 +/- 3.963 ms` and NEP
+  `812.733 +/- 5.350 ms`. The gap is `149.267 ms`, NEP slowdown `22.498%`, owner-time parity
+  `81.634%`, and per-GPU TFLOP/s parity `81.629%`. This strengthens the earlier one-sample result
+  rather than explaining it as warmup.
+- Rank-0 profiler GPU envelopes were `793.977 ms` healthy and `934.424 ms` NEP, a
+  `140.446 ms` gap that closely matches the profiled log gap. Exact interval closure is:
+  `+17.257 ms` non-NCCL union, `+172.727 ms` NCCL union, `-47.132 ms` from additional
+  NCCL/non-NCCL overlap, and `-2.406 ms` GPU idle. Thus `125.595 ms` (89.4% of the profiled gap)
+  is additional NCCL occupancy not hidden by non-NCCL work. GPU idle does not cause the slowdown.
+- Expert EDP is the largest individual inflation. Healthy rank 0 has five buckets totaling
+  `1,835,925,504` elements; NEP has three totaling `2,524,397,568`, exactly `11/8 = 1.375x`
+  because each surviving EP12 owner represents 11 expert slots versus eight on healthy EP16.
+  Participant-aligned matched service rises from about `84.275` to `117.180 ms/step`
+  (`+32.905 ms`). More importantly, rank-0 pre-last-participant wait rises from about
+  `2.770` to `88.170 ms/step` (`+85.400 ms`). The rank-0/rank-16 host `record_param_comms`
+  spread (`29.382 ms/operation`) matches the GPU-kernel start spread (`29.390 ms`) while each
+  record-to-kernel delay is only about `0.1 ms`; the delay is therefore bucket-readiness/host
+  submission on the reduced replica, not a queued CUDA-stream dependency.
+- Native dense-DP carries the same payload in both cases but is delayed by the same readiness skew.
+  Its rank-0 residency rises `14.855 -> 85.021 ms`. Across its five calls, matched service rises
+  only about `11.310 -> 14.145 ms`, while cumulative rank-0 pre-arrival wait rises roughly
+  `3.495 -> 70.810 ms`. The large-call host record spreads and kernel-start spreads agree, reaching
+  `45-49 ms` in profiler step 6. Much of this waiting dense-DP residency coexists with EDP, so
+  group residencies are not additive; it represents native collective inflation caused by late
+  reduced-replica participation.
+- Gather and Scatter themselves are not the dominant transfer cost on rank 0: Gather is
+  `3.501 ms` and Scatter `3.942 ms`, both almost fully exposed. Owner-layout staging is
+  `9.467 ms` resident and `6.637 ms` exposed. The whole Gather/EDP/Scatter union has
+  `47.437 ms` more exposure than healthy EDP, while its overlapped waiting also inflates native
+  dense-DP/TP work.
+- Secondary NCCL increases are TP `+9.866 ms` residency, the 2,944-element TP-DP-CP synchronization
+  `+8.102 ms`, and default-process-group synchronization `+2.658 ms`. The small synchronization
+  calls are enabled in this original workload and are avoidable experiment noise/overhead, but they
+  do not explain the main gap.
+- Full-owner compute is nearly unchanged: the same 1,569 expert GEMM kernels take only
+  `+1.496 ms` summed GPU time under NEP; grouped-backward CPU scope sum rises `+2.304 ms`, and
+  internal grouped-launch gaps rise only `+0.058 ms`. HybridEP custom-kernel residency rises
+  `8.842 ms` but its exposed time decreases because it overlaps more NCCL. Raw full-owner compute
+  is therefore not the primary regression.
+- Reduced rank 16 launches 2,121 expert GEMM kernels versus 1,569 on healthy/full owners because it
+  owns 10/11 experts instead of eight. Its summed GEMM time is only about `3.5 ms` above healthy,
+  but grouped-backward CPU scope time is about `10.2 ms` higher and its GPU envelope contains
+  about `110.5 ms` more idle time. This establishes that fragmentation contributes to readiness
+  lag, while the remaining lag is scheduling/synchronization rather than extra GEMM service. The
+  two-rank trace is sufficient to locate the immediate host-readiness bottleneck but not to name
+  the single slowest rank among every EP12 participant.
+- Both training legs and their verifiers completed successfully. The outer batch was marked failed
+  only because the first analyzer assumed three steps instead of the profiler's two end-exclusive
+  steps; the wrapper was corrected and analysis reran successfully on a compute node.
+- Artifacts:
+  `slurm_runs/lyris_a3b_30b_original_128e_ep16_ep12_postwarm_ab/`
+  (`timing_comparison_2664083.json`, `trace_analysis_2664083.json`, and healthy/NEP rank-0/rank-16
+  traces).
+
+#### Reduced-replica readiness diagnosis
+
+- A new per-layer alignment of the existing rank-0/rank-16 profiles confirms that the EDP lag is
+  created before the EDP call. In profiler step 6, reduced rank 16 reaches the three EDP CPU
+  records `17.371`, `44.150`, and `49.224 ms` after full-owner rank 0. The matching dense-DP
+  records lag `16.934`, `45.621`, and `49.114 ms`. This is backward-progress skew, not NCCL
+  launch/stream latency.
+- EP12 rank 16 owns 11 experts versus eight on EP16 rank 0. Across the 23 MoE layers this produces
+  878 versus 740 `AccumulateGrad` evaluations (exactly 138 additional expert-parameter readiness
+  hooks), 2,121 versus 1,569 expert GEMM launches, and 506 versus 368 expert parameters across the
+  three expert buckets. The reduced rank therefore has similar aggregate expert FLOPs but more,
+  smaller expert operations and more host/autograd/DDP bookkeeping.
+- The largest single step-6 skew increment is now identified exactly. In layer 31's checkpoint
+  backward/recompute scope, rank 16 spends `19.814 ms` in `cudaStreamSynchronize` inside
+  `HybridEPDispatch`; the corresponding rank-0 scope has no long synchronize and is `20.137 ms`
+  shorter. This one fence moves the cumulative rank-16 lag from about `19.7` to `39.9 ms`.
+- This fence is the configured HybridEP dynamic-sizing path, not NEP EDP: no static
+  `num_permuted_tokens` bound is supplied, so `_HybridEPManager` leaves it as `None`, and
+  `HybridEPDispatch` invokes the backend with `non_blocking=False`. The source comments explicitly
+  document that this path performs a CPU synchronization to obtain the dynamic token count. The
+  trace shows the synchronization draining queued GPU work, including an `ag_nvl_kernel`, before
+  host backward can continue.
+- The same dynamic-size fence can occasionally stall a full replica: in profiler step 5, rank 0
+  spends `42.976 ms` in the same `HybridEPDispatch` synchronization and the reduced rank catches
+  up. Thus the fence amplifies whichever model-EP participant/stream is late; the reduced replica's
+  systematically more fragmented expert work makes it arrive late more often, but the current
+  two-rank profile cannot identify the ultimate slow peer within every EP group.
+- The healthy EP16/EP16 control rules out a persistent node/rank-16 confounder. Across its two
+  profiled steps, rank-0/rank-16 backward-layer skew stays within roughly six milliseconds instead
+  of accumulating to `44-49 ms` as it does for NEP EP16/EP12.
+- Compact analysis artifacts are in the same run directory:
+  `reduced_layer_skew.txt`, `healthy_layer_skew.txt`, `reduced_scope_details.txt`, and
+  `reduced_delay_cpu_events.txt`.
+
+## 2026-08-10
+
+### Prioritized NEP next steps
+
+#### Immediate
+
+1. Implement nonuniform expert ownership for expert counts that are not divisible by every EP
+   replica size. Replace the current expert-padding workaround with deterministic uneven ownership
+   (for example, floor/ceiling expert counts per rank), and carry the true ownership through
+   routing, dispatch/combine, expert-gradient layout, and NEP resharding. Validate exact expert
+   coverage, routing and gradient correctness, and collective ordering before performance testing.
+2. Add distributed-optimizer compatibility with maximum reuse of native Megatron DDP and optimizer
+   interfaces. Preserve the current NEP communication schedule and require correctness plus no
+   measurable NEP performance regression on the established EP8/EP16/EP32 controls.
+
+#### Later, after the immediate compatibility work
+
+3. Tune full-versus-reduced replica work allocation through replica-local MBS and gradient
+   accumulation settings. Sweep proportional and intentionally under-proportional assignments,
+   adjusting GBS consistently, to balance owner-rank iteration time while recovering expert-GEMM
+   efficiency where memory permits.
+4. Sweep DDP gradient-bucket size/count, including both dense and expert buckets. Compare healthy
+   and NEP cases under matched bucket layouts to determine the best overlap/launch-overhead tradeoff
+   without introducing correctness or performance regressions.
+
+### Cross-scale iteration chart title correction
+
+- Retitled `slurm_runs/plots/nep_healthy_vs_nep_mean_iteration_ep8_ep16_ep32.png`
+  without changing its data or chart body. Removed the configured DDP bucket target, internal
+  `MEME...` layer-pattern notation, and packed-Scatter implementation label. The title now gives
+  the meaningful 14-layer architecture (6 Mamba, 2 attention, and 6 MoE layers), hidden/expert-FFN
+  dimensions, top-k, exact parallelism, and actual realized dense/expert gradient-bucket counts:
+  EP8 `4/11`, EP16 `4/8`, and EP32 `4/7`.
+- Verified from all three active wrappers that these plotted runs use TP2, **CP1**, and ETP1; they
+  do not use CP2. The title now states `TP2 / CP1 / ETP1` explicitly.
+- The changing expert-bucket count is not caused by a fixed cross-scale bucket size. Megatron
+  derives the bucket-size threshold separately for each model shape from local parameter count,
+  then lays out dense and expert buffers independently at whole-parameter boundaries. Full-replica
+  experts per GPU change from 16 to 9 to 7 across EP8/EP16/EP32, changing both local expert-buffer
+  volume and the derived threshold; these layouts realize 11, 8, and 7 expert buckets. Within each
+  healthy/NEP pair, NEP synchronizes the threshold to the healthy/full-replica value.
+
+### Exact expert, attention, and gradient-bucket derivation
+
+- The 14-layer benchmark has six routed-MoE layers. Every routed expert is a bias-free
+  `2688 -> 1856 -> 2688` squared-ReLU MLP: each FC matrix has `2688 * 1856 = 4,988,928`
+  parameters and each expert has `9,977,856` parameters. Routing is top-6. The EP8, EP16, and
+  EP32 scale points use 128, 144, and 224 routed experts per MoE layer, respectively; this gives
+  16, 9, and 7 experts per healthy/full-EP GPU. The reduced replicas hold 32, 12, and 8 per GPU.
+  Each MoE layer also has one shared expert with global intermediate size 3712.
+- The two attention layers are causal Transformer-Engine dot-product Flash Attention using GQA:
+  32 query heads, 2 KV/query groups (16 query heads per KV head), head dimension 128, no positional
+  embeddings, and zero attention dropout. The benchmark is TP2/CP1/ETP1, not CP2.
+- Exact native healthy/full-rank expert bucket derivation from jobs `2649337`, `2649339`, and
+  `2649340`: Megatron computes the threshold as local total parameter count divided by 16, giving
+  `94,486,908`, `68,311,164`, and `60,908,412` elements. Expert parameters are individual FC
+  matrices of `4,988,928` elements; the non-distributed-optimizer layout walks them in reverse
+  backward order and closes a bucket only after adding a whole matrix crosses the threshold.
+  Therefore full buckets contain 19, 14, and 13 matrices. The six MoE layers contain
+  `6 * local_experts * 2` matrices: 192, 108, and 84. Hence EP8 is
+  `192 = 10*19 + 2` -> 11 buckets; EP16 is `108 = 7*14 + 10` -> 8; EP32 is
+  `84 = 6*13 + 6` -> 7. Logged bucket sizes match exactly: EP8 ten buckets of `94,789,632`
+  plus `9,977,856`; EP16 seven of `69,844,992` plus `49,889,280`; EP32 six of
+  `64,856,064` plus `29,933,568`. The explicit NEP expert-group settings were selected to match
+  these native healthy counts within each A/B pair.
+
+### Exact reason dense bucket count remains four
+
+- The four native dense buckets are not forced; this is an emergent result of reverse-backward
+  parameter order, whole-parameter boundaries, and two very large untied vocabulary matrices.
+  Both the output and input embedding weights contain `65,536 * 2,688 = 176,160,768` local
+  elements, exceeding every EP8/EP16/EP32 threshold. The output matrix appears first and closes
+  bucket 1 immediately. The intervening decoder-dense region is `201,594,816`, `201,852,864`,
+  and `203,143,104` elements; it closes exactly two middle buckets at each threshold. The final
+  remaining decoder segment is below threshold and is combined with the input embedding because
+  Megatron checks the threshold only after adding a whole parameter, producing bucket 4.
+- Logged dense layouts are EP8
+  `[176,160,768; 100,795,968; 100,796,064; 176,163,552]`, EP16
+  `[176,160,768; 71,183,584; 71,183,680; 235,646,368]`, and EP32
+  `[176,160,768; 71,613,664; 71,613,760; 236,076,448]`. Thus only the count happens to remain
+  four; boundaries and payloads change. A threshold below the final roughly 59.9M-element decoder
+  remainder, a different parameter order, or tied embeddings could change the count.
+
+### Replica-local MBS interpretation for the cross-scale chart
+
+- The current full/reduced MBS `4/1` is intentionally below proportional, not a GPU-count-proportional
+  assignment. MBS is per TP/CP data lane; because a reduced replica already has fewer such lanes,
+  equal per-lane MBS (`4/4`) would make aggregate replica work proportional to GPU count. Current
+  NEP work decomposes as EP8 `16 + 2 = 18`, EP16 `32 + 6 = 38`, and EP32
+  `64 + 14 = 78` samples, where the second term is reduced-replica work. A proportional MBS4
+  assignment would instead yield NEP GBS `24`, `56`, and `120`.
+- MBS1 was retained as a conservative underload after controlled EP8/EP4 sweeps showed that a
+  nominally proportional reduced replica could arrive late to shared dense-DP/EDP boundaries.
+  Reduced EP owns more experts per GPU and incurs finer grouped-expert launch/dependency structure;
+  in the MBS2 x 7 sweep, proportional reduced work reached only `92.64%` owner parity while one
+  fewer reduced round reached `99.39%`. The current chart therefore measures NEP full-owner latency
+  with the reduced replica deliberately prevented from becoming the bottleneck; it is not an
+  equal-GBS or proportional-load aggregate-throughput comparison.
+
+### Minimum-collectives EP16 and EP32 all-rank profiles
+
+- EP16/EP12 profiler job `2649339` completed `0:0` in `6m37s` on
+  `lyris[0060-0067]`. Both cases completed 12 finite iterations and wrote all expected traces
+  (`32` healthy and `28` NEP). Rank-0 profiler steps 5-6 average `556.335 ms` healthy and
+  `565.584 ms` NEP, or `98.365%` owner parity (`+9.249 ms`, `1.662%` slowdown). The trace is
+  confounded in NEP's favor by `38.172 ms` of healthy owner EDP participant wait: matched EDP
+  service is `6.618 ms` healthy and `6.740 ms` NEP, while rank-0 EDP residency is
+  `44.758/6.740 ms`. Structured analyses are
+  `slurm_runs/lyris_a3b_ep16_ep12_mincollectives_profile_20260810/trace_analysis_2649339.json`
+  and `overhead_breakdown_2649339.json` in the same directory.
+- EP32/EP28 profiler job `2649340` completed `0:0` in `8m29s`. Both profile cases exited zero
+  and wrote all expected traces (`64` healthy and `60` NEP). Rank-0 profiler steps 5-6 average
+  `549.464 ms` healthy and `560.044 ms` NEP, or `98.111%` owner parity (`+10.580 ms`, `1.926%`
+  slowdown). NEP Gather/EDP/packed-Scatter residency is `1.054/22.450/0.772 ms`, with
+  `1.054/1.933/0.772 ms` exposed against every other GPU operation. Healthy EDP contains
+  `10.315 ms` participant wait (`20.036 ms` matched service), while NEP EDP has no owner wait and
+  `22.451 ms` matched service. NEP TP residency is inflated to `13.795 ms` by rank-1 arrival skew;
+  matched TP service is only `2.865 ms` versus `2.773 ms` healthy. Artifacts are under
+  `slurm_runs/lyris_a3b_ep32_ep28_mincollectives_profile_20260810`, including
+  `overhead_breakdown_2649340.json` and `participant_alignment_rank0_2649340.json`.
+
+- Generated the grouped healthy-versus-NEP owner iteration-time chart at
+  `slurm_runs/plots/nep_healthy_vs_nep_mean_iteration_ep8_ep16_ep32.png`, with exact per-scale
+  model, sequence length, healthy/NEP GBS, per-replica MBS, and DDP/expert gradient-bucket details
+  in the title. Source values are in the same-directory CSV.
+
+### NEP rank-local variability versus healthy iteration skew
+
+- Re-audited the existing all-rank job `2638156` traces without rerunning. NEP did not eliminate
+  rank-local compute/runtime variability. In profiler step 6, full-replica owners 0-27 had forward
+  spans from `256.099` to `265.237 ms` (`9.138 ms` range, `2.722 ms` standard deviation). The
+  corresponding healthy full replicas had ranges of `7.427 ms` (ranks 0-31) and `10.032 ms`
+  (ranks 32-63), so NEP's full-replica variation was comparable to healthy's.
+- The different EDP wait comes from workload placement. In healthy, both replicas execute MBS4,
+  and the second replica averaged `2.147 ms` longer in forward than the first in step 6; ranks
+  56/57 were its late pair. In NEP, that same rank range belongs to the MBS1 reduced replica.
+  Reduced-rank forward spans were only `83.219-85.012 ms`, so even its slowest participant reached
+  EDP before the MBS4 full owner. Reduced-side variability is absorbed as reduced-rank wait; hence
+  it does not appear as owner-rank EDP wait.
+- Only profiler steps 5 and 6 contain all-rank GPU detail, so the trace cannot prove skew occurred
+  in every iteration. Both captured iterations show it: all-rank healthy forward ranges were
+  `10.294 ms` and `11.633 ms`, with similar standard deviations (`2.503/2.518 ms`). The slowest
+  forward rank changed from 38 to 56, while the slowest backward rank changed from 16 to 28, so
+  the variability recurs but its location is transient rather than fixed to one rank.
+- Corrected the EDP table interpretation. Its `34.224 ms` healthy versus `22.309 ms` NEP values
+  are rank-0 NCCL residency, including participant-arrival wait, not pure collective service.
+  Removing wait gives `20.509 ms` healthy versus `22.311 ms` NEP, so NEP service is `8.8%` slower
+  as expected. Healthy distributes `419,069,952` elements per owner across 32 owner lanes; NEP
+  distributes `478,937,088` per owner across 28 lanes (`14.29%` more per owner), preserving the
+  exact same `13,410,238,464` total elements. Each EDP all-reduce remains a two-rank pair; NEP has
+  fewer parallel pairs, not fewer participants within each all-reduce.
+
+### Healthy backward versus NEP post-backward tail
+
+- At rank 0 over profiler steps 5-6, healthy backward is `9.355 ms` longer than NEP backward,
+  while backward non-NCCL compute union differs by only `+0.897 ms`. Healthy communication union
+  is `+16.011 ms`, but `9.262 ms` more of it overlaps another operation; GPU idle is `+1.708 ms`.
+  Healthy EDP residency alone is `11.915 ms` larger and exposed EDP is `4.506 ms` larger. The
+  healthy backward difference is therefore primarily participant synchronization and downstream
+  model-EP/dense-DP timing, not faster NEP math or slower healthy kernels.
+- No expert-EDP or Gather kernel remains after the final backward-compute kernel in either case.
+  NEP's post-backward tail is genuinely `9.199 ms` longer on the sampled rank, decomposing into
+  `+4.765 ms` GPU-idle/host gaps, `+3.658 ms` communication-only residency, and `+0.776 ms`
+  non-NCCL copies/staging. Of the communication delta, `+2.940 ms` is dense-DP residency,
+  `+0.574 ms` is the packed Scatter, and about `+0.144 ms` is other communication. The enlarged
+  dense-DP operation is a one-element integer all-reduce: `3.376/3.445 ms` in NEP versus
+  `0.106/0.691 ms` healthy in steps 5/6, proving that component is participant-arrival wait rather
+  than transfer volume. It remains real critical-path overhead because no backward compute remains
+  to hide it.
+- Identified the one-element integer collective as the `num_tokens` all-reduce in
+  `finalize_model_grads()`, used to normalize gradients by the global non-padding token count.
+  It is guarded by `config.calculate_per_token_loss`, and the EP32 wrapper explicitly supplies
+  `--calculate-per-token-loss`; both profile logs confirm `calculate_per_token_loss=True`.
+  Previously disabled controls were different: router expert-bias statistics removed the
+  1,344-element float all-reduce, while `skip_owner_grad_check` removed only NEP owner validation.
+  Omitting `--calculate-per-token-loss` would remove this token-count collective because the
+  option defaults false, but it also changes gradient normalization from total-token scaling to
+  DP-size scaling and is therefore not a semantics-preserving performance toggle.
+
 ## 2026-08-09
 
 ### Audit of the apparent EP32 zero-overhead result
@@ -30,8 +665,30 @@
   `34.224 ms`: `20.509 ms` matched service plus `13.786 ms` participant-arrival wait. NEP EDP
   is `22.309 ms`: `22.311 ms` matched service and effectively no owner wait, despite a larger
   payload. Thus the healthy-control arrival delay offsets new exposed reshard work in this trace.
+- The healthy wait is not a replica-placement regression. Ranks 0-31 and 32-63 remain wholly
+  contained in their respective eight-node NVLink segments. In profiler step 6, rank 32 begins
+  backward `2.154 ms` before rank 0 but records the first four expert-DP buckets
+  `3.874-4.398 ms` later, so the offset develops inside backward rather than at allocation.
+- The offset is propagated by the first backward model-EP all-to-all. Replica 0's 32 participants
+  record that operation across a `9.678 ms` window and finish near `282.0 ms`; replica 1 spans
+  `12.723 ms` and finishes near `286.4 ms`. Ranks 56 and 57 are the latest replica-1 participants.
+  Rank 57's forward phase is `266.105 ms` versus rank 47's `256.149 ms`. At the final dense
+  boundary, its same-shape forward GEMM is `15.752 ms` versus `13.099 ms`, and its backward
+  weight-gradient GEMM is `15.567 ms` versus `12.768 ms`. Those two slower kernels plus the
+  accumulated earlier drift place the gradient-ready point `12.774 ms` later, matching the
+  `12.723 ms` model-EP submission spread. The model-EP rendezvous then carries that delay to rank
+  32's later expert-DP launches.
+- This healthy run still had native `check_for_nan_in_grad=True`; `skip_owner_grad_check=1` only
+  disabled the NEP-specific owner validation. Native `check_grads()` performs a per-bucket norm
+  and scalar validation inside `AccumulateGrad`, synchronizing each host to its GPU before the
+  asynchronous DDP launch. It makes the existing GPU progress skew visible in host launch times,
+  but it is not the primary GPU-time source: the first validation reduction is about `0.13 ms`,
+  while the late rank is already about `12.77 ms` behind when that reduction completes.
 - Conclusion: job `2638156` demonstrates same-allocation mean parity and no compute-kernel
   regression, but it does not prove NEP has intrinsically zero overhead. Its near-zero total delta
+  is partly explained by a slow healthy control whose local compute skew becomes model-EP and
+  expert-DP participant wait.
+
 ### Router-statistics removal and packed end-of-iteration Scatter
 
 - Created rollback checkpoint commit `2c81b9d58` before changing the performance path.

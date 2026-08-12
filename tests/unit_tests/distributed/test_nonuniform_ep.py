@@ -11,7 +11,9 @@ from megatron.core.distributed.nonuniform_common import (
     build_expert_axis_permutation,
     build_expert_to_ep_rank_map,
     clear_nonuniform_ep_runtime_config,
+    compute_nonuniform_ep_dispatch_slots,
     compute_nonuniform_ep_expert_placement,
+    compute_nonuniform_ep_owner_expert_slots,
     get_nonuniform_ep_expert_axis_permutation,
     get_nonuniform_ep_expert_to_ep_rank_map,
     get_nonuniform_ep_local_expert_indices,
@@ -37,7 +39,11 @@ from megatron.core.distributed.nonuniform_ep import (
 )
 from megatron.core.transformer.cuda_graphs import _CudagraphReplayNode, _GraphStatus
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
-from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
+from megatron.core.transformer.moe.token_dispatcher import (
+    MoEAlltoAllTokenDispatcher,
+    MoEFlexTokenDispatcher,
+    _pad_nonuniform_flex_dispatch_slots,
+)
 
 
 class _FakeWork:
@@ -335,6 +341,71 @@ def test_ep64_ep48_round_robin_placement_limits_owner_source_fanout():
         _source_ep_ranks_for_owner(placement, owner_rank, 192, 48) for owner_rank in range(48)
     ]
     assert max(map(len, source_groups)) == 2
+
+
+def test_nondivisible_ep8_ep6_uses_balanced_logical_experts_and_virtual_slots():
+    owner_slots = compute_nonuniform_ep_owner_expert_slots(16, 6)
+    assert owner_slots == [
+        [0, 1, 2],
+        [3, 4, 5],
+        [6, 7, 8],
+        [9, 10, 11],
+        [12, 13, None],
+        [14, 15, None],
+    ]
+
+    reduced_placement, reduced_gather_map = compute_nonuniform_ep_expert_placement(16, 6, 6)
+    assert reduced_placement == [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11], [12, 13], [14, 15]]
+    assert reduced_gather_map == {}
+    assert compute_nonuniform_ep_dispatch_slots(reduced_placement, 16) == owner_slots
+
+    full_placement, full_gather_map = compute_nonuniform_ep_expert_placement(16, 8, 6)
+    assert full_placement == [[0, 1], [3, 4], [6, 7], [9, 10], [12, 13], [14, 15], [2, 5], [8, 11]]
+    assert full_gather_map == {6: [(0, 0, 2), (1, 1, 2)], 7: [(0, 2, 2), (1, 3, 2)]}
+    assert compute_nonuniform_ep_dispatch_slots(full_placement, 16) == full_placement
+    assert sorted(expert_id for experts in full_placement for expert_id in experts) == list(
+        range(16)
+    )
+
+
+def test_flex_metadata_maps_logical_experts_to_padded_ep6_slots():
+    owner_slots = compute_nonuniform_ep_owner_expert_slots(16, 6)
+    dispatch_slots = _pad_nonuniform_flex_dispatch_slots(owner_slots, 6, "hybridep")
+    assert dispatch_slots == [
+        [0, 1, 2, None],
+        [3, 4, 5, None],
+        [6, 7, 8, None],
+        [9, 10, 11, None],
+        [12, 13, None, None],
+        [14, 15, None, None],
+    ]
+
+    dispatcher = MoEFlexTokenDispatcher.__new__(MoEFlexTokenDispatcher)
+    dispatcher.ep_size = 6
+    dispatcher.tp_size = 1
+    dispatcher.num_local_expert_slots = 4
+    physical_slots = [
+        0 if expert_id is None else expert_id for slots in dispatch_slots for expert_id in slots
+    ]
+    active_slots = [expert_id is not None for slots in dispatch_slots for expert_id in slots]
+    dispatcher._dispatch_expert_axis = torch.tensor(physical_slots)
+    dispatcher._dispatch_expert_slot_mask = torch.tensor(active_slots)
+
+    routing_map = torch.eye(16, dtype=torch.bool)
+    probs = torch.eye(16, dtype=torch.float32)
+    physical_map, physical_probs = dispatcher._initialize_metadata(routing_map, probs)
+
+    assert physical_map.shape == (16, 6, 4)
+    assert physical_probs.shape == (16, 6, 4)
+    flat_map = physical_map.reshape(16, 24)
+    flat_probs = physical_probs.reshape(16, 24)
+    for physical_index, expert_id in enumerate(physical_slots):
+        if active_slots[physical_index]:
+            assert flat_map[:, physical_index].equal(routing_map[:, expert_id])
+            assert flat_probs[:, physical_index].equal(probs[:, expert_id])
+        else:
+            assert not flat_map[:, physical_index].any()
+            assert torch.count_nonzero(flat_probs[:, physical_index]) == 0
 
 
 class TestNonuniformEPTokenRouting:

@@ -89,6 +89,7 @@ LOG_PARAMS_NORM="${LOG_PARAMS_NORM:-1}"
 LOG_NUM_ZEROS_IN_GRAD="${LOG_NUM_ZEROS_IN_GRAD:-1}"
 LOG_ENERGY="${LOG_ENERGY:-0}"
 MANUAL_GC_INTERVAL="${MANUAL_GC_INTERVAL:-10}"
+LOG_INTERVAL="${LOG_INTERVAL:-1}"
 NVLINK_SEGMENT_NODES="${NVLINK_SEGMENT_NODES:-}"
 
 for toggle in MOE_ROUTER_FORCE_LOAD_BALANCING MOE_ROUTER_FORCE_UNIFORM_ROUTING NONUNIFORM_SKIP_OPTIMIZER_STEP; do
@@ -375,7 +376,7 @@ options=" \
     ${high_priority_stream_args} \
     --ddp-num-buckets ${DDP_NUM_BUCKETS} \
     --attention-backend flash \
-    --log-interval 1 \
+    --log-interval ${LOG_INTERVAL} \
     --log-memory-interval 50 \
     ${diagnostic_logging_args} \
     --log-throughput \

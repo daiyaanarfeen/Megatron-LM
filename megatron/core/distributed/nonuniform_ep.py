@@ -34,7 +34,9 @@ from .distributed_data_parallel import DistributedDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .nonuniform_common import (
     NonuniformEPRankGenerator,
+    compute_nonuniform_ep_dispatch_slots,
     compute_nonuniform_ep_expert_placement,
+    compute_nonuniform_ep_owner_expert_slots,
     configure_ordered_bucket_group_scheduler,
     filter_kwargs_for_callable,
     get_global_rank,
@@ -608,14 +610,15 @@ def _copy_flat_into_bucket(bucket, slices: List[Tuple[int, int]], flat: torch.Te
 def _source_ep_ranks_for_owner(
     expert_placement: List[List[int]], owner_ep_rank: int, num_experts: int, min_ep_size: int
 ) -> List[int]:
-    """Return EP ranks that physically hold an owner's expert range."""
-    experts_per_owner = num_experts // min_ep_size
-    owner_first_expert = owner_ep_rank * experts_per_owner
-    owner_last_expert = owner_first_expert + experts_per_owner
+    """Return EP ranks that physically hold one owner's logical experts."""
+    owner_slots = compute_nonuniform_ep_owner_expert_slots(num_experts, min_ep_size)
+    owner_expert_ids = {
+        expert_id for expert_id in owner_slots[owner_ep_rank] if expert_id is not None
+    }
     return [
         source_ep_rank
         for source_ep_rank, expert_ids in enumerate(expert_placement)
-        if any(owner_first_expert <= expert_id < owner_last_expert for expert_id in expert_ids)
+        if owner_expert_ids.intersection(expert_ids)
     ]
 
 
@@ -822,10 +825,11 @@ def initialize_nonuniform_ep_process_groups(
 
     for replica_index, num_tp_cp in enumerate(num_tp_cp_per_replica):
         local_ep_size = num_tp_cp * tp * cp // etp
-        if num_moe_experts % local_ep_size != 0:
+        if num_moe_experts < local_ep_size:
             raise RuntimeError(
-                f"num_moe_experts ({num_moe_experts}) must be divisible by local EP "
-                f"size {local_ep_size} for replica {replica_index}"
+                "Nonuniform EP currently requires at least one logical expert per local EP "
+                f"rank; replica {replica_index} has num_moe_experts={num_moe_experts}, "
+                f"local_ep_size={local_ep_size}"
             )
 
     timeout = timedelta(minutes=distributed_timeout_minutes)
@@ -1065,6 +1069,11 @@ def initialize_nonuniform_ep_process_groups(
     _set_parallel_state_attr("_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP", dist.group.WORLD)
     parallel_state._set_global_memory_buffer()
 
+    replica_ep_sizes = [num_tp_cp * tp * cp // etp for num_tp_cp in num_tp_cp_per_replica]
+    has_nondivisible_expert_placement = any(
+        num_moe_experts % replica_ep_size != 0 for replica_ep_size in replica_ep_sizes
+    )
+
     local_ep_size = None
     for replica_index, num_tp_cp in enumerate(num_tp_cp_per_replica):
         replica_start = generator.replica_offsets[replica_index]
@@ -1083,6 +1092,16 @@ def initialize_nonuniform_ep_process_groups(
         min_ep_size,
         preferred_follower_fanout=2 if zero_sm_reshard else 1,
     )
+    owner_expert_slots = compute_nonuniform_ep_owner_expert_slots(num_moe_experts, min_ep_size)
+    expert_to_owner = {}
+    expert_to_owner_slot = {}
+    for owner_ep_rank, owner_slots in enumerate(owner_expert_slots):
+        for owner_slot, expert_id in enumerate(owner_slots):
+            if expert_id is None:
+                continue
+            expert_to_owner[expert_id] = owner_ep_rank
+            expert_to_owner_slot[expert_id] = owner_slot
+    dispatch_expert_slots = compute_nonuniform_ep_dispatch_slots(expert_placement, num_moe_experts)
     runtime_config = {
         "needs_reshard": local_ep_size > min_ep_size,
         "local_ep_size": local_ep_size,
@@ -1117,6 +1136,11 @@ def initialize_nonuniform_ep_process_groups(
         "is_b_leader": ep_rank < min_ep_size,
         "local_expert_indices": expert_placement[ep_rank],
         "expert_placement": expert_placement,
+        "dispatch_expert_slots": dispatch_expert_slots,
+        "owner_expert_slots": owner_expert_slots,
+        "has_nondivisible_expert_placement": has_nondivisible_expert_placement,
+        "expert_to_owner": expert_to_owner,
+        "expert_to_owner_slot": expert_to_owner_slot,
         "expert_gather_map": expert_gather_map,
         "zero_sm_reshard": zero_sm_reshard,
     }
@@ -1135,12 +1159,22 @@ def _owner_for_expert(
     if explicit_owner is not None and expert_id in explicit_owner:
         return explicit_owner[expert_id]
 
+    expert_to_owner = runtime_config.get("expert_to_owner")
+    if expert_to_owner is not None:
+        try:
+            return int(expert_to_owner[expert_id])
+        except KeyError as exc:
+            raise RuntimeError(f"NEP has no owner mapping for expert {expert_id}") from exc
+
     min_ep_size = runtime_config.get("min_ep_size")
     placement = runtime_config.get("expert_placement")
     if min_ep_size is not None and placement is not None:
         num_experts = sum(len(experts) for experts in placement)
-        experts_per_owner = num_experts // min_ep_size
-        return min(expert_id // experts_per_owner, min_ep_size - 1)
+        owner_slots = compute_nonuniform_ep_owner_expert_slots(num_experts, min_ep_size)
+        for owner_ep_rank, slots in enumerate(owner_slots):
+            if expert_id in slots:
+                return owner_ep_rank
+        raise RuntimeError(f"NEP has no owner mapping for expert {expert_id}")
 
     ep_rank = runtime_config["ep_rank"]
     return ep_rank
@@ -2007,18 +2041,23 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             num_experts = local_ep_size
         else:
             num_experts = sum(len(experts) for experts in placement)
-        if num_experts % min_ep_size != 0:
+        owner_expert_slots = cfg.get("owner_expert_slots")
+        if owner_expert_slots is None:
+            owner_expert_slots = compute_nonuniform_ep_owner_expert_slots(num_experts, min_ep_size)
+        if len(owner_expert_slots) != min_ep_size:
             raise RuntimeError(
-                f"NEP NCCL owner layout requires num_experts ({num_experts}) to be "
-                f"divisible by min_ep_size ({min_ep_size})"
+                "NEP owner-slot row count must equal min_ep_size: "
+                f"got {len(owner_expert_slots)} and {min_ep_size}"
             )
+        experts_per_owner = len(owner_expert_slots[0])
+        if any(len(slots) != experts_per_owner for slots in owner_expert_slots):
+            raise RuntimeError("NEP owner-layout communication requires fixed-width owner slots")
         expert_stride = getattr(self, "_nep_nccl_expert_stride", None)
         if expert_stride is None:
             expert_stride = self._nep_nccl_slot_numel
         if expert_stride is None:
             raise RuntimeError("NEP NCCL bucket group is missing slot-size metadata")
 
-        experts_per_owner = num_experts // min_ep_size
         owner_numel = experts_per_owner * expert_stride
         target_chunks = _get_nep_nccl_target_chunks()
         max_gather_bytes = _get_nep_nccl_max_gather_bytes()
@@ -2034,6 +2073,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             "min_ep_size": min_ep_size,
             "num_experts": num_experts,
             "experts_per_owner": experts_per_owner,
+            "owner_expert_slots": owner_expert_slots,
             "expert_stride": expert_stride,
             "owner_numel": owner_numel,
             "target_chunks": target_chunks,
@@ -2070,27 +2110,50 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             )
         return transfer_group, transfer_rank, transfer_size, transfer_ranks
 
+    def _nep_nccl_owner_expert_ids(self, owner_ep_rank: int) -> List[int]:
+        """Return logical experts assigned to one fixed-width owner row."""
+        layout = self._get_nep_nccl_owner_layout()
+        return [
+            expert_id
+            for expert_id in layout["owner_expert_slots"][owner_ep_rank]
+            if expert_id is not None
+        ]
+
+    def _nep_nccl_owner_slot_for_expert(self, expert_id: int) -> Tuple[int, int]:
+        """Return ``(owner rank, owner-local physical slot)`` for a logical expert."""
+        cfg = self._nep_runtime_config
+        expert_to_owner = cfg.get("expert_to_owner")
+        expert_to_owner_slot = cfg.get("expert_to_owner_slot")
+        if expert_to_owner is not None and expert_to_owner_slot is not None:
+            try:
+                return int(expert_to_owner[expert_id]), int(expert_to_owner_slot[expert_id])
+            except KeyError as exc:
+                raise RuntimeError(f"NEP has no owner slot for expert {expert_id}") from exc
+
+        layout = self._get_nep_nccl_owner_layout()
+        for owner_ep_rank, owner_slots in enumerate(layout["owner_expert_slots"]):
+            if expert_id in owner_slots:
+                return owner_ep_rank, owner_slots.index(expert_id)
+        raise RuntimeError(f"NEP has no owner slot for expert {expert_id}")
+
     def _nep_nccl_owner_entries(self, owner_ep_rank: int) -> List[dict]:
         """Return local expert-slot entries that contribute to an owner-layout chunk."""
-        layout = self._get_nep_nccl_owner_layout()
-        experts_per_owner = layout["experts_per_owner"]
-        owner_first_expert = owner_ep_rank * experts_per_owner
-        owner_last_expert = owner_first_expert + experts_per_owner
-        return [
-            entry
-            for entry in self._nep_nccl_entries
-            if owner_first_expert <= entry["expert_id"] < owner_last_expert
-        ]
+        owner_expert_ids = set(self._nep_nccl_owner_expert_ids(owner_ep_rank))
+        return [entry for entry in self._nep_nccl_entries if entry["expert_id"] in owner_expert_ids]
 
     @staticmethod
     def _nep_nccl_entry_key(entry: dict) -> tuple:
         return entry.get("entry_key", (entry["expert_id"], entry.get("slot_index", 0)))
 
-    def _nep_nccl_entry_owner_start(self, entry: dict, owner_first_expert: int) -> int:
+    def _nep_nccl_entry_owner_start(self, entry: dict, owner_ep_rank: int) -> int:
         expert_stride = getattr(self, "_nep_nccl_expert_stride", self._nep_nccl_slot_numel)
-        return (entry["expert_id"] - owner_first_expert) * expert_stride + entry.get(
-            "slot_offset", 0
-        )
+        mapped_owner, owner_slot = self._nep_nccl_owner_slot_for_expert(entry["expert_id"])
+        if mapped_owner != owner_ep_rank:
+            raise RuntimeError(
+                f"Expert {entry['expert_id']} belongs to owner {mapped_owner}, "
+                f"not requested owner {owner_ep_rank}"
+            )
+        return owner_slot * expert_stride + entry.get("slot_offset", 0)
 
     def _nep_nccl_owner_task_ready(
         self, owner_ep_rank: int, respect_dispatch_boundary: bool = True
@@ -2143,19 +2206,12 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         self, owner_ep_rank: int, chunk_start: int, chunk_end: int, chunk: torch.Tensor
     ) -> None:
         """Pack local source grads into a common owner-rank layout chunk."""
-        experts_per_owner = self._nep_nccl_experts_per_owner
-        owner_first_expert = owner_ep_rank * experts_per_owner
 
         def build_views():
             destinations = []
             sources = []
-            for entry in self._nep_nccl_entries:
-                expert_id = entry["expert_id"]
-                owner_local_expert_index = expert_id - owner_first_expert
-                if owner_local_expert_index < 0 or owner_local_expert_index >= experts_per_owner:
-                    continue
-
-                entry_start = self._nep_nccl_entry_owner_start(entry, owner_first_expert)
+            for entry in self._nep_nccl_owner_entries(owner_ep_rank):
+                entry_start = self._nep_nccl_entry_owner_start(entry, owner_ep_rank)
                 entry_end = entry_start + entry["numel"]
                 overlap_start = max(chunk_start, entry_start)
                 overlap_end = min(chunk_end, entry_end)
@@ -2202,14 +2258,17 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         slot_numels = getattr(self, "_nep_nccl_slot_numels", (self._nep_nccl_slot_numel,))
         slot_offsets = getattr(self, "_nep_nccl_slot_offsets", (0,))
         expert_stride = getattr(self, "_nep_nccl_expert_stride", self._nep_nccl_slot_numel)
-        experts_per_owner = self._nep_nccl_experts_per_owner
-        owner_first_expert = owner_ep_rank * experts_per_owner
-        owner_last_expert = owner_first_expert + experts_per_owner
+        owner_expert_ids = set(self._nep_nccl_owner_expert_ids(owner_ep_rank))
         segments = []
         for expert_id in source_expert_ids:
-            if expert_id < owner_first_expert or expert_id >= owner_last_expert:
+            if expert_id not in owner_expert_ids:
                 continue
-            expert_start = (expert_id - owner_first_expert) * expert_stride
+            mapped_owner, owner_slot = self._nep_nccl_owner_slot_for_expert(expert_id)
+            if mapped_owner != owner_ep_rank:
+                raise RuntimeError(
+                    f"Expert {expert_id} maps to owner {mapped_owner}, not {owner_ep_rank}"
+                )
+            expert_start = owner_slot * expert_stride
             for slot_index, (slot_offset, slot_numel) in enumerate(zip(slot_offsets, slot_numels)):
                 entry_start = expert_start + slot_offset
                 overlap_start = max(chunk_start, entry_start)
@@ -2460,19 +2519,12 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         self, owner_ep_rank: int, chunk_start: int, chunk_end: int, chunk: torch.Tensor
     ) -> None:
         """Copy a reduced common owner-rank layout chunk back to local source grads."""
-        experts_per_owner = self._nep_nccl_experts_per_owner
-        owner_first_expert = owner_ep_rank * experts_per_owner
 
         def build_views():
             destinations = []
             sources = []
-            for entry in self._nep_nccl_entries:
-                expert_id = entry["expert_id"]
-                owner_local_expert_index = expert_id - owner_first_expert
-                if owner_local_expert_index < 0 or owner_local_expert_index >= experts_per_owner:
-                    continue
-
-                entry_start = self._nep_nccl_entry_owner_start(entry, owner_first_expert)
+            for entry in self._nep_nccl_owner_entries(owner_ep_rank):
+                entry_start = self._nep_nccl_entry_owner_start(entry, owner_ep_rank)
                 entry_end = entry_start + entry["numel"]
                 overlap_start = max(chunk_start, entry_start)
                 overlap_end = min(chunk_end, entry_end)
@@ -2505,12 +2557,10 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if placement is None:
             return [owner_ep_rank]
 
-        experts_per_owner = self._nep_nccl_experts_per_owner
-        owner_first_expert = owner_ep_rank * experts_per_owner
-        owner_last_expert = owner_first_expert + experts_per_owner
+        owner_expert_ids = set(self._nep_nccl_owner_expert_ids(owner_ep_rank))
         source_ranks = []
         for source_ep_rank, expert_ids in enumerate(placement):
-            if any(owner_first_expert <= expert_id < owner_last_expert for expert_id in expert_ids):
+            if owner_expert_ids.intersection(expert_ids):
                 source_ranks.append(source_ep_rank)
         return source_ranks
 
@@ -6227,6 +6277,87 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 )
             self._configure_nep_dispatch_boundary_hooks()
         self._configure_expert_gradient_scaling(config, runtime_config)
+        if self.nonuniform_ep_config.approach == NonuniformEPApproach.NCCL and runtime_config.get(
+            "has_nondivisible_expert_placement", False
+        ):
+            self._synchronize_nondivisible_expert_parameters()
+
+    @torch.no_grad()
+    def _synchronize_nondivisible_expert_parameters(self) -> None:
+        """Give every physical holder the same logical expert parameters.
+
+        Uniform EP initializes equal-shaped expert tensors deterministically on
+        every EDP replica. Non-divisible EP does not: for example, EP8 creates
+        two-expert tensors while EP6 creates a mix of two- and three-expert
+        tensors, so their RNG streams differ. Reuse the Approach-A owner layout
+        and existing process groups once at DDP construction time:
+
+        1. gather each replica's physical expert shards into owner layouts;
+        2. broadcast the first EDP owner's layout to the other replicas;
+        3. broadcast that layout back to every physical holder in each replica.
+
+        This is startup-only synchronization; it adds no training-iteration work.
+        """
+        runtime_config = self._nonuniform_ep_runtime_config
+        ep_rank = runtime_config["ep_rank"]
+        ep_group = runtime_config["ep_group"]
+        edp_group = runtime_config.get("edp_group")
+
+        for bucket_group in self.expert_parallel_bucket_groups:
+            layout = bucket_group._get_nep_nccl_owner_layout()
+            for owner_ep_rank in range(layout["min_ep_size"]):
+                transfer_group, _, transfer_size, transfer_ranks = (
+                    bucket_group._get_nep_nccl_transfer_group_info(owner_ep_rank)
+                )
+                if ep_rank not in transfer_ranks:
+                    continue
+
+                local_entries = bucket_group._nep_nccl_owner_entries(owner_ep_rank)
+                if not local_entries:
+                    raise RuntimeError(
+                        "NEP parameter synchronization found no local expert entries for "
+                        f"owner={owner_ep_rank}, ep_rank={ep_rank}"
+                    )
+                reference_param = local_entries[0]["bucket"].params_list[0]
+                owner_params = torch.zeros(
+                    layout["owner_numel"],
+                    dtype=reference_param.dtype,
+                    device=reference_param.device,
+                )
+                for entry in local_entries:
+                    params = entry["bucket"].params_list
+                    if len(params) != 1 or params[0].numel() != entry["numel"]:
+                        raise RuntimeError(
+                            "NEP parameter synchronization requires one exact parameter "
+                            f"per expert entry; got params={len(params)}, "
+                            f"param_numel={sum(param.numel() for param in params)}, "
+                            f"entry_numel={entry['numel']}"
+                        )
+                    start = bucket_group._nep_nccl_entry_owner_start(entry, owner_ep_rank)
+                    owner_params[start : start + entry["numel"]].copy_(params[0].detach().view(-1))
+
+                if transfer_group is not None and transfer_size > 1:
+                    dist.all_reduce(owner_params, group=transfer_group)
+
+                if ep_rank == owner_ep_rank and edp_group is not None and edp_group.size() > 1:
+                    dist.broadcast(owner_params, src=get_global_rank(edp_group, 0), group=edp_group)
+
+                if transfer_group is not None and transfer_size > 1:
+                    dist.broadcast(
+                        owner_params,
+                        src=get_global_rank(ep_group, owner_ep_rank),
+                        group=transfer_group,
+                    )
+
+                for entry in local_entries:
+                    start = bucket_group._nep_nccl_entry_owner_start(entry, owner_ep_rank)
+                    entry["bucket"].params_list[0].copy_(
+                        owner_params[start : start + entry["numel"]].view_as(
+                            entry["bucket"].params_list[0]
+                        )
+                    )
+
+        _nep_debug_print("synchronized non-divisible logical expert parameters")
 
     @staticmethod
     def _find_nep_local_cuda_graph_manager(module_name: str, named_modules: dict):

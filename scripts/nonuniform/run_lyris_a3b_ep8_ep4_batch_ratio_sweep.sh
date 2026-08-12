@@ -29,6 +29,7 @@ CASE_PROFILE_STEP_START="${CASE_PROFILE_STEP_START:-3}"
 CASE_PROFILE_STEP_END="${CASE_PROFILE_STEP_END:-4}"
 CASE_PROFILE_RANKS="${CASE_PROFILE_RANKS:-all}"
 CASE_EXTRA_MEGATRON_ARGS="${CASE_EXTRA_MEGATRON_ARGS:-}"
+CASE_DISABLE_NONGRAD_SYNC_COLLECTIVES="${CASE_DISABLE_NONGRAD_SYNC_COLLECTIVES:-0}"
 CASE_TRAIN_ITERS="${CASE_TRAIN_ITERS:-8}"
 CASE_LR_WSD_DECAY_ITERS="${CASE_LR_WSD_DECAY_ITERS:-4}"
 CASE_LOG_PARAMS_NORM="${CASE_LOG_PARAMS_NORM:-1}"
@@ -74,6 +75,13 @@ case "${INITIAL_SKIP_PREFLIGHT}" in
     0|1) ;;
     *)
         echo "INITIAL_SKIP_PREFLIGHT must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
+case "${CASE_DISABLE_NONGRAD_SYNC_COLLECTIVES}" in
+    0|1) ;;
+    *)
+        echo "CASE_DISABLE_NONGRAD_SYNC_COLLECTIVES must be 0 or 1" >&2
         exit 2
         ;;
 esac
@@ -133,6 +141,9 @@ run_case() {
     local skip_preflight=1
     local profile_ranks
     local master_port
+    local extra_megatron_args="--calculate-per-token-loss ${CASE_EXTRA_MEGATRON_ARGS}"
+    local exit_duration_in_mins=9
+    local log_interval=1
 
     if [[ "${mode}" == "ep" ]]; then
         split_host_phases=1
@@ -148,6 +159,11 @@ run_case() {
     fi
     master_port=$((30500 + case_index))
     case_index=$((case_index + 1))
+    if [[ "${CASE_DISABLE_NONGRAD_SYNC_COLLECTIVES}" == "1" ]]; then
+        extra_megatron_args="--no-check-for-nan-in-loss-and-grad --rerun-mode disabled --nonuniform-disable-nongrad-sync-collectives --nonuniform-log-local-iteration-times ${CASE_EXTRA_MEGATRON_ARGS}"
+        exit_duration_in_mins=0
+        log_interval=50
+    fi
 
     echo "[ep8-ep4-batch-ratio] $(date --iso-8601=seconds) starting ${name}"
     timeout --foreground --signal=TERM --kill-after=45s "${CASE_TIMEOUT}" \
@@ -189,7 +205,8 @@ run_case() {
             LOG_NUM_ZEROS_IN_GRAD="${CASE_LOG_NUM_ZEROS_IN_GRAD}" \
             LOG_ENERGY="${CASE_LOG_ENERGY}" \
             MANUAL_GC_INTERVAL="${CASE_MANUAL_GC_INTERVAL}" \
-            EXTRA_MEGATRON_ARGS="--calculate-per-token-loss ${CASE_EXTRA_MEGATRON_ARGS}" \
+            LOG_INTERVAL="${log_interval}" \
+            EXTRA_MEGATRON_ARGS="${extra_megatron_args}" \
             HIGH_PRIORITY_STREAM_GROUPS=ep \
             CUDA_DEVICE_MAX_CONNECTIONS=32 \
             NCCL_LAUNCH_ORDER_IMPLICIT=1 \
@@ -218,7 +235,7 @@ run_case() {
             MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_OWNER_GRAD_CHECK="${CASE_SKIP_OWNER_GRAD_CHECK}" \
             MEGATRON_NONUNIFORM_EP_OVERLAP_DEBUG=0 \
             DISTRIBUTED_TIMEOUT_MINUTES=4 \
-            EXIT_DURATION_IN_MINS=9 \
+            EXIT_DURATION_IN_MINS="${exit_duration_in_mins}" \
             USE_GLOO_PROCESS_GROUPS=1 \
             SKIP_PREFLIGHT="${skip_preflight}" \
             bash "${RUNNER}"

@@ -388,6 +388,9 @@ def _make_fake_te_namespace():
             self.glu_interleave_size = glu_interleave_size
             self.limit = limit
 
+    class FakeScaledSReLU(torch.nn.Module):
+        pass
+
     class FakeSequential(list):
         def register_forward_pre_hook(self, hook):
             self.forward_pre_hook = hook
@@ -400,6 +403,7 @@ def _make_fake_te_namespace():
                     GroupedLinear=FakeGroupedLinear,
                     ScaledSwiGLU=FakeScaledSwiGLU,
                     ScaledClampedQGeGLU=FakeScaledClampedQGeGLU,
+                    ScaledSReLU=FakeScaledSReLU,
                     Sequential=FakeSequential,
                 ),
             )
@@ -441,6 +445,39 @@ def test_make_fused_ops_uses_clamped_qgeglu_for_quick_gelu(monkeypatch):
     assert type(activation).__name__ == "FakeScaledClampedQGeGLU"
     assert activation.glu_interleave_size == 4
     assert activation.limit == 7.0
+
+
+def test_make_fused_ops_uses_scaled_srelu_for_weighted_squared_relu(monkeypatch):
+    """Weighted squared-ReLU uses TE's GPU-resident scaled activation op."""
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.config = SimpleNamespace(
+        moe_mlp_glu_interleave_size=None,
+        delay_wgrad_compute=False,
+        activation_func_clamp_value=None,
+        gated_linear_unit=False,
+        use_fused_weighted_squared_relu=True,
+    )
+    module.activation_func = experts_module.squared_relu
+    common = dict(
+        device="cuda",
+        dtype=torch.bfloat16,
+        accumulate_into_main_grad=False,
+        single_grouped_weight=False,
+    )
+    module.linear_fc1 = FakeGroupedLinear(2, 4, 8, bias=False, **common)
+    module.linear_fc2 = FakeGroupedLinear(2, 8, 4, bias=False, **common)
+    module.linear_fc1.weight0 = torch.nn.Parameter(torch.ones(8, 4))
+    module.linear_fc1.weight1 = torch.nn.Parameter(torch.ones(8, 4))
+    module.linear_fc2.weight0 = torch.nn.Parameter(torch.ones(4, 8))
+    module.linear_fc2.weight1 = torch.nn.Parameter(torch.ones(4, 8))
+
+    ops = module._make_fused_ops()
+
+    assert type(ops[1]).__name__ == "FakeScaledSReLU"
 
 
 def test_make_fused_ops_attaches_single_grouped_bias_for_fc1(monkeypatch):

@@ -895,9 +895,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             use_nccl_stream=self.use_nccl_stream,
             a2a_burst_scheduler=self._model_ep_a2a_burst_scheduler,
             a2a_burst_role=(
-                _A2A_BURST_COMBINE
-                if self._model_ep_a2a_burst_scheduler is not None
-                else None
+                _A2A_BURST_COMBINE if self._model_ep_a2a_burst_scheduler is not None else None
             ),
         )
         if self.shared_experts is not None:
@@ -1451,6 +1449,25 @@ class _DeepepManager(_DispatchManager):
         return hidden_states
 
 
+def _pad_nonuniform_flex_dispatch_slots(
+    dispatch_expert_slots: List[List[Optional[int]]], ep_size: int, backend: str
+) -> List[List[Optional[int]]]:
+    """Add only the virtual expert slots required by a Flex backend.
+
+    HybridEP's TMA metadata requires the physical expert count in an NVLink
+    domain to be divisible by four. The EP8/EP6 test places each replica in one
+    NVLink domain, so pad the per-rank virtual width until the group-wide count
+    satisfies that constraint. These slots never create expert modules,
+    parameters, gradients, or optimizer state.
+    """
+    padded_slots = [list(slots) for slots in dispatch_expert_slots]
+    if backend == "hybridep":
+        while (len(padded_slots[0]) * ep_size) % 4 != 0:
+            for slots in padded_slots:
+                slots.append(None)
+    return padded_slots
+
+
 class MoEFlexTokenDispatcher(MoETokenDispatcher):
     """A flexible token dispatcher that abstracts the underlying tensor and expert
     parallelism. It uses a single communication group over all TP and EP ranks,
@@ -1477,31 +1494,79 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
         self.num_local_experts = num_local_experts
         self.local_expert_indices = local_expert_indices
-        from megatron.core.distributed.nonuniform_common import (
-            get_nonuniform_ep_expert_axis_permutation,
-        )
+        from megatron.core.distributed.nonuniform_common import get_nonuniform_ep_runtime_config
 
-        expert_axis_permutation = get_nonuniform_ep_expert_axis_permutation(config.num_moe_experts)
-        if expert_axis_permutation not in (None, list(range(config.num_moe_experts))):
-            raise RuntimeError(
-                "NEP placement-aware token routing currently supports allgather and "
-                "alltoall token dispatchers. Use --moe-token-dispatcher-type alltoall."
+        runtime_config = get_nonuniform_ep_runtime_config()
+        dispatch_expert_slots = (
+            runtime_config.get('dispatch_expert_slots') if runtime_config is not None else None
+        )
+        if dispatch_expert_slots is None:
+            self.num_local_expert_slots = self.num_local_experts
+            self._dispatch_expert_axis = None
+            self._dispatch_expert_slot_mask = None
+            self._active_local_expert_slots = None
+            num_dispatch_experts = self.config.num_moe_experts
+        else:
+            dispatch_expert_slots = _pad_nonuniform_flex_dispatch_slots(
+                dispatch_expert_slots, self.ep_size, self.config.moe_flex_dispatcher_backend
             )
+            if len(dispatch_expert_slots) != self.ep_size:
+                raise RuntimeError(
+                    "NEP Flex dispatch placement must have one row per local EP rank: "
+                    f"got {len(dispatch_expert_slots)}, expected {self.ep_size}"
+                )
+            self.num_local_expert_slots = len(dispatch_expert_slots[0])
+            if self.num_local_expert_slots == 0 or any(
+                len(slots) != self.num_local_expert_slots for slots in dispatch_expert_slots
+            ):
+                raise RuntimeError("NEP Flex dispatch requires nonempty fixed-width rank slots")
+
+            local_slots = dispatch_expert_slots[self.ep_rank]
+            active_local_expert_slots = [
+                slot_index
+                for slot_index, expert_id in enumerate(local_slots)
+                if expert_id is not None
+            ]
+            active_local_expert_ids = [
+                int(expert_id) for expert_id in local_slots if expert_id is not None
+            ]
+            if active_local_expert_ids != list(self.local_expert_indices):
+                raise RuntimeError(
+                    "NEP Flex dispatch slots must preserve this rank's logical expert order: "
+                    f"slots={active_local_expert_ids}, local={self.local_expert_indices}"
+                )
+
+            flattened_slots = [expert_id for slots in dispatch_expert_slots for expert_id in slots]
+            dispatch_expert_axis = [
+                0 if expert_id is None else int(expert_id) for expert_id in flattened_slots
+            ]
+            dispatch_expert_slot_mask = [expert_id is not None for expert_id in flattened_slots]
+            self._dispatch_expert_axis = torch.tensor(
+                dispatch_expert_axis, dtype=torch.long, device='cuda'
+            )
+            self._dispatch_expert_slot_mask = torch.tensor(
+                dispatch_expert_slot_mask, dtype=torch.bool, device='cuda'
+            )
+            self._active_local_expert_slots = torch.tensor(
+                active_local_expert_slots, dtype=torch.long, device='cuda'
+            )
+            num_dispatch_experts = len(flattened_slots)
+
         if self.config.moe_flex_dispatcher_backend == "deepep":
             assert self.tp_size * self.ep_size > 1, "DeepEP dispatcher requires TPxEP > 1"
             self._comm_manager = _DeepepManager(
                 group=self.tp_ep_group,
-                num_local_experts=self.num_local_experts,
+                num_local_experts=self.num_local_expert_slots,
                 router_topk=self.tp_size * self.config.moe_router_topk,
-                num_experts=self.tp_size * self.config.num_moe_experts,
+                num_experts=self.tp_size * num_dispatch_experts,
                 config=self.config,
             )
             self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
         elif self.config.moe_flex_dispatcher_backend == "hybridep":
             self._comm_manager = _HybridEPManager(
                 group=self.tp_ep_group,
-                num_local_experts=self.num_local_experts,
-                num_experts=self.tp_size * self.config.num_moe_experts,
+                num_local_experts=self.num_local_expert_slots,
+                num_experts=self.tp_size * num_dispatch_experts,
                 config=self.config,
             )
             self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.routing_map']
@@ -1526,16 +1591,22 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         """
         num_local_tokens = routing_map.shape[0]
         world_size = self.tp_size * self.ep_size
+        if self._dispatch_expert_axis is not None:
+            routing_map = routing_map.index_select(1, self._dispatch_expert_axis)
+            routing_map = routing_map & self._dispatch_expert_slot_mask.unsqueeze(0)
+            probs = probs.index_select(1, self._dispatch_expert_axis)
+            probs = probs * self._dispatch_expert_slot_mask.unsqueeze(0)
+
         # Organize routing map and probs to [num_local_tokens, world_size, num_local_experts]
         routing_map = (
-            routing_map.reshape(num_local_tokens, self.ep_size, 1, self.num_local_experts)
+            routing_map.reshape(num_local_tokens, self.ep_size, 1, self.num_local_expert_slots)
             .expand(-1, -1, self.tp_size, -1)
-            .reshape(num_local_tokens, world_size, self.num_local_experts)
+            .reshape(num_local_tokens, world_size, self.num_local_expert_slots)
         ).contiguous()
         probs = (
-            probs.reshape(num_local_tokens, self.ep_size, 1, self.num_local_experts)
+            probs.reshape(num_local_tokens, self.ep_size, 1, self.num_local_expert_slots)
             .expand(-1, -1, self.tp_size, -1)
-            .reshape(num_local_tokens, world_size, self.num_local_experts)
+            .reshape(num_local_tokens, world_size, self.num_local_expert_slots)
         ).contiguous()
 
         return routing_map, probs
@@ -1619,6 +1690,10 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             self._comm_manager.get_permuted_hidden_states_by_experts(hidden_states)
         )
         tokens_per_expert = self._comm_manager.get_number_of_tokens_per_expert()
+        if self._active_local_expert_slots is not None:
+            tokens_per_expert = tokens_per_expert.index_select(
+                0, self._active_local_expert_slots.to(tokens_per_expert.device)
+            )
         return global_input_tokens, tokens_per_expert, permuted_probs
 
     def combine_preprocess(self, hidden_states: torch.Tensor):

@@ -21,6 +21,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+import megatron.training.training as training_module
 import pretrain_gpt as gpt
 from megatron.core import parallel_state
 from megatron.core.distributed.nonuniform_common import (
@@ -40,8 +41,6 @@ from megatron.core.distributed.nonuniform_tp import (
     ntp_init,
     ntp_map,
 )
-import megatron.training.training as training_module
-
 
 _NTP_GROUPS_INITIALIZED = False
 _NTP_CONFIG_CACHE = {}
@@ -64,9 +63,7 @@ def _load_json_arg(value: Optional[str], path: Optional[str], default=None):
 
 def _parse_ntp_non_active_map(args) -> Optional[Dict[object, list]]:
     raw_map = _load_json_arg(
-        args.nonuniform_tp_non_active_ranks_json,
-        args.nonuniform_tp_non_active_ranks_path,
-        None,
+        args.nonuniform_tp_non_active_ranks_json, args.nonuniform_tp_non_active_ranks_path, None
     )
     if raw_map is None:
         return None
@@ -76,9 +73,7 @@ def _parse_ntp_non_active_map(args) -> Optional[Dict[object, list]]:
         if "," in str(key):
             parsed_key = tuple(int(part.strip()) for part in str(key).split(","))
             if len(parsed_key) != 3:
-                raise ValueError(
-                    "NTP non-active rank map tuple keys must be 'dp,cp,pp' triples"
-                )
+                raise ValueError("NTP non-active rank map tuple keys must be 'dp,cp,pp' triples")
         else:
             parsed_key = int(key)
         parsed[parsed_key] = [int(rank) for rank in value]
@@ -123,9 +118,7 @@ def _ntp_model_provider(builder, ntp_config, exit_inactive_ranks, *provider_args
 def _build_ep_runtime_config(args):
     registered_runtime_config = get_nonuniform_ep_runtime_config()
     placement = _load_json_arg(
-        args.nonuniform_ep_placement_json,
-        args.nonuniform_ep_placement_path,
-        None,
+        args.nonuniform_ep_placement_json, args.nonuniform_ep_placement_path, None
     )
     if placement is None:
         return dict(registered_runtime_config) if registered_runtime_config is not None else None
@@ -152,9 +145,7 @@ def _build_ep_runtime_config(args):
         'local_ep_size': local_ep_size,
         'min_ep_size': min_ep_size,
         'num_replicas': max(1, parallel_state.get_data_parallel_world_size()),
-        'dp_size': max(
-            1, parallel_state.get_data_parallel_world_size(with_context_parallel=True)
-        ),
+        'dp_size': max(1, parallel_state.get_data_parallel_world_size(with_context_parallel=True)),
         'ep_group': ep_group,
         'edp_group': edp_group,
         'ep_rank': ep_rank,
@@ -165,9 +156,7 @@ def _build_ep_runtime_config(args):
 
 def _create_gloo_process_groups_arg(args):
     return getattr(
-        args,
-        "enable_gloo_process_groups",
-        getattr(args, "use_gloo_process_groups", True),
+        args, "enable_gloo_process_groups", getattr(args, "use_gloo_process_groups", True)
     )
 
 
@@ -244,10 +233,10 @@ def _initialize_model_parallel(*args, **kwargs):
                 f"num_tp_cp={num_tp_cp}, TP*CP={tp_cp}, ETP={etp}"
             )
         ep_size = num_tp_cp * tp_cp // etp
-        if megatron_args.num_experts % ep_size != 0:
+        if megatron_args.num_experts < ep_size:
             raise RuntimeError(
-                f"num_experts ({megatron_args.num_experts}) must be divisible by "
-                f"local EP size {ep_size}"
+                "Nonuniform EP currently requires at least one logical expert per local EP "
+                f"rank; got num_experts={megatron_args.num_experts}, local_ep_size={ep_size}"
             )
 
     runtime_config = initialize_nonuniform_ep_process_groups(
@@ -269,9 +258,7 @@ def _initialize_model_parallel(*args, **kwargs):
 
 def _build_ep_config(args) -> NonuniformEPConfig:
     expert_owner = _load_json_arg(
-        args.nonuniform_ep_expert_owner_json,
-        args.nonuniform_ep_expert_owner_path,
-        None,
+        args.nonuniform_ep_expert_owner_json, args.nonuniform_ep_expert_owner_path, None
     )
     if expert_owner is not None:
         expert_owner = {int(expert): int(owner) for expert, owner in expert_owner.items()}
@@ -363,10 +350,7 @@ def _canonical_grad_name(name, local_expert_indices):
         if part == 'local_experts' and parts[index + 1].isdigit():
             local_expert_index = int(parts[index + 1])
             break
-    if local_expert_index is None and len(parts) >= 2 and parts[-2] in (
-        'linear_fc1',
-        'linear_fc2',
-    ):
+    if local_expert_index is None and len(parts) >= 2 and parts[-2] in ('linear_fc1', 'linear_fc2'):
         for prefix in ('weight', 'bias'):
             suffix = parts[-1][len(prefix) :]
             if parts[-1].startswith(prefix) and suffix.isdigit():
@@ -419,10 +403,13 @@ def _log_nonuniform_grad_checksum(model, iteration):
                 if not getattr(param, 'allreduce', True)
                 else name
             )
-            name_weight = 1 + sum(
-                (index + 1) * ord(character)
-                for index, character in enumerate(canonical_name)
-            ) % 104729
+            name_weight = (
+                1
+                + sum(
+                    (index + 1) * ord(character) for index, character in enumerate(canonical_name)
+                )
+                % 104729
+            )
             target = expert_stats if not getattr(param, 'allreduce', True) else dense_stats
             target[0] += grad.sum(dtype=torch.float64) * name_weight
             target[1] += grad.abs().sum(dtype=torch.float64) * name_weight
@@ -432,8 +419,7 @@ def _log_nonuniform_grad_checksum(model, iteration):
 
     dist.all_reduce(dense_stats, group=parallel_state.get_model_parallel_group())
     dist.all_reduce(
-        expert_stats,
-        group=parallel_state.get_expert_tensor_model_pipeline_parallel_group(),
+        expert_stats, group=parallel_state.get_expert_tensor_model_pipeline_parallel_group()
     )
     stats = dense_stats + expert_stats
     checksum_line = (
@@ -491,10 +477,13 @@ def _log_nonuniform_param_checksum(model, iteration):
                 if not getattr(param, 'allreduce', True)
                 else name
             )
-            name_weight = 1 + sum(
-                (index + 1) * ord(character)
-                for index, character in enumerate(canonical_name)
-            ) % 104729
+            name_weight = (
+                1
+                + sum(
+                    (index + 1) * ord(character) for index, character in enumerate(canonical_name)
+                )
+                % 104729
+            )
             target = expert_stats if not getattr(param, 'allreduce', True) else dense_stats
             value = param.detach()
             target[0] += value.sum(dtype=torch.float64) * name_weight
@@ -503,10 +492,10 @@ def _log_nonuniform_param_checksum(model, iteration):
             target[3] += value.numel() * name_weight
             target[4] += value.numel()
 
+    local_expert_numel = expert_stats[4].clone()
     dist.all_reduce(dense_stats, group=parallel_state.get_model_parallel_group())
     dist.all_reduce(
-        expert_stats,
-        group=parallel_state.get_expert_tensor_model_pipeline_parallel_group(),
+        expert_stats, group=parallel_state.get_expert_tensor_model_pipeline_parallel_group()
     )
     stats = dense_stats + expert_stats
     checksum_line = (
@@ -525,7 +514,8 @@ def _log_nonuniform_param_checksum(model, iteration):
         f"expert_weighted_abs={expert_stats[1].item():.17e} "
         f"expert_weighted_sq={expert_stats[2].item():.17e} "
         f"expert_weighted_numel={expert_stats[3].item():.0f} "
-        f"expert_numel={expert_stats[4].item():.0f}"
+        f"expert_numel={expert_stats[4].item():.0f} "
+        f"local_expert_numel={local_expert_numel.item():.0f}"
     )
     print(checksum_line, flush=True)
     if args.nonuniform_param_checksum_dir is not None:
@@ -605,11 +595,7 @@ def _install_opt_in_ddp(args):
 
     class BenchmarkNonuniformEPDDP(NonuniformEPDistributedDataParallel):
         def __init__(self, *ddp_args, **kwargs):
-            super().__init__(
-                *ddp_args,
-                nonuniform_ep_config=_get_ep_config(args),
-                **kwargs,
-            )
+            super().__init__(*ddp_args, nonuniform_ep_config=_get_ep_config(args), **kwargs)
 
     training_module.DDP = BenchmarkNonuniformEPDDP
     parallel_state.initialize_model_parallel = _initialize_model_parallel
@@ -653,12 +639,7 @@ def _add_nonuniform_args(parser):
     )
 
     group.add_argument('--nonuniform-ep-min-size', type=int, default=None)
-    group.add_argument(
-        '--nonuniform-ep-num-tp-cp-per-replica',
-        nargs="+",
-        type=int,
-        default=None,
-    )
+    group.add_argument('--nonuniform-ep-num-tp-cp-per-replica', nargs="+", type=int, default=None)
     group.add_argument('--nonuniform-ep-placement-json', default=None)
     group.add_argument('--nonuniform-ep-placement-path', default=None)
     group.add_argument('--nonuniform-ep-expert-owner-json', default=None)
@@ -705,10 +686,7 @@ def _add_nonuniform_args(parser):
 
 if __name__ == "__main__":
     _MAIN_ENTRY_TIME = gpt.time.time()
-    gpt.set_startup_timestamps(
-        program_start=gpt._PROGRAM_START_TIME,
-        main_entry=_MAIN_ENTRY_TIME,
-    )
+    gpt.set_startup_timestamps(program_start=gpt._PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
 
     gpt.train_valid_test_datasets_provider.is_distributed = True
     pretrain, store = gpt.inprocess_restart.maybe_wrap_for_inprocess_restart(gpt.pretrain)

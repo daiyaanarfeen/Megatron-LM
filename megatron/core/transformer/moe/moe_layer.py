@@ -182,30 +182,26 @@ class BaseMoELayer(MegatronModule, ABC):
         ep_rank = utils.get_pg_rank(self.ep_group)
         assert ep_size > 0, "Expected non-negative expert parallel size"
 
-        assert self.config.num_moe_experts % ep_size == 0
-        self.num_local_experts = self.config.num_moe_experts // ep_size
-
-        self.use_shared_expert = self.config.moe_shared_expert_intermediate_size is not None
-        self.shared_expert_overlap = self.config.moe_shared_expert_overlap
-
         from megatron.core.distributed.nonuniform_common import (
             get_nonuniform_ep_local_expert_indices,
         )
 
         nonuniform_expert_indices = get_nonuniform_ep_local_expert_indices()
         if nonuniform_expert_indices is not None:
-            if len(nonuniform_expert_indices) != self.num_local_experts:
-                raise RuntimeError(
-                    "NEP local expert placement length must match this rank's "
-                    f"num_local_experts: got {len(nonuniform_expert_indices)}, "
-                    f"expected {self.num_local_experts}"
-                )
             self.local_expert_indices = nonuniform_expert_indices
+            self.num_local_experts = len(self.local_expert_indices)
+            if self.num_local_experts == 0:
+                raise RuntimeError("NEP currently requires at least one local logical expert")
         else:
+            assert self.config.num_moe_experts % ep_size == 0
+            self.num_local_experts = self.config.num_moe_experts // ep_size
             local_expert_indices_offset = ep_rank * self.num_local_experts
             self.local_expert_indices = [
                 local_expert_indices_offset + i for i in range(self.num_local_experts)
             ]
+
+        self.use_shared_expert = self.config.moe_shared_expert_intermediate_size is not None
+        self.shared_expert_overlap = self.config.moe_shared_expert_overlap
         assert all(map(lambda x: x < self.config.num_moe_experts, self.local_expert_indices))
         self.router: RouterInterface = None
         self.experts = None

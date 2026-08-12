@@ -136,104 +136,197 @@ def local_expert_indices_are_contiguous(local_expert_indices: Sequence[int]) -> 
     )
 
 
+def compute_nonuniform_ep_owner_expert_slots(
+    num_experts: int, min_ep_size: int
+) -> List[List[Optional[int]]]:
+    """Return balanced logical expert IDs in fixed-width owner slots.
+
+    The first ``num_experts % min_ep_size`` owners receive one additional
+    logical expert.  Every owner row is padded with ``None`` to
+    ``ceil(num_experts / min_ep_size)`` slots so communication layouts can stay
+    uniform without creating dummy expert parameters.
+    """
+    if min_ep_size <= 0:
+        raise RuntimeError(f"min_ep_size must be positive; got {min_ep_size}")
+    if num_experts < min_ep_size:
+        raise RuntimeError(
+            "NEP requires at least one logical expert per minimum-EP rank; "
+            f"got num_experts={num_experts}, min_ep_size={min_ep_size}"
+        )
+
+    base_count, remainder = divmod(num_experts, min_ep_size)
+    slots_per_owner = math.ceil(num_experts / min_ep_size)
+    owner_slots = []
+    next_expert_id = 0
+    for owner_ep_rank in range(min_ep_size):
+        logical_count = base_count + (1 if owner_ep_rank < remainder else 0)
+        slots = list(range(next_expert_id, next_expert_id + logical_count))
+        slots.extend([None] * (slots_per_owner - logical_count))
+        owner_slots.append(slots)
+        next_expert_id += logical_count
+    return owner_slots
+
+
+def compute_nonuniform_ep_dispatch_slots(
+    expert_placement: Sequence[Sequence[int]], num_experts: int
+) -> List[List[Optional[int]]]:
+    """Pad one replica's logical placement to a uniform Flex-dispatch width."""
+    if not expert_placement:
+        raise RuntimeError("NEP expert placement must contain at least one EP rank")
+    slots_per_rank = math.ceil(num_experts / len(expert_placement))
+    dispatch_slots = []
+    for ep_rank, expert_ids in enumerate(expert_placement):
+        if len(expert_ids) > slots_per_rank:
+            raise RuntimeError(
+                f"EP rank {ep_rank} owns {len(expert_ids)} experts, exceeding the "
+                f"virtual dispatch width {slots_per_rank}"
+            )
+        slots = [int(expert_id) for expert_id in expert_ids]
+        slots.extend([None] * (slots_per_rank - len(slots)))
+        dispatch_slots.append(slots)
+    return dispatch_slots
+
+
 def compute_nonuniform_ep_expert_placement(
     num_experts: int,
     local_ep_size: int,
     min_ep_size: int,
     preferred_follower_fanout: Optional[int] = None,
 ) -> Tuple[List[List[int]], Dict[int, List[Tuple[int, int, int]]]]:
-    """Compute placement for replicas with ``local_ep_size >= min_ep_size``.
+    """Compute logical expert placement for a nonuniform EP replica.
 
-    Min-EP replicas use contiguous owner ranges. Wider replicas keep the first
-    slice of each owner range on owner ranks. By default, remaining experts are
-    placed round-robin on follower ranks. When ``preferred_follower_fanout`` is
-    set, use the smallest exactly balanced striped placement at or above that
-    fanout, falling back to round-robin when no such stripe exists. The returned
-    gather map is shared by token routing tests and NEP gradient ownership
-    transfer setup.
+    Divisible configurations retain the established striped/round-robin layout.
+    For non-divisible configurations, minimum-EP owners receive balanced
+    floor/ceiling expert counts and wider replicas offload only the excess owner
+    experts to follower ranks.  The model contains only logical experts; uniform
+    virtual slots are built separately for fused token dispatch and owner-layout
+    communication.
     """
-    if num_experts % local_ep_size != 0 or num_experts % min_ep_size != 0:
-        raise RuntimeError(
-            "NEP expert placement requires num_experts to be divisible by both "
-            f"local_ep_size ({local_ep_size}) and min_ep_size ({min_ep_size}); "
-            f"got num_experts={num_experts}"
-        )
     if local_ep_size < min_ep_size:
         raise RuntimeError(
             f"local_ep_size ({local_ep_size}) must be >= min_ep_size ({min_ep_size})"
         )
+    if num_experts < local_ep_size:
+        raise RuntimeError(
+            "NEP currently requires at least one logical expert per local EP rank; "
+            f"got num_experts={num_experts}, local_ep_size={local_ep_size}"
+        )
     if preferred_follower_fanout is not None and preferred_follower_fanout <= 0:
         raise RuntimeError("preferred_follower_fanout must be positive")
 
-    experts_per_rank = num_experts // local_ep_size
-    experts_per_owner = num_experts // min_ep_size
-    experts_offloaded = experts_per_owner - experts_per_rank
-    num_followers = local_ep_size - min_ep_size
+    owner_slots = compute_nonuniform_ep_owner_expert_slots(num_experts, min_ep_size)
+    owner_expert_ids = [
+        [expert_id for expert_id in slots if expert_id is not None] for slots in owner_slots
+    ]
 
-    placement = [[] for _ in range(local_ep_size)]
-    for owner_rank in range(min_ep_size):
-        start = owner_rank * experts_per_owner
-        placement[owner_rank] = list(range(start, start + experts_per_rank))
+    if num_experts % local_ep_size != 0 or num_experts % min_ep_size != 0:
+        base_count, remainder = divmod(num_experts, local_ep_size)
+        target_counts = [
+            base_count + (1 if ep_rank < remainder else 0) for ep_rank in range(local_ep_size)
+        ]
+        placement = [[] for _ in range(local_ep_size)]
+        offloaded_experts = []
+        for owner_ep_rank, expert_ids in enumerate(owner_expert_ids):
+            keep_count = target_counts[owner_ep_rank]
+            if keep_count > len(expert_ids):
+                raise RuntimeError(
+                    f"Owner rank {owner_ep_rank} target count {keep_count} exceeds its "
+                    f"logical owner count {len(expert_ids)}"
+                )
+            placement[owner_ep_rank].extend(expert_ids[:keep_count])
+            offloaded_experts.extend(expert_ids[keep_count:])
 
-    striped_assignment = None
-    if preferred_follower_fanout is not None and num_followers > 0 and experts_offloaded > 0:
-        minimum_fanout = max(
-            preferred_follower_fanout, math.ceil(experts_offloaded / experts_per_rank)
-        )
-        maximum_fanout = min(experts_offloaded, num_followers)
-        for fanout in range(min(minimum_fanout, maximum_fanout), maximum_fanout + 1):
-            if experts_offloaded % fanout != 0:
-                continue
-            if min_ep_size * fanout % num_followers != 0:
-                continue
-            expected_follower_degree = min_ep_size * fanout // num_followers
-            chunk_size = experts_offloaded // fanout
-            for stride in range(1, num_followers + 1):
-                follower_offsets_by_owner = [
-                    [(owner_rank * stride + lane) % num_followers for lane in range(fanout)]
-                    for owner_rank in range(min_ep_size)
-                ]
-                follower_degrees = [0] * num_followers
-                for follower_offsets in follower_offsets_by_owner:
-                    for follower_offset in set(follower_offsets):
-                        follower_degrees[follower_offset] += 1
-                if all(
-                    len(set(follower_offsets)) == fanout
-                    for follower_offsets in follower_offsets_by_owner
-                ) and all(degree == expected_follower_degree for degree in follower_degrees):
-                    striped_assignment = (follower_offsets_by_owner, chunk_size)
-                    break
-            if striped_assignment is not None:
-                break
+        next_offloaded = 0
+        for follower_ep_rank in range(min_ep_size, local_ep_size):
+            follower_count = target_counts[follower_ep_rank]
+            placement[follower_ep_rank].extend(
+                offloaded_experts[next_offloaded : next_offloaded + follower_count]
+            )
+            next_offloaded += follower_count
+        if next_offloaded != len(offloaded_experts):
+            raise RuntimeError(
+                "NEP balanced placement did not consume every offloaded expert: "
+                f"used {next_offloaded}, available {len(offloaded_experts)}"
+            )
+    else:
+        experts_per_rank = num_experts // local_ep_size
+        experts_per_owner = num_experts // min_ep_size
+        experts_offloaded = experts_per_owner - experts_per_rank
+        num_followers = local_ep_size - min_ep_size
 
-    if striped_assignment is not None:
-        follower_offsets_by_owner, chunk_size = striped_assignment
-        for owner_rank, follower_offsets in enumerate(follower_offsets_by_owner):
-            offload_start = owner_rank * experts_per_owner + experts_per_rank
-            for lane, follower_offset in enumerate(follower_offsets):
-                follower_rank = min_ep_size + follower_offset
-                chunk_start = offload_start + lane * chunk_size
-                placement[follower_rank].extend(range(chunk_start, chunk_start + chunk_size))
-    elif num_followers > 0 and experts_offloaded > 0:
-        follower_index = 0
+        placement = [[] for _ in range(local_ep_size)]
         for owner_rank in range(min_ep_size):
-            offload_start = owner_rank * experts_per_owner + experts_per_rank
-            for offset in range(experts_offloaded):
-                expert_id = offload_start + offset
-                follower_rank = min_ep_size + (follower_index % num_followers)
-                placement[follower_rank].append(expert_id)
-                follower_index += 1
+            start = owner_rank * experts_per_owner
+            placement[owner_rank] = list(range(start, start + experts_per_rank))
+
+        striped_assignment = None
+        if preferred_follower_fanout is not None and num_followers > 0 and experts_offloaded > 0:
+            minimum_fanout = max(
+                preferred_follower_fanout, math.ceil(experts_offloaded / experts_per_rank)
+            )
+            maximum_fanout = min(experts_offloaded, num_followers)
+            for fanout in range(min(minimum_fanout, maximum_fanout), maximum_fanout + 1):
+                if experts_offloaded % fanout != 0:
+                    continue
+                if min_ep_size * fanout % num_followers != 0:
+                    continue
+                expected_follower_degree = min_ep_size * fanout // num_followers
+                chunk_size = experts_offloaded // fanout
+                for stride in range(1, num_followers + 1):
+                    follower_offsets_by_owner = [
+                        [(owner_rank * stride + lane) % num_followers for lane in range(fanout)]
+                        for owner_rank in range(min_ep_size)
+                    ]
+                    follower_degrees = [0] * num_followers
+                    for follower_offsets in follower_offsets_by_owner:
+                        for follower_offset in set(follower_offsets):
+                            follower_degrees[follower_offset] += 1
+                    if all(
+                        len(set(follower_offsets)) == fanout
+                        for follower_offsets in follower_offsets_by_owner
+                    ) and all(degree == expected_follower_degree for degree in follower_degrees):
+                        striped_assignment = (follower_offsets_by_owner, chunk_size)
+                        break
+                if striped_assignment is not None:
+                    break
+
+        if striped_assignment is not None:
+            follower_offsets_by_owner, chunk_size = striped_assignment
+            for owner_rank, follower_offsets in enumerate(follower_offsets_by_owner):
+                offload_start = owner_rank * experts_per_owner + experts_per_rank
+                for lane, follower_offset in enumerate(follower_offsets):
+                    follower_rank = min_ep_size + follower_offset
+                    chunk_start = offload_start + lane * chunk_size
+                    placement[follower_rank].extend(range(chunk_start, chunk_start + chunk_size))
+        elif num_followers > 0 and experts_offloaded > 0:
+            follower_index = 0
+            for owner_rank in range(min_ep_size):
+                offload_start = owner_rank * experts_per_owner + experts_per_rank
+                for offset in range(experts_offloaded):
+                    expert_id = offload_start + offset
+                    follower_rank = min_ep_size + (follower_index % num_followers)
+                    placement[follower_rank].append(expert_id)
+                    follower_index += 1
 
     for expert_ids in placement:
         expert_ids.sort()
+    build_expert_to_ep_rank_map(placement, num_experts)
+
+    expert_to_owner = {}
+    expert_to_owner_slot = {}
+    for owner_ep_rank, slots in enumerate(owner_slots):
+        for owner_slot, expert_id in enumerate(slots):
+            if expert_id is not None:
+                expert_to_owner[expert_id] = owner_ep_rank
+                expert_to_owner_slot[expert_id] = owner_slot
 
     gather_map = {}
     for follower_rank in range(min_ep_size, local_ep_size):
         gather_map[follower_rank] = []
         for local_index, expert_id in enumerate(placement[follower_rank]):
-            owner_rank = expert_id // experts_per_owner
-            owner_slot = expert_id - owner_rank * experts_per_owner
-            gather_map[follower_rank].append((local_index, owner_rank, owner_slot))
+            gather_map[follower_rank].append(
+                (local_index, expert_to_owner[expert_id], expert_to_owner_slot[expert_id])
+            )
 
     return placement, gather_map
 
