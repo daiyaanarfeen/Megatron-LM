@@ -3654,3 +3654,26 @@ Append a dated entry whenever we do something new: code changes, job submissions
   were +1.594% and +4.895%), definitively ruling out a cleanup regression.
 - Decision: accept Stage 2c3. The first job's candidate-B slowdown was run variability; the inverse
   gate shows unchanged or improved performance with identical GPU collective structure.
+
+## 2026-08-14 — Cleanup Stage 2d1: restore native MoE/CUDA-graph callback behavior
+
+- Removed the globally unregistered expert-compute backward callback lists/autograd wrapper from
+  `moe_layer.py` and the matching backward-replay callback API/state from `cuda_graphs.py`.
+  Stage 2c2 removed their only NEP registrations; with empty callback lists the old eager helper
+  returned each tensor unchanged, and CUDA graphs are disabled in the gate workload. Nonuniform
+  expert placement in `BaseMoELayer` is retained.
+- This removes net 53 lines from `moe_layer.py` and 24 lines from `cuda_graphs.py`, and eliminates
+  NEP-only callback plumbing from another native Megatron subsystem.
+- Candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2d1_callback_plumbing_removed_20260814`.
+  Compute-node isort/compile job `2694754` passed; frozen hashes are
+  `3973ceec...` (`moe_layer.py`) and `3c4bee45...` (`cuda_graphs.py`).
+- All-rank EP8/EP4 ABBA job `2694794`:
+  - Stage-2c3 reference pooled mean: 229.213 ms,
+  - Stage-2d1 candidate pooled mean: 225.900 ms (-1.445%),
+  - paired deltas: +1.602% and -4.340%, with no pooled regression,
+  - exactly 48,386.22 MiB peak allocation in all four cases,
+  - zero skipped/NaN iterations,
+  - exact 12/12-rank collective and NEP-annotation signatures across every case.
+- Decision: accept Stage 2d1. Native eager behavior, memory, GPU work, and performance are
+  preserved while two files lose obsolete NEP callback machinery.
