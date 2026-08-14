@@ -3553,3 +3553,32 @@ Append a dated entry whenever we do something new: code changes, job submissions
   hash unchanged (`f9ebb0dd...`).
 - Decision: accept Stage 2b1. The inverse-order confirmation rules out a reproducible performance
   regression; behavior, memory, and all-rank collective structure remained exact.
+
+## 2026-08-14 — Cleanup Stage 2b2: hardwire the accepted two-level Gather/EDP path
+
+- Removed configuration selectors and inactive alternatives around the accepted steady-state path:
+  bucket-ready Gather, one Gather bucket per expert-EDP bucket, one Gather submission stream,
+  device-ordered expert EDP, split host phases, shared native expert-DDP bucket groups, and packed
+  end-of-iteration Scatter. The remaining code executes the same branch selected by the EP8 gate
+  environment. `nonuniform_ep.py` fell from 6,030 to 5,601 lines (net -429 lines); no other
+  implementation file changed in this stage.
+- Candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2b2_fixed_two_level_20260814` (SHA-256
+  `fd1d312e8b95a1ac4614f2704fd36000137e577970d356d2337af6d02d0cf065`).
+- All-rank EP8/EP4 DistOpt + Flex/HybridEP ABBA job `2693745` preserved exactly 12/12 rank
+  collective/annotation signatures, 48,386.22 MiB peak allocation, and zero skipped/NaN
+  iterations in all four cases. Its pooled timing was noisy (Stage 2b1 230.617 ms versus Stage
+  2b2 236.483 ms, +2.543%), with contradictory paired deltas of +12.643% and -6.923%.
+- Inverse-order confirmation job `2693815` again preserved exact all-rank trace signatures,
+  exact peak memory, and zero skipped/NaN iterations. The first Stage-2b2 occurrence was a timing
+  outlier at 254.357 ms while its later same-source edge was 213.930 ms; the two intervening
+  Stage-2b1 runs were 216.365 and 215.674 ms. The stable final adjacent comparison therefore had
+  Stage 2b2 0.809% faster than Stage 2b1. Profiled Step 6 on rank 0 was 305.1–309.6 ms across all
+  four cases, with the same GPU collective structure.
+- Direct source review confirmed that every collapsed conditional has the gate's already-selected
+  value and that task batching, stream choice, canonical task advancement, Gather-to-EDP device
+  dependency, and packed Scatter scheduling are unchanged. The large pooled swings are therefore
+  not assigned to the cleanup; they are inconsistent within identical source and absent from the
+  structural traces.
+- Decision: accept Stage 2b2. No repeatable behavioral, memory, collective-structure, or
+  performance regression was observed.
