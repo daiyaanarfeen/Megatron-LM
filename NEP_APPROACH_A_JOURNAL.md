@@ -3529,3 +3529,27 @@ Append a dated entry whenever we do something new: code changes, job submissions
 - `_native_nccl.py` had no caller in the measured candidate and was deleted after the gate; file
   presence therefore could not affect the executed Python module graph or GPU trace.
 - Decision: accept Stage 2a; no behavioral, memory, trace, or performance regression was observed.
+
+## 2026-08-14 — Cleanup Stage 2b1: remove disabled readiness experiments
+
+- Removed the disabled stream-memory EDP gate, host-gated EDP/Scatter progression, same-communicator
+  readiness collectives, Scatter descriptor gate, their worker/future state, readiness-only Gloo
+  group, and the now-unused `enable_edp_ready_gate` entrypoint argument. All conditionals were
+  collapsed to the exact `EDP_READY_GATE=0`, `HOST_EDP_READY_GATE=0`, and `SAME_COMM_READY=0`
+  branches already selected by the accepted EP8 workload. The obsolete `_cuda_stream_ops.py`
+  helper was unimported by the measured candidate and then deleted. `nonuniform_ep.py` fell from
+  6,600 to 6,030 lines; the deleted helper removes another 76 lines.
+- Candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2b1_readiness_removed_20260814`.
+- First all-rank EP8/EP4 ABBA job `2693447` had exact trace signatures and memory in all cases, but
+  its first edge run was anomalously fast: pooled Stage 2a 217.500 ms versus candidate 224.296 ms
+  (+3.124%), while the adjacent candidate-B/reference-B pair differed by only +0.422%.
+- To avoid accepting or rejecting on that run-order artifact, inverse-order all-rank ABBA job
+  `2693540` placed Stage 2b1 on the edges and Stage 2a in the middle. It measured Stage 2b1 at
+  249.713 ms versus Stage 2a at 249.861 ms (-0.059%); pair deltas in reported order were +0.303%
+  and -0.184%. All four cases again had exactly 12/12 structurally equal rank traces, exactly
+  48,386.22 MiB peak allocation, and zero skipped/NaN iterations.
+- The mandatory containerized isort/compile job `2693665` passed and left the measured candidate
+  hash unchanged (`f9ebb0dd...`).
+- Decision: accept Stage 2b1. The inverse-order confirmation rules out a reproducible performance
+  regression; behavior, memory, and all-rank collective structure remained exact.
