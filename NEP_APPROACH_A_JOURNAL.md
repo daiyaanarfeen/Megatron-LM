@@ -3634,3 +3634,23 @@ Append a dated entry whenever we do something new: code changes, job submissions
   - exact 12/12-rank collective and NEP-annotation signatures across every case.
 - Decision: accept Stage 2c2. Removing the no-op hooks preserves behavior, memory, collective
   structure, and calibrated EP8 performance.
+
+## 2026-08-14 — Cleanup Stage 2c3: remove unused NEP Gloo communicators
+
+- Removed only Gloo process groups left behind by the abandoned phase/ticket schedulers:
+  model-EP phase rendezvous, owner-transfer rendezvous, and Scatter-launch rendezvous groups, plus
+  their runtime-config keys and uncalled compatibility accessor. Native Megatron DP, DP+CP, and
+  expert-DP Gloo groups remain unchanged. The NCCL owner Gather/transfer groups used by the active
+  reshard path also remain unchanged. `nonuniform_ep.py` fell from 4,961 to 4,917 lines.
+- Candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2c3_unused_gloo_removed_20260814`; SHA-256
+  `19a30b934081eb74365f9eb1baddcfa83e2afc92f5d60929b6c985f835871bfa`.
+- First all-rank EP8/EP4 ABBA job `2694542` preserved exact 12/12-rank trace signatures,
+  48,386.22 MiB peak allocation, and zero skipped/NaN iterations. Candidate-A was 1.000% faster,
+  but candidate-B was an isolated 20.146% timing outlier, making the pooled result unusable.
+- Inverse-order confirmation job `2694623` again preserved exact traces, memory, and correctness.
+  Stage 2c3 occupied the edges at 207.835 and 207.130 ms; Stage 2c2 occupied the middle at 211.148
+  and 217.270 ms. Thus both inverse pairs favored Stage 2c3 (the reported old-versus-new deltas
+  were +1.594% and +4.895%), definitively ruling out a cleanup regression.
+- Decision: accept Stage 2c3. The first job's candidate-B slowdown was run variability; the inverse
+  gate shows unchanged or improved performance with identical GPU collective structure.

@@ -463,11 +463,8 @@ def _runtime_config_from_parallel_state() -> dict:
         "num_replicas": 1,
         "dp_size": 1,
         "ep_group": ep_group if ep_group is not None else dist.group.WORLD,
-        "ep_group_gloo": None,
         "nep_owner_gather_groups": {},
         "nep_owner_transfer_groups": {},
-        "nep_owner_transfer_groups_gloo": {},
-        "nep_owner_scatter_launch_groups_gloo": {},
         "nep_owner_transfer_group_ranks": {},
         "nep_owner_source_ranks": {},
         "edp_group": None,
@@ -483,13 +480,6 @@ def _get_runtime_config(config: NonuniformEPConfig) -> dict:
     return _runtime_config_from_parallel_state()
 
 
-def _get_nep_owner_scatter_launch_group(runtime_config: dict, owner_ep_rank: int):
-    """Return the phase-specific Scatter launch rendezvous group."""
-    if "nep_owner_scatter_launch_groups_gloo" in runtime_config:
-        return runtime_config["nep_owner_scatter_launch_groups_gloo"].get(owner_ep_rank)
-    # Preserve compatibility with focused tests and external runtime configs
-    # created before Scatter launch received a dedicated communicator.
-    return runtime_config.get("nep_owner_transfer_groups_gloo", {}).get(owner_ep_rank)
 
 
 def _set_parallel_state_attr(name: str, value) -> None:
@@ -668,20 +658,12 @@ def initialize_nonuniform_ep_process_groups(
 
     # Expert groups.
     min_ep_size = generator.min_k * tp * cp // etp
-    ep_phase_group_gloo = None
     nep_owner_gather_groups = {}
     nep_owner_transfer_groups = {}
-    nep_owner_transfer_groups_gloo = {}
-    nep_owner_scatter_launch_groups_gloo = {}
     nep_owner_transfer_group_ranks = {}
     nep_owner_source_ranks = {}
     for ranks in generator.get_ranks("ep"):
         group = _create_group(ranks, timeout, nccl_comm_cfgs, "ep")
-        group_gloo = (
-            _create_group(ranks, timeout, nccl_comm_cfgs, "NEP_EP_PHASE_GLOO", "gloo")
-            if create_gloo_process_groups
-            else None
-        )
         group_expert_placement, _ = compute_nonuniform_ep_expert_placement(
             num_moe_experts,
             len(ranks),
@@ -705,8 +687,6 @@ def initialize_nonuniform_ep_process_groups(
             transfer_global_ranks = [ranks[ep_rank] for ep_rank in transfer_ep_ranks]
             owner_transfer_group = None
             owner_gather_group = None
-            owner_transfer_group_gloo = None
-            owner_scatter_launch_group_gloo = None
             if len(transfer_global_ranks) > 1:
                 owner_transfer_group = _create_group(
                     transfer_global_ranks,
@@ -718,22 +698,6 @@ def initialize_nonuniform_ep_process_groups(
                     owner_gather_group = _create_group(
                         transfer_global_ranks, timeout, nccl_comm_cfgs, "nep_owner_gather"
                     )
-                if create_gloo_process_groups:
-                    owner_transfer_group_gloo = _create_group(
-                        transfer_global_ranks,
-                        timeout,
-                        nccl_comm_cfgs,
-                        "nep_owner_transfer_gloo",
-                        "gloo",
-                    )
-                    if not _nep_end_iteration_scatter_enabled():
-                        owner_scatter_launch_group_gloo = _create_group(
-                            transfer_global_ranks,
-                            timeout,
-                            nccl_comm_cfgs,
-                            "NEP_OWNER_SCATTER_LAUNCH_GLOO",
-                            "gloo",
-                        )
             if rank in ranks:
                 nep_owner_source_ranks[owner_ep_rank] = source_ep_ranks
                 nep_owner_transfer_group_ranks[owner_ep_rank] = transfer_ep_ranks
@@ -741,14 +705,9 @@ def initialize_nonuniform_ep_process_groups(
                     if owner_gather_group is not None:
                         nep_owner_gather_groups[owner_ep_rank] = owner_gather_group
                     nep_owner_transfer_groups[owner_ep_rank] = owner_transfer_group
-                    nep_owner_transfer_groups_gloo[owner_ep_rank] = owner_transfer_group_gloo
-                    nep_owner_scatter_launch_groups_gloo[owner_ep_rank] = (
-                        owner_scatter_launch_group_gloo
-                    )
         if rank in ranks:
             _set_parallel_state_attr("_EXPERT_MODEL_PARALLEL_GROUP", group)
             _set_parallel_state_attr("_EXPERT_MODEL_PARALLEL_RANKS", ranks)
-            ep_phase_group_gloo = group_gloo
 
     for ranks in generator.get_ranks("etp"):
         group = _create_group(ranks, timeout, nccl_comm_cfgs, "ep_tp")
@@ -827,11 +786,8 @@ def initialize_nonuniform_ep_process_groups(
         "num_replicas": generator.num_replicas,
         "dp_size": sum(num_tp_cp_per_replica),
         "ep_group": ep_group,
-        "ep_group_gloo": ep_phase_group_gloo,
         "nep_owner_gather_groups": nep_owner_gather_groups,
         "nep_owner_transfer_groups": nep_owner_transfer_groups,
-        "nep_owner_transfer_groups_gloo": nep_owner_transfer_groups_gloo,
-        "nep_owner_scatter_launch_groups_gloo": nep_owner_scatter_launch_groups_gloo,
         "nep_owner_transfer_group_ranks": nep_owner_transfer_group_ranks,
         "nep_owner_source_ranks": nep_owner_source_ranks,
         "edp_group": parallel_state.get_expert_data_parallel_group(),
