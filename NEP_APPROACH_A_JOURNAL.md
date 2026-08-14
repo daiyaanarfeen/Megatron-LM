@@ -3582,3 +3582,30 @@ Append a dated entry whenever we do something new: code changes, job submissions
   structural traces.
 - Decision: accept Stage 2b2. No repeatable behavioral, memory, collective-structure, or
   performance regression was observed.
+
+## 2026-08-14 — Cleanup Stage 2c1: remove the abandoned A2A-gap Scatter scheduler
+
+- Removed the unused model-EP-burst Scatter experiment: burst begin/end callbacks, Gloo ticket
+  agreement, window polling, graph replay progress hooks, burst/alignment state, deferred-submit
+  branches, and scheduler-only descriptor fields. The accepted packed end-of-iteration Scatter
+  queue, stream ordering, task bookkeeping, and final drain remain.
+- Restored Megatron's native `tensor_parallel.mappings.all_to_all` API and removed the optional
+  burst-scheduler plumbing from `MoETokenDispatcher`; the accepted configuration had always passed
+  `None`, so these native files now contain no NEP-only callback redundancy. This stage changed only
+  `nonuniform_ep.py`, `mappings.py`, and `token_dispatcher.py`. `nonuniform_ep.py` fell from 5,601
+  to 5,253 lines, and the cross-file callback cleanup removed another net 72 lines.
+- Candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2c1_a2a_scheduler_removed_20260814`; main-file SHA-256
+  `8de24430005238fb7a96dc76cd0f02d27763ab4f6ddc210989cf65ededd6d2e9`.
+- All-rank EP8/EP4 ABBA job `2694057` completed with exact 12/12-rank collective/annotation
+  signatures, exactly 48,386.22 MiB peak allocation, and zero skipped/NaN iterations in every
+  case. The pooled delta was +1.873%, but its paired deltas contradicted each other (+5.735% and
+  -2.020%) because candidate-A was the high-variance outlier.
+- Inverse-order confirmation job `2694213` again had exact all-rank signatures, memory, and
+  correctness. The first Stage-2c1 edge was an outlier at 249.826 ms, while its later same-source
+  edge was 221.578 ms. The stable final adjacent pair was Stage 2b2 at 221.996 ms versus Stage 2c1
+  at 221.578 ms (Stage 2c1 0.188% faster). The reported inverse pairs were -7.000% and +0.188% in
+  old-versus-new order, demonstrating the same first-occurrence/run-order artifact rather than a
+  repeatable source regression.
+- Decision: accept Stage 2c1. The active GPU collective structure, memory footprint, correctness,
+  and stable adjacent performance are unchanged; obsolete cross-file Megatron hooks are gone.

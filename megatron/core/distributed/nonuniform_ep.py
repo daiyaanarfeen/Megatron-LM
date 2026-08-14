@@ -131,13 +131,6 @@ def _nep_defer_model_ep_fence_enabled() -> bool:
     )
 
 
-def _nep_a2a_scatter_scheduler_enabled() -> bool:
-    return os.getenv("MEGATRON_NONUNIFORM_EP_A2A_SCATTER_SCHEDULER", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
 
 
 def _nep_end_iteration_scatter_enabled() -> bool:
@@ -611,9 +604,7 @@ def initialize_nonuniform_ep_process_groups(
     timeout = timedelta(minutes=distributed_timeout_minutes)
     nccl_comm_cfgs = _get_nccl_communicator_configs(nccl_communicator_config_path)
     use_separate_owner_gather_groups = (
-        "nep_owner_gather" in nccl_comm_cfgs
-        or _nep_a2a_scatter_scheduler_enabled()
-        or _nep_end_iteration_scatter_enabled()
+        "nep_owner_gather" in nccl_comm_cfgs or _nep_end_iteration_scatter_enabled()
     )
     # Attention/data groups.
     for ranks in generator.get_ranks("dp-cp"):
@@ -2770,22 +2761,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     )
                 )
 
-        for descriptor in descriptors:
-            if (
-                _nep_a2a_scatter_scheduler_enabled()
-                and descriptor is not None
-                and descriptor["kind"] == "local"
-            ):
-                self._submit_nep_nccl_owner_all_to_all_scatter(descriptor)
-                self._order_nep_nccl_owner_all_to_all_scatter_completion(descriptor)
-                self._finish_nep_nccl_owner_all_to_all_scatter(descriptor)
-                copy_done = torch.cuda.Event()
-                copy_done.record(torch.cuda.current_stream())
-                state = self._get_nep_nccl_shared_buffer_state()
-                state["buffer_slot_events"].setdefault(context["buffer_slot_key"], []).append(
-                    copy_done
-                )
-                descriptor["kind"] = "completed_local"
         return {
             "group": self,
             "context": context,
@@ -2794,22 +2769,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             "task_marked": False,
         }
 
-    def _mark_nep_nccl_scatter_train_scheduled(self, train: dict) -> None:
-        """Mark a background Scatter train as issued to the scheduler."""
-        if train["task_marked"]:
-            return
-        if self.is_first_batch:
-            raise RuntimeError("A2A-gated Scatter scheduling is not supported on the first batch")
-        context = train["context"]
-        scatter_contexts = context.get("scatter_contexts")
-        if scatter_contexts is None:
-            self._mark_nep_nccl_task_started(context["owner_ep_rank"], context["chunk_index"])
-        else:
-            for task_context in scatter_contexts:
-                task_context["group"]._mark_nep_nccl_task_started(
-                    task_context["owner_ep_rank"], task_context["chunk_index"]
-                )
-        train["task_marked"] = True
 
     def _finish_nep_nccl_scatter_train_submission(self, train: dict) -> None:
         """Finish bookkeeping after every descriptor in one train is submitted."""
@@ -3177,7 +3136,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         pending_host_phases: List[dict],
         device_align_phases: bool = False,
         finish_all_phases: bool = True,
-        defer_scatter_submission: bool = False,
         scatter_context_batches: Optional[List[List[dict]]] = None,
     ) -> bool:
         """Progress ordered EDP and Scatter phases after backward compute is queued."""
@@ -3209,7 +3167,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                         pending_host_phases,
                         device_align_phases=device_align_phases,
                         finish_all_phases=finish_all_phases,
-                        defer_scatter_submission=defer_scatter_submission,
                         scatter_context_batches=scatter_context_batches,
                     )
                 continue
@@ -3226,32 +3183,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                         edp_done_event.synchronize()
                 pending["phase"] = "edp_complete"
 
-                if (
-                    not _nep_benchmark_skip_scatter_enabled()
-                    and not _nep_end_iteration_scatter_enabled()
-                ):
-                    scatter_barrier_works = []
-                    for owner, (_, _, scatter_launch_group_gloo) in pending[
-                        "local_transfer_contexts"
-                    ].items():
-                        _nep_debug_print(
-                            f"submit split_dispatch_edp_owner_barrier "
-                            f"batch={batch_index} owner={owner}"
-                        )
-                        scatter_barrier_works.append(
-                            (owner, dist.barrier(group=scatter_launch_group_gloo, async_op=True))
-                        )
-                    for owner, work in scatter_barrier_works:
-                        with torch.profiler.record_function("nep_split_wait_scatter_launch"):
-                            work.wait()
-                        _nep_debug_print(
-                            f"finish split_dispatch_edp_owner_barrier "
-                            f"batch={batch_index} owner={owner}"
-                        )
-
                 pending["phase"] = "scatter_ready"
-                if defer_scatter_submission and self._nep_benchmark_phase_enabled("scatter"):
-                    continue
             else:
                 raise RuntimeError(f"Unknown split NEP host phase: {pending['phase']}")
 
@@ -3289,7 +3221,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     pending_host_phases,
                     device_align_phases=device_align_phases,
                     finish_all_phases=finish_all_phases,
-                    defer_scatter_submission=defer_scatter_submission,
                     scatter_context_batches=scatter_context_batches,
                 )
 
@@ -4289,15 +4220,9 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         self._nep_dispatch_deferred_compute_ready_event = None
         self._nep_dispatch_waiting_groups = None
         self._nep_dispatch_waiting_module_label = None
-        self._nep_model_ep_a2a_burst_depth = 0
-        self._nep_model_ep_a2a_burst_count = 0
         self._nep_scatter_batches = []
         self._nep_end_iteration_scatter_context_batches = []
         self._nep_scatter_inflight_event = None
-        self._nep_scatter_next_batch_ordinal = 0
-        self._nep_scatter_next_layer_ordinal = 0
-        self._nep_scatter_alignment_tensor = None
-        self._nep_scatter_alignment_work = None
         self._nep_scatter_stream = None
         self._nep_scatter_backward_complete = False
         if benchmark_phase_limit != "scatter":
@@ -4309,16 +4234,11 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             raise RuntimeError(
                 "NEP requires MEGATRON_NONUNIFORM_EP_END_ITERATION_SCATTER=1"
             )
-        if _nep_a2a_scatter_scheduler_enabled() and _nep_end_iteration_scatter_enabled():
+        if not _nep_defer_model_ep_fence_enabled():
             raise RuntimeError(
-                "A2A-gated and end-of-iteration NEP Scatter modes are mutually exclusive"
+                "Deferred NEP Scatter requires MEGATRON_NONUNIFORM_EP_DEFER_MODEL_EP_FENCE=1"
             )
-        if _nep_a2a_scatter_scheduler_enabled() or _nep_end_iteration_scatter_enabled():
-            if not _nep_defer_model_ep_fence_enabled():
-                raise RuntimeError(
-                    "Deferred NEP Scatter requires MEGATRON_NONUNIFORM_EP_DEFER_MODEL_EP_FENCE=1"
-                )
-            self._nep_scatter_stream = torch.cuda.Stream(device=torch.cuda.current_device())
+        self._nep_scatter_stream = torch.cuda.Stream(device=torch.cuda.current_device())
         self._configure_nep_dispatch_boundary_hooks()
         self._configure_expert_gradient_scaling(config, runtime_config)
         if self.ddp_config.use_distributed_optimizer or runtime_config.get(
@@ -4654,186 +4574,33 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         self._nep_scatter_inflight_event = None
         return True
 
-    def _peek_nep_scatter_ticket_window(self) -> tuple:
-        """Return the contiguous descriptor window for the next expert bucket group."""
-        first_ticket = None
-        last_ticket = None
-        descriptor_count = 0
-        window_key = None
-        for batch in self._nep_scatter_batches:
-            if batch.get("submission_complete", False):
-                continue
-            for train_index in range(batch["next_train"], len(batch["trains"])):
-                train = batch["trains"][train_index]
-                train_group_index = getattr(train["group"], "_nep_nccl_group_index", -1)
-                train_window_key = (
-                    batch.get("layer_ordinal", batch["schedule_ordinal"]),
-                    train_group_index,
-                )
-                if window_key is None:
-                    window_key = train_window_key
-                elif train_window_key != window_key:
-                    return "ready", descriptor_count, first_ticket, last_ticket
 
-                descriptor_start = (
-                    train["next_descriptor"] if train_index == batch["next_train"] else 0
-                )
-                context = train["context"]
-                for descriptor_index in range(descriptor_start, len(train["descriptors"])):
-                    ticket = (
-                        batch["schedule_ordinal"],
-                        train_index,
-                        train_group_index,
-                        context["owner_ep_rank"],
-                        context["chunk_index"],
-                        descriptor_index,
-                    )
-                    if first_ticket is None:
-                        first_ticket = ticket
-                    last_ticket = ticket
-                    descriptor_count += 1
 
-        if first_ticket is None:
-            return "empty", 0, None, None
-        return "ready", descriptor_count, first_ticket, last_ticket
 
-    def _consume_model_ep_aligned_nep_scatter_ticket(
-        self, after_event: Optional[torch.cuda.Event] = None
-    ) -> int:
-        """Consume one aligned ticket window and submit its descriptors in order."""
-        alignment_work = self._nep_scatter_alignment_work
-        if alignment_work is None:
-            return 0
 
-        with torch.profiler.record_function("nep_model_ep_scatter_ticket_wait"):
-            alignment_work.wait()
-        self._nep_scatter_alignment_work = None
-
-        alignment_tensor = self._nep_scatter_alignment_tensor
-        if alignment_tensor is None:
-            raise RuntimeError("NEP Scatter ticket completed without its alignment tensor")
-        value_count = alignment_tensor.numel() // 2
-        minimum = alignment_tensor[:value_count].tolist()
-        maximum = (-alignment_tensor[value_count:]).tolist()
-        if minimum[0] != 2 or maximum[0] != 2:
-            return 0
-        if minimum[1:] != maximum[1:]:
-            raise RuntimeError(
-                "NEP Scatter ranks reached an ordered boundary with different windows: "
-                f"minimum={tuple(minimum[1:])}, maximum={tuple(maximum[1:])}"
-            )
-
-        descriptor_count = minimum[1]
-        first_ticket = tuple(minimum[2:8])
-        last_ticket = tuple(minimum[8:14])
-        status, local_count, local_first, local_last = self._peek_nep_scatter_ticket_window()
-        if (
-            status != "ready"
-            or local_count != descriptor_count
-            or local_first != first_ticket
-            or local_last != last_ticket
-        ):
-            raise RuntimeError(
-                "NEP Scatter queue changed after its window agreement: "
-                f"agreed={(descriptor_count, first_ticket, last_ticket)} "
-                f"local={(status, local_count, local_first, local_last)}"
-            )
-        with torch.profiler.record_function(
-            f"nep_submit_scatter_window_g{first_ticket[2]}_n{descriptor_count}"
-        ):
-            for descriptor_index in range(descriptor_count):
-                submitted = self._submit_nep_scatter_chunk(
-                    after_event=after_event if descriptor_index == 0 else None,
-                    queue_behind_inflight=True,
-                )
-                if not submitted:
-                    raise RuntimeError(
-                        "NEP Scatter agreed window could not submit descriptor "
-                        f"{descriptor_index + 1}/{descriptor_count}"
-                    )
-        return descriptor_count
-
-    def _launch_model_ep_aligned_nep_scatter_ticket(self) -> None:
-        """Launch a nonblocking agreement for the next bucket-group window."""
-        if getattr(self, "_nep_scatter_backward_complete", False):
-            raise RuntimeError("NEP Scatter cannot poll for a new window after backward completes")
-        runtime_config = self._nonuniform_ep_runtime_config
-        ep_group_gloo = runtime_config.get("ep_group_gloo")
-        if ep_group_gloo is None:
-            raise RuntimeError("A2A-gated NEP Scatter requires a model-EP Gloo group")
-        if self._nep_scatter_alignment_work is not None:
-            raise RuntimeError("NEP Scatter launched a ticket before consuming its predecessor")
-
-        status, descriptor_count, first_ticket, last_ticket = self._peek_nep_scatter_ticket_window()
-        status_value = {"empty": 0, "busy": 1, "ready": 2}[status]
-        local_values = [status_value, descriptor_count]
-        local_values.extend(first_ticket if first_ticket is not None else (-1,) * 6)
-        local_values.extend(last_ticket if last_ticket is not None else (-1,) * 6)
-
-        alignment_tensor = self._nep_scatter_alignment_tensor
-        if alignment_tensor is None or alignment_tensor.numel() != 2 * len(local_values):
-            alignment_tensor = torch.empty(2 * len(local_values), dtype=torch.int64)
-            self._nep_scatter_alignment_tensor = alignment_tensor
-        positive = alignment_tensor[: len(local_values)]
-        negative = alignment_tensor[len(local_values) :]
-        positive.copy_(torch.tensor(local_values, dtype=torch.int64))
-        negative.copy_(-positive)
-
-        with torch.profiler.record_function("nep_model_ep_scatter_ticket_launch"):
-            self._nep_scatter_alignment_work = dist.all_reduce(
-                alignment_tensor, op=dist.ReduceOp.MIN, group=ep_group_gloo, async_op=True
-            )
-        if self._nep_scatter_alignment_work is None:
-            raise RuntimeError("Nonblocking NEP Scatter ticket launch returned no work handle")
-
-    def _submit_model_ep_aligned_nep_scatter_chunk(
-        self, after_event: Optional[torch.cuda.Event] = None
-    ) -> int:
-        """Advance ordered Scatter windows at a model-EP boundary."""
-        runtime_config = self._nonuniform_ep_runtime_config
-        if not runtime_config.get("needs_reshard", False):
-            return int(self._submit_nep_scatter_chunk(after_event=after_event))
-
-        submitted = self._consume_model_ep_aligned_nep_scatter_ticket(after_event=after_event)
-        self._launch_model_ep_aligned_nep_scatter_ticket()
-        return submitted
-
-    def _submit_nep_scatter_chunk(
-        self,
-        after_event: Optional[torch.cuda.Event] = None,
-        force: bool = False,
-        queue_behind_inflight: bool = False,
-    ) -> bool:
-        """Submit one Scatter chunk on the caller thread with explicit device ordering."""
-        if self._nep_model_ep_a2a_burst_depth != 0:
-            return False
-        predecessor_complete = self._retire_nep_scatter_chunk(force=force)
+    def _submit_nep_scatter_chunk(self) -> bool:
+        """Submit one end-of-iteration Scatter chunk in stream order."""
+        self._retire_nep_scatter_chunk()
         if not self._nep_scatter_batches:
             return False
 
         batch = self._nep_scatter_batches[0]
         while batch.get("submission_complete", False):
-            if not predecessor_complete and not queue_behind_inflight:
-                return False
             self._nep_scatter_batches.pop(0)
             _nep_debug_print(f"retired scheduled Scatter batch module={batch['module_label']}")
             if not self._nep_scatter_batches:
                 return True
             batch = self._nep_scatter_batches[0]
-        if not predecessor_complete and not queue_behind_inflight:
-            return False
 
         scatter_stream = self._nep_scatter_stream
         if scatter_stream is None:
-            raise RuntimeError("A2A-gated NEP Scatter stream was not initialized")
+            raise RuntimeError("End-of-iteration NEP Scatter stream was not initialized")
         train = batch["trains"][batch["next_train"]]
         descriptor_index = train["next_descriptor"]
         descriptor = train["descriptors"][descriptor_index]
         context = train["context"]
         group_index = getattr(train["group"], "_nep_nccl_group_index", -1)
         with torch.cuda.stream(scatter_stream):
-            if after_event is not None:
-                scatter_stream.wait_event(after_event)
             with torch.profiler.record_function(
                 "nep_scheduled_scatter_chunk_"
                 f"g{group_index}_o{context['owner_ep_rank']}_"
@@ -4864,44 +4631,25 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         )
         return True
 
-    def _progress_nep_scatter_after_compute_launch(self) -> None:
-        """Retire Scatter work without launching rank-dependent collectives."""
-        if (
-            not _nep_a2a_scatter_scheduler_enabled()
-            or not self._nep_scatter_batches
-            or self._nep_model_ep_a2a_burst_depth != 0
-        ):
-            return
-
-        self._retire_nep_scatter_chunk()
 
     def _queue_nep_scatter_context_batches(
         self,
         context_batches: List[List[dict]],
         completion_event: torch.cuda.Event,
         module_label: str,
-        a2a_completion_event: Optional[torch.cuda.Event],
-        tasks_already_marked: bool = False,
     ) -> None:
-        """Prepare a layer's Scatter trains while preserving ordered owner batches."""
+        """Prepare a layer's end-of-iteration Scatter trains in owner order."""
         scatter_stream = self._nep_scatter_stream
         if scatter_stream is None:
-            raise RuntimeError("A2A-gated NEP Scatter state was not initialized")
+            raise RuntimeError("End-of-iteration NEP Scatter state was not initialized")
 
         scheduled_context_batches = context_batches or [[]]
-        layer_ordinal = self._nep_scatter_next_layer_ordinal
-        self._nep_scatter_next_layer_ordinal += 1
         with torch.cuda.stream(scatter_stream):
-            if a2a_completion_event is not None:
-                scatter_stream.wait_event(a2a_completion_event)
             for batch_index, contexts in enumerate(scheduled_context_batches):
                 trains = []
                 for context in contexts:
                     train = context["group"]._prepare_nep_nccl_owner_task_scatter_train(context)
-                    if tasks_already_marked:
-                        train["task_marked"] = True
-                    else:
-                        context["group"]._mark_nep_nccl_scatter_train_scheduled(train)
+                    train["task_marked"] = True
                     trains.append(train)
 
                 is_last_batch = batch_index == len(scheduled_context_batches) - 1
@@ -4917,10 +4665,7 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                     "completion_event": batch_completion_event,
                     "module_label": batch_label,
                     "submission_complete": not trains,
-                    "schedule_ordinal": self._nep_scatter_next_batch_ordinal,
-                    "layer_ordinal": layer_ordinal,
                 }
-                self._nep_scatter_next_batch_ordinal += 1
                 if not trains:
                     batch_completion_event.record(scatter_stream)
                 self._nep_scatter_batches.append(batch)
@@ -4995,88 +4740,33 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
 
         self._nep_end_iteration_scatter_completion_events = completion_events[:-1]
         self._queue_nep_scatter_context_batches(
-            [packed_contexts],
-            completion_events[-1],
-            "end_iteration_scatter",
-            a2a_completion_event=None,
-            tasks_already_marked=True,
+            [packed_contexts], completion_events[-1], "end_iteration_scatter"
         )
         return True
 
     def _drain_nep_scatter_scheduler(self) -> None:
-        """Queue all remaining Scatter chunks, then wait once before final gradient sync."""
+        """Queue all deferred Scatter chunks, then wait once before final gradient sync."""
         if self.ddp_config.use_distributed_optimizer:
             if self._nep_end_iteration_scatter_context_batches or self._nep_scatter_batches:
                 raise RuntimeError("NEP DistOpt unexpectedly queued a gradient Scatter")
             return
-        a2a_scheduler = _nep_a2a_scatter_scheduler_enabled()
-        end_iteration_scatter = _nep_end_iteration_scatter_enabled()
-        if not a2a_scheduler and not end_iteration_scatter:
-            return
         if not self._nep_scatter_backward_complete:
             raise RuntimeError("NEP Scatter drain requires a completed backward pass")
-        if self._nep_model_ep_a2a_burst_depth != 0:
-            raise RuntimeError("Cannot drain NEP Scatter during a model-EP A2A burst")
-        if end_iteration_scatter:
-            with torch.profiler.record_function("nep_end_iteration_scatter_global_fence"):
-                torch.cuda.synchronize()
-            while self._materialize_next_nep_end_iteration_scatter_batch():
-                pass
-            while self._nep_scatter_batches:
-                if not self._submit_nep_scatter_chunk(queue_behind_inflight=True):
-                    raise RuntimeError("End-of-iteration NEP Scatter drain made no progress")
-            for completion_event in getattr(
-                self, "_nep_end_iteration_scatter_completion_events", ()
-            ):
-                completion_event.record(self._nep_scatter_stream)
-            self._nep_end_iteration_scatter_completion_events = []
-            self._retire_nep_scatter_chunk(force=True)
-            return
-        if self._nonuniform_ep_runtime_config.get("needs_reshard", False):
-            self._consume_model_ep_aligned_nep_scatter_ticket()
+        with torch.profiler.record_function("nep_end_iteration_scatter_global_fence"):
+            torch.cuda.synchronize()
+        while self._materialize_next_nep_end_iteration_scatter_batch():
+            pass
         while self._nep_scatter_batches:
-            if not self._submit_nep_scatter_chunk(queue_behind_inflight=True):
-                raise RuntimeError("A2A-gated NEP Scatter drain made no progress")
+            if not self._submit_nep_scatter_chunk():
+                raise RuntimeError("End-of-iteration NEP Scatter drain made no progress")
+        for completion_event in getattr(
+            self, "_nep_end_iteration_scatter_completion_events", ()
+        ):
+            completion_event.record(self._nep_scatter_stream)
+        self._nep_end_iteration_scatter_completion_events = []
         self._retire_nep_scatter_chunk(force=True)
 
-    def model_ep_a2a_burst_begin(self) -> None:
-        """Mark a native model-EP A2A burst before its collective is enqueued."""
-        if not _nep_a2a_scatter_scheduler_enabled():
-            return
-        if getattr(self, "_nep_scatter_backward_complete", False):
-            if (
-                self._nep_scatter_batches
-                or self._nep_scatter_inflight_event is not None
-                or self._nep_scatter_alignment_work is not None
-            ):
-                raise RuntimeError("A new backward pass started before NEP Scatter drained")
-            self._nep_scatter_backward_complete = False
-        if self._nep_model_ep_a2a_burst_depth != 0:
-            raise RuntimeError("Nested model-EP A2A bursts are not supported")
-        self._nep_model_ep_a2a_burst_depth = 1
-        _nep_debug_print("model_ep_a2a_burst_begin")
 
-    def model_ep_a2a_burst_end(self) -> None:
-        """Device-order one Scatter chunk after this model-EP A2A burst."""
-        if not _nep_a2a_scatter_scheduler_enabled():
-            return
-
-        completion_event = torch.cuda.Event()
-        completion_event.record(torch.cuda.current_stream())
-        if self._nep_model_ep_a2a_burst_depth != 1:
-            raise RuntimeError("Model-EP A2A burst ended without a matching begin")
-        self._nep_model_ep_a2a_burst_depth = 0
-        self._nep_model_ep_a2a_burst_count += 1
-        _nep_debug_print(f"model_ep_a2a_burst_end count={self._nep_model_ep_a2a_burst_count}")
-        if self._nep_dispatch_pending_host_phases is not None:
-            with torch.profiler.record_function("nep_a2a_burst_end_queue_scatter"):
-                phases_finished = self._finish_pending_nep_dispatch_host_phases(
-                    defer_scatter_submission=False, scatter_after_event=completion_event
-                )
-            if not phases_finished:
-                raise RuntimeError("Model-EP A2A burst end did not queue all staged Scatter work")
-            self._wait_for_nep_dispatch_launch()
-        self._submit_model_ep_aligned_nep_scatter_chunk(after_event=completion_event)
 
     def _configure_nep_dispatch_boundary_hooks(self) -> None:
         """Launch NCCL reshard pipelines after each MoE dispatch backward."""
@@ -5097,15 +4787,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                     module_groups.append(bucket_group)
             if not module_groups:
                 continue
-
-            if _nep_a2a_scatter_scheduler_enabled():
-                token_dispatcher = getattr(module, "token_dispatcher", None)
-                attach_scheduler = getattr(
-                    token_dispatcher, "set_model_ep_a2a_burst_scheduler", None
-                )
-                if attach_scheduler is None:
-                    raise RuntimeError("A2A-gated NEP Scatter requires an A2A token dispatcher")
-                attach_scheduler(self)
 
             module_groups.sort(key=lambda group: group._nep_nccl_group_index)
             dispatch_groups = tuple(module_groups)
@@ -5187,15 +4868,10 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 "Device-aligned and host-only post-graph NEP phases are mutually exclusive"
             )
         non_moe_graph_managers = ()
-        if _nep_a2a_scatter_scheduler_enabled() or post_graph_phases or post_graph_host_phases:
+        if post_graph_phases or post_graph_host_phases:
             non_moe_graph_managers = self._find_nep_non_moe_cuda_graph_managers(
                 named_modules, BaseMoELayer
             )
-        if _nep_a2a_scatter_scheduler_enabled():
-            for graph_manager in non_moe_graph_managers:
-                graph_manager.register_backward_replay_hooks(
-                    post_hook=self._progress_nep_scatter_after_compute_launch
-                )
         if post_graph_phases or post_graph_host_phases:
             for graph_manager in non_moe_graph_managers:
                 graph_manager.register_backward_replay_hooks(
@@ -5418,8 +5094,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         self,
         device_align_phases: bool = False,
         finish_all_phases: bool = True,
-        defer_scatter_submission: bool = False,
-        scatter_after_event: Optional[torch.cuda.Event] = None,
     ) -> bool:
         """Progress a split NEP pipeline without consuming its model-EP completion fence."""
         pending_host_phases = getattr(self, "_nep_dispatch_pending_host_phases", None)
@@ -5434,41 +5108,24 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         if completion_event is None:
             raise RuntimeError("Split NEP host phases are missing their completion event")
 
-        end_iteration_scatter = _nep_end_iteration_scatter_enabled()
-        scatter_context_batches = (
-            []
-            if end_iteration_scatter
-            or (_nep_a2a_scatter_scheduler_enabled() and not defer_scatter_submission)
-            else None
-        )
+        scatter_context_batches = []
         boundary_group, host_phases = pending_host_phases
-        finish_kwargs = {
-            "device_align_phases": device_align_phases,
-            "finish_all_phases": finish_all_phases,
-            "defer_scatter_submission": defer_scatter_submission,
-        }
-        if scatter_context_batches is not None:
-            finish_kwargs["scatter_context_batches"] = scatter_context_batches
         phases_finished = boundary_group._finish_nep_nccl_process_group_dispatch_batches(
-            host_phases, **finish_kwargs
+            host_phases,
+            device_align_phases=device_align_phases,
+            finish_all_phases=finish_all_phases,
+            scatter_context_batches=scatter_context_batches,
         )
         if phases_finished is False:
             _nep_debug_print(f"progressed split dispatch host phases module={module_label}")
             return False
 
-        if scatter_context_batches is None:
-            completion_stream = boundary_group._get_nep_nccl_comm_stream(0)
-            completion_event.record(completion_stream)
-        elif end_iteration_scatter and scatter_context_batches:
+        if scatter_context_batches:
             self._defer_nep_scatter_context_batches_to_iteration_end(
                 scatter_context_batches, completion_event, module_label
             )
-        elif end_iteration_scatter:
-            completion_event.record(boundary_group._get_nep_nccl_comm_stream(0))
         else:
-            self._queue_nep_scatter_context_batches(
-                scatter_context_batches, completion_event, module_label, scatter_after_event
-            )
+            completion_event.record(boundary_group._get_nep_nccl_comm_stream(0))
         not_ready = [group._nep_nccl_group_index for group in groups if not group._nep_nccl_ready]
         if not_ready and scatter_context_batches:
             raise RuntimeError(
@@ -5505,15 +5162,10 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             pending_host_phases = getattr(self, "_nep_dispatch_pending_host_phases", None)
 
         if pending_host_phases is not None:
-            defer_scatter_submission = _nep_a2a_scatter_scheduler_enabled() and not final
             phases_finished = self._finish_pending_nep_dispatch_host_phases(
-                device_align_phases=_nep_post_graph_phases_enabled(),
-                defer_scatter_submission=defer_scatter_submission,
+                device_align_phases=_nep_post_graph_phases_enabled()
             )
             if not phases_finished:
-                if defer_scatter_submission:
-                    _nep_debug_print("staged Scatter until the next model-EP A2A burst end")
-                    return
                 raise RuntimeError("The next model-EP boundary did not finish split NEP phases")
             pending_host_phases = None
 
