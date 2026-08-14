@@ -3609,3 +3609,28 @@ Append a dated entry whenever we do something new: code changes, job submissions
   repeatable source regression.
 - Decision: accept Stage 2c1. The active GPU collective structure, memory footprint, correctness,
   and stable adjacent performance are unchanged; obsolete cross-file Megatron hooks are gone.
+
+## 2026-08-14 — Cleanup Stage 2c2: remove dead module/CUDA-graph dispatch hooks
+
+- Removed the unreachable module-boundary readiness body, full-backward pre/post hooks, partial
+  CUDA-graph callbacks, post-graph phase modes, deferred-host-launch state, graph-only readiness
+  fields, and their helper methods. These hooks no longer launched work because Stage 2b2 had
+  hardwired the accepted bucket-ready path and `_mark_nep_dispatch_boundary_ready` returned
+  unconditionally.
+- The remaining dispatch setup only maps each expert bucket to the existing
+  `register_grad_ready`/AccumulateGrad callback. Gather launch, canonical EDP ordering, packed
+  end-of-iteration Scatter, and the final fence path are unchanged. `nonuniform_ep.py` fell from
+  5,253 to 4,961 lines (net -292 lines); no other implementation file changed.
+- Candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2c2_dead_dispatch_hooks_removed_20260814`; SHA-256
+  `d4a4c87b25c9df5e7bb8e6d251822ca7764eff733f8628f8040c0138d3b1204b`.
+- Mandatory compute-node isort/compile job `2694389` passed before the snapshot was frozen.
+- All-rank EP8/EP4 ABBA job `2694464`:
+  - Stage-2c1 reference pooled mean: 257.183 ms,
+  - Stage-2c2 candidate pooled mean: 258.615 ms (+0.557%),
+  - paired deltas: -0.053% and +1.185%, both within the +1.442% same-code ordering calibration,
+  - exactly 48,386.22 MiB peak allocation in all four cases,
+  - zero skipped/NaN iterations,
+  - exact 12/12-rank collective and NEP-annotation signatures across every case.
+- Decision: accept Stage 2c2. Removing the no-op hooks preserves behavior, memory, collective
+  structure, and calibrated EP8 performance.

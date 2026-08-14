@@ -29,7 +29,6 @@ from ..optimizer.param_layout import (
     pad_param_start,
 )
 from ..process_groups_config import ProcessGroupCollection
-from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
 from .distributed_data_parallel import DistributedDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
@@ -113,13 +112,6 @@ def _nep_overlap_debug_enabled() -> bool:
 
 
 
-def _nep_defer_dispatch_host_launch_enabled() -> bool:
-    return os.getenv("MEGATRON_NONUNIFORM_EP_DEFER_HOST_LAUNCH", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
 
 
 def _nep_defer_model_ep_fence_enabled() -> bool:
@@ -147,22 +139,8 @@ def _nep_end_iteration_scatter_enabled() -> bool:
 
 
 
-def _nep_post_graph_phases_enabled() -> bool:
-    return os.getenv("MEGATRON_NONUNIFORM_EP_POST_GRAPH_PHASES", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
 
 
-def _nep_post_graph_host_phases_enabled() -> bool:
-    return os.getenv("MEGATRON_NONUNIFORM_EP_POST_GRAPH_HOST_PHASES", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
 
 
 def _nep_benchmark_skip_scatter_enabled() -> bool:
@@ -977,15 +955,12 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         self._nep_nccl_overlap_debug_events = []
         self._nep_dispatch_boundary_launch = False
         self._nep_dispatch_boundary_ready = False
-        self._nep_dispatch_boundary_graph_replay_ready = False
         self._nep_dispatch_boundary_launched = False
         self._nep_dispatch_boundary_launching = False
         self._nep_dispatch_boundary_wait_logged = False
         self._nep_dispatch_boundary_callback = None
         self._nep_dispatch_boundary_groups = ()
         self._nep_dispatch_boundary_module_label = None
-        self._nep_dispatch_boundary_required_modules = set()
-        self._nep_dispatch_boundary_ready_modules = set()
 
     def _nep_benchmark_phase_enabled(self, phase: str) -> bool:
         """Check cached causal-benchmark state without a hot-path environment read."""
@@ -1293,8 +1268,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             and not self._nep_dispatch_boundary_ready
         ):
             return False
-        if self._nep_dispatch_boundary_graph_replay_ready:
-            return True
         for entry in self._nep_nccl_owner_entries(owner_ep_rank):
             for param in entry["bucket"].params_list:
                 ready_count = self.per_param_grad_ready_counts.get(param, 0)
@@ -3134,8 +3107,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
     def _finish_nep_nccl_process_group_dispatch_batches(
         self,
         pending_host_phases: List[dict],
-        device_align_phases: bool = False,
-        finish_all_phases: bool = True,
         scatter_context_batches: Optional[List[List[dict]]] = None,
     ) -> bool:
         """Progress ordered EDP and Scatter phases after backward compute is queued."""
@@ -3165,8 +3136,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     pending_host_phases[pending_index : pending_index + 1] = next_pending
                     return self._finish_nep_nccl_process_group_dispatch_batches(
                         pending_host_phases,
-                        device_align_phases=device_align_phases,
-                        finish_all_phases=finish_all_phases,
                         scatter_context_batches=scatter_context_batches,
                     )
                 continue
@@ -3175,12 +3144,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             if pending["phase"] == "scatter_ready":
                 pass
             elif pending["phase"] == "edp_launched":
-                if device_align_phases:
-                    edp_done_event = pending.get("edp_done_event")
-                    if edp_done_event is None:
-                        raise RuntimeError("Post-graph NEP phases are missing the EDP event")
-                    with torch.profiler.record_function("nep_post_graph_wait_edp_device"):
-                        edp_done_event.synchronize()
                 pending["phase"] = "edp_complete"
 
                 pending["phase"] = "scatter_ready"
@@ -3219,8 +3182,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     pending.update(next_pending)
                 return self._finish_nep_nccl_process_group_dispatch_batches(
                     pending_host_phases,
-                    device_align_phases=device_align_phases,
-                    finish_all_phases=finish_all_phases,
                     scatter_context_batches=scatter_context_batches,
                 )
 
@@ -3544,11 +3505,9 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         self._nep_nccl_started_tasks = set()
         self._nep_nccl_prepped_experts = set()
         self._nep_dispatch_boundary_ready = False
-        self._nep_dispatch_boundary_graph_replay_ready = False
         self._nep_dispatch_boundary_launched = False
         self._nep_dispatch_boundary_launching = False
         self._nep_dispatch_boundary_wait_logged = False
-        self._nep_dispatch_boundary_ready_modules = set()
         reset_ordered_bucket_group_scheduler(
             self, "_nep_nccl_scheduler_state", "_nep_nccl_group_index"
         )
@@ -4212,12 +4171,9 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                     bucket_groups[len(bucket_groups) - index - 1]
                 )
         self._configure_nep_distributed_optimizer_buffers()
-        self._nep_dispatch_boundary_hook_handles = []
-        self._nep_dispatch_boundary_pre_hook_handles = []
         self._nep_dispatch_pending_completion_event = None
         self._nep_dispatch_pending_host_phases = None
         self._nep_dispatch_inflight_completion_events = []
-        self._nep_dispatch_deferred_compute_ready_event = None
         self._nep_dispatch_waiting_groups = None
         self._nep_dispatch_waiting_module_label = None
         self._nep_scatter_batches = []
@@ -4499,67 +4455,9 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
 
         _nep_debug_print("synchronized logical expert and owner parameters")
 
-    @staticmethod
-    def _find_nep_local_cuda_graph_manager(module_name: str, named_modules: dict):
-        """Find the nearest full-layer local graph manager containing an MoE module."""
-        path = module_name.split(".") if module_name else []
-        for prefix_length in range(len(path), -1, -1):
-            parent_name = ".".join(path[:prefix_length])
-            parent = named_modules.get(parent_name)
-            if getattr(parent, "use_partial_cudagraphs", False):
-                return None
-            graph_manager = getattr(parent, "cudagraph_manager", None)
-            if graph_manager is not None:
-                return graph_manager
-        return None
 
-    @staticmethod
-    def _nep_module_uses_partial_cuda_graphs(module_name: str, named_modules: dict) -> bool:
-        """Return whether an MoE module is owned by a partial-graph transformer layer."""
-        path = module_name.split(".") if module_name else []
-        for prefix_length in range(len(path), -1, -1):
-            parent_name = ".".join(path[:prefix_length])
-            parent = named_modules.get(parent_name)
-            if getattr(parent, "use_partial_cudagraphs", False):
-                return True
-        return False
 
-    @staticmethod
-    def _coalesce_nep_cuda_graph_boundary(module_entries: list) -> tuple:
-        """Combine all MoE groups covered by one local CUDA graph replay."""
-        groups = []
-        seen_group_ids = set()
-        for _, module_groups in module_entries:
-            for group in module_groups:
-                if id(group) in seen_group_ids:
-                    continue
-                seen_group_ids.add(id(group))
-                groups.append(group)
-        ordered_groups = tuple(sorted(groups, key=lambda group: group._nep_nccl_group_index))
-        module_label = (
-            "cuda_graph[" + ",".join(module_name for module_name, _ in module_entries) + "]"
-        )
-        return ordered_groups, module_label
 
-    @staticmethod
-    def _find_nep_non_moe_cuda_graph_managers(named_modules: dict, moe_type: type) -> tuple:
-        """Return unique local graph managers whose module subtree contains no MoE layer."""
-        manager_entries = {}
-        for module in named_modules.values():
-            graph_manager = getattr(module, "cudagraph_manager", None)
-            if graph_manager is None:
-                continue
-            entry = manager_entries.setdefault(
-                id(graph_manager), {"manager": graph_manager, "contains_moe": False}
-            )
-            child_modules = getattr(module, "modules", None)
-            if child_modules is not None:
-                entry["contains_moe"] |= any(
-                    isinstance(child, moe_type) for child in child_modules()
-                )
-        return tuple(
-            entry["manager"] for entry in manager_entries.values() if not entry["contains_moe"]
-        )
 
     def _retire_nep_scatter_chunk(self, force: bool = False) -> bool:
         """Retire the last Scatter chunk without launching NCCL from another thread."""
@@ -4769,14 +4667,12 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
 
 
     def _configure_nep_dispatch_boundary_hooks(self) -> None:
-        """Launch NCCL reshard pipelines after each MoE dispatch backward."""
+        """Map expert buckets to their AccumulateGrad launch callbacks."""
         from ..transformer.moe.moe_layer import BaseMoELayer
 
         expert_groups = set(self.expert_parallel_bucket_groups)
-        assigned_groups = {}
-        named_modules = dict(self.module.named_modules())
-        graph_manager_entries = {}
-        for module_name, module in named_modules.items():
+        assigned_groups = set()
+        for module_name, module in self.module.named_modules():
             if not isinstance(module, BaseMoELayer):
                 continue
 
@@ -4785,179 +4681,25 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 bucket_group = self.param_to_bucket_group.get(param)
                 if bucket_group in expert_groups and bucket_group not in module_groups:
                     module_groups.append(bucket_group)
-            if not module_groups:
-                continue
-
             module_groups.sort(key=lambda group: group._nep_nccl_group_index)
-            dispatch_groups = tuple(module_groups)
             for bucket_group in module_groups:
-                assigned_groups.setdefault(bucket_group, set()).add(module_name)
+                assigned_groups.add(bucket_group)
                 bucket_group._nep_dispatch_boundary_launch = True
                 bucket_group._nep_dispatch_boundary_callback = (
                     self._launch_and_release_nep_two_level_gather
                 )
                 bucket_group._nep_dispatch_boundary_groups = (bucket_group,)
                 bucket_group._nep_dispatch_boundary_module_label = module_name
-                bucket_group._nep_dispatch_boundary_required_modules.add(module_name)
 
-            uses_partial_cuda_graphs = self._nep_module_uses_partial_cuda_graphs(
-                module_name, named_modules
-            )
-            graph_manager = self._find_nep_local_cuda_graph_manager(module_name, named_modules)
-            if graph_manager is not None:
-                entry = graph_manager_entries.setdefault(
-                    id(graph_manager), {"manager": graph_manager, "modules": []}
-                )
-                entry["modules"].append((module_name, tuple(module_groups)))
-
-            def dispatch_boundary_hook(
-                unused_module,
-                unused_grad_input,
-                unused_grad_output,
-                groups=tuple(module_groups),
-                module_label=module_name,
-            ):
-                self._mark_nep_dispatch_boundary_ready(groups, module_label)
-
-            def dispatch_boundary_pre_hook(unused_module, unused_grad_output):
-                if not is_graph_capturing():
-                    self._wait_for_nep_dispatch_launch()
-
-            if uses_partial_cuda_graphs:
-
-                def dispatch_input_grad_callback(
-                    groups=tuple(module_groups), module_label=module_name
-                ):
-                    self._mark_nep_dispatch_boundary_ready(groups, module_label)
-
-                module.register_expert_compute_input_grad_callback(dispatch_input_grad_callback)
-                module.register_expert_compute_dgrad_callback(self._wait_for_nep_dispatch_launch)
-                self._nep_dispatch_boundary_pre_hook_handles.append(
-                    module.register_full_backward_pre_hook(dispatch_boundary_pre_hook)
-                )
-            else:
-                self._nep_dispatch_boundary_hook_handles.append(
-                    module.register_full_backward_hook(dispatch_boundary_hook)
-                )
-                self._nep_dispatch_boundary_pre_hook_handles.append(
-                    module.register_full_backward_pre_hook(dispatch_boundary_pre_hook)
-                )
-
-        for entry in graph_manager_entries.values():
-            graph_groups, graph_label = self._coalesce_nep_cuda_graph_boundary(entry["modules"])
-            ready_modules_by_group = {group: set() for group in graph_groups}
-            for module_name, module_groups in entry["modules"]:
-                for group in module_groups:
-                    ready_modules_by_group[group].add(module_name)
-
-            def graph_post_replay_hook(
-                groups=graph_groups, module_label=graph_label, ready_modules=ready_modules_by_group
-            ):
-                self._mark_nep_dispatch_boundary_ready(
-                    groups, module_label, graph_replay=True, ready_modules_by_group=ready_modules
-                )
-
-            entry["manager"].register_backward_replay_hooks(
-                pre_hook=self._wait_for_nep_dispatch_launch, post_hook=graph_post_replay_hook
-            )
-
-        post_graph_phases = _nep_post_graph_phases_enabled()
-        post_graph_host_phases = _nep_post_graph_host_phases_enabled()
-        if post_graph_phases and post_graph_host_phases:
-            raise RuntimeError(
-                "Device-aligned and host-only post-graph NEP phases are mutually exclusive"
-            )
-        non_moe_graph_managers = ()
-        if post_graph_phases or post_graph_host_phases:
-            non_moe_graph_managers = self._find_nep_non_moe_cuda_graph_managers(
-                named_modules, BaseMoELayer
-            )
-        if post_graph_phases or post_graph_host_phases:
-            for graph_manager in non_moe_graph_managers:
-                graph_manager.register_backward_replay_hooks(
-                    post_hook=self._progress_nep_dispatch_after_graph_launch
-                )
-
-        missing_groups = expert_groups - set(assigned_groups)
+        missing_groups = expert_groups - assigned_groups
         if missing_groups:
             missing_indices = sorted(group._nep_nccl_group_index for group in missing_groups)
             raise RuntimeError(
-                "NCCL NEP could not map expert bucket groups to MoE dispatch boundaries: "
+                "NCCL NEP could not map expert bucket groups to MoE modules: "
                 f"groups={missing_indices}"
             )
 
-    def _mark_nep_dispatch_boundary_ready(
-        self,
-        groups: tuple,
-        module_label: str,
-        graph_replay: bool = False,
-        defer_launch: bool = False,
-        ready_modules_by_group: Optional[dict] = None,
-    ) -> None:
-        """Launch a combined group only after every constituent MoE module is ready."""
-        if (
-            is_graph_capturing()
-            or any(group.is_first_batch for group in groups)
-            or not all(group.is_last_microbatch for group in groups)
-        ):
-            return
-        return
 
-        for group in groups:
-            ready_modules = getattr(group, "_nep_dispatch_boundary_ready_modules", None)
-            if ready_modules is None:
-                ready_modules = set()
-                group._nep_dispatch_boundary_ready_modules = ready_modules
-            if ready_modules_by_group is None:
-                ready_modules.add(module_label)
-            else:
-                ready_modules.update(ready_modules_by_group.get(group, ()))
-
-        incomplete_groups = []
-        for group in groups:
-            required_modules = getattr(
-                group, "_nep_dispatch_boundary_required_modules", {module_label}
-            )
-            if not required_modules.issubset(group._nep_dispatch_boundary_ready_modules):
-                incomplete_groups.append(group)
-        if incomplete_groups:
-            _nep_debug_print(
-                f"dispatch_backward_boundary_waiting_for_modules module={module_label} "
-                f"groups={[group._nep_nccl_group_index for group in incomplete_groups]}"
-            )
-            return
-
-        for group in groups:
-            group._nep_dispatch_boundary_ready = True
-            if graph_replay:
-                group._nep_dispatch_boundary_graph_replay_ready = True
-        self._nep_dispatch_waiting_groups = groups
-        self._nep_dispatch_waiting_module_label = module_label
-        host_launch_deferred = defer_launch or _nep_defer_dispatch_host_launch_enabled()
-        if host_launch_deferred and _nep_post_graph_host_phases_enabled():
-            if getattr(self, "_nep_dispatch_deferred_compute_ready_event", None) is not None:
-                raise RuntimeError("Prior deferred NEP compute-ready event was not consumed")
-            compute_ready_event = torch.cuda.Event()
-            compute_ready_event.record(torch.cuda.current_stream())
-            self._nep_dispatch_deferred_compute_ready_event = compute_ready_event
-        if not host_launch_deferred:
-            self._launch_nep_dispatch_boundary_tasks(groups, module_label)
-
-    def _launch_waiting_nep_dispatch_boundary_tasks(self) -> None:
-        """Launch the prior ready layer after the next combine backward is enqueued."""
-        groups = self._nep_dispatch_waiting_groups
-        if (
-            groups is None
-            or self._nep_dispatch_pending_completion_event is not None
-            or getattr(self, "_nep_dispatch_pending_host_phases", None) is not None
-        ):
-            return
-        module_label = self._nep_dispatch_waiting_module_label
-        if not self._launch_nep_dispatch_boundary_tasks(groups, module_label):
-            raise RuntimeError(
-                "NEP dispatch boundary reached its launch point before gradients were ready: "
-                f"module={module_label}"
-            )
 
     def _launch_and_release_nep_two_level_gather(self, groups: tuple, module_label: str) -> None:
         """Submit one ready Gather group and release its host boundary immediately."""
@@ -5007,12 +4749,8 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             or getattr(self, "_nep_dispatch_pending_host_phases", None) is not None
         ):
             raise RuntimeError("Prior NEP dispatch completion has not been consumed")
-        compute_ready_event = getattr(self, "_nep_dispatch_deferred_compute_ready_event", None)
-        if compute_ready_event is None:
-            compute_ready_event = torch.cuda.Event()
-            compute_ready_event.record(torch.cuda.current_stream())
-        else:
-            self._nep_dispatch_deferred_compute_ready_event = None
+        compute_ready_event = torch.cuda.Event()
+        compute_ready_event.record(torch.cuda.current_stream())
         completion_event = torch.cuda.Event()
         for group in groups:
             group._nep_dispatch_boundary_launching = True
@@ -5090,12 +4828,8 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
 
 
 
-    def _finish_pending_nep_dispatch_host_phases(
-        self,
-        device_align_phases: bool = False,
-        finish_all_phases: bool = True,
-    ) -> bool:
-        """Progress a split NEP pipeline without consuming its model-EP completion fence."""
+    def _finish_pending_nep_dispatch_host_phases(self) -> bool:
+        """Finish a launched Gather/EDP pipeline and defer its packed Scatter."""
         pending_host_phases = getattr(self, "_nep_dispatch_pending_host_phases", None)
         if pending_host_phases is None:
             return False
@@ -5111,10 +4845,7 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         scatter_context_batches = []
         boundary_group, host_phases = pending_host_phases
         phases_finished = boundary_group._finish_nep_nccl_process_group_dispatch_batches(
-            host_phases,
-            device_align_phases=device_align_phases,
-            finish_all_phases=finish_all_phases,
-            scatter_context_batches=scatter_context_batches,
+            host_phases, scatter_context_batches=scatter_context_batches
         )
         if phases_finished is False:
             _nep_debug_print(f"progressed split dispatch host phases module={module_label}")
@@ -5133,22 +4864,9 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 f"module={module_label}, groups={not_ready}"
             )
         self._nep_dispatch_pending_host_phases = None
-        _nep_debug_print(
-            f"finished split dispatch host phases module={module_label} "
-            f"device_aligned={device_align_phases}"
-        )
+        _nep_debug_print(f"finished split dispatch host phases module={module_label}")
         return True
 
-    def _progress_nep_dispatch_after_graph_launch(self) -> None:
-        """Progress split NEP phases after useful non-MoE graph work is queued."""
-        if _nep_post_graph_host_phases_enabled():
-            if _nep_defer_dispatch_host_launch_enabled():
-                self._launch_waiting_nep_dispatch_boundary_tasks()
-            self._finish_pending_nep_dispatch_host_phases()
-        elif _nep_post_graph_phases_enabled():
-            self._finish_pending_nep_dispatch_host_phases(
-                device_align_phases=True, finish_all_phases=False
-            )
 
     def _wait_for_nep_dispatch_launch(self, final: bool = False) -> None:
         """Retire one host launch and optionally fence all device-inflight reshards."""
@@ -5156,18 +4874,10 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         module_label = self._nep_dispatch_waiting_module_label
         completion_event = self._nep_dispatch_pending_completion_event
         pending_host_phases = getattr(self, "_nep_dispatch_pending_host_phases", None)
-        if groups is not None and completion_event is None:
-            self._launch_waiting_nep_dispatch_boundary_tasks()
-            completion_event = self._nep_dispatch_pending_completion_event
-            pending_host_phases = getattr(self, "_nep_dispatch_pending_host_phases", None)
 
         if pending_host_phases is not None:
-            phases_finished = self._finish_pending_nep_dispatch_host_phases(
-                device_align_phases=_nep_post_graph_phases_enabled()
-            )
-            if not phases_finished:
+            if not self._finish_pending_nep_dispatch_host_phases():
                 raise RuntimeError("The next model-EP boundary did not finish split NEP phases")
-            pending_host_phases = None
 
         if completion_event is not None:
             if _nep_defer_model_ep_fence_enabled():
@@ -5185,8 +4895,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                     f"ordered dispatch_backward_boundary completion module={module_label}"
                 )
             self._nep_dispatch_pending_completion_event = None
-        elif pending_host_phases is not None:
-            raise RuntimeError("Split NEP host phases are missing their CUDA completion event")
         if groups is not None:
             if not all(group._nep_dispatch_boundary_launched for group in groups):
                 raise RuntimeError(f"NEP dispatch launch did not finish: module={module_label}")
