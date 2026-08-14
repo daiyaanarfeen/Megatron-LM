@@ -3482,3 +3482,28 @@ Append a dated entry whenever we do something new: code changes, job submissions
   - confirmed boundaries: `slurm_runs/lyris_ep16_mbs_limit/boundaries_2692017.tsv`
   - exact driver: `slurm_runs/lyris_ep16_mbs_limit/driver_2692017.slurm`
   - batch log: `slurm_runs/lyris/coreai_comparch_sysarch-ep16.mbs-limit-2692017.out`
+
+## 2026-08-14 — Cleanup Stage 1: remove legacy P2P backend
+
+- Established an immutable pre-cleanup checkpoint at `3760f4823` and rollback branch
+  `rollback/nep-pre-cleanup-20260814`; expanded the source snapshot under
+  `slurm_runs/nep_cleanup_snapshots/baseline_20260814` to all 19 NEP-related source/test files.
+- Same-code EP8/EP4 calibration:
+  - jobs `2692791` (short window) and `2692879` (23 clean iterations per run),
+  - 12/12 rank traces were structurally identical across all four ABBA cases,
+  - the longer same-code ABBA measured a +1.44% middle-vs-edge ordering bias, so cleanup gates
+    use the pooled ABBA delta together with exact trace signatures rather than a single pair.
+- Removed the unused P2P gradient-transfer implementation, P2P tags/buffers/plans, synthetic
+  P2P buckets, its extra `nep_grad_transfer` process group, and the P2P selector internals.
+  The accepted `--nonuniform-ep-ddp-approach nccl` spelling remains as a one-value launcher
+  compatibility argument. `nonuniform_ep.py` fell from 8,016 to 7,176 lines.
+- EP8/EP4 DistOpt + Flex/HybridEP all-rank-profiled ABBA validation job `2693035`:
+  - reference pooled mean: 211.441 ms,
+  - candidate pooled mean: 213.591 ms (+1.017%), below the +1.442% same-code ordering bias,
+  - peak allocated memory: exactly 48,386.22 MiB in every case,
+  - no skipped/NaN iterations,
+  - all 12 per-rank NEP annotation and process-group collective signatures were exactly equal
+    between reference and candidate (including Gather, expert EDP, packed Scatter, dense DP,
+    model EP, TP, and parameter-gather counts).
+- Decision: accept Stage 1; there is no measured behavioral, memory, trace, or performance
+  regression relative to the calibrated same-code gate.

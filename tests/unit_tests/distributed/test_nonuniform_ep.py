@@ -20,7 +20,6 @@ from megatron.core.distributed.nonuniform_common import (
     set_nonuniform_ep_runtime_config,
 )
 from megatron.core.distributed.nonuniform_ep import (
-    NonuniformEPApproach,
     NonuniformEPDistributedDataParallel,
     NonuniformEPNCCLParamAndGradBucketGroup,
     _build_nep_nccl_scatter_chunk_ranges,

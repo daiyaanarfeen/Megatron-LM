@@ -462,7 +462,7 @@ def _initialize_model_parallel(*args, **kwargs):
         tensor_model_parallel_size=megatron_args.tensor_model_parallel_size,
         context_parallel_size=megatron_args.context_parallel_size,
         num_tp_cp_per_replica=nep_topology,
-        enable_edp_ready_gate=megatron_args.nonuniform_ep_ddp_approach == "nccl",
+        enable_edp_ready_gate=True,
         expert_tensor_parallel_size=megatron_args.expert_tensor_parallel_size,
         num_moe_experts=megatron_args.num_experts,
         nccl_communicator_config_path=megatron_args.nccl_communicator_config_path,
@@ -476,20 +476,7 @@ def _initialize_model_parallel(*args, **kwargs):
 
 
 def _build_ep_config(args) -> NonuniformEPConfig:
-    expert_owner = _load_json_arg(
-        args.nonuniform_ep_expert_owner_json,
-        args.nonuniform_ep_expert_owner_path,
-        None,
-    )
-    if expert_owner is not None:
-        expert_owner = {int(expert): int(owner) for expert, owner in expert_owner.items()}
-
-    kwargs = {
-        'approach': args.nonuniform_ep_ddp_approach,
-        'runtime_config': _build_ep_runtime_config(args),
-        'expert_owner': expert_owner,
-        'require_owner_local_expert': True,
-    }
+    kwargs = {'runtime_config': _build_ep_runtime_config(args)}
     if args.nonuniform_ep_expert_name_pattern is not None:
         kwargs['expert_name_pattern'] = args.nonuniform_ep_expert_name_pattern
     return NonuniformEPConfig(**kwargs)
@@ -711,14 +698,12 @@ def _add_nonuniform_args(parser):
     )
     group.add_argument('--nonuniform-ep-placement-json', default=None)
     group.add_argument('--nonuniform-ep-placement-path', default=None)
-    group.add_argument('--nonuniform-ep-expert-owner-json', default=None)
-    group.add_argument('--nonuniform-ep-expert-owner-path', default=None)
     group.add_argument('--nonuniform-ep-expert-name-pattern', default=None)
     group.add_argument(
         '--nonuniform-ep-ddp-approach',
-        choices=['p2p', 'nccl'],
-        default='p2p',
-        help='Nonuniform EP expert-gradient sync approach. `nccl` is Approach A.',
+        choices=['nccl'],
+        default='nccl',
+        help='Compatibility spelling for the NCCL nonuniform-EP implementation.',
     )
     group.add_argument(
         '--nonuniform-skip-optimizer-step',
