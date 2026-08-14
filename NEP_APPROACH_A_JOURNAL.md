@@ -3507,3 +3507,25 @@ Append a dated entry whenever we do something new: code changes, job submissions
     model EP, TP, and parameter-gather counts).
 - Decision: accept Stage 1; there is no measured behavioral, memory, trace, or performance
   regression relative to the calibrated same-code gate.
+
+## 2026-08-14 — Cleanup Stage 2a: remove disabled zero-SM reshard experiment
+
+- Removed only the opt-in zero-SM/copy-engine reshard experiment from the NEP core: its native
+  NCCL wrapper, registered staging buffers, CTA-policy process groups, helper-rank placement,
+  native Gather/Scatter implementations, first-batch phase barriers, and host completion worker.
+  Every selected-path conditional was collapsed to the exact ProcessGroup all-to-all branch that
+  was already active in the accepted EP8 configuration. `nonuniform_ep.py` fell from 7,176 to
+  6,600 lines; deleting the now-unimported `_native_nccl.py` removes another 101 lines.
+- The candidate was compile-checked and frozen at
+  `slurm_runs/nep_cleanup_snapshots/stage2a_zero_sm_removed_20260814` before measurement.
+- EP8/EP4 DistOpt + Flex/HybridEP all-rank-profiled ABBA validation job `2693260`:
+  - Stage-1 reference pooled mean: 213.820 ms,
+  - Stage-2a candidate pooled mean: 213.176 ms (-0.301%),
+  - pair deltas: -1.886% and +1.327%, consistent with the calibrated run-order noise,
+  - peak allocated memory: exactly 48,386.22 MiB in all four cases,
+  - zero skipped/NaN iterations,
+  - all 12 per-rank NEP annotation and process-group collective signatures were exactly equal
+    across both references and both candidates.
+- `_native_nccl.py` had no caller in the measured candidate and was deleted after the gate; file
+  presence therefore could not affect the executed Python module graph or GPU trace.
+- Decision: accept Stage 2a; no behavioral, memory, trace, or performance regression was observed.
