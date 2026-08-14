@@ -3056,3 +3056,429 @@ Append a dated entry whenever we do something new: code changes, job submissions
 - Focused on `8b_1t`, `a8b_120b_latentmoe_1t`, `a3b_30b_moe_1t`, and `a3b_30b_transformer_moe_1t`, then pulled and ran the Nemotron3 nano/super/ultra scripts.
 - Tuned allowed knobs only: decrease TP / increase EP or DP, and adjust MBS/GBS.
 - Settled on the best known baseline settings for the seven runs before switching focus to NEP Approach A correctness and performance.
+
+### Native distributed-optimizer implementation — synchronous bring-up
+
+- Preserved the accepted implementation at local rollback commit `837882969`; the attempted push
+  to the personal fork was blocked by the execution policy, so no remote branch was changed.
+- Began the approved narrow BF16-Adam DistOpt path without modifying native Adam or
+  `DistributedOptimizer`: NEP now constructs persistent logical-owner proxy parameters in native
+  `_ParamAndGradBuffer` storage, stages Gather results into those buffers, invokes native
+  `_ParamAndGradBucketGroup` reduce-scatter, omits the regular optimizer's gradient Scatter, and
+  uses native parameter all-gather followed by owner-to-physical parameter redistribution.
+- Added only the reviewed optimizer-factory substitution for expert params/buffers and removed the
+  obsolete opt-in entrypoint rejection. Dense/non-expert params still use the untouched native
+  factory path. The accepted non-distributed path is guarded from the substitution.
+- Initial gates remain intentionally narrow: one DistOpt instance, ProcessGroup NCCL Approach A,
+  synchronous parameter gather, BF16 Adam, no FSDP/offload/precision-aware/FP8/FP4/NCCL-UB. No
+  unexpected subsystem has been changed. Syntax and whitespace checks pass; focused tests and GPU
+  correctness validation are next.
+
+## 2026-08-12T11:52:54-07:00 — NEP native distributed-optimizer EP8/EP4 bring-up submitted
+
+- Kept the approved implementation scope: `nonuniform_ep.py`, the narrow expert-buffer hook in `optimizer/__init__.py`, opt-in entrypoints, focused tests, and one runner. No `distrib_optimizer.py` or other core subsystem was changed.
+- Added logical owner proxy buffers that reuse native `_ParamAndGradBuffer`, native EDP reduce-scatter, and native parameter all-gather; gradient Scatter is skipped in DistOpt mode and updated owner parameters are redistributed to physical expert holders.
+- Corrected the owner named-parameter interface to emit standard `(name, parameter)` tuples and cached parameter redistribution buffers so the training loop does not allocate them per iteration.
+- Added a fail-fast requirement for the existing one-Gather-per-EDP scheduler (`MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP=1`).
+- Submitted job **2674633** on `gb200-backfill`: 3 nodes, segment 3, 12 ranks, topology EP8/EP4, TP1/CP1, 16 experts, 2 layers, MBS1, GBS12, 4 iterations, BF16 Adam DistOpt, fixed balanced routing, profiler on all ranks.
+- The wrapper first runs read-only isort/Black/Ruff/compile checks and focused distributed `nep_distopt` unit tests, then checksum-validates cross-replica updates and requires profiler traces.
+- Initial scheduler state: `PENDING (Priority)`, `StartTime=Unknown` (test-only estimate favored GB200 over GB300).
+- Wrapper: `scripts/nonuniform/run_lyris_ep8_ep4_distopt_smoke.sh`; expected run root: `slurm_runs/lyris_ep8_ep4_distopt_smoke/ep8_ep4_distopt_2674633`.
+
+## 2026-08-12T12:00:00-07:00 — DistOpt smoke preflight failure
+
+- Job **2674633** allocated immediately on `lyris[0131-0132,0134]` and stopped before unit tests or training.
+- Cause: isort reported only `pretrain_hybrid.py` and `tests/unit_tests/distributed/test_nonuniform_ep.py` as unsorted.
+- No implementation/runtime result was produced. The wrapper now applies isort and Black, verifies both plus Ruff/compile, then proceeds to the same focused tests and unchanged training case.
+
+## 2026-08-12T12:15:00-07:00 — DistOpt focused-test initialization fix
+
+- Job **2674766** allocated on `lyris[0111-0112,0118]`; formatting and three focused tests passed, but training did not start.
+- The factory-substitution test failed because `torchrun` exported rank metadata but this plain function test had not initialized the default process group before native `_get_param_groups` called `all_gather_object`.
+- Fixed only the test by calling the repository-native `Utils.initialize_distributed()` helper.
+- Reverted broad Black-only churn in `pretrain_hybrid.py`, retaining exactly the approved six-line distributed-optimizer gate removal. The smoke still syntax-checks that file but does not reformat unrelated pre-existing code.
+
+## 2026-08-12T14:00:00-07:00 — First DistOpt training launch reached model wrapping
+
+- Job **2674913** allocated on `lyris[0104-0106]`.
+- Formatting, Ruff/compile, and all four focused distributed `nep_distopt` tests passed.
+- All 12 training ranks initialized through model construction but failed before the first iteration because native training now passes `full_param_layout` into DDP and the opt-in NEP wrapper signature had not mirrored that native argument.
+- Applied the narrow compatibility fix entirely in `nonuniform_ep.py`: accept typed `Optional[FullParamLayout]` and forward it through the existing filtered parent kwargs. No optimizer or unrelated subsystem changed.
+
+## 2026-08-12T14:15:00-07:00 — EP8/EP4 native DistOpt correctness gate passed
+
+- Job **2675511** ran on `lyris[0223-0225]`; all formatter/Ruff/compile checks and all four focused distributed unit tests passed.
+- The unchanged 12-rank EP8/EP4 training case completed all 4 BF16 Adam distributed-optimizer iterations with zero skipped/NaN iterations.
+- Cross-replica and within-replica parameter fingerprints match after every recorded optimizer step; parameters change across iterations, proving real updates rather than a no-op. All 12 profiler traces exist under `training/torch_profile/rank-*.json.gz`.
+- Slurm marked the wrapper failed only because its validator expected PyTorch's older `*.pt.trace.json.gz` filename. Correcting the filename glob and rerunning the validator against the existing artifacts yields PASS; training itself and every SLURM training step completed with exit 0.
+- This validates synchronous parameter gather only. `overlap_grad_reduce=True` is already active; `overlap_param_gather` remains intentionally gated pending a separate implementation/validation step.
+
+## 2026-08-12T14:25:00-07:00 — Duplicate parameter sync removed
+
+- Job **2675637** completed successfully on `lyris[0086-0088]` with all five focused tests, all 4 training iterations, checksum validation, and all-rank profiler traces passing.
+- Added an NEP-local `param_gather_dispatched` idempotence guard; no native optimizer file changed.
+- Profile confirmation on owner ranks 0 and 8 for the two captured iterations: 4 owner-gradient staging calls, 4 native expert reduce-scatters, 4 native owner parameter all-gathers, and 4 owner-to-physical parameter redistributions. The prior run had 8 parameter all-gathers/redistributions, so the duplicate chained-optimizer launch is removed while the expected 2 expert buckets × 2 profiled iterations remain.
+- Follower rank 4 has zero owner staging/reduce-scatter/all-gather and exactly 4 parameter redistributions, as intended.
+
+## 2026-08-12T14:52:30-07:00 — Native overlap-param-gather lifecycle validated
+
+- Extended only the existing NEP expert bucket wrapper to reuse native
+  `_ParamAndGradBucketGroup.start_param_sync()` / `finish_param_sync()` and the existing DDP
+  forward-prehook lifecycle. No `distrib_optimizer.py` or other unapproved subsystem changed.
+- The first expert owner parameter all-gather starts on demand; its physical-parameter
+  redistribution completes before that expert module executes. Completing one representative NEP
+  bucket starts the next in canonical reverse-bucket order so native parameter all-gather can overlap
+  forward compute. Non-owner ranks participate only in owner-to-physical redistribution.
+- Added a focused async lifecycle test and kept the synchronous idempotence test. The smoke runner now
+  accepts `OVERLAP_PARAM_GATHER=1`, remains profiler-on for all ranks, and is check-only during
+  preflight so a job cannot mutate shared implementation files.
+- Job **2675719** allocated on `lyris[0086-0088]` but stopped in formatter preflight; Black 26 found two
+  approved files needing formatting. No tests/training ran. Applied isort and Black only to the four
+  approved Python files in short allocation **2675761**.
+- Job **2675786** allocated on `lyris[0225,0229-0230]`. All six focused distributed tests passed and
+  all 12 ranks completed four training iterations with zero skipped/NaN iterations and all-rank
+  profiler traces. Expert fingerprints changed across iterations and matched between EP8 and EP4 and
+  within each replica.
+- The wrapper's original dense post-step fingerprint assertion was invalid specifically under native
+  `overlap_param_gather`: native DistOpt deliberately reuses dense parameter-buffer storage for
+  gradients after backward, so this observation point is not a full dense-parameter checkpoint.
+  This was a validator false negative, not a training failure. The validator now checks stable dense
+  metadata there while preserving direct expert update/cross-replica checks.
+- Corrected validation against job 2675786 artifacts passes. All-rank traces show the intended
+  lifecycle in the active profile window: every owner rank has 2 native owner parameter-all-gather
+  starts, 2 finishes, and 2 physical redistributions; every follower has 0 starts/finishes and 2
+  redistributions. No duplicates or unmatched lifecycle calls were observed.
+- Remaining gates before calling regular DistOpt compatibility complete: rerun the wrapper to obtain a
+  clean Slurm PASS, regression-check synchronous parameter gather, validate EP8/EP6 non-divisible
+  Flex/HybridEP, checkpoint save/load naming, and finally perform healthy-versus-NEP performance
+  validation at intermediate scale before EP32.
+
+## 2026-08-12T15:17:56-07:00 — Clean sync/async and non-divisible Flex DistOpt gates passed
+
+- Clean asynchronous rerun **2675879** completed `0:0` on GB200 nodes
+  `lyris[0096,0100-0101]`. All six focused distributed tests, four EP8/EP4 training
+  iterations, expert-update/cross-replica fingerprints, no-dummy-state checks, and all-rank
+  profiler lifecycle checks passed.
+- Synchronous regression rerun **2675932** completed `0:0` on the same GB200 nodes. The same tests,
+  four iterations, checksums, and all-rank traces passed, showing the async lifecycle addition did
+  not regress the original synchronous path.
+- Generalized only the existing DistOpt smoke runner (no second implementation runner) to select
+  full/reduced EP sizes and All-to-All versus Flex. Its validator derives owners from topology,
+  requires every logical expert exactly once per replica, and proves local physical parameter counts
+  equal logical ownership counts, so virtual Flex slots cannot silently acquire optimizer state.
+- Non-divisible EP8/EP6 Flex/HybridEP overlap job **2675982** completed `0:0` on GB300 nodes
+  `theia[0073-0076]`: 14 ranks, 16 true experts, two layers, MBS1/GBS14, BF16 Adam DistOpt,
+  `overlap_grad_reduce=True`, `overlap_param_gather=True`, four iterations, profiler on all ranks.
+  The wrapper passed exact logical coverage, zero dummy parameters/optimizer state, changing and
+  equal EP8/EP6 expert fingerprints, and balanced owner all-gather/finish/redistribution lifecycles.
+  There were zero skipped or NaN iterations and no timeout/illegal-access/runtime error.
+
+### Checkpoint compatibility requires an explicit design decision
+
+- Source inspection confirms dense and expert optimizers do **not** traverse each other's optimizer
+  parameters. The expert `DistributedOptimizer` owns only NEP logical owner proxies/buffers.
+- The next agreed checkpoint gate exposed a distinct native assumption: model-space DistOpt formats
+  (`fully_reshardable` and `fully_sharded_model_space`) build
+  `param_to_sharded_metadata[sharded_model_tensor.data]` and look up each optimizer parameter by
+  object identity. NEP owner proxies are intentionally not physical model parameters, and an owner
+  can hold logical experts not physically resident on that same rank; setting only stable proxy names
+  therefore cannot satisfy native model-space metadata lookup.
+- Same-topology `dp_reshardable` can avoid this lookup with minimal work, but it cannot satisfy the
+  agreed healthy-to-NEP / NEP-to-healthy fully-reshardable checkpoint requirement. Supporting that
+  requirement needs either (a) an NEP model-sharded-state metadata adapter in the existing approved
+  files, with careful duplicate/replica semantics, or (b) a small generic metadata-override hook in
+  `distrib_optimizer.py`, which is outside the previously approved file set. Per the no-unreviewed-
+  subsystem rule, implementation stops here pending approval of the checkpoint approach.
+
+## 2026-08-13T03:15:00-07:00 — Full-shape DistOpt layout mismatch identified and fixed
+
+- Full EP16/EP12 validation exposed a native dense DistOpt reduce-scatter mismatch: full-replica ranks used a 361,235,840-element bucket while reduced-follower ranks used 254,931,712 elements.
+- Root cause was a stale `full_param_layout`: native training computed it before NEP synchronized `ddp_config.bucket_size`; different physical expert counts on reduced replicas had selected different automatic bucket thresholds. NEP then synchronized the threshold but retained layouts built from the old values.
+- The narrow NEP-local fix recomputes `full_param_layout` after `_synchronize_bucket_size()` only for DistOpt, using native `DistributedOptimizer.compute_full_param_layout`. No native DistOpt algorithm or checkpoint code changed.
+- Bounded EP8/EP6 Flex/HybridEP DistOpt job **2681494** passed four real optimizer iterations, all focused tests/style checks, cross-replica expert updates, and all-rank profiles.
+- Full-shape EP16/EP12 job **2681524** passed three real optimizer iterations (steady iteration 3: 725.0 ms), confirming the collective mismatch is fixed without the discarded first-batch scheduling experiments.
+
+## 2026-08-13T03:45:47-07:00 — Same-allocation EP16 healthy/NEP DistOpt A/B
+
+- Job **2681602** completed on eight GB200 nodes, segment 4. Healthy EP16+EP16 (32 ranks, GBS16) and NEP EP16+EP12 (28 ranks, GBS14) ran sequentially on the same allocation with identical model/runtime features: TP2/CP1, 128 experts, top-k6, sequence 8192, MBS1, one microbatch per replica, original a3b/30b hybrid pattern, Flex/HybridEP, static rank capacity 1.5, BF16 Adam DistOpt, overlap-grad-reduce, overlap-param-gather, eight DDP/expert bucket groups, and profiler on every rank.
+- A benchmark-only scalar-conversion bug was fixed before this run: the no-reporting-collectives shim now converts a one-element grad-norm Tensor with `.item()` while still avoiding its reporting-only all-reduce. The previous attempt **2681567** had completed its first optimizer step but failed while formatting that Tensor.
+- Clean iterations 8-10: healthy 726.3 +/- 1.3 ms; NEP 777.0 +/- 3.2 ms; gap 50.7 ms; parity 93.47%.
+- Job **2681864** independently replicated the same A/B on another eight-node GB200 allocation: healthy 772.23 +/- 1.53 ms; NEP 834.30 +/- 6.71 ms; gap 62.07 ms; parity 92.56%. Across the two allocation-local comparisons, the measured NEP penalty is therefore reproducibly about 7-8% (93.0% aggregate ratio of the two case means).
+- Both cases completed all 10 optimizer iterations with zero skipped/NaN iterations and emitted 32/28 all-rank traces. The earlier bounded correctness job remains the direct cross-replica update/checksum gate.
+
+### Trace findings (jobs 2681602 and 2681864)
+
+- PyTorch profile steps are much slower than the clean timing window and show strong rank-dependent participant-arrival residency; do not equate a rank-local NCCL kernel's full residency with causal iteration overhead. The 50.7/62.1 ms clean end-to-end deltas are the authoritative overhead.
+- In the cleaner replicate trace (**2681864**), rank-0 NEP Gather was only 3.02 ms total and 0.00 ms exposed. Owner-layout GPU staging was 5.95 ms total with 1.18 ms exposed. Thus gradient Gather and staging are not the major remaining penalty.
+- Expert EDP reduce-scatter residency rose from 68.45 ms healthy to 362.03 ms NEP on sampled rank 0, but exposure rose only 1.35 ms (6.59 -> 7.94 ms); the additional EDP residency was almost entirely concurrent with other GPU work. Participant alignment shows much of long owner residency is arrival wait, not transfer service.
+- Dense DistOpt DP residency/exposure increased from 35.04/15.96 ms to 153.63/26.45 ms on sampled owner rank 0 in that trace, a +10.49 ms exposed increase. This is a reproducible secondary source, though participant-arrival direction varies by allocation/rank.
+- NEP's explicit owner-gradient staging CPU scope consumed 49.87 ms across the two profile steps (16 calls, about 24.93 ms per step) versus zero in healthy. This work copies Gather results into native DistOpt owner buffers and is the clearest NEP-only host-path cost in the traces; it can delay subsequent launches even where its GPU copies overlap.
+- A final annotation/collective inventory found an important correctness defect in the full workload: healthy rank 0 recorded five expert parameter all-gathers in each profiled step, while NEP rank 0 recorded zero `nep_distopt_native_param_all_gather`, zero `nep_distopt_param_scatter`, and zero expert parameter all-gather collectives. The full a3b path therefore is not invoking the NEP overlap-param-gather/owner-to-physical redistribution lifecycle in steady state, despite the bounded toy lifecycle test passing.
+- Consequently the measured 7-8% penalty is the performance of the current incomplete full-model path and is likely optimistic; it is not a valid final DistOpt-compatibility performance result. Backward-side conclusions remain usable: Gather is hidden, incremental EDP exposure is small in the cleaner replicate, explicit owner-gradient staging is material, and dense-DP exposure is a secondary cost. Parameter-sync overhead is absent rather than unclassified.
+- The two traces assign long participant-wait residency to different healthy/NEP ranks, demonstrating why raw per-rank union decompositions were not stable enough for an exact additive attribution.
+
+### Correctness caveat discovered during performance review
+
+- NEP reported extremely large grad norms (roughly 16k-149k) while healthy reported roughly 0.5-9, reproducibly in both full A/B runs. The bounded non-static EP8/EP6 correctness gate reported normal ~0.9 norms.
+- These performance jobs used `--no-check-for-nan-in-loss-and-grad` to avoid HybridEP's synchronous dynamic-overflow path; despite its name, this disables overflow checking but not gradient clipping/norm computation. Therefore this discrepancy cannot be dismissed as disabled logging and requires a focused correctness diagnosis of the static-capacity/full-model DistOpt path before claiming regular DistOpt compatibility complete.
+- Checkpoint support remains explicitly out of scope and was not changed or tested here.
+
+### Stop point after full-trace lifecycle inventory
+
+- Per the instruction to stop and consult when distributed-optimizer support requires an unexpected change, no implementation change was made after discovering the missing full-model parameter-sync lifecycle. The next implementation task is to determine why the bounded two-layer smoke invokes the representative NEP bucket's native parameter all-gather/redistribution while the original multi-module a3b forward prehook path does not, then rerun bounded correctness before repeating EP16.
+
+### 2026-08-13 — Root causes of the full-workload DistOpt correctness failures
+
+- The missing steady-state expert parameter all-gathers are caused by stale NEP wrapper state. `finish_grad_sync()` resets `param_gather_dispatched`, but leaves the shared bundle's `param_sync_completed=True`. On the next forward, `finish_param_sync()` checks `param_sync_completed` first and returns before `start_param_sync()` can clear it. Existing bounded validation only required at least one lifecycle occurrence and compared iteration 0 with the final iteration, so it passed even though expert checksums changed only from iteration 0 to 1 and then remained bit-identical through iterations 2 and 3.
+- The huge full-workload NEP gradient norms are caused by omitted per-token-loss normalization of the synthetic owner buffers. With `--calculate-per-token-loss`, native DDP deliberately uses a gradient scaling factor of 1 and `finalize_model_grads()` later calls `model_chunk.scale_gradients(1 / global_num_tokens)`. The inherited DDP method scales only physical dense/expert buffers; it does not know about `nonuniform_ep_distributed_optimizer_buffers`. The optimizer therefore consumes raw, unnormalized owner-proxy expert gradients. The bounded smoke did not use per-token loss, so it could not expose this bug.
+- These are independent correctness bugs. They invalidate the current full EP16/EP12 DistOpt performance result: it omitted steady-state expert parameter synchronization and optimized/clipped incorrectly scaled expert gradients.
+
+### 2026-08-13T09:33:36-07:00 — Minimal DistOpt correctness fixes validated at EP16/EP12
+
+- Implemented exactly two NEP-local correctness fixes in
+  `megatron/core/distributed/nonuniform_ep.py`:
+  1. `finish_param_sync()` now starts a not-yet-dispatched parameter sync before consulting
+     the bundle's completion bit. This lets the next forward clear the previous iteration's
+     completion state and launch a fresh native owner parameter all-gather.
+  2. `NonuniformEPDistributedDataParallel.scale_gradients()` now delegates to native DDP and
+     additionally scales the persistent logical-owner DistOpt buffers. This applies Megatron's
+     per-token-loss normalization to the gradients actually consumed by the expert optimizer.
+- Added focused regressions for a second asynchronous parameter-sync iteration and for owner-buffer
+  gradient scaling. The bounded wrapper's checksum gate now requires expert state to change on every
+  optimizer step. No checkpoint code or native optimizer implementation was changed.
+- First bounded attempt **2683111** stopped before model construction because the toy runner
+  hard-codes `--ddp-average-in-collective`, which native DDP correctly rejects together with
+  `--calculate-per-token-loss`. This was a test-harness incompatibility, not an implementation
+  failure; the per-token flag was removed only from the toy wrapper, while the focused scaling test
+  and full workload retain coverage.
+- Bounded EP8/EP6 Flex/HybridEP job **2683152** completed `0:0` on GB200 nodes
+  `lyris[0199-0200,0203-0204]`, segment 4. Seven focused DistOpt tests plus isort/Black/Ruff/compile
+  gates passed. Four real optimizer iterations completed with finite ~0.9 gradient norms. Rank-0
+  expert fingerprints changed at every transition (0->1, 1->2, and 2->3), remained equal across
+  EP8/EP6 replicas, and all 14 rank traces passed the parameter-sync lifecycle validator.
+- Full original a3b/30b EP16/EP12 NEP-only job **2683198** completed `0:0` on eight GB200 nodes,
+  segment 4 (28 training ranks on the first seven nodes). It retained the exact prior workload:
+  TP2/CP1, 128 experts, top-k6, sequence 8192, MBS1/GBS14, one microbatch per replica, original
+  hybrid layer pattern, Flex/HybridEP static capacity 1.5, BF16 Adam DistOpt, overlap-grad-reduce,
+  overlap-param-gather, eight DDP/expert bucket groups, ten iterations, and profiler on all ranks.
+  All ten iterations had zero skips/NaNs. Gradient norms were 9.201, 9.415, then 1.284 down to
+  0.500-0.722, replacing the prior erroneous 16k-149k range. Profiler-free iterations 8-10 were
+  671.3, 737.3, and 725.5 ms (mean 711.37 ms).
+- Compute-node trace validator **2683253** parsed all 28 traces and passed. In each profiled steady
+  step (ProfilerStep#5 and #6), every owner rank recorded exactly eight owner-gradient stages,
+  eight native owner parameter-all-gather starts, eight finishes, and eight physical parameter
+  redistributions. Full-replica follower ranks 12-15 correctly recorded no native owner all-gather
+  start/finish and exactly eight redistributions per step. Thus the missing steady-state parameter
+  lifecycle is fixed on the full workload.
+- The new NEP-only mean is below both previously retained healthy means (726.3 ms in job 2681602 and
+  772.23 ms in job 2681864), but that comparison crosses allocations. It is evidence of no obvious
+  performance regression, not a new allocation-local A/B parity claim.
+- Artifacts:
+  - bounded: `slurm_runs/lyris_ep8_ep6_distopt_twofix_r2/ep8_ep6_flex_distopt_opg1_2683152/`
+  - full: `slurm_runs/lyris_a3b_128e_ep16_ep12_distopt_nep_twofix/nep_ep16_ep12/a3b_30b_128e_nep_ep16_ep12_distopt_i10/2683198/`
+  - full validation: `.../2683198/nep_distopt_validation.json`
+
+## 2026-08-13T11:36:00-07:00 — Allocation-local healthy/NEP DistOpt A/B and remaining-overhead isolation
+
+- No implementation file was changed. The implementation under test remained HEAD
+  `837882969dcfc1d19a1191a55c50969b9f900aa0`; only analysis artifacts and a temporary
+  `/tmp` launcher copy were created.
+- Job **2683319** completed a same-allocation GB200 A/B on eight nodes, segment 4:
+  healthy EP16+EP16/32 ranks/GBS16 followed by NEP EP16+EP12/28 ranks/GBS14. Both used
+  TP2/CP1, 128 experts, top-k6, seq8192, MBS1, one microbatch per replica, the original
+  a3b/30b hybrid pattern, forced load balancing, Flex/HybridEP, BF16 Adam DistOpt,
+  overlap-grad-reduce/param-gather, and all-rank profiles. Both completed ten optimizer
+  iterations with finite normal grad norms and zero skipped/NaN iterations.
+- Clean iterations 8-10 in 2683319 were healthy **687.47 +/- 2.89 ms** and NEP
+  **794.87 +/- 6.40 ms**, a **107.40 ms / 15.62%** slowdown and **86.49% owner parity**.
+- Trace inventory exposed a benchmark confound: native healthy created five expert
+  reduce-scatter/all-gather buckets per step, while the wrapper explicitly forced eight NEP
+  buckets. The rank-0 profile gap was dominated by +99.6 ms of
+  `hybrid_ep::device_sync_kernel<16>` residency. Direct NEP reshard was much smaller:
+  Gather 2.98 ms and fully overlapped; EDP RS+AG incremental exposure was negative on rank 0;
+  end-of-iteration parameter redistribution was 10.22 ms fully exposed. Expert GEMM count and
+  summed time were effectively unchanged (649 kernels, 76.22 vs 76.42 ms). The profile gap is
+  larger than clean time due to profiler/all-rank-wait inflation and is not an additive causal
+  decomposition.
+- The older all-rank analyzer job **2683442** failed only because it assumed model-EP is a
+  ProcessGroup NCCL category; HybridEP uses custom kernels. Analysis attempt **2683492** failed
+  only because it aligned exact HybridEP kernel names instead of dispatch/combine families.
+  Corrected jobs **2683519** and **2683595** completed. They confirm the long HybridEP auxiliary
+  kernels are participant-wait residency: one latest participant per HybridEP group has only
+  ~3-4 ms total device-sync time, while the other ranks wait ~130-204 ms. This is not additional
+  expert GEMM work. NEP-only host scopes remain material in profiles (owner-gradient staging and
+  physical-parameter redistribution), but their nested CPU durations are not directly additive to
+  iteration time.
+- Jobs **2683701** and **2683864** accidentally remained eight-bucket runs because the checked-in
+  wrapper unconditionally exports eight expert buckets; the attempted submission-time override
+  could not supersede it. They are retained only as replication/noise evidence, not the
+  bucket-isomorphic result. Job 2683701 happened to show 96.13% parity; job 2683864 showed 79.45%,
+  underscoring allocation sensitivity of the eight-bucket path.
+- Controlled job **2683913** used a temporary copy of the exact wrapper with only line 134 changed
+  from eight to five NEP expert bucket groups; repository code and wrapper were untouched. Trace
+  inventory proves both healthy and NEP issued exactly five expert RS and five expert parameter AG
+  collectives per profiled step. The job completed `0:0`, with all 60 expected traces and zero
+  skipped/NaN iterations.
+- Clean iterations 8-10 in the bucket-isomorphic A/B were healthy
+  **715.10 +/- 2.10 ms** and NEP **708.90 +/- 20.72 ms**: delta **-6.20 ms**, nominal slowdown
+  **-0.87%**, and **100.87% owner parity**. With only three samples and larger NEP variance, this
+  establishes no measurable regression in this allocation rather than a real speedup.
+- Final all-rank analysis job **2684000** completed. On representative owner rank 0, true NEP-only
+  communication was: Gather **3.20 ms, 100% overlapped**; expert EDP RS+AG residency
+  **92.34 ms**, of which **86.25 ms overlapped** and **6.09 ms exposed** versus healthy
+  **5.80 ms exposed** (only **+0.29 ms**); end-of-iteration parameter redistribution
+  **9.14 ms, fully exposed**. Thus the only clear irreducible NEP communication tail is about
+  9.1 ms, with negligible incremental exposed Gather/EDP cost.
+- Owner expert compute remained invariant in the final A/B: 649 expert GEMM kernels and
+  75.54 vs 75.71 ms summed time. Smaller secondary profile deltas were dense gradient
+  reduce-scatter exposure +3.84 ms, TP exposure +1.95 ms, optimizer kernels +1.87 ms, and
+  owner-buffer D2D staging copies (~12 ms residency, ~5.1 ms exposed); these overlap and cannot
+  be summed because the authoritative clean end-to-end delta is statistically consistent with zero.
+- Final conclusion: regular non-checkpoint DistOpt support now has allocation-local owner-time
+  parity when actual expert bucket boundaries are matched. The major remaining performance risk is
+  not raw Gather or EDP transfer; it is sensitivity to forcing more NEP expert buckets than native
+  healthy (8 vs 5), which increases launch/staging/parameter-redistribution work and lengthens
+  HybridEP participant waits. The benchmark wrapper should not force eight if the desired default is
+  performance-isomorphic native bucketing, but changing that checked-in default was not part of this
+  A/B and was not done.
+- Artifacts:
+  - initial A/B: `slurm_runs/lyris_a3b_128e_ep16_ep12_distopt_fixed_ab/comparison_2683319.json`
+  - initial traces/analysis: `.../trace_owner_analysis_2683319.json`,
+    `.../remaining_overheads_2683319.json`, `.../device_sync_roles_2683319.json`
+  - final bucket-isomorphic A/B:
+    `slurm_runs/lyris_a3b_128e_ep16_ep12_distopt_bucket5_true_ab/comparison_2683913.json`
+  - final all-rank trace analysis: `.../remaining_overheads_2683913.json`
+
+
+## 2026-08-13T13:05:21-07:00 - Root cause of EP16/EP12 DistOpt memory explosion
+
+- No implementation file was changed. The investigation used the final bucket-isomorphic A/B job
+  **2683913**, its rank-0/rank-1 allocator logs, the exact five physical expert-bucket sizes, and
+  byte-level source accounting.
+- Healthy EP16 peaked at **32,936.61 MiB/GPU**; NEP EP16/EP12 peaked at
+  **174,432.79 MiB/GPU**, a **138.180 GiB (5.30x)** per-GPU delta on logged full-replica owner
+  ranks 0 and 1. The expected physical expert-count scaling remains only 8 to 10/11 experts per
+  GPU (25%/37.5%, 33.3% on average); it does not explain the measured result.
+- The dominant issue is a DistOpt-incompatible buffer-lifetime bug. With
+  `MEGATRON_NONUNIFORM_EP_END_ITERATION_SCATTER=1`,
+  `_get_nep_nccl_task_buffer_slot()` assigns a unique slot to every
+  `(expert bucket, owner rank, chunk)` task. `_prepare_nep_nccl_owner_task_context()` then
+  unconditionally allocates and retains one FP32 fixed-width owner-layout tensor for every task on
+  every rank. DistOpt never performs end-of-iteration gradient Scatter, but the unique-slot policy
+  remains active even though `_configure_nep_end_iteration_scatter_buffers()` explicitly skips
+  DistOpt. The shared scheduler `gather_buf_cache` is also not cleared by the per-group cache drain.
+- For this model, one physical EP16 rank has **1,835,925,504** expert elements (8 experts), or
+  **229,490,688 elements/expert**. EP12 uses 12 fixed-width rows of 11 slots, so the persistent
+  all-task FP32 cache is `12 * 11 * 229,490,688 * 4` bytes = **112.849 GiB/GPU**, accounting for
+  **81.67%** of the observed delta by itself.
+- The remaining delta is also accounted for: owner Gather receive staging **2.565 GiB**; persistent
+  BF16 owner-parameter transfer staging **4.702 GiB**; and **17.953 GiB** net from retaining the
+  physical EP16 parameter/gradient layout while adding the 11-expert logical-owner BF16 parameter,
+  FP32 gradient, and sharded Adam state required by the current DistOpt adapter. Total predicted
+  delta is **138.069 GiB** versus **138.180 GiB** observed, leaving only **0.110 GiB unexplained**
+  (**99.92% byte-level coverage**).
+- Conclusion: the 5.30x result is not intrinsic EP16-to-EP12 memory scaling. It is primarily a
+  full-model-sized persistent Gather cache caused by applying deferred-Scatter slot lifetimes to
+  DistOpt, plus current logical-owner/physical-layout duplication. A safe correction must first give
+  DistOpt bounded task-buffer reuse (with existing CUDA/NCCL completion dependencies) and avoid
+  allocating owner-layout tensors on non-owner ranks; parameter-transfer storage can then be aliased
+  or reused separately.
+
+
+## 2026-08-13T13:46:19-07:00 - Stage 1 bounded DistOpt Gather scratch accepted
+
+- Implemented the smallest safe correction first: DistOpt source/non-owner ranks no longer allocate
+  the full owner-layout Gather scratch tensor. Only the owner rank allocates the receive/accumulation
+  scratch; other participants retain empty placeholders and preserve the existing collective order.
+- Validation was incremental. Job **2684778** passed formatting, Ruff, compilation, and the focused
+  distributed unit suite. Job **2684848** passed an EP8/EP6 Flex/HybridEP DistOpt smoke with finite
+  losses/grad norms and checksum validation. Full all-rank-profiled EP16/EP12 A/B job **2684885**
+  found no measurable iteration-time regression.
+- Peak allocated memory fell from **174,432.79 MiB/GPU** to **68,504.86 MiB/GPU**, saving
+  **105,927.93 MiB/GPU (60.73%)** while preserving the accepted performance path. The exact accepted
+  source and test snapshots are under `/tmp/nep_memfix_stage1_pass_20260813/`.
+
+
+## 2026-08-13T14:20:00-07:00 - Rejected follow-up buffer-lifetime experiments
+
+- Evaluated each storage reduction as a separate candidate and restored the exact Stage-1 source
+  after every failure or regression.
+- A decoupled four-slot scratch ring (job **2685636**) regressed iteration time by **7.06%** despite
+  lowering peak memory to **60,968.48 MiB/GPU**; rejected.
+- An immediate direct-to-proxy path (job **2685998**) regressed by **1.99%** at
+  **58,875.04 MiB/GPU**; rejected. Deferring the same path (job **2686366**) regressed by
+  **12.11%**; rejected. A readiness-gated variant (job **2686496**) timed out before iteration 1;
+  rejected and archived at `/tmp/nep_memfix_direct_ready_hung_2686496/`.
+- Per-bundle parameter-transfer reuse passed unit job **2686603** and smoke job **2686626**, but
+  ABBA job **2686676** showed **+1.87%** pooled slowdown and **0 MiB** memory saving because the
+  current one-Gather-bucket-per-EDP-bucket layout already has only one expert group in each bundle;
+  rejected and archived at `/tmp/nep_memfix_transfer_reuse_rejected_2686676/`.
+- A single DDP-wide transfer buffer passed unit job **2686752** and smoke job **2686811**, and saved
+  **3,768.19 MiB/GPU**, but ABBA job **2686932** regressed by **1.90%** pooled; rejected and archived
+  at `/tmp/nep_memfix_transfer_reuse_global_rejected_2686932/`. Profiles indicated that collapsing
+  all adjacent bucket staging to one slot increased HybridEP participant-wait/model-EP residency,
+  so storage reuse must retain adjacent-bucket concurrency.
+
+
+## 2026-08-13T19:27:39-07:00 - Two-slot alternating parameter-transfer ring accepted
+
+- Implemented a DDP-wide **two-slot alternating ring** for temporary DistOpt owner-to-physical
+  parameter redistribution. Adjacent EDP buckets use distinct storage, while buckets two positions
+  apart reuse the same pre-sized tensor. This is the only source behavior changed relative to the
+  accepted Stage-1 snapshot; the Scatter, optimizer, and native DDP call order are unchanged.
+- Focused unit/style job **2687054** passed 11 tests per rank on four ranks. EP8/EP6 correctness
+  smoke **2687111** deliberately used four MoE layers/four expert buckets so that slot reuse was
+  exercised across four optimizer iterations; it passed finite-value and checksum validation and
+  produced all 14 expected rank traces.
+- Full original-workload EP16/EP12 ABBA job **2687188** found Stage 1 **727.01 ms** versus candidate
+  **729.10 ms** pooled (**+0.29%**, with opposite per-bracket signs), i.e. no measurable regression.
+  Independent confirmation ABBA job **2687329** found Stage 1 **744.94 ms** versus candidate
+  **675.29 ms** (**-9.35%**, both brackets favoring the candidate). The large nominal speedup is not
+  claimed as causal—it reflects allocation/run-order variability—but it decisively rules out a
+  repeatable candidate slowdown. Across both jobs the nominal pooled means were **735.98 ms** for
+  Stage 1 and **702.20 ms** for the candidate (**-4.59%**); all four candidate runs completed with
+  28/28 rank traces per case.
+- Peak allocated memory was stable in both ABBA jobs: **68,504.86 MiB/GPU** for Stage 1 versus
+  **65,783.39 MiB/GPU** for the two-slot candidate, saving **2,721.47 MiB/GPU** with no measurable
+  performance regression. Combined with Stage 1, the fix reduces the original NEP peak by
+  **108,649.40 MiB/GPU (62.29%)**, from **174,432.79** to **65,783.39 MiB/GPU**.
+- Artifacts:
+  - first ABBA: `slurm_runs/lyris_nep_memfix_transfer_ring2_abba/comparison_2687188.json`
+  - confirmation ABBA: `slurm_runs/lyris_nep_memfix_transfer_ring2_abba/comparison_2687329.json`
+  - accepted snapshot: `/tmp/nep_memfix_transfer_ring2_pass_20260813/`
+
+
+## 2026-08-14T10:30:00-07:00 - EP16 healthy versus NEP maximum-MBS boundary
+
+- Searched the maximum **uniform per-replica MBS** for the accepted a3b/30b configuration. Healthy
+  used two EP16 replicas (`8 8`, 32 ranks); NEP used EP16+EP12 (`8 6`, 28 ranks). Both used TP2,
+  CP1, seq8192, 128 experts, top-k6, Flex/HybridEP, BF16 DistOpt with overlap-grad-reduce and
+  overlap-param-gather, full activation recompute, forced load balancing, five expert grad buckets,
+  CUDA graphs disabled, and one optimizer microbatch per replica. GBS was scaled as
+  `MBS * sum(replica DP lanes)`: `16*MBS` for healthy and `14*MBS` for NEP. Every passing probe
+  profiled every rank in a one-iteration active PyTorch-profiler window.
+- Harness job **2691862** failed before training because `profile_step_start == profile_step_end`
+  produced a zero-length active profiler schedule. This was a driver-only error; the implementation
+  was unchanged. Job **2691954** then completed healthy MBS4 with finite metrics and all 32 traces,
+  but the outer analyzer expected the old `*.pt.trace.json` filename rather than NeMo 26.06's
+  `rank-*.json.gz`; this second driver-only issue was corrected without changing the workload.
+- Final adaptive sweep job **2692017** completed on GB200 nodes
+  `lyris[0167-0174]`, segment 4. Healthy passed MBS **32** (GBS **512**) twice, with three finite
+  optimizer iterations, zero skipped/NaN iterations, and 32/32 traces each time. MBS **33** (GBS
+  528) produced a CUDA OOM twice. The boundary OOM occurred in vocab-parallel cross entropy while
+  casting logits to FP32 and requesting a 66.00-GiB tensor.
+- NEP passed uniform MBS **25** on both EP16 and EP12 replicas (true GBS **350**) twice, with three
+  finite optimizer iterations, zero skipped/NaN iterations, and 28/28 traces each time. MBS **26**
+  (GBS 364) produced a CUDA OOM twice. The boundary OOM occurred on reduced-replica ranks including
+  21 and 22 in the same vocab-parallel cross-entropy FP32 cast, which requested 52.00 GiB.
+- Logged rank-0/1 peak allocation at the passing boundary was **166,525.85 MiB** for healthy MBS32
+  and **169,207.33 MiB** for NEP MBS25. These are profiler-enabled, CUDA-graph-disabled limits for
+  this exact workload; disabling profiling or enabling graph capture may change the boundary.
+- No implementation file was edited. The accepted NEP source remained
+  `2cc78fd17b5115d807c2395982efe8b1e588435d22b116c374172b485dbb088a` before and after the sweep.
+- Artifacts:
+  - summary: `slurm_runs/lyris_ep16_mbs_limit/summary_2692017.json`
+  - all probes: `slurm_runs/lyris_ep16_mbs_limit/results_2692017.tsv`
+  - confirmed boundaries: `slurm_runs/lyris_ep16_mbs_limit/boundaries_2692017.tsv`
+  - exact driver: `slurm_runs/lyris_ep16_mbs_limit/driver_2692017.slurm`
+  - batch log: `slurm_runs/lyris/coreai_comparch_sysarch-ep16.mbs-limit-2692017.out`

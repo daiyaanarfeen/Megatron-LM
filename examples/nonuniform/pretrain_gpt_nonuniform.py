@@ -2,10 +2,10 @@
 """GPT pretraining entrypoint for opt-in nonuniform TP/EP benchmarks.
 
 This script intentionally keeps the generic Megatron training loop untouched.  It imports the
-standard GPT pretraining providers, patches the DDP class used by ``megatron.training.training``
-to one of the opt-in nonuniform wrappers, and rejects distributed optimizer for nonuniform
-benchmark modes.  With the non-distributed optimizer, synced gradients are present on the ranks
-that own the local parameters before the normal optimizer step runs.
+standard GPT pretraining providers and patches the DDP class used by
+``megatron.training.training`` with an opt-in nonuniform wrapper. NEP Approach A supports either
+local optimizer updates after gradient redistribution or native distributed-optimizer updates on
+logical owner buffers.
 """
 
 import json
@@ -390,19 +390,18 @@ def _log_nonuniform_grad_checksum(model, iteration):
     dense_stats = torch.zeros(5, dtype=torch.float64, device='cuda')
     expert_stats = torch.zeros_like(dense_stats)
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    expert_tp_rank = parallel_state.get_expert_tensor_parallel_rank()
     for model_chunk in model:
         unwrapped_model = training_module.unwrap_model(model_chunk)
         for name, param in unwrapped_model.named_parameters():
             grad = getattr(param, 'main_grad', None)
             if grad is None or getattr(param, 'shared', False):
                 continue
-            if not getattr(param, 'tensor_model_parallel', False) and tp_rank != 0:
+            is_expert = not getattr(param, 'allreduce', True)
+            dedup_rank = expert_tp_rank if is_expert else tp_rank
+            if not getattr(param, 'tensor_model_parallel', False) and dedup_rank != 0:
                 continue
-            canonical_name = (
-                _canonical_grad_name(name, local_expert_indices)
-                if not getattr(param, 'allreduce', True)
-                else name
-            )
+            canonical_name = _canonical_grad_name(name, local_expert_indices) if is_expert else name
             name_weight = (
                 1
                 + sum(
@@ -410,7 +409,7 @@ def _log_nonuniform_grad_checksum(model, iteration):
                 )
                 % 104729
             )
-            target = expert_stats if not getattr(param, 'allreduce', True) else dense_stats
+            target = expert_stats if is_expert else dense_stats
             target[0] += grad.sum(dtype=torch.float64) * name_weight
             target[1] += grad.abs().sum(dtype=torch.float64) * name_weight
             target[2] += grad.square().sum(dtype=torch.float64) * name_weight
@@ -465,18 +464,17 @@ def _log_nonuniform_param_checksum(model, iteration):
     dense_stats = torch.zeros(5, dtype=torch.float64, device='cuda')
     expert_stats = torch.zeros_like(dense_stats)
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    expert_tp_rank = parallel_state.get_expert_tensor_parallel_rank()
     for model_chunk in model:
         unwrapped_model = training_module.unwrap_model(model_chunk)
         for name, param in unwrapped_model.named_parameters():
             if getattr(param, 'shared', False):
                 continue
-            if not getattr(param, 'tensor_model_parallel', False) and tp_rank != 0:
+            is_expert = not getattr(param, 'allreduce', True)
+            dedup_rank = expert_tp_rank if is_expert else tp_rank
+            if not getattr(param, 'tensor_model_parallel', False) and dedup_rank != 0:
                 continue
-            canonical_name = (
-                _canonical_grad_name(name, local_expert_indices)
-                if not getattr(param, 'allreduce', True)
-                else name
-            )
+            canonical_name = _canonical_grad_name(name, local_expert_indices) if is_expert else name
             name_weight = (
                 1
                 + sum(
@@ -484,7 +482,7 @@ def _log_nonuniform_param_checksum(model, iteration):
                 )
                 % 104729
             )
-            target = expert_stats if not getattr(param, 'allreduce', True) else dense_stats
+            target = expert_stats if is_expert else dense_stats
             value = param.detach()
             target[0] += value.sum(dtype=torch.float64) * name_weight
             target[1] += value.abs().sum(dtype=torch.float64) * name_weight
@@ -570,10 +568,9 @@ def _install_opt_in_ddp(args):
         set_nonuniform_ep_runtime_config(None)
         parallel_state.initialize_model_parallel = _ORIGINAL_INITIALIZE_MODEL_PARALLEL
         return None
-    if args.use_distributed_optimizer:
+    if args.use_distributed_optimizer and args.nonuniform_mode == "tp":
         raise RuntimeError(
-            "Nonuniform TP/EP benchmark modes intentionally use the non-distributed "
-            "optimizer. Remove --use-distributed-optimizer."
+            "Nonuniform TP benchmark mode does not support distributed optimizer yet"
         )
 
     if args.nonuniform_mode == "tp":

@@ -388,10 +388,13 @@ def align_collective_participants(
         "matched_service_ms",
         "end_spread_ms",
     )
+    if not rows:
+        return {"rows": [], "summary": {}}
     return {
         "rows": rows,
         "summary": {key: summary([float(row[key]) for row in rows]) for key in numeric},
     }
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)

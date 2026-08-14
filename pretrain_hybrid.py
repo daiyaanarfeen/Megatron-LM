@@ -666,7 +666,9 @@ def _install_nonuniform_ep_ddp(args):
         args.log_throughput = False
         args.log_progress = False
         training_module.logical_and_across_model_parallel_group = lambda value: value
-        training_module.reduce_max_stat_across_model_parallel_group = lambda value: value
+        training_module.reduce_max_stat_across_model_parallel_group = (
+            lambda value: value.item() if isinstance(value, torch.Tensor) else value
+        )
         training_module.track_moe_metrics = (
             lambda *unused_args, **unused_kwargs: training_module.clear_aux_losses_tracker()
         )
@@ -675,12 +677,6 @@ def _install_nonuniform_ep_ddp(args):
         training_module.DDP = _ORIGINAL_DDP
         parallel_state.initialize_model_parallel = _ORIGINAL_INITIALIZE_MODEL_PARALLEL
         return
-    if args.use_distributed_optimizer:
-        raise RuntimeError(
-            "Nonuniform EP benchmark mode intentionally uses the non-distributed optimizer. "
-            "Remove --use-distributed-optimizer."
-        )
-
     class BenchmarkNonuniformEPDDP(NonuniformEPDistributedDataParallel):
         def __init__(self, *ddp_args, **kwargs):
             super().__init__(

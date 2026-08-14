@@ -1,13 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Opt-in nonuniform expert-parallel gradient ownership transfer.
 
-This module keeps nonuniform EP out of generic Megatron DDP.  Expert params
-are wrapped into expert-level bucket groups.  Non-owner ranks transfer whole
-expert gradients to an owner rank with point-to-point ops; owner ranks accumulate
-those incoming gradients into their normal contiguous ``main_grad`` storage before
-running the ordinary expert-data-parallel grad sync.  The synced gradients are
-then scattered back to every source rank so non-distributed optimizers can step
-the local expert params on every rank.
+This module keeps nonuniform EP out of generic Megatron DDP. Expert params
+are wrapped into expert-level bucket groups. Non-owner ranks transfer expert
+gradients to owner ranks before native expert-data-parallel synchronization.
+Non-distributed optimizers receive the synchronized gradients back on every
+physical holder. Distributed optimizers instead update persistent owner-layout
+parameter buffers and redistribute the updated parameters to physical holders.
 """
 
 import copy
@@ -25,6 +24,12 @@ import torch
 import torch.distributed as dist
 
 from .. import parallel_state
+from ..optimizer.param_layout import (
+    FullParamLayout,
+    PerBufferParamLayout,
+    pad_bucket_end,
+    pad_param_start,
+)
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
@@ -45,7 +50,11 @@ from .nonuniform_common import (
     set_nonuniform_ep_runtime_config,
     try_start_ordered_bucket_groups,
 )
-from .param_and_grad_buffer import _ParamAndGradBucket, _ParamAndGradBucketGroup
+from .param_and_grad_buffer import (
+    _ParamAndGradBucket,
+    _ParamAndGradBucketGroup,
+    _ParamAndGradBuffer,
+)
 
 logger = logging.getLogger(__name__)
 _NEP_TAG_SLOT_STRIDE = 256
@@ -544,6 +553,63 @@ class _ExpertBucketSpec:
     end: int
     slot_key: Tuple[str, ...]
     synthetic_owner: bool = False
+
+
+def _copy_nep_optimizer_parameter_attributes(
+    source: torch.nn.Parameter, target: torch.nn.Parameter
+) -> None:
+    """Copy optimizer- and model-parallel metadata to an owner proxy parameter."""
+    attribute_names = (
+        "allreduce",
+        "expert_model_parallel",
+        "is_embedding_or_output_parameter",
+        "is_embedding_parameter",
+        "partition_dim",
+        "partition_stride",
+        "sequence_parallel",
+        "shared",
+        "shared_embedding",
+        "tensor_model_parallel",
+    )
+    for attribute_name in attribute_names:
+        if hasattr(source, attribute_name):
+            setattr(target, attribute_name, getattr(source, attribute_name))
+    # Owner proxies always belong to the expert optimizer.
+    target.allreduce = False
+
+
+def _compute_nep_distopt_owner_layout(
+    params: List[torch.nn.Parameter],
+    data_parallel_world_size: int,
+    ddp_config: DistributedDataParallelConfig,
+) -> PerBufferParamLayout:
+    """Build one native-compatible distributed-optimizer bucket for owner params."""
+    if not params:
+        raise RuntimeError("NEP owner DistOpt layout requires at least one logical parameter")
+
+    param_index_map = {}
+    param_end_index = 0
+    for param in params[::-1]:
+        param_start_index = pad_param_start(param_end_index)
+        param_end_index = param_start_index + param.numel()
+        param_index_map[param] = (param_start_index, param_end_index, 0)
+
+    bucket_end_index = pad_bucket_end(
+        param_end_index, data_parallel_world_size, ddp_config.pad_buckets_for_high_nccl_busbw
+    )
+    return PerBufferParamLayout(
+        param_index_map=param_index_map,
+        bucket_indices=[(0, bucket_end_index)],
+        per_bucket_numel_unpadded=[param_end_index],
+        param_indices=list(range(len(params))),
+    )
+
+
+def _nep_distopt_proxy_name(slot_key: Tuple[str, ...], expert_id: int) -> str:
+    """Return a stable logical-expert name for one owner proxy parameter."""
+    if len(slot_key) != 1:
+        raise RuntimeError(f"NEP DistOpt expects one name per parameter slot; got {slot_key}")
+    return slot_key[0].replace("{expert}", str(expert_id))
 
 
 class _P2PGradTransferHandle:
@@ -1994,13 +2060,22 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         layout = self._get_nep_nccl_owner_layout()
         buffer_slots = _get_nep_nccl_async_chunk_window()
         group_index = max(0, getattr(self, "_nep_nccl_group_index", 0))
+        if _nep_end_iteration_scatter_enabled():
+            state = getattr(self, "_nep_nccl_scheduler_state", None)
+            group_slot_offsets = None if state is None else state.get("group_slot_offsets")
+            if group_slot_offsets is None:
+                raise RuntimeError("End-of-iteration NEP slots are not configured")
+            task_ordinal = (
+                group_slot_offsets[group_index]
+                + owner_ep_rank * max(1, layout["num_chunks"])
+                + chunk_index
+            )
+            return task_ordinal
         task_ordinal = (
             group_index * layout["min_ep_size"] * max(1, layout["num_chunks"])
             + owner_ep_rank * max(1, layout["num_chunks"])
             + chunk_index
         )
-        if _nep_end_iteration_scatter_enabled():
-            return task_ordinal
         return task_ordinal % buffer_slots
 
     def _flush_nep_nccl_pending_scatters(
@@ -3428,6 +3503,48 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if len(self._nep_nccl_started_tasks) == self._nep_nccl_task_count:
             self._nep_nccl_ready = True
 
+    def _copy_nep_nccl_contexts_to_distopt_grads(self, contexts: List[dict]) -> None:
+        """Stage compact Gather results into native owner DistOpt gradient views."""
+        if not self.ddp_config.use_distributed_optimizer:
+            return
+        if not contexts:
+            return
+
+        bundle = contexts[0]["group"]._nep_distopt_owner_bundle
+        owner_ep_rank = contexts[0]["owner_ep_rank"]
+        if self._nep_runtime_config["ep_rank"] != owner_ep_rank:
+            return
+        for context in contexts:
+            group = context["group"]
+            if group._nep_distopt_owner_bundle is not bundle:
+                raise RuntimeError("NEP DistOpt EDP batch spans different owner buffers")
+            layout = group._get_nep_nccl_owner_layout()
+            chunk_start = context["chunk_start"]
+            chunk_end = context["chunk_end"]
+            group_index = group._nep_nccl_group_index
+            for expert_id in group._nep_nccl_owner_expert_ids(owner_ep_rank):
+                _, owner_slot = group._nep_nccl_owner_slot_for_expert(expert_id)
+                for slot_index, (slot_offset, slot_numel) in enumerate(
+                    zip(group._nep_nccl_slot_offsets, group._nep_nccl_slot_numels)
+                ):
+                    entry_start = owner_slot * layout["expert_stride"] + slot_offset
+                    overlap_start = max(chunk_start, entry_start)
+                    overlap_end = min(chunk_end, entry_start + slot_numel)
+                    if overlap_start >= overlap_end:
+                        continue
+                    proxy = bundle["proxy_by_key"][(group_index, expert_id, slot_index)]
+                    proxy_offset = overlap_start - entry_start
+                    chunk_offset = overlap_start - chunk_start
+                    numel = overlap_end - overlap_start
+                    proxy.main_grad.view(-1)[proxy_offset : proxy_offset + numel].copy_(
+                        context["chunk"][chunk_offset : chunk_offset + numel]
+                    )
+
+            copy_done = torch.cuda.Event()
+            copy_done.record(torch.cuda.current_stream())
+            state = group._get_nep_nccl_shared_buffer_state()
+            state["buffer_slot_events"].setdefault(context["buffer_slot_key"], []).append(copy_done)
+
     def _get_nep_nccl_native_edp_bucket_group(self, contexts):
         """Wrap one logical owner group in Megatron's native DDP lifecycle."""
         if isinstance(contexts, dict):
@@ -3447,7 +3564,18 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             return None
 
         if self.ddp_config.use_distributed_optimizer:
-            raise RuntimeError("NEP owner-layout DDP does not support distributed optimizer")
+            bundle = contexts[0]["group"]._nep_distopt_owner_bundle
+            if any(
+                context["group"]._nep_distopt_owner_bundle is not bundle for context in contexts
+            ):
+                raise RuntimeError("NEP DistOpt EDP batch spans different owner buffers")
+            native_group = bundle.get("native_group")
+            if native_group is None:
+                raise RuntimeError("NEP DistOpt owner rank is missing its native bucket group")
+            if native_group.grad_reduce_handle is not None:
+                raise RuntimeError("NEP DistOpt owner group still has an outstanding reduction")
+            return native_group
+
         edp_group = cfg.get("edp_group")
         if edp_group is None:
             raise RuntimeError(
@@ -3550,6 +3678,9 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             f"edp_rank={edp_group.rank()}"
         )
         native_group = self._get_nep_nccl_native_edp_bucket_group(contexts)
+        if self.ddp_config.use_distributed_optimizer:
+            with torch.profiler.record_function("nep_distopt_stage_owner_grads"):
+                self._copy_nep_nccl_contexts_to_distopt_grads(contexts)
         _nep_debug_chunk_checksum(f"before_edp group={group_index} owner={owner_ep_rank}", contexts)
         with torch.profiler.record_function("nep_native_ddp_start_grad_sync"):
             native_group.start_grad_sync()
@@ -3620,7 +3751,10 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         for native_state in native_states:
             if native_state["finished"]:
                 continue
-            if not native_state["scatter_dependency_ordered"]:
+            if (
+                not self.ddp_config.use_distributed_optimizer
+                and not native_state["scatter_dependency_ordered"]
+            ):
                 raise RuntimeError("NEP final DDP drain reached an unordered EDP Scatter")
 
             native_group = native_state["group"]
@@ -3757,13 +3891,23 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         self._order_nep_nccl_buffer_slot(buffer_slot_key)
 
         gather_buf_cache = self._get_nep_nccl_shared_buffer_state()["gather_buf_cache"]
-        chunk = self._get_nep_nccl_cached_tensor(
-            gather_buf_cache,
-            ("owner_layout_gather", buffer_slot, chunk_size, chunk_dtype, chunk_device),
-            chunk_size,
-            chunk_dtype,
-            chunk_device,
-        )
+        if (
+            self.ddp_config.use_distributed_optimizer
+            and self._nep_runtime_config["ep_rank"] != owner_ep_rank
+        ):
+            # DistOpt consumes the common owner layout only on its owner rank. Source ranks
+            # contribute packed Gather inputs, but never read the full owner-layout scratch.
+            chunk = self._get_nep_nccl_cached_tensor(
+                gather_buf_cache, ("empty", chunk_dtype, chunk_device), 0, chunk_dtype, chunk_device
+            )
+        else:
+            chunk = self._get_nep_nccl_cached_tensor(
+                gather_buf_cache,
+                ("owner_layout_gather", buffer_slot, chunk_size, chunk_dtype, chunk_device),
+                chunk_size,
+                chunk_dtype,
+                chunk_device,
+            )
         if async_op:
             self._nep_nccl_async_tensors.append(chunk)
 
@@ -3996,7 +4140,138 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     )
             train["task_marked"] = True
 
+    def _mark_nep_distopt_task_complete(self, context: dict) -> None:
+        """Complete task bookkeeping without scattering reduced gradients."""
+        scatter_contexts = context.get("scatter_contexts")
+        if scatter_contexts is None:
+            self._mark_nep_nccl_task_started(context["owner_ep_rank"], context["chunk_index"])
+            return
+        for task_context in scatter_contexts:
+            task_context["group"]._mark_nep_nccl_task_started(
+                task_context["owner_ep_rank"], task_context["chunk_index"]
+            )
+
+    @torch.no_grad()
+    def _scatter_nep_distopt_owner_params_to_physical_holders(self) -> None:
+        """Redistribute all-gathered logical owner parameters within each EP replica."""
+        bundle = self._nep_distopt_owner_bundle
+        ep_rank = self._nep_runtime_config["ep_rank"]
+        ep_group = self._nep_runtime_config["ep_group"]
+        for bucket_group in bundle["groups"]:
+            layout = bucket_group._get_nep_nccl_owner_layout()
+            group_index = bucket_group._nep_nccl_group_index
+            for owner_ep_rank in range(layout["min_ep_size"]):
+                transfer_group, _, transfer_size, transfer_ranks = (
+                    bucket_group._get_nep_nccl_transfer_group_info(owner_ep_rank)
+                )
+                if ep_rank not in transfer_ranks:
+                    continue
+                local_entries = bucket_group._nep_nccl_owner_entries(owner_ep_rank)
+                if not local_entries:
+                    raise RuntimeError(
+                        "NEP DistOpt parameter Scatter found no local physical entries"
+                    )
+                reference_param = local_entries[0]["bucket"].params_list[0]
+                transfer_slot = bundle["param_transfer_slot"]
+                cache_key = (transfer_slot, reference_param.dtype, reference_param.device)
+                transfer_storage = bundle["param_transfer_buffers"].get(cache_key)
+                if transfer_storage is None:
+                    transfer_storage = torch.empty(
+                        bundle["param_transfer_numel_by_slot"][transfer_slot],
+                        dtype=reference_param.dtype,
+                        device=reference_param.device,
+                    )
+                    bundle["param_transfer_buffers"][cache_key] = transfer_storage
+                owner_params = transfer_storage[: layout["owner_numel"]]
+                if ep_rank == owner_ep_rank:
+                    for expert_id in bucket_group._nep_nccl_owner_expert_ids(owner_ep_rank):
+                        _, owner_slot = bucket_group._nep_nccl_owner_slot_for_expert(expert_id)
+                        for slot_index, (slot_offset, slot_numel) in enumerate(
+                            zip(
+                                bucket_group._nep_nccl_slot_offsets,
+                                bucket_group._nep_nccl_slot_numels,
+                            )
+                        ):
+                            proxy = bundle["proxy_by_key"][(group_index, expert_id, slot_index)]
+                            start = owner_slot * layout["expert_stride"] + slot_offset
+                            owner_params[start : start + slot_numel].copy_(proxy.detach().view(-1))
+
+                if transfer_group is not None and transfer_size > 1:
+                    dist.broadcast(
+                        owner_params,
+                        src=get_global_rank(ep_group, owner_ep_rank),
+                        group=transfer_group,
+                    )
+
+                for entry in local_entries:
+                    start = bucket_group._nep_nccl_entry_owner_start(entry, owner_ep_rank)
+                    entry["bucket"].params_list[0].copy_(
+                        owner_params[start : start + entry["numel"]].view_as(
+                            entry["bucket"].params_list[0]
+                        )
+                    )
+
+    def start_param_sync(self, force_sync: bool = False):
+        """Start native owner parameter all-gather and redistribute when ready."""
+        if not self.ddp_config.use_distributed_optimizer:
+            return super().start_param_sync(force_sync=force_sync)
+        if not self._nep_distopt_param_sync_representative:
+            return
+
+        bundle = self._nep_distopt_owner_bundle
+        if self.param_gather_dispatched:
+            if (
+                force_sync
+                and self.ddp_config.overlap_param_gather
+                and not bundle["param_sync_completed"]
+            ):
+                self.finish_param_sync(skip_next_bucket_dispatch=True)
+            return
+
+        bundle["param_sync_completed"] = False
+        native_group = bundle.get("native_group")
+        if native_group is not None:
+            with torch.profiler.record_function("nep_distopt_native_param_all_gather"):
+                native_group.start_param_sync(force_sync=force_sync)
+                if not self.ddp_config.overlap_param_gather:
+                    native_group._post_param_sync()
+        self.param_gather_dispatched = True
+        if self.ddp_config.overlap_param_gather and not force_sync:
+            return
+
+        with torch.profiler.record_function("nep_distopt_param_scatter"):
+            self._scatter_nep_distopt_owner_params_to_physical_holders()
+        bundle["param_sync_completed"] = True
+
+    def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
+        """Finish owner all-gather, redistribute params, and launch the next bucket."""
+        if not self.ddp_config.use_distributed_optimizer:
+            return super().finish_param_sync(skip_next_bucket_dispatch=skip_next_bucket_dispatch)
+        if not self._nep_distopt_param_sync_representative:
+            return
+
+        bundle = self._nep_distopt_owner_bundle
+        if not self.param_gather_dispatched:
+            self.start_param_sync()
+        if bundle["param_sync_completed"]:
+            return
+
+        native_group = bundle.get("native_group")
+        if native_group is not None:
+            with torch.profiler.record_function("nep_distopt_finish_native_param_all_gather"):
+                native_group.finish_param_sync(skip_next_bucket_dispatch=True)
+        with torch.profiler.record_function("nep_distopt_param_scatter"):
+            self._scatter_nep_distopt_owner_params_to_physical_holders()
+        bundle["param_sync_completed"] = True
+
+        next_group = self.next_param_gather_bucket_group
+        if next_group is not None and not skip_next_bucket_dispatch:
+            next_group.start_param_sync()
+
     def _start_nep_nccl_owner_task_scatter(self, context: dict) -> None:
+        if self.ddp_config.use_distributed_optimizer:
+            self._mark_nep_distopt_task_complete(context)
+            return
         if _nep_benchmark_skip_scatter_enabled():
             owner_ep_rank = context["owner_ep_rank"]
             if self._nep_runtime_config["ep_rank"] == owner_ep_rank:
@@ -5475,6 +5750,14 @@ def _configure_nep_nccl_task_scheduler(
                     }
                 )
 
+    group_slot_offsets = []
+    next_group_slot = 0
+    for bucket_group in bucket_groups:
+        group_slot_offsets.append(next_group_slot)
+        layout = bucket_group._get_nep_nccl_owner_layout()
+        next_group_slot += layout["min_ep_size"] * max(1, layout["num_chunks"])
+
+    state["group_slot_offsets"] = tuple(group_slot_offsets)
     state["task_sequence"] = task_sequence
     state["task_next_index"] = 0
     state["pending_scatters"] = []
@@ -5499,6 +5782,10 @@ def _configure_nep_end_iteration_scatter_buffers(
 ) -> None:
     """Preallocate one persistent Gather/Scatter buffer set per iteration task."""
     if not bucket_groups or not _nep_end_iteration_scatter_enabled():
+        return
+    if bucket_groups[0].ddp_config.use_distributed_optimizer:
+        # DistOpt updates logical owner shards and redistributes parameters;
+        # it never scatters reduced gradients back to physical expert holders.
         return
 
     state = bucket_groups[0]._get_nep_nccl_shared_buffer_state()
@@ -6161,6 +6448,7 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         nonuniform_ep_config: Optional[NonuniformEPConfig] = None,
         disable_bucketing: bool = False,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        full_param_layout: Optional[FullParamLayout] = None,
     ):
         self.nonuniform_ep_config = nonuniform_ep_config or NonuniformEPConfig()
         runtime_config = _get_runtime_config(self.nonuniform_ep_config)
@@ -6171,13 +6459,49 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 benchmark_phase_limit
             )
         if ddp_config.use_distributed_optimizer:
-            raise RuntimeError(
-                "NonuniformEPDistributedDataParallel currently supports only "
-                "non-distributed optimizers. Synced expert grads are scattered back "
-                "so every rank can step its local expert params."
-            )
+            if self.nonuniform_ep_config.approach != NonuniformEPApproach.NCCL:
+                raise RuntimeError("NEP distributed optimizer requires NCCL Approach A")
+            if ddp_config.num_distributed_optimizer_instances != 1:
+                raise RuntimeError("NEP distributed optimizer initially supports one instance")
+            if ddp_config.use_megatron_fsdp:
+                raise RuntimeError("NEP distributed optimizer does not support Megatron FSDP")
+            if ddp_config.nccl_ub:
+                raise RuntimeError("NEP distributed optimizer does not support NCCL UB yet")
+            if runtime_config.get("zero_sm_reshard", False):
+                raise RuntimeError("NEP distributed optimizer initially uses ProcessGroup NCCL")
+            if not _nep_two_level_gather_enabled():
+                raise RuntimeError(
+                    "NEP distributed optimizer requires one Gather bucket per EDP bucket; set "
+                    "MEGATRON_NONUNIFORM_EP_NCCL_GATHER_BUCKETS_PER_EDP=1"
+                )
+            if ddp_config.fp8_param_gather or ddp_config.fp4_param_gather:
+                raise RuntimeError(
+                    "NEP distributed optimizer initially supports BF16 owner parameters only"
+                )
 
         self._synchronize_bucket_size(ddp_config)
+        if ddp_config.use_distributed_optimizer:
+            # The caller computes this layout before NEP can synchronize the native
+            # bucket threshold. Reduced replicas have different physical expert
+            # parameter counts, so that stale threshold can produce different dense
+            # reduce-scatter bucket boundaries across DP participants. Recompute with
+            # the synchronized threshold using the native DistOpt layout machinery.
+            from ..optimizer.distrib_optimizer import DistributedOptimizer
+
+            effective_bucket_size = (
+                None
+                if disable_bucketing or parallel_state.get_pipeline_model_parallel_rank() > 0
+                else ddp_config.bucket_size
+            )
+            full_param_layout = DistributedOptimizer.compute_full_param_layout(
+                [param for param in module.parameters() if param.requires_grad],
+                effective_bucket_size,
+                parallel_state.get_data_parallel_world_size(with_context_parallel=True),
+                ddp_config,
+                expert_data_parallel_world_size=(
+                    parallel_state.get_expert_data_parallel_world_size()
+                ),
+            )
 
         parent_kwargs = {
             "config": config,
@@ -6185,6 +6509,7 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             "module": module,
             "disable_bucketing": disable_bucketing,
             "pg_collection": pg_collection,
+            "full_param_layout": full_param_layout,
         }
         super().__init__(
             **filter_kwargs_for_callable(DistributedDataParallel.__init__, parent_kwargs)
@@ -6210,6 +6535,13 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 self.param_to_bucket_group,
                 self._param_to_name,
             )
+        if self.ddp_config.overlap_param_gather:
+            bucket_groups = self.expert_parallel_bucket_groups
+            for index in range(1, len(bucket_groups)):
+                bucket_groups[len(bucket_groups) - index].next_param_gather_bucket_group = (
+                    bucket_groups[len(bucket_groups) - index - 1]
+                )
+        self._configure_nep_distributed_optimizer_buffers()
         self._nep_dispatch_boundary_hook_handles = []
         self._nep_dispatch_boundary_pre_hook_handles = []
         self._nep_dispatch_completion_executor = None
@@ -6277,10 +6609,172 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 )
             self._configure_nep_dispatch_boundary_hooks()
         self._configure_expert_gradient_scaling(config, runtime_config)
-        if self.nonuniform_ep_config.approach == NonuniformEPApproach.NCCL and runtime_config.get(
-            "has_nondivisible_expert_placement", False
+        if self.nonuniform_ep_config.approach == NonuniformEPApproach.NCCL and (
+            self.ddp_config.use_distributed_optimizer
+            or runtime_config.get("has_nondivisible_expert_placement", False)
         ):
             self._synchronize_nondivisible_expert_parameters()
+
+    def _configure_nep_distributed_optimizer_buffers(self) -> None:
+        """Create persistent logical-owner buffers consumed by native DistOpt."""
+        self.nonuniform_ep_distributed_optimizer_params_with_names = []
+        self.nonuniform_ep_distributed_optimizer_buffers = []
+        if not self.ddp_config.use_distributed_optimizer:
+            return
+
+        runtime_config = self._nonuniform_ep_runtime_config
+        ep_rank = runtime_config["ep_rank"]
+        min_ep_size = runtime_config["min_ep_size"]
+        edp_group = runtime_config.get("edp_group")
+        if ep_rank < min_ep_size and edp_group is None:
+            raise RuntimeError("NEP DistOpt owner ranks require an expert-data-parallel group")
+
+        groups_by_edp_bucket = {}
+        for bucket_group in self.expert_parallel_bucket_groups:
+            edp_bucket_index = bucket_group._nep_nccl_edp_bucket_index
+            groups_by_edp_bucket.setdefault(edp_bucket_index, []).append(bucket_group)
+
+        # Preserve adjacent parameter-bucket concurrency while bounding temporary
+        # physical-layout staging to two alternating slots across this DDP instance.
+        param_transfer_buffers = {}
+        param_transfer_slot_count = min(2, len(groups_by_edp_bucket))
+        param_transfer_numel_by_slot = {
+            slot: max(
+                group._get_nep_nccl_owner_layout()["owner_numel"]
+                for index, groups in groups_by_edp_bucket.items()
+                if index % param_transfer_slot_count == slot
+                for group in groups
+            )
+            for slot in range(param_transfer_slot_count)
+        }
+        for edp_bucket_index in sorted(groups_by_edp_bucket):
+            bucket_groups = tuple(
+                sorted(
+                    groups_by_edp_bucket[edp_bucket_index],
+                    key=lambda group: group._nep_nccl_group_index,
+                )
+            )
+            bundle = {
+                "edp_bucket_index": edp_bucket_index,
+                "groups": bucket_groups,
+                "buffer": None,
+                "native_group": None,
+                "proxy_by_key": {},
+                "params_with_names": [],
+                "param_transfer_buffers": param_transfer_buffers,
+                "param_transfer_slot": edp_bucket_index % param_transfer_slot_count,
+                "param_transfer_numel_by_slot": param_transfer_numel_by_slot,
+                "param_sync_completed": False,
+            }
+
+            if ep_rank < min_ep_size:
+                params_with_names = []
+                proxy_by_key = {}
+                for bucket_group in bucket_groups:
+                    layout = bucket_group._get_nep_nccl_owner_layout()
+                    owner_expert_ids = [
+                        expert_id
+                        for expert_id in layout["owner_expert_slots"][ep_rank]
+                        if expert_id is not None
+                    ]
+                    templates = {}
+                    for entry in bucket_group._nep_nccl_entries:
+                        params = entry["bucket"].params_list
+                        if len(params) != 1:
+                            raise RuntimeError(
+                                "NEP DistOpt requires exactly one physical parameter per slot"
+                            )
+                        templates.setdefault(entry["slot_index"], params[0])
+                    if len(templates) != len(bucket_group._nep_nccl_slot_keys):
+                        raise RuntimeError(
+                            "NEP DistOpt could not find a physical template for every owner slot"
+                        )
+
+                    for expert_id in owner_expert_ids:
+                        for slot_index, slot_key in enumerate(bucket_group._nep_nccl_slot_keys):
+                            template = templates[slot_index]
+                            proxy = torch.nn.Parameter(
+                                torch.empty_like(template.detach()), requires_grad=True
+                            )
+                            _copy_nep_optimizer_parameter_attributes(template, proxy)
+                            proxy.nonuniform_ep_logical_expert_id = expert_id
+                            proxy.nonuniform_ep_owner_rank = ep_rank
+                            proxy.nonuniform_ep_group_index = bucket_group._nep_nccl_group_index
+                            proxy.nonuniform_ep_slot_index = slot_index
+                            name = _nep_distopt_proxy_name(slot_key, expert_id)
+                            proxy.nonuniform_ep_logical_name = name
+                            key = (bucket_group._nep_nccl_group_index, expert_id, slot_index)
+                            proxy_by_key[key] = proxy
+                            params_with_names.append((proxy, name))
+
+                if not params_with_names:
+                    raise RuntimeError("NEP DistOpt owner rank has no logical expert parameters")
+                param_dtypes = {param.dtype for param, _ in params_with_names}
+                grad_dtypes = {
+                    group.buckets[0].grad_data.dtype for group in bucket_groups if group.buckets
+                }
+                scaling_factors = {
+                    bucket.gradient_scaling_factor
+                    for group in bucket_groups
+                    for bucket in group.buckets
+                }
+                if len(param_dtypes) != 1 or len(grad_dtypes) != 1 or len(scaling_factors) != 1:
+                    raise RuntimeError(
+                        "NEP DistOpt owner buckets require one parameter dtype, gradient dtype, "
+                        "and scaling factor"
+                    )
+
+                params = [param for param, _ in params_with_names]
+                owner_layout = _compute_nep_distopt_owner_layout(
+                    params, edp_group.size(), self.ddp_config
+                )
+                owner_buffer = _ParamAndGradBuffer(
+                    self.ddp_config,
+                    next(iter(param_dtypes)),
+                    next(iter(grad_dtypes)),
+                    params_with_names,
+                    edp_group,
+                    None,
+                    dict(params_with_names),
+                    next(iter(scaling_factors)),
+                    list(range(len(params))),
+                    False,
+                    ProcessGroupCollection(tp=self.tp_group, dp_cp=self.dp_cp_group),
+                    param_layout=owner_layout,
+                )
+                owner_buffer.nonuniform_ep_owner_layout = True
+                native_group = _ParamAndGradBucketGroup(
+                    owner_buffer.buckets,
+                    _nep_owner_ddp_config(self.ddp_config),
+                    edp_group,
+                    edp_group.size(),
+                )
+                # Gather readiness is owned explicitly by the NEP scheduler.
+                native_group.is_first_batch = False
+                bundle.update(
+                    {
+                        "buffer": owner_buffer,
+                        "native_group": native_group,
+                        "proxy_by_key": proxy_by_key,
+                        "params_with_names": params_with_names,
+                    }
+                )
+                self.nonuniform_ep_distributed_optimizer_params_with_names.extend(params_with_names)
+                self.nonuniform_ep_distributed_optimizer_buffers.append(owner_buffer)
+
+            for group_index, bucket_group in enumerate(bucket_groups):
+                bucket_group._nep_distopt_owner_bundle = bundle
+                bucket_group._nep_distopt_param_sync_representative = group_index == 0
+
+    def get_nonuniform_ep_distributed_optimizer_state(self) -> tuple:
+        """Return owner proxy parameters and buffers for the optimizer factory."""
+        return (
+            tuple(
+                (name, param)
+                for param, name in self.nonuniform_ep_distributed_optimizer_params_with_names
+            ),
+            tuple(self.nonuniform_ep_distributed_optimizer_buffers),
+        )
 
     @torch.no_grad()
     def _synchronize_nondivisible_expert_parameters(self) -> None:
@@ -6342,6 +6836,21 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 if ep_rank == owner_ep_rank and edp_group is not None and edp_group.size() > 1:
                     dist.broadcast(owner_params, src=get_global_rank(edp_group, 0), group=edp_group)
 
+                if self.ddp_config.use_distributed_optimizer and ep_rank == owner_ep_rank:
+                    bundle = bucket_group._nep_distopt_owner_bundle
+                    group_index = bucket_group._nep_nccl_group_index
+                    for expert_id in bucket_group._nep_nccl_owner_expert_ids(owner_ep_rank):
+                        _, owner_slot = bucket_group._nep_nccl_owner_slot_for_expert(expert_id)
+                        for slot_index, (slot_offset, slot_numel) in enumerate(
+                            zip(
+                                bucket_group._nep_nccl_slot_offsets,
+                                bucket_group._nep_nccl_slot_numels,
+                            )
+                        ):
+                            proxy = bundle["proxy_by_key"][(group_index, expert_id, slot_index)]
+                            start = owner_slot * layout["expert_stride"] + slot_offset
+                            proxy.copy_(owner_params[start : start + slot_numel].view_as(proxy))
+
                 if transfer_group is not None and transfer_size > 1:
                     dist.broadcast(
                         owner_params,
@@ -6357,7 +6866,7 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                         )
                     )
 
-        _nep_debug_print("synchronized non-divisible logical expert parameters")
+        _nep_debug_print("synchronized logical expert and owner parameters")
 
     @staticmethod
     def _find_nep_local_cuda_graph_manager(module_name: str, named_modules: dict):
@@ -6723,6 +7232,13 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         module_label: str,
     ) -> None:
         """Retain persistent task buffers until the end-of-iteration Scatter drain."""
+        if self.ddp_config.use_distributed_optimizer:
+            for contexts in context_batches:
+                for context in contexts:
+                    context["group"]._mark_nep_distopt_task_complete(context)
+            completion_event.record(torch.cuda.current_stream())
+            return
+
         for contexts in context_batches:
             for context in contexts:
                 scatter_contexts = context.get("scatter_contexts")
@@ -6786,6 +7302,10 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
 
     def _drain_nep_scatter_scheduler(self) -> None:
         """Queue all remaining Scatter chunks, then wait once before final gradient sync."""
+        if self.ddp_config.use_distributed_optimizer:
+            if self._nep_end_iteration_scatter_context_batches or self._nep_scatter_batches:
+                raise RuntimeError("NEP DistOpt unexpectedly queued a gradient Scatter")
+            return
         a2a_scheduler = _nep_a2a_scatter_scheduler_enabled()
         end_iteration_scatter = _nep_end_iteration_scatter_enabled()
         if not a2a_scheduler and not end_iteration_scatter:
@@ -7465,6 +7985,22 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         for bucket_group in self.expert_parallel_bucket_groups:
             for bucket in bucket_group.buckets:
                 bucket.gradient_scaling_factor = expert_gradient_scaling_factor
+        for buffer in self.nonuniform_ep_distributed_optimizer_buffers:
+            buffer.gradient_scaling_factor = expert_gradient_scaling_factor
+            for bucket in buffer.buckets:
+                bucket.gradient_scaling_factor = expert_gradient_scaling_factor
+
+    def zero_grad_buffer(self):
+        """Reset physical gradients and persistent logical-owner gradients."""
+        super().zero_grad_buffer()
+        for buffer in self.nonuniform_ep_distributed_optimizer_buffers:
+            buffer.reset()
+
+    def scale_gradients(self, scaling_factor: float):
+        """Scale physical gradients and persistent logical-owner gradients."""
+        super().scale_gradients(scaling_factor)
+        for buffer in self.nonuniform_ep_distributed_optimizer_buffers:
+            buffer.scale_gradients(scaling_factor)
 
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         _nep_debug_print(

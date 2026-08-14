@@ -24,6 +24,7 @@ from megatron.core.distributed.nonuniform_ep import (
     NonuniformEPDistributedDataParallel,
     NonuniformEPNCCLParamAndGradBucketGroup,
     _build_nep_nccl_scatter_chunk_ranges,
+    _compute_nep_distopt_owner_layout,
     _configure_nep_edp_ready_gate,
     _ExpertBucketSpec,
     _get_nep_benchmark_phase_limit,
@@ -32,11 +33,14 @@ from megatron.core.distributed.nonuniform_ep import (
     _group_expert_bucket_specs_in_backward_order,
     _nep_benchmark_phase_enabled,
     _nep_benchmark_skip_owner_grad_check_enabled,
+    _nep_distopt_proxy_name,
     _nep_owner_ddp_config,
     _partition_expert_bucket_specs,
     _source_ep_ranks_for_owner,
     _zero_sm_transfer_ranks_by_owner,
 )
+from megatron.core.optimizer import _get_param_groups_and_buffers
+from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.transformer.cuda_graphs import _CudagraphReplayNode, _GraphStatus
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.token_dispatcher import (
@@ -44,6 +48,300 @@ from megatron.core.transformer.moe.token_dispatcher import (
     MoEFlexTokenDispatcher,
     _pad_nonuniform_flex_dispatch_slots,
 )
+from tests.unit_tests.test_utilities import Utils
+
+
+def test_nep_distopt_owner_layout_uses_only_real_params_and_native_padding():
+    config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    params = [
+        torch.nn.Parameter(torch.empty(3, dtype=torch.bfloat16)),
+        torch.nn.Parameter(torch.empty(5, dtype=torch.bfloat16)),
+    ]
+
+    layout = _compute_nep_distopt_owner_layout(params, 2, config)
+
+    assert set(layout.param_index_map) == set(params)
+    assert layout.param_index_map[params[1]] == (0, 5, 0)
+    assert layout.param_index_map[params[0]] == (64, 67, 0)
+    assert layout.per_bucket_numel_unpadded == [67]
+    assert layout.bucket_indices[0][1] % 2 == 0
+    assert layout.bucket_indices[0][1] >= 67
+
+
+def test_nep_distopt_proxy_name_materializes_logical_expert():
+    assert (
+        _nep_distopt_proxy_name(
+            ("decoder.layers.3.mlp.experts.local_experts.{expert}.linear_fc1.weight",), 11
+        )
+        == "decoder.layers.3.mlp.experts.local_experts.11.linear_fc1.weight"
+    )
+
+
+def test_nep_distopt_factory_substitutes_only_in_distopt_mode():
+    Utils.initialize_distributed()
+    physical_param = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
+    physical_param.allreduce = False
+    owner_param = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
+    owner_param.allreduce = False
+    physical_buffer = object()
+    owner_buffer = object()
+
+    class _FakeChunk:
+        expert_parallel_buffers = [physical_buffer]
+
+        def named_parameters(self):
+            return iter((("physical_expert.weight", physical_param),))
+
+        def get_nonuniform_ep_distributed_optimizer_state(self):
+            return ((('logical_expert.weight', owner_param),), (owner_buffer,))
+
+    regular_config = OptimizerConfig(optimizer='adam', bf16=True)
+    regular_groups, regular_buffers = _get_param_groups_and_buffers(
+        [_FakeChunk()],
+        model_chunk_offset=0,
+        config=regular_config,
+        config_overrides={},
+        filter_fn=lambda group: group['is_expert_parallel'],
+        buffer_name='expert_parallel_buffers',
+    )
+    assert [param for group in regular_groups for param in group['params']] == [physical_param]
+    assert regular_buffers == {0: [physical_buffer]}
+
+    distopt_config = OptimizerConfig(optimizer='adam', bf16=True, use_distributed_optimizer=True)
+    distopt_groups, distopt_buffers = _get_param_groups_and_buffers(
+        [_FakeChunk()],
+        model_chunk_offset=0,
+        config=distopt_config,
+        config_overrides={},
+        filter_fn=lambda group: group['is_expert_parallel'],
+        buffer_name='expert_parallel_buffers',
+    )
+    assert [param for group in distopt_groups for param in group['params']] == [owner_param]
+    assert distopt_buffers == {0: [owner_buffer]}
+
+
+def test_nep_distopt_param_sync_is_idempotent_per_iteration():
+    bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
+        NonuniformEPNCCLParamAndGradBucketGroup
+    )
+    bucket_group.ddp_config = SimpleNamespace(
+        use_distributed_optimizer=True, overlap_param_gather=False
+    )
+    bucket_group._nep_distopt_param_sync_representative = True
+    bucket_group.param_gather_dispatched = False
+
+    class _NativeGroup:
+        def __init__(self):
+            self.starts = 0
+            self.posts = 0
+
+        def start_param_sync(self, force_sync=False):
+            assert not force_sync
+            self.starts += 1
+
+        def _post_param_sync(self):
+            self.posts += 1
+
+    native_group = _NativeGroup()
+    bucket_group._nep_distopt_owner_bundle = {"native_group": native_group}
+    scatters = []
+    bucket_group._scatter_nep_distopt_owner_params_to_physical_holders = lambda: scatters.append(
+        True
+    )
+
+    bucket_group.start_param_sync()
+    bucket_group.start_param_sync()
+
+    assert native_group.starts == 1
+    assert native_group.posts == 1
+    assert scatters == [True]
+
+
+def test_nep_distopt_async_param_sync_uses_native_forward_lifecycle():
+    bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
+        NonuniformEPNCCLParamAndGradBucketGroup
+    )
+    bucket_group.ddp_config = SimpleNamespace(
+        use_distributed_optimizer=True, overlap_param_gather=True
+    )
+    bucket_group._nep_distopt_param_sync_representative = True
+    bucket_group.param_gather_dispatched = False
+
+    class _NativeGroup:
+        def __init__(self):
+            self.starts = 0
+            self.finishes = 0
+
+        def start_param_sync(self, force_sync=False):
+            assert not force_sync
+            self.starts += 1
+
+        def finish_param_sync(self, skip_next_bucket_dispatch=False):
+            assert skip_next_bucket_dispatch
+            self.finishes += 1
+
+    class _NextGroup:
+        def __init__(self):
+            self.starts = 0
+
+        def start_param_sync(self):
+            self.starts += 1
+
+    native_group = _NativeGroup()
+    next_group = _NextGroup()
+    bucket_group._nep_distopt_owner_bundle = {
+        "native_group": native_group,
+        "param_sync_completed": False,
+    }
+    bucket_group.next_param_gather_bucket_group = next_group
+    scatters = []
+    bucket_group._scatter_nep_distopt_owner_params_to_physical_holders = lambda: scatters.append(
+        True
+    )
+
+    bucket_group.start_param_sync()
+    assert native_group.starts == 1
+    assert native_group.finishes == 0
+    assert scatters == []
+
+    bucket_group.finish_param_sync()
+    bucket_group.finish_param_sync()
+    assert native_group.finishes == 1
+    assert scatters == [True]
+    assert next_group.starts == 1
+
+    # The next forward calls finish directly. It must launch a fresh native
+    # all-gather rather than returning on the previous iteration's completion.
+    bucket_group.param_gather_dispatched = False
+    bucket_group.finish_param_sync()
+    assert native_group.starts == 2
+    assert native_group.finishes == 2
+    assert scatters == [True, True]
+    assert next_group.starts == 2
+
+
+def test_nep_distopt_scale_gradients_includes_owner_buffers(monkeypatch):
+    ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
+    base_scalings = []
+    monkeypatch.setattr(
+        "megatron.core.distributed.nonuniform_ep.DistributedDataParallel.scale_gradients",
+        lambda _self, scaling_factor: base_scalings.append(scaling_factor),
+    )
+
+    class _OwnerBuffer:
+        def __init__(self):
+            self.scalings = []
+
+        def scale_gradients(self, scaling_factor):
+            self.scalings.append(scaling_factor)
+
+    owner_buffers = [_OwnerBuffer(), _OwnerBuffer()]
+    ddp.nonuniform_ep_distributed_optimizer_buffers = owner_buffers
+
+    ddp.scale_gradients(0.125)
+
+    assert base_scalings == [0.125]
+    assert [buffer.scalings for buffer in owner_buffers] == [[0.125], [0.125]]
+
+
+def test_nep_distopt_owner_task_skips_gradient_scatter():
+    bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
+        NonuniformEPNCCLParamAndGradBucketGroup
+    )
+    bucket_group.ddp_config = SimpleNamespace(use_distributed_optimizer=True)
+    completed = []
+    bucket_group._mark_nep_distopt_task_complete = completed.append
+    context = {"owner_ep_rank": 0, "chunk_index": 0}
+
+    bucket_group._start_nep_nccl_owner_task_scatter(context)
+
+    assert completed == [context]
+
+
+def test_nep_distopt_param_transfer_slots_preserve_adjacent_storage():
+    physical_params = [torch.nn.Parameter(torch.empty(numel)) for numel in (5, 8, 6)]
+
+    def make_group(index, physical_param):
+        group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
+            NonuniformEPNCCLParamAndGradBucketGroup
+        )
+        group._nep_nccl_group_index = index
+        group._get_nep_nccl_owner_layout = lambda: {
+            "min_ep_size": 1,
+            "owner_numel": physical_param.numel(),
+        }
+        group._get_nep_nccl_transfer_group_info = lambda owner: (None, None, 1, (0,))
+        group._nep_nccl_owner_entries = lambda owner: [
+            {
+                "bucket": SimpleNamespace(params_list=[physical_param]),
+                "numel": physical_param.numel(),
+            }
+        ]
+        group._nep_nccl_owner_expert_ids = lambda owner: ()
+        group._nep_nccl_entry_owner_start = lambda entry, owner: 0
+        group._nep_runtime_config = {"ep_rank": 0, "ep_group": None}
+        return group
+
+    groups = tuple(
+        make_group(index, physical_param) for index, physical_param in enumerate(physical_params)
+    )
+    shared_transfer_buffers = {}
+    for index, group in enumerate(groups):
+        group._nep_distopt_owner_bundle = {
+            "groups": (group,),
+            "proxy_by_key": {},
+            "param_transfer_buffers": shared_transfer_buffers,
+            "param_transfer_slot": index % 2,
+            "param_transfer_numel_by_slot": {0: 6, 1: 8},
+        }
+
+    storage_by_group = []
+    for group in groups:
+        group._scatter_nep_distopt_owner_params_to_physical_holders()
+        storage_by_group.append(
+            shared_transfer_buffers[
+                (
+                    group._nep_distopt_owner_bundle["param_transfer_slot"],
+                    physical_params[0].dtype,
+                    physical_params[0].device,
+                )
+            ]
+        )
+
+    assert len(shared_transfer_buffers) == 2
+    assert storage_by_group[0] is not storage_by_group[1]
+    assert storage_by_group[0] is storage_by_group[2]
+    assert storage_by_group[0].numel() == 6
+    assert storage_by_group[1].numel() == 8
+
+
+@pytest.mark.parametrize(
+    ("use_distributed_optimizer", "ep_rank", "expected_numel"),
+    ((True, 0, 8), (True, 1, 0), (False, 1, 8)),
+)
+def test_nep_distopt_allocates_owner_layout_scratch_only_on_owner(
+    use_distributed_optimizer, ep_rank, expected_numel
+):
+    bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
+        NonuniformEPNCCLParamAndGradBucketGroup
+    )
+    grad_data = torch.empty(8)
+    bucket_group.buckets = [SimpleNamespace(grad_data=grad_data)]
+    bucket_group.ddp_config = SimpleNamespace(use_distributed_optimizer=use_distributed_optimizer)
+    bucket_group._nep_runtime_config = {"ep_rank": ep_rank}
+    bucket_group._nep_nccl_async_tensors = []
+    state = {"gather_buf_cache": {}, "buffer_slot_handles": {}, "buffer_slot_events": {}}
+    bucket_group._nep_nccl_scheduler_state = state
+    bucket_group._get_nep_nccl_task_buffer_slot = lambda owner, chunk: 7
+    bucket_group._prep_nep_nccl_owner_entries_for_sync = lambda owner: None
+
+    context = bucket_group._prepare_nep_nccl_owner_task_context(
+        owner_ep_rank=0, chunk_index=0, chunk_start=0, chunk_end=8, async_op=True
+    )
+
+    assert context["chunk"].numel() == expected_numel
+    full_key = ("owner_layout_gather", 7, 8, grad_data.dtype, grad_data.device)
+    assert (full_key in state["gather_buf_cache"]) == (expected_numel == 8)
 
 
 class _FakeWork:
