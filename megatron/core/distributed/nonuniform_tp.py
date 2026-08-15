@@ -41,7 +41,6 @@ from .nonuniform_common import (
     all_to_all_with_output_views,
     configure_post_sync_handle_tracker,
     create_nonuniform_process_group,
-    filter_kwargs_for_callable,
     initialize_nonuniform_attention_process_groups,
     load_nonuniform_nccl_communicator_configs,
     patch_ddp_param_and_grad_buffer,
@@ -1350,22 +1349,14 @@ class NonuniformTPDistributedDataParallel(DistributedDataParallel):
         self.ntp_config = ntp_config or NonuniformTPConfig()
 
         def _call_parent_init():
-            parent_kwargs = {
-                'config': config,
-                'ddp_config': ddp_config,
-                'module': module,
-                'disable_bucketing': disable_bucketing,
-                'pg_collection': pg_collection,
-                'full_param_layout': full_param_layout,
-            }
-            filtered_parent_kwargs = filter_kwargs_for_callable(
-                DistributedDataParallel.__init__, parent_kwargs
+            super(NonuniformTPDistributedDataParallel, self).__init__(
+                config=config,
+                ddp_config=ddp_config,
+                module=module,
+                disable_bucketing=disable_bucketing,
+                pg_collection=pg_collection,
+                full_param_layout=full_param_layout,
             )
-            if full_param_layout is not None and 'full_param_layout' not in filtered_parent_kwargs:
-                logger.warning(
-                    "Ignoring full_param_layout because this DDP base does not accept it"
-                )
-            super(NonuniformTPDistributedDataParallel, self).__init__(**filtered_parent_kwargs)
 
         # Use NTP-aware buffer class
         if self.ntp_config.tp_spares > 0:

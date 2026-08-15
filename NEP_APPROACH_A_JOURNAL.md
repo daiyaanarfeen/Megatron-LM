@@ -4208,3 +4208,36 @@ Append a dated entry whenever we do something new: code changes, job submissions
 - Decision: accept Stage 2i4. Native Megatron layout code replaces duplicate NEP logic with exact
   construction behavior and traced GPU work. The large timing swings are explicitly not attributed
   to this source change; critically, neither run order produced a reproducible Stage-2i4 regression.
+
+
+## 2026-08-15 — Cleanup Stage 2i5: remove obsolete DDP signature compatibility shim
+
+- Removed the reflection-based `filter_kwargs_for_callable` helper and its sole `inspect` import.
+  This repository's current native `DistributedDataParallel.__init__` accepts all six arguments
+  passed by both nonuniform wrappers, so NEP and NTP now pass those same values directly. Removed
+  NTP's unreachable warning for an older DDP base lacking `full_param_layout`. No initialization
+  ordering, buffer patching, bucket wrapping, or per-iteration path changed. The stage is 13
+  insertions and 33 deletions across the common, EP, and TP modules.
+- Compute job `2699635` ran mandatory `uv run isort`, Ruff, focused Black, py_compile, and
+  `git diff --check`; asserted the current native/wrapper signatures; monkeypatched the native DDP
+  constructor and proved NTP forwards exactly the same six object identities; and passed all 65
+  NEP tests on each of four ranks.
+- Frozen candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2i5_direct_native_ddp_init_20260815`; hashes
+  `52ac2b704f54beb9268ed94d6c9fa0c3d0cc38d44096de1684f6b06998181208`
+  (`nonuniform_common.py`),
+  `8898b033af4e5cdf18d6ba3e95ac34941934b081fb21ce772e654f62c3aeab98`
+  (`nonuniform_ep.py`), and
+  `2faf903203fe84a031371c3caed28cd037174f44c1318e5b34e0734af26ef4d9`
+  (`nonuniform_tp.py`).
+- Controlled exact-uniform-routing EP8/EP4 all-rank profiler ABBA `2699684` completed on
+  `lyris[0009,0015-0016]` with 30 iterations and profiles from all 12 ranks:
+  - Stage-2i4 reference pooled mean: 213.265 ms;
+  - Stage-2i5 candidate pooled mean: 213.607 ms (+0.160%);
+  - paired deltas: +0.938% and -0.594%, both inside measured same-code variation;
+  - every case used exactly 48,386.22 MiB peak allocation, had zero skipped/NaN iterations and
+    12/12 traces, and produced byte-for-byte identical per-rank collective/NEP annotation
+    signatures.
+- Decision: accept Stage 2i5. Current DDP argument behavior is exact, the old-version compatibility
+  branch and reflection overhead are gone, and controlled EP8 behavior, memory, and performance are
+  unchanged.

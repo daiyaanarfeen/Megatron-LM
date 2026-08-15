@@ -7,7 +7,6 @@ DDP subclass construction, bucket-group wrapping, handle tracking, and local buf
 layout utilities.
 """
 
-import inspect
 import math
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -814,12 +813,6 @@ def configure_post_sync_handle_tracker(bucket_groups: List[object], state_attr: 
     state = {'handles': [], 'last_bucket_group': bucket_groups[-1]}
     for bucket_group in bucket_groups:
         setattr(bucket_group, state_attr, state)
-
-
-def filter_kwargs_for_callable(fn: Callable, kwargs: Dict[str, object]) -> Dict[str, object]:
-    """Return only kwargs accepted by ``fn``."""
-    parameters = inspect.signature(fn).parameters
-    return {key: value for key, value in kwargs.items() if key in parameters}
 
 
 @contextmanager

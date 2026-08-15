@@ -33,7 +33,6 @@ from .nonuniform_common import (
     compute_nonuniform_ep_owner_expert_slots,
     configure_ordered_bucket_group_scheduler,
     create_nonuniform_process_group,
-    filter_kwargs_for_callable,
     get_nonuniform_ep_runtime_config,
     initialize_nonuniform_attention_process_groups,
     load_nonuniform_nccl_communicator_configs,
@@ -3411,16 +3410,13 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 ),
             )
 
-        parent_kwargs = {
-            "config": config,
-            "ddp_config": ddp_config,
-            "module": module,
-            "disable_bucketing": disable_bucketing,
-            "pg_collection": pg_collection,
-            "full_param_layout": full_param_layout,
-        }
         super().__init__(
-            **filter_kwargs_for_callable(DistributedDataParallel.__init__, parent_kwargs)
+            config=config,
+            ddp_config=ddp_config,
+            module=module,
+            disable_bucketing=disable_bucketing,
+            pg_collection=pg_collection,
+            full_param_layout=full_param_layout,
         )
 
         self._nonuniform_ep_runtime_config = runtime_config
