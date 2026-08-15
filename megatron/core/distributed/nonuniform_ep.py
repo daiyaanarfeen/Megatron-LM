@@ -37,10 +37,14 @@ from .nonuniform_common import (
     compute_nonuniform_ep_expert_placement,
     compute_nonuniform_ep_owner_expert_slots,
     configure_ordered_bucket_group_scheduler,
+    create_nonuniform_process_group,
     filter_kwargs_for_callable,
     get_nonuniform_ep_runtime_config,
+    initialize_nonuniform_attention_process_groups,
+    load_nonuniform_nccl_communicator_configs,
     reset_ordered_bucket_group_scheduler,
     set_nonuniform_ep_runtime_config,
+    set_nonuniform_parallel_state_attr,
 )
 from .param_and_grad_buffer import (
     _ParamAndGradBucket,
@@ -337,34 +341,6 @@ def _get_runtime_config(config: NonuniformEPConfig) -> dict:
     return _runtime_config_from_parallel_state()
 
 
-def _set_parallel_state_attr(name: str, value) -> None:
-    setattr(parallel_state, name, value)
-
-
-def _get_nccl_communicator_configs(path: Optional[str]) -> dict:
-    if path is None:
-        return {}
-    try:
-        import yaml
-    except ImportError as exc:
-        raise RuntimeError(
-            "Cannot import `yaml`. Setting custom NCCL communicator configs "
-            "requires the yaml package."
-        ) from exc
-    with open(path, "r", encoding="utf-8") as stream:
-        return yaml.safe_load(stream)
-
-
-def _create_group(ranks, timeout, nccl_comm_cfgs, desc, backend=None):
-    pg_options = (
-        None if backend == "gloo" else parallel_state.get_nccl_options(desc, nccl_comm_cfgs)
-    )
-    group = parallel_state.create_group(
-        ranks, timeout=timeout, backend=backend, pg_options=pg_options, group_desc=desc
-    )
-    return group
-
-
 def initialize_nonuniform_ep_process_groups(
     tensor_model_parallel_size: int,
     context_parallel_size: int,
@@ -418,88 +394,17 @@ def initialize_nonuniform_ep_process_groups(
             )
 
     timeout = timedelta(minutes=distributed_timeout_minutes)
-    nccl_comm_cfgs = _get_nccl_communicator_configs(nccl_communicator_config_path)
-    # Attention/data groups.
-    for ranks in generator.get_ranks("dp-cp"):
-        group = _create_group(ranks, timeout, nccl_comm_cfgs, "dp_cp")
-        group_gloo = (
-            _create_group(
-                ranks, timeout, nccl_comm_cfgs, "DATA_PARALLEL_GROUP_WITH_CP_GLOO", "gloo"
-            )
-            if create_gloo_process_groups
-            else None
-        )
-        if rank in ranks:
-            _set_parallel_state_attr("_DATA_PARALLEL_GROUP_WITH_CP", group)
-            _set_parallel_state_attr("_DATA_PARALLEL_GROUP_WITH_CP_GLOO", group_gloo)
-            _set_parallel_state_attr("_DATA_PARALLEL_GLOBAL_RANKS_WITH_CP", ranks)
-            _set_parallel_state_attr("_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP", group)
-            _set_parallel_state_attr("_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO", group_gloo)
-
-    for ranks in generator.get_ranks("dp"):
-        group = _create_group(ranks, timeout, nccl_comm_cfgs, "dp")
-        group_gloo = (
-            _create_group(ranks, timeout, nccl_comm_cfgs, "DATA_PARALLEL_GROUP_GLOO", "gloo")
-            if create_gloo_process_groups
-            else None
-        )
-        if rank in ranks:
-            _set_parallel_state_attr("_DATA_PARALLEL_GROUP", group)
-            _set_parallel_state_attr("_DATA_PARALLEL_GROUP_GLOO", group_gloo)
-            _set_parallel_state_attr("_DATA_PARALLEL_GLOBAL_RANKS", ranks)
-
-    for ranks in generator.get_ranks("cp"):
-        group = _create_group(ranks, timeout, nccl_comm_cfgs, "cp")
-        if rank in ranks:
-            _set_parallel_state_attr("_CONTEXT_PARALLEL_GROUP", group)
-            _set_parallel_state_attr("_CONTEXT_PARALLEL_GLOBAL_RANKS", ranks)
-
-    for ranks in generator.get_ranks("tp"):
-        group = _create_group(ranks, timeout, nccl_comm_cfgs, "tp")
-        if rank in ranks:
-            _set_parallel_state_attr("_TENSOR_MODEL_PARALLEL_GROUP", group)
-            _set_parallel_state_attr("_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS", ranks)
-
-    for ranks in generator.get_ranks("tp"):
-        group = _create_group(ranks, timeout, nccl_comm_cfgs, "mp")
-        if rank in ranks:
-            _set_parallel_state_attr("_MODEL_PARALLEL_GROUP", group)
-            _set_parallel_state_attr("_MODEL_PARALLEL_GLOBAL_RANKS", ranks)
-
-    for ranks in [[global_rank] for global_rank in range(world_size)]:
-        pp_group = _create_group(ranks, timeout, nccl_comm_cfgs, "pp")
-        if rank in ranks:
-            _set_parallel_state_attr("_PIPELINE_MODEL_PARALLEL_GROUP", pp_group)
-            _set_parallel_state_attr("_PIPELINE_GLOBAL_RANKS", ranks)
-
-        embedding_ranks = get_embedding_ranks(ranks)
-        embedding_group = _create_group(embedding_ranks, timeout, nccl_comm_cfgs, "embd")
-        if rank in embedding_ranks:
-            _set_parallel_state_attr("_EMBEDDING_GROUP", embedding_group)
-            _set_parallel_state_attr("_EMBEDDING_GLOBAL_RANKS", embedding_ranks)
-
-        position_embedding_ranks = get_position_embedding_ranks(ranks)
-        position_embedding_group = _create_group(
-            position_embedding_ranks, timeout, nccl_comm_cfgs, "pos_embd"
-        )
-        if rank in position_embedding_ranks:
-            _set_parallel_state_attr("_POSITION_EMBEDDING_GROUP", position_embedding_group)
-            _set_parallel_state_attr("_POSITION_EMBEDDING_GLOBAL_RANKS", position_embedding_ranks)
-
-    for ranks in generator.get_ranks("tp-dp-cp"):
-        group = _create_group(ranks, timeout, nccl_comm_cfgs, "tp_dp_cp")
-        if rank in ranks:
-            _set_parallel_state_attr("_TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP", group)
-
-    for ranks in generator.get_ranks("tp-dp"):
-        group = _create_group(ranks, timeout, nccl_comm_cfgs, "tp_dp")
-        if rank in ranks:
-            _set_parallel_state_attr("_TENSOR_AND_DATA_PARALLEL_GROUP", group)
-
-    for ranks in generator.get_ranks("tp-cp"):
-        group = _create_group(ranks, timeout, nccl_comm_cfgs, "tp_cp")
-        if rank in ranks:
-            _set_parallel_state_attr("_TENSOR_AND_CONTEXT_PARALLEL_GROUP", group)
+    nccl_comm_cfgs = load_nonuniform_nccl_communicator_configs(nccl_communicator_config_path)
+    initialize_nonuniform_attention_process_groups(
+        generator=generator,
+        rank=rank,
+        world_size=world_size,
+        timeout=timeout,
+        nccl_comm_cfgs=nccl_comm_cfgs,
+        create_gloo_process_groups=create_gloo_process_groups,
+        get_embedding_ranks=get_embedding_ranks,
+        get_position_embedding_ranks=get_position_embedding_ranks,
+    )
 
     # Expert groups.
     min_ep_size = generator.min_k * tp * cp // etp
@@ -508,7 +413,7 @@ def initialize_nonuniform_ep_process_groups(
     nep_owner_transfer_group_ranks = {}
     nep_owner_source_ranks = {}
     for ranks in generator.get_ranks("ep"):
-        group = _create_group(ranks, timeout, nccl_comm_cfgs, "ep")
+        group = create_nonuniform_process_group(ranks, timeout, nccl_comm_cfgs, "ep")
         group_expert_placement, _ = compute_nonuniform_ep_expert_placement(
             num_moe_experts,
             len(ranks),
@@ -533,13 +438,10 @@ def initialize_nonuniform_ep_process_groups(
             owner_transfer_group = None
             owner_gather_group = None
             if len(transfer_global_ranks) > 1:
-                owner_transfer_group = _create_group(
-                    transfer_global_ranks,
-                    timeout,
-                    nccl_comm_cfgs,
-                    "nep_owner_transfer",
+                owner_transfer_group = create_nonuniform_process_group(
+                    transfer_global_ranks, timeout, nccl_comm_cfgs, "nep_owner_transfer"
                 )
-                owner_gather_group = _create_group(
+                owner_gather_group = create_nonuniform_process_group(
                     transfer_global_ranks, timeout, nccl_comm_cfgs, "nep_owner_gather"
                 )
             if rank in ranks:
@@ -550,23 +452,25 @@ def initialize_nonuniform_ep_process_groups(
                         nep_owner_gather_groups[owner_ep_rank] = owner_gather_group
                     nep_owner_transfer_groups[owner_ep_rank] = owner_transfer_group
         if rank in ranks:
-            _set_parallel_state_attr("_EXPERT_MODEL_PARALLEL_GROUP", group)
-            _set_parallel_state_attr("_EXPERT_MODEL_PARALLEL_RANKS", ranks)
+            set_nonuniform_parallel_state_attr("_EXPERT_MODEL_PARALLEL_GROUP", group)
+            set_nonuniform_parallel_state_attr("_EXPERT_MODEL_PARALLEL_RANKS", ranks)
 
     for ranks in generator.get_ranks("etp"):
-        group = _create_group(ranks, timeout, nccl_comm_cfgs, "ep_tp")
+        group = create_nonuniform_process_group(ranks, timeout, nccl_comm_cfgs, "ep_tp")
         if rank in ranks:
-            _set_parallel_state_attr("_EXPERT_TENSOR_PARALLEL_GROUP", group)
+            set_nonuniform_parallel_state_attr("_EXPERT_TENSOR_PARALLEL_GROUP", group)
 
     for ranks in generator.get_ranks("etp-ep"):
-        group = _create_group(ranks, timeout, nccl_comm_cfgs, "tp_ep_mp")
+        group = create_nonuniform_process_group(ranks, timeout, nccl_comm_cfgs, "tp_ep_mp")
         if rank in ranks:
-            _set_parallel_state_attr("_EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP", group)
+            set_nonuniform_parallel_state_attr("_EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP", group)
 
     for ranks in generator.get_ranks("etp-ep"):
-        group = _create_group(ranks, timeout, nccl_comm_cfgs, "tp_ep_pp")
+        group = create_nonuniform_process_group(ranks, timeout, nccl_comm_cfgs, "tp_ep_pp")
         if rank in ranks:
-            _set_parallel_state_attr("_EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP", group)
+            set_nonuniform_parallel_state_attr(
+                "_EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP", group
+            )
 
     edp_groups = generator.get_ranks("edp")
     covered_edp_ranks = {covered_rank for group in edp_groups for covered_rank in group}
@@ -574,20 +478,26 @@ def initialize_nonuniform_ep_process_groups(
         [uncovered_rank] for uncovered_rank in sorted(set(range(world_size)) - covered_edp_ranks)
     ]
     for ranks in all_edp_groups:
-        group = _create_group(ranks, timeout, nccl_comm_cfgs, "ep_dp")
+        group = create_nonuniform_process_group(ranks, timeout, nccl_comm_cfgs, "ep_dp")
         group_gloo = (
-            _create_group(ranks, timeout, nccl_comm_cfgs, "EXPERT_DATA_PARALLEL_GROUP_GLOO", "gloo")
+            create_nonuniform_process_group(
+                ranks, timeout, nccl_comm_cfgs, "EXPERT_DATA_PARALLEL_GROUP_GLOO", "gloo"
+            )
             if create_gloo_process_groups
             else None
         )
         if rank in ranks:
-            _set_parallel_state_attr("_EXPERT_DATA_PARALLEL_GROUP", group)
-            _set_parallel_state_attr("_EXPERT_DATA_PARALLEL_GROUP_GLOO", group_gloo)
-            _set_parallel_state_attr("_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP", group)
-            _set_parallel_state_attr("_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO", group_gloo)
-            _set_parallel_state_attr("_INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP", None)
+            set_nonuniform_parallel_state_attr("_EXPERT_DATA_PARALLEL_GROUP", group)
+            set_nonuniform_parallel_state_attr("_EXPERT_DATA_PARALLEL_GROUP_GLOO", group_gloo)
+            set_nonuniform_parallel_state_attr("_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP", group)
+            set_nonuniform_parallel_state_attr(
+                "_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO", group_gloo
+            )
+            set_nonuniform_parallel_state_attr("_INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP", None)
 
-    _set_parallel_state_attr("_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP", dist.group.WORLD)
+    set_nonuniform_parallel_state_attr(
+        "_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP", dist.group.WORLD
+    )
     parallel_state._set_global_memory_buffer()
 
     replica_ep_sizes = [num_tp_cp * tp * cp // etp for num_tp_cp in num_tp_cp_per_replica]

@@ -4015,3 +4015,41 @@ Append a dated entry whenever we do something new: code changes, job submissions
     signatures.
 - Decision: accept Stage 2h2. Startup validation and process-group creation are consolidated with
   unchanged traced GPU work, memory, correctness, and EP8 performance.
+
+
+## 2026-08-15 — Cleanup Stage 2h3: share nonuniform process-group bootstrap
+
+- Consolidated the duplicated NEP/NTP YAML communicator-config loader, Megatron-native
+  `create_group`/NCCL-options adapter, parallel-state assignment helper, and the complete shared
+  attention/model group creation sequence (`dp-cp`, `dp`, `cp`, `tp`, `mp`, singleton PP and
+  embedding groups, `tp-dp-cp`, `tp-dp`, and `tp-cp`) into `nonuniform_common.py`.
+- Both topology initializers still create groups in the identical order, then create their distinct
+  expert groups exactly where they did before. NTP's one-line all-to-all wrapper was removed and
+  its two callers now invoke the already-shared `all_to_all_with_output_views` function directly.
+  No NEP iteration-time collective, stream, event, buffer, dependency, or launch path changed. The
+  stage is 226 insertions and 278 deletions across the three nonuniform core files.
+- Compute job `2698102` passed mandatory isort, Ruff, focused Black, py_compile,
+  `git diff --check`, and all 65 NEP tests on each of four ranks. Its focused compatibility test
+  extracted both Stage-2h2 group-creation blocks and proved the new helper emits the exact same
+  process-group calls and parallel-state assignments for NEP and NTP, with Gloo creation both
+  enabled and disabled.
+- Frozen candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2h3_shared_process_group_bootstrap_20260815`; hashes
+  `6fe83ca46a3da86f49575cd919e66e489d2dd3aa895a26c3060817eff82d4f0d`
+  (`nonuniform_common.py`),
+  `11441a663aac302537ff9064345958e4e6b3e97a39c27e847451bce61bb2fba7`
+  (`nonuniform_ep.py`), and
+  `6ca8020f212099bf41285d4a90d67a26b3cf59ddec9a7017ef2b48fcb470a379`
+  (`nonuniform_tp.py`).
+- All-rank EP8/EP4 profiler ABBA job `2698126` completed on `lyris[0091,0098,0100]` with
+  30 iterations and profiles from all 12 ranks:
+  - Stage-2h2 reference pooled mean: 217.330 ms;
+  - Stage-2h3 candidate pooled mean: 214.235 ms (-1.424%);
+  - paired deltas: -4.096% and +1.355%; the latter remains inside the measured +1.442% same-code
+    ordering calibration and the pooled result has no regression;
+  - every case used exactly 48,386.22 MiB peak allocation, had zero skipped/NaN iterations and
+    12/12 traces, and produced byte-for-byte identical per-rank collective/NEP annotation
+    signatures.
+- Decision: accept Stage 2h3. Duplicate process-group bootstrap and NTP forwarding code are gone
+  with exact launch-order equivalence and unchanged EP8 GPU behavior, memory, correctness, and
+  calibrated performance.

@@ -11,11 +11,13 @@ import inspect
 import math
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from datetime import timedelta
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
 
+from .. import parallel_state
 from . import distributed_data_parallel as ddp_module
 
 _NONUNIFORM_EP_RUNTIME_CONFIG: Optional[dict] = None
@@ -635,6 +637,146 @@ class NonuniformTPTopologyRankGenerator:
 
     def _get_tp_dp_cp_ranks(self) -> List[List[int]]:
         return [[rank for replica in self.replicas for rank in replica.ranks]]
+
+
+def load_nonuniform_nccl_communicator_configs(path: Optional[str]) -> Dict[str, Any]:
+    """Load optional NCCL process-group tuning from a YAML file."""
+    if path is None:
+        return {}
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError(
+            "Cannot import `yaml`. Setting custom NCCL communicator configs "
+            "requires the yaml package."
+        ) from exc
+    with open(path, "r", encoding="utf-8") as stream:
+        return yaml.safe_load(stream)
+
+
+def create_nonuniform_process_group(
+    ranks: Sequence[int],
+    timeout: timedelta,
+    nccl_comm_cfgs: Dict[str, Any],
+    desc: str,
+    backend: Optional[str] = None,
+) -> Any:
+    """Create a nonuniform process group with Megatron's native NCCL options."""
+    pg_options = (
+        None if backend == "gloo" else parallel_state.get_nccl_options(desc, nccl_comm_cfgs)
+    )
+    return parallel_state.create_group(
+        ranks, timeout=timeout, backend=backend, pg_options=pg_options, group_desc=desc
+    )
+
+
+def set_nonuniform_parallel_state_attr(name: str, value: Any) -> None:
+    """Set process-group state owned by Megatron's parallel-state module."""
+    setattr(parallel_state, name, value)
+
+
+def initialize_nonuniform_attention_process_groups(
+    *,
+    generator: Any,
+    rank: int,
+    world_size: int,
+    timeout: timedelta,
+    nccl_comm_cfgs: Dict[str, Any],
+    create_gloo_process_groups: bool,
+    get_embedding_ranks: Callable[[List[int]], List[int]],
+    get_position_embedding_ranks: Callable[[List[int]], List[int]],
+) -> None:
+    """Create the shared attention/model process groups for a nonuniform topology."""
+    for ranks in generator.get_ranks("dp-cp"):
+        group = create_nonuniform_process_group(ranks, timeout, nccl_comm_cfgs, "dp_cp")
+        group_gloo = (
+            create_nonuniform_process_group(
+                ranks, timeout, nccl_comm_cfgs, "DATA_PARALLEL_GROUP_WITH_CP_GLOO", "gloo"
+            )
+            if create_gloo_process_groups
+            else None
+        )
+        if rank in ranks:
+            set_nonuniform_parallel_state_attr("_DATA_PARALLEL_GROUP_WITH_CP", group)
+            set_nonuniform_parallel_state_attr("_DATA_PARALLEL_GROUP_WITH_CP_GLOO", group_gloo)
+            set_nonuniform_parallel_state_attr("_DATA_PARALLEL_GLOBAL_RANKS_WITH_CP", ranks)
+            set_nonuniform_parallel_state_attr("_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP", group)
+            set_nonuniform_parallel_state_attr(
+                "_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO", group_gloo
+            )
+
+    for ranks in generator.get_ranks("dp"):
+        group = create_nonuniform_process_group(ranks, timeout, nccl_comm_cfgs, "dp")
+        group_gloo = (
+            create_nonuniform_process_group(
+                ranks, timeout, nccl_comm_cfgs, "DATA_PARALLEL_GROUP_GLOO", "gloo"
+            )
+            if create_gloo_process_groups
+            else None
+        )
+        if rank in ranks:
+            set_nonuniform_parallel_state_attr("_DATA_PARALLEL_GROUP", group)
+            set_nonuniform_parallel_state_attr("_DATA_PARALLEL_GROUP_GLOO", group_gloo)
+            set_nonuniform_parallel_state_attr("_DATA_PARALLEL_GLOBAL_RANKS", ranks)
+
+    for ranks in generator.get_ranks("cp"):
+        group = create_nonuniform_process_group(ranks, timeout, nccl_comm_cfgs, "cp")
+        if rank in ranks:
+            set_nonuniform_parallel_state_attr("_CONTEXT_PARALLEL_GROUP", group)
+            set_nonuniform_parallel_state_attr("_CONTEXT_PARALLEL_GLOBAL_RANKS", ranks)
+
+    for ranks in generator.get_ranks("tp"):
+        group = create_nonuniform_process_group(ranks, timeout, nccl_comm_cfgs, "tp")
+        if rank in ranks:
+            set_nonuniform_parallel_state_attr("_TENSOR_MODEL_PARALLEL_GROUP", group)
+            set_nonuniform_parallel_state_attr("_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS", ranks)
+
+    for ranks in generator.get_ranks("tp"):
+        group = create_nonuniform_process_group(ranks, timeout, nccl_comm_cfgs, "mp")
+        if rank in ranks:
+            set_nonuniform_parallel_state_attr("_MODEL_PARALLEL_GROUP", group)
+            set_nonuniform_parallel_state_attr("_MODEL_PARALLEL_GLOBAL_RANKS", ranks)
+
+    for ranks in [[global_rank] for global_rank in range(world_size)]:
+        group = create_nonuniform_process_group(ranks, timeout, nccl_comm_cfgs, "pp")
+        if rank in ranks:
+            set_nonuniform_parallel_state_attr("_PIPELINE_MODEL_PARALLEL_GROUP", group)
+            set_nonuniform_parallel_state_attr("_PIPELINE_GLOBAL_RANKS", ranks)
+
+        embedding_ranks = get_embedding_ranks(ranks)
+        embedding_group = create_nonuniform_process_group(
+            embedding_ranks, timeout, nccl_comm_cfgs, "embd"
+        )
+        if rank in embedding_ranks:
+            set_nonuniform_parallel_state_attr("_EMBEDDING_GROUP", embedding_group)
+            set_nonuniform_parallel_state_attr("_EMBEDDING_GLOBAL_RANKS", embedding_ranks)
+
+        position_embedding_ranks = get_position_embedding_ranks(ranks)
+        position_embedding_group = create_nonuniform_process_group(
+            position_embedding_ranks, timeout, nccl_comm_cfgs, "pos_embd"
+        )
+        if rank in position_embedding_ranks:
+            set_nonuniform_parallel_state_attr(
+                "_POSITION_EMBEDDING_GROUP", position_embedding_group
+            )
+            set_nonuniform_parallel_state_attr(
+                "_POSITION_EMBEDDING_GLOBAL_RANKS", position_embedding_ranks
+            )
+
+    for ranks in generator.get_ranks("tp-dp-cp"):
+        group = create_nonuniform_process_group(ranks, timeout, nccl_comm_cfgs, "tp_dp_cp")
+        if rank in ranks:
+            set_nonuniform_parallel_state_attr("_TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP", group)
+
+    for ranks in generator.get_ranks("tp-dp"):
+        group = create_nonuniform_process_group(ranks, timeout, nccl_comm_cfgs, "tp_dp")
+        if rank in ranks:
+            set_nonuniform_parallel_state_attr("_TENSOR_AND_DATA_PARALLEL_GROUP", group)
+
+    for ranks in generator.get_ranks("tp-cp"):
+        group = create_nonuniform_process_group(ranks, timeout, nccl_comm_cfgs, "tp_cp")
+        if rank in ranks:
+            set_nonuniform_parallel_state_attr("_TENSOR_AND_CONTEXT_PARALLEL_GROUP", group)
 
 
 class ViewCopyHandle:
