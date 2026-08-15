@@ -29,7 +29,6 @@ from megatron.core import mpu, parallel_state
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.distributed.nonuniform_common import (
-    get_nonuniform_ep_runtime_config,
     set_nonuniform_ep_runtime_config,
 )
 from megatron.core.distributed.nonuniform_ep import (
@@ -360,14 +359,13 @@ def _load_json_arg(value: Optional[str], path: Optional[str], default=None):
 
 
 def _build_ep_runtime_config(args):
-    registered_runtime_config = get_nonuniform_ep_runtime_config()
     placement = _load_json_arg(
         args.nonuniform_ep_placement_json,
         args.nonuniform_ep_placement_path,
         None,
     )
     if placement is None:
-        return dict(registered_runtime_config) if registered_runtime_config is not None else None
+        return None
 
     ep_group = parallel_state.get_expert_model_parallel_group()
     ep_rank = parallel_state.get_expert_model_parallel_rank()
@@ -400,14 +398,6 @@ def _build_ep_runtime_config(args):
         'local_expert_indices': local_expert_indices,
         'expert_placement': [[int(expert) for expert in experts] for experts in placement],
     }
-
-
-def _create_gloo_process_groups_arg(args):
-    return getattr(
-        args,
-        "enable_gloo_process_groups",
-        getattr(args, "use_gloo_process_groups", True),
-    )
 
 
 def _initialize_model_parallel(*args, **kwargs):
@@ -461,7 +451,7 @@ def _initialize_model_parallel(*args, **kwargs):
         num_moe_experts=megatron_args.num_experts,
         nccl_communicator_config_path=megatron_args.nccl_communicator_config_path,
         distributed_timeout_minutes=megatron_args.distributed_timeout_minutes,
-        create_gloo_process_groups=_create_gloo_process_groups_arg(megatron_args),
+        create_gloo_process_groups=megatron_args.use_gloo_process_groups,
         get_embedding_ranks=kwargs.get("get_embedding_ranks"),
         get_position_embedding_ranks=kwargs.get("get_position_embedding_ranks"),
     )
@@ -479,7 +469,8 @@ def _build_ep_config(args) -> NonuniformEPConfig:
 def _get_ep_config(args) -> NonuniformEPConfig:
     if 'config' not in _EP_CONFIG_CACHE:
         _EP_CONFIG_CACHE['config'] = _build_ep_config(args)
-        set_nonuniform_ep_runtime_config(_EP_CONFIG_CACHE['config'].runtime_config)
+        if _EP_CONFIG_CACHE['config'].runtime_config is not None:
+            set_nonuniform_ep_runtime_config(_EP_CONFIG_CACHE['config'].runtime_config)
     return _EP_CONFIG_CACHE['config']
 
 

@@ -3906,3 +3906,37 @@ Append a dated entry whenever we do something new: code changes, job submissions
     signatures within and across both jobs.
 - Decision: accept Stage 2g2. The active GPU behavior and calibrated EP8 performance are unchanged,
   while dead host helpers and a wrapper redundant with native PyTorch/Megatron code are removed.
+
+
+## 2026-08-14 — Cleanup Stage 2g3: remove redundant runtime bootstrap compatibility
+
+- Preserved the public manual-placement path, but stopped copying an already-registered topology
+  runtime config into every entrypoint-local `NonuniformEPConfig` and then registering that same
+  dict again. When no explicit placement is supplied, the config now leaves `runtime_config=None`
+  and the existing core `_get_runtime_config` path reads the config registered by
+  `initialize_nonuniform_ep_process_groups`. Explicit placement still builds, stores, and registers
+  its entrypoint-local config exactly as before.
+- Removed `_create_gloo_process_groups_arg` from both entrypoints and passed Megatron's current
+  native `args.use_gloo_process_groups` value directly. This is the same argument used by native
+  `megatron.training.initialize`; the obsolete `enable_gloo_process_groups` fallback had no current
+  producer. The stage changes only the two entrypoints (28 deletions, 10 insertions).
+- Compute job `2697118` stopped before tests because its wrapper used a check-only Black command on
+  the newly edited dedicated entrypoint. Corrected job `2697144` formatted that file, then passed
+  isort, Ruff, Black, py_compile, `git diff --check`, and all 65 NEP tests on each of four ranks.
+- Frozen candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2g3_native_runtime_bootstrap_20260814`; hashes
+  `64a7292d11444b4b7eda51d4d852076149bd77e2115e5b2d5f765733325746b5`
+  (dedicated GPT entrypoint) and
+  `ae7abf61b3b9aafec5b4ed4c0295f603115a87e2c0ba74d9afd7bae671376f39`
+  (hybrid entrypoint).
+- All-rank EP8/EP4 profiler ABBA job `2697185` used 30 iterations and measured:
+  - Stage 2g2 reference pooled mean: 219.996 ms;
+  - Stage 2g3 candidate pooled mean: 223.150 ms (+1.434%);
+  - paired deltas: +0.362% and +2.554%;
+  - the two reference positions themselves drifted -4.289% and the two candidate positions drifted
+    -2.199%, so the pooled delta remains within the previously measured +1.442% same-code ordering
+    calibration;
+  - all four cases had exactly 48,386.22 MiB peak allocation, zero skipped/NaN iterations, 12/12
+    traces, and byte-for-byte identical per-rank collective/NEP annotation signatures.
+- Decision: accept Stage 2g3. The active per-iteration path and traced GPU work are unchanged while
+  redundant entrypoint runtime-config and obsolete argument-compatibility work are removed.
