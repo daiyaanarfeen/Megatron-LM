@@ -74,33 +74,6 @@ def _nep_debug_print(message: str) -> None:
     print(f"[NEP_DEBUG rank={rank}] {message}", flush=True)
 
 
-def _nep_debug_chunk_checksum(label: str, contexts: List[dict]) -> None:
-    """Synchronously log owner-layout chunks for targeted correctness debugging."""
-    if os.getenv("MEGATRON_NONUNIFORM_EP_DEBUG_CHUNK_CHECKSUM", "0").lower() not in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    ):
-        return
-    rank = dist.get_rank()
-    rank_filter = os.getenv("MEGATRON_NONUNIFORM_EP_DEBUG_RANKS")
-    if rank_filter and rank not in {
-        int(part) for part in rank_filter.replace(",", " ").split() if part.strip()
-    }:
-        return
-    values = [float(context["chunk"].float().sum().item()) for context in contexts]
-    print(f"[NEP_CHUNK_CHECKSUM rank={rank}] {label} values={values}", flush=True)
-
-
-def _nep_overlap_debug_enabled() -> bool:
-    return os.getenv("MEGATRON_NONUNIFORM_EP_OVERLAP_DEBUG", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
 
 
 
@@ -826,7 +799,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         self._nep_nccl_started_tasks = set()
         self._nep_nccl_prepped_experts = set()
         self._nep_nccl_task_count = 0
-        self._nep_nccl_overlap_debug_events = []
         self._nep_dispatch_boundary_launch = False
         self._nep_dispatch_boundary_ready = False
         self._nep_dispatch_boundary_launched = False
@@ -2292,7 +2264,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if self.ddp_config.use_distributed_optimizer:
             with torch.profiler.record_function("nep_distopt_stage_owner_grads"):
                 self._copy_nep_nccl_contexts_to_distopt_grads(contexts)
-        _nep_debug_chunk_checksum(f"before_edp group={group_index} owner={owner_ep_rank}", contexts)
         with torch.profiler.record_function("nep_native_ddp_start_grad_sync"):
             native_group.start_grad_sync()
         native_state = {
@@ -2338,12 +2309,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 raise RuntimeError("NEP Scatter reached an owner without an EDP Work handle")
             with torch.profiler.record_function("nep_native_ddp_order_scatter_stream"):
                 _nep_block_current_stream(native_group.grad_reduce_handle)
-            _nep_debug_chunk_checksum(
-                "after_edp "
-                f"group={getattr(self, '_nep_nccl_group_index', -1)} "
-                f"owner={context['owner_ep_rank']}",
-                native_state["contexts"],
-            )
         elif native_group.grad_reduce_handle is not None:
             raise RuntimeError("Synchronous NEP native DDP left an outstanding reduction")
         native_state["scatter_dependency_ordered"] = True
@@ -3058,21 +3023,9 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     nccl_stream.wait_event(compute_ready_event)
                 else:
                     nccl_stream.wait_stream(compute_stream)
-                debug_start_event = None
-                debug_done_event = None
                 with torch.cuda.stream(nccl_stream):
-                    if _nep_overlap_debug_enabled():
-                        debug_start_event = torch.cuda.Event(enable_timing=True)
-                        debug_start_event.record(nccl_stream)
                     group._flush_nep_nccl_pending_scatters(buffer_slot=stream_slot)
                     launch_next_task()
-                    if _nep_overlap_debug_enabled():
-                        debug_done_event = torch.cuda.Event(enable_timing=True)
-                        debug_done_event.record(nccl_stream)
-                if debug_start_event is not None and debug_done_event is not None:
-                    group._nep_nccl_overlap_debug_events.append(
-                        (task_index, task_index + 1, debug_start_event, debug_done_event)
-                    )
             if force_ready:
                 self._flush_nep_nccl_pending_scatters(force_all=True)
         else:
@@ -3142,42 +3095,9 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         _nep_debug_print(f"start_grad_sync exit group={group_index}")
 
     def _finish_nonuniform_ep_nccl_grad_sync(self):
-        overlap_debug = _nep_overlap_debug_enabled()
-        compute_ready_event = None
-        if overlap_debug and self._nep_nccl_streams:
-            compute_ready_event = torch.cuda.Event(enable_timing=True)
-            compute_ready_event.record(torch.cuda.current_stream())
-        drain_start = time.perf_counter() if overlap_debug else None
         self._drain_nep_nccl_async_window(force_all=True)
-        drain_ms = (time.perf_counter() - drain_start) * 1000.0 if overlap_debug else None
         for nccl_stream in self._nep_nccl_streams.values():
             torch.cuda.current_stream().wait_stream(nccl_stream)
-        if overlap_debug and self._nep_nccl_overlap_debug_events:
-            after_wait_event = torch.cuda.Event(enable_timing=True)
-            after_wait_event.record(torch.cuda.current_stream())
-            after_wait_event.synchronize()
-            group_index = getattr(self, "_nep_nccl_group_index", -1)
-            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
-            for start_idx, end_idx, start_event, done_event in self._nep_nccl_overlap_debug_events:
-                comm_ms = start_event.elapsed_time(done_event)
-                ready_since_start_ms = (
-                    start_event.elapsed_time(compute_ready_event)
-                    if compute_ready_event is not None
-                    else float("nan")
-                )
-                finish_wait_ms = (
-                    compute_ready_event.elapsed_time(after_wait_event)
-                    if compute_ready_event is not None
-                    else float("nan")
-                )
-                print(
-                    "[NEP_OVERLAP_DEBUG "
-                    f"rank={rank} group={group_index} tasks={start_idx}:{end_idx} "
-                    f"comm_ms={comm_ms:.3f} ready_since_comm_start_ms={ready_since_start_ms:.3f} "
-                    f"finish_wait_ms={finish_wait_ms:.3f} cpu_drain_ms={drain_ms:.3f}]",
-                    flush=True,
-                )
-            self._nep_nccl_overlap_debug_events = []
         self._nep_nccl_async_handles = []
         self._nep_nccl_async_tensors = []
         # Drop large chunk temporaries after this bucket group completes; they

@@ -3732,3 +3732,25 @@ Append a dated entry whenever we do something new: code changes, job submissions
 - Decision: accept Stage 2e2. The initial candidate-A result was not reproducible; supported GPU
   work and all-rank traces are identical, memory is unchanged, and calibrated EP8 performance is
   unchanged.
+
+
+## 2026-08-14 — Cleanup Stage 2e3a: remove disabled overlap diagnostics
+
+- Removed the synchronous owner-chunk checksum mode and the old per-task CUDA-event overlap
+  diagnostic. This deletes their environment reads, event list, timing events, forced event
+  synchronization/printing, and no-op calls around EDP. With the accepted debug flags disabled,
+  the surviving launch/drain statements are the exact branch bodies previously executed.
+- `nonuniform_ep.py` fell from 4,737 to 4,657 lines (net -80 lines). No tests, process groups,
+  collective calls, streams, buffer logic, or optimizer paths changed.
+- Frozen candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2e3a_debug_timing_removed_20260814`; SHA-256
+  `6258988d623b23c1caa8d83b3f03d70027f2dc5347f129239f595aa80e277a2c`.
+- All-rank EP8/EP4 ABBA job `2695398`:
+  - Stage-2e2 reference pooled mean: 216.830 ms,
+  - Stage-2e3a candidate pooled mean: 214.711 ms (-0.978%),
+  - paired deltas: -4.661% and +2.950%, reflecting position variability but no pooled regression,
+  - exactly 48,386.22 MiB peak allocation in all four cases,
+  - zero skipped/NaN iterations,
+  - exact 12/12-rank collective and NEP-annotation signatures across all cases.
+- Decision: accept Stage 2e3a. Disabled diagnostics contributed no GPU work in the reference;
+  removing them preserves traces, memory, correctness, and pooled EP8 performance.
