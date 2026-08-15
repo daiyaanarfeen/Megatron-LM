@@ -114,35 +114,6 @@ def _nep_overlap_debug_enabled() -> bool:
 
 
 
-def _nep_defer_model_ep_fence_enabled() -> bool:
-    return os.getenv("MEGATRON_NONUNIFORM_EP_DEFER_MODEL_EP_FENCE", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
-
-
-def _nep_end_iteration_scatter_enabled() -> bool:
-    """Return whether every Scatter is deferred until backward has completed."""
-    return os.getenv("MEGATRON_NONUNIFORM_EP_END_ITERATION_SCATTER", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
-
-
-
-
-
-
-
-
 def _nep_benchmark_skip_scatter_enabled() -> bool:
     """Return whether the intentionally incorrect no-Scatter benchmark is enabled."""
     return os.getenv("MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_SCATTER", "0").lower() in (
@@ -571,9 +542,6 @@ def initialize_nonuniform_ep_process_groups(
 
     timeout = timedelta(minutes=distributed_timeout_minutes)
     nccl_comm_cfgs = _get_nccl_communicator_configs(nccl_communicator_config_path)
-    use_separate_owner_gather_groups = (
-        "nep_owner_gather" in nccl_comm_cfgs or _nep_end_iteration_scatter_enabled()
-    )
     # Attention/data groups.
     for ranks in generator.get_ranks("dp-cp"):
         group = _create_group(ranks, timeout, nccl_comm_cfgs, "dp_cp")
@@ -694,10 +662,9 @@ def initialize_nonuniform_ep_process_groups(
                     nccl_comm_cfgs,
                     "nep_owner_transfer",
                 )
-                if use_separate_owner_gather_groups:
-                    owner_gather_group = _create_group(
-                        transfer_global_ranks, timeout, nccl_comm_cfgs, "nep_owner_gather"
-                    )
+                owner_gather_group = _create_group(
+                    transfer_global_ranks, timeout, nccl_comm_cfgs, "nep_owner_gather"
+                )
             if rank in ranks:
                 nep_owner_source_ranks[owner_ep_rank] = source_ep_ranks
                 nep_owner_transfer_group_ranks[owner_ep_rank] = transfer_ep_ranks
@@ -1000,10 +967,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         state = getattr(self, "_nep_nccl_scheduler_state", None)
         if self._nep_dispatch_boundary_launch and not self.is_first_batch:
             stream_key = "dispatch"
-        elif _nep_end_iteration_scatter_enabled():
-            stream_key = ("end_iteration", stream_slot % _get_nep_nccl_async_chunk_window())
         else:
-            stream_key = stream_slot
+            stream_key = ("end_iteration", stream_slot % _get_nep_nccl_async_chunk_window())
         if state is not None:
             streams = state.setdefault("comm_streams", {})
             stream = streams.get(stream_key)
@@ -1040,25 +1005,16 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
 
     def _get_nep_nccl_task_buffer_slot(self, owner_ep_rank: int, chunk_index: int) -> int:
         layout = self._get_nep_nccl_owner_layout()
-        buffer_slots = _get_nep_nccl_async_chunk_window()
         group_index = max(0, getattr(self, "_nep_nccl_group_index", 0))
-        if _nep_end_iteration_scatter_enabled():
-            state = getattr(self, "_nep_nccl_scheduler_state", None)
-            group_slot_offsets = None if state is None else state.get("group_slot_offsets")
-            if group_slot_offsets is None:
-                raise RuntimeError("End-of-iteration NEP slots are not configured")
-            task_ordinal = (
-                group_slot_offsets[group_index]
-                + owner_ep_rank * max(1, layout["num_chunks"])
-                + chunk_index
-            )
-            return task_ordinal
-        task_ordinal = (
-            group_index * layout["min_ep_size"] * max(1, layout["num_chunks"])
+        state = getattr(self, "_nep_nccl_scheduler_state", None)
+        group_slot_offsets = None if state is None else state.get("group_slot_offsets")
+        if group_slot_offsets is None:
+            raise RuntimeError("End-of-iteration NEP slots are not configured")
+        return (
+            group_slot_offsets[group_index]
             + owner_ep_rank * max(1, layout["num_chunks"])
             + chunk_index
         )
-        return task_ordinal % buffer_slots
 
     def _flush_nep_nccl_pending_scatters(
         self, buffer_slot: Optional[int] = None, force_all: bool = False
@@ -3769,7 +3725,7 @@ def _configure_nep_end_iteration_scatter_buffers(
     bucket_groups: List[NonuniformEPNCCLParamAndGradBucketGroup],
 ) -> None:
     """Preallocate one persistent Gather/Scatter buffer set per iteration task."""
-    if not bucket_groups or not _nep_end_iteration_scatter_enabled():
+    if not bucket_groups:
         return
     if bucket_groups[0].ddp_config.use_distributed_optimizer:
         # DistOpt updates logical owner shards and redistributes parameters;
@@ -4142,14 +4098,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 raise RuntimeError(
                     "NEP benchmark phase limit cannot be combined with skip-Scatter mode"
                 )
-        if not _nep_end_iteration_scatter_enabled():
-            raise RuntimeError(
-                "NEP requires MEGATRON_NONUNIFORM_EP_END_ITERATION_SCATTER=1"
-            )
-        if not _nep_defer_model_ep_fence_enabled():
-            raise RuntimeError(
-                "Deferred NEP Scatter requires MEGATRON_NONUNIFORM_EP_DEFER_MODEL_EP_FENCE=1"
-            )
         self._nep_scatter_stream = torch.cuda.Stream(device=torch.cuda.current_device())
         self._configure_nep_dispatch_boundary_hooks()
         self._configure_expert_gradient_scaling(config, runtime_config)
@@ -4836,20 +4784,14 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 raise RuntimeError("The next model-EP boundary did not finish split NEP phases")
 
         if completion_event is not None:
-            if _nep_defer_model_ep_fence_enabled():
-                inflight_events = getattr(self, "_nep_dispatch_inflight_completion_events", None)
-                if inflight_events is None:
-                    inflight_events = []
-                    self._nep_dispatch_inflight_completion_events = inflight_events
-                inflight_events.append((module_label, completion_event))
-                _nep_debug_print(
-                    f"deferred dispatch_backward_boundary completion module={module_label}"
-                )
-            else:
-                torch.cuda.current_stream().wait_event(completion_event)
-                _nep_debug_print(
-                    f"ordered dispatch_backward_boundary completion module={module_label}"
-                )
+            inflight_events = getattr(self, "_nep_dispatch_inflight_completion_events", None)
+            if inflight_events is None:
+                inflight_events = []
+                self._nep_dispatch_inflight_completion_events = inflight_events
+            inflight_events.append((module_label, completion_event))
+            _nep_debug_print(
+                f"deferred dispatch_backward_boundary completion module={module_label}"
+            )
             self._nep_dispatch_pending_completion_event = None
         if groups is not None:
             if not all(group._nep_dispatch_boundary_launched for group in groups):

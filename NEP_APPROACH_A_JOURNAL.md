@@ -3677,3 +3677,27 @@ Append a dated entry whenever we do something new: code changes, job submissions
   - exact 12/12-rank collective and NEP-annotation signatures across every case.
 - Decision: accept Stage 2d1. Native eager behavior, memory, GPU work, and performance are
   preserved while two files lose obsolete NEP callback machinery.
+
+
+## 2026-08-14 — Cleanup Stage 2e1: hardwire the accepted end-of-iteration path
+
+- Removed the two feature selectors and all alternatives for
+  `MEGATRON_NONUNIFORM_EP_END_ITERATION_SCATTER` and
+  `MEGATRON_NONUNIFORM_EP_DEFER_MODEL_EP_FENCE`. The constructor already rejected every valid
+  NEP run unless both were enabled, so the implementation now directly creates separate owner
+  Gather groups, uses persistent end-of-iteration task slots, preallocates Scatter buffers, and
+  defers model-EP completion fences until the final drain.
+- No ordering, collective, stream, buffer, optimizer, or model logic was otherwise changed.
+  `nonuniform_ep.py` fell from 4,917 to 4,859 lines (net -58 lines).
+- Frozen candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2e1_required_paths_hardwired_20260814`; SHA-256
+  `e88e62ab228b33ed43239e8dcbdc44ce4d34abcabb4ab97bccedd2d593c7b8bf`.
+- All-rank EP8/EP4 ABBA job `2694904` completed on three GB200 nodes:
+  - Stage-2d1 reference pooled mean: 246.796 ms,
+  - Stage-2e1 candidate pooled mean: 232.967 ms (-5.603%),
+  - paired deltas: -0.751% and -10.384%, with no candidate regression,
+  - exactly 48,386.22 MiB peak allocation in all four cases,
+  - zero skipped/NaN iterations,
+  - exact 12/12-rank collective and NEP-annotation signatures across all cases.
+- Decision: accept Stage 2e1. The removed branches were unreachable in every supported run; the
+  accepted GPU work, memory footprint, correctness checks, and EP8 performance are preserved.
