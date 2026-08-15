@@ -3701,3 +3701,34 @@ Append a dated entry whenever we do something new: code changes, job submissions
   - exact 12/12-rank collective and NEP-annotation signatures across all cases.
 - Decision: accept Stage 2e1. The removed branches were unreachable in every supported run; the
   accepted GPU work, memory footprint, correctness checks, and EP8 performance are preserved.
+
+
+## 2026-08-14 — Cleanup Stage 2e2: remove causal-benchmark-only execution paths
+
+- Removed the intentionally incomplete phase-limit (`none`/Gather/EDP-only) and no-Scatter
+  execution modes. Every supported run now directly executes the same full Gather, native EDP,
+  and Scatter path selected by the accepted EP8 configuration.
+- Removed their cached phase state, owner-copy substitute, bookkeeping shim, environment readers,
+  and benchmark-only unit tests. The owner native-DDP groups still use a shallow copy of the live
+  DDP config with duplicate NaN/large-gradient checks disabled, which is exactly the accepted
+  `BENCHMARK_SKIP_OWNER_GRAD_CHECK=1` behavior; its direct unit test remains.
+- `nonuniform_ep.py` fell from 4,859 to 4,737 lines; the stale unit-test file lost 179 net lines.
+  Stage 2e2 removes 301 net lines across the two files.
+- Mandatory compute-node isort and compile job `2695201` completed successfully.
+- Frozen candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2e2_benchmark_paths_removed_20260814`; SHA-256
+  `fdeb2658c354dce1f3e8eb6961028751cc2186a2471f446fdd0401c2b03c23ea`
+  (`nonuniform_ep.py`) and
+  `d79d8c57295f79a7953aa79780471425f7bd53489572fa2cb54f70cca95285d3`
+  (unit tests).
+- First all-rank EP8/EP4 ABBA job `2695236` preserved exact 12/12-rank collective/annotation
+  signatures, exactly 48,386.22 MiB peak allocation, and zero skipped/NaN iterations. Its two
+  candidate deltas contradicted each other (+17.752% and -4.832%); candidate-A was the isolated
+  244.330 ms timing outlier while candidate-B was 208.004 ms.
+- Inverse-order job `2695295` again preserved exact traces, memory, and correctness. Stage 2e2 on
+  the edges averaged 230.235 ms versus 228.061 ms for Stage 2e1 in the middle (+0.953%, within the
+  measured 1.442% same-code ordering calibration). The stable final adjacent pair was Stage 2e2
+  at 227.461 ms versus Stage 2e1 at 227.870 ms (Stage 2e2 0.179% faster).
+- Decision: accept Stage 2e2. The initial candidate-A result was not reproducible; supported GPU
+  work and all-rank traces are identical, memory is unchanged, and calibrated EP8 performance is
+  unchanged.
