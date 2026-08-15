@@ -32,11 +32,6 @@ def get_nonuniform_ep_runtime_config() -> Optional[dict]:
     return _NONUNIFORM_EP_RUNTIME_CONFIG
 
 
-def clear_nonuniform_ep_runtime_config() -> None:
-    """Clear opt-in NEP runtime metadata."""
-    set_nonuniform_ep_runtime_config(None)
-
-
 def get_nonuniform_ep_local_expert_indices() -> Optional[List[int]]:
     """Return this rank's placement-aware local expert IDs, if NEP is active."""
     runtime_config = get_nonuniform_ep_runtime_config()
@@ -103,14 +98,6 @@ def build_expert_to_ep_rank_map(
     return expert_to_ep_rank
 
 
-def get_nonuniform_ep_expert_to_ep_rank_map(num_experts: int) -> Optional[List[int]]:
-    """Return placement-aware token destination ranks, if NEP is active."""
-    runtime_config = get_nonuniform_ep_runtime_config()
-    if runtime_config is None:
-        return None
-    return build_expert_to_ep_rank_map(runtime_config.get('expert_placement'), num_experts)
-
-
 def build_expert_axis_permutation(
     expert_placement: Optional[Sequence[Sequence[int]]], num_experts: int
 ) -> Optional[List[int]]:
@@ -127,13 +114,6 @@ def get_nonuniform_ep_expert_axis_permutation(num_experts: int) -> Optional[List
     if runtime_config is None:
         return None
     return build_expert_axis_permutation(runtime_config.get('expert_placement'), num_experts)
-
-
-def local_expert_indices_are_contiguous(local_expert_indices: Sequence[int]) -> bool:
-    """Return whether local expert IDs form one contiguous ascending range."""
-    return list(local_expert_indices) == list(
-        range(local_expert_indices[0], local_expert_indices[0] + len(local_expert_indices))
-    )
 
 
 def compute_nonuniform_ep_owner_expert_slots(
@@ -712,19 +692,6 @@ class ViewCopyHandle:
         self.output_copies = []
 
 
-class CudaEventHandle:
-    """Small wait handle compatible with Megatron bucket-group finish logic."""
-
-    def __init__(self, events: List[torch.cuda.Event]):
-        self.events = events
-
-    def wait(self):
-        current_stream = torch.cuda.current_stream()
-        for event in self.events:
-            current_stream.wait_event(event)
-        self.events = []
-
-
 def all_to_all_with_output_views(output_tensors, input_tensors, group, async_op: bool = False):
     """Run all_to_all, preserving non-contiguous output views via temporary buffers."""
     output_list = []
@@ -844,36 +811,8 @@ def configure_ordered_bucket_group_scheduler(
         setattr(bucket_group, ready_attr, False)
 
 
-def try_start_ordered_bucket_groups(
-    bucket_group, state_attr: str, ready_attr: str, start_fn_name: str, *args, **kwargs
-) -> None:
-    """Start ready bucket groups in deterministic order."""
-    state = getattr(bucket_group, state_attr, None)
-    if state is None:
-        getattr(bucket_group, start_fn_name)(*args, **kwargs)
-        return
-
-    groups = state["groups"]
-    while state["next_index"] < len(groups):
-        group = groups[state["next_index"]]
-        if not getattr(group, ready_attr, False):
-            break
-        getattr(group, start_fn_name)(*args, **kwargs)
-        state["next_index"] += 1
-
-
 def reset_ordered_bucket_group_scheduler(bucket_group, state_attr: str, index_attr: str) -> None:
     """Reset ordered scheduler state at the first bucket group."""
     state = getattr(bucket_group, state_attr, None)
     if state is not None and getattr(bucket_group, index_attr, -1) == 0:
         state["next_index"] = 0
-
-
-def get_global_rank(group, group_rank: int) -> int:
-    """Translate a process-group rank to a global rank."""
-    if hasattr(dist, "get_global_rank"):
-        return dist.get_global_rank(group, group_rank)
-    ranks = getattr(group, "ranks", None)
-    if ranks is None:
-        raise RuntimeError("Cannot map process-group rank to global rank")
-    return ranks[group_rank]

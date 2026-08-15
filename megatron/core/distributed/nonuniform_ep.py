@@ -38,7 +38,6 @@ from .nonuniform_common import (
     compute_nonuniform_ep_owner_expert_slots,
     configure_ordered_bucket_group_scheduler,
     filter_kwargs_for_callable,
-    get_global_rank,
     get_nonuniform_ep_runtime_config,
     reset_ordered_bucket_group_scheduler,
     set_nonuniform_ep_runtime_config,
@@ -2504,7 +2503,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 if transfer_group is not None and transfer_size > 1:
                     dist.broadcast(
                         owner_params,
-                        src=get_global_rank(ep_group, owner_ep_rank),
+                        src=dist.get_global_rank(ep_group, owner_ep_rank),
                         group=transfer_group,
                     )
 
@@ -3765,7 +3764,9 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                     dist.all_reduce(owner_params, group=transfer_group)
 
                 if ep_rank == owner_ep_rank and edp_group is not None and edp_group.size() > 1:
-                    dist.broadcast(owner_params, src=get_global_rank(edp_group, 0), group=edp_group)
+                    dist.broadcast(
+                        owner_params, src=dist.get_global_rank(edp_group, 0), group=edp_group
+                    )
 
                 if self.ddp_config.use_distributed_optimizer and ep_rank == owner_ep_rank:
                     bundle = bucket_group._nep_distopt_owner_bundle
@@ -3785,7 +3786,7 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 if transfer_group is not None and transfer_size > 1:
                     dist.broadcast(
                         owner_params,
-                        src=get_global_rank(ep_group, owner_ep_rank),
+                        src=dist.get_global_rank(ep_group, owner_ep_rank),
                         group=transfer_group,
                     )
 

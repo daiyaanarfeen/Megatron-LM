@@ -23,12 +23,12 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 
+import megatron.training.training as training_module
 from hybrid_builders import hybrid_builder
 from megatron.core import mpu, parallel_state
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.distributed.nonuniform_common import (
-    get_global_rank,
     get_nonuniform_ep_runtime_config,
     set_nonuniform_ep_runtime_config,
 )
@@ -69,7 +69,6 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
-import megatron.training.training as training_module
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from model_provider import model_provider
@@ -384,7 +383,7 @@ def _build_ep_runtime_config(args):
             f"--nonuniform-ep-min-size must be in [1, {local_ep_size}], got {min_ep_size}"
         )
 
-    owner_global_ranks = [get_global_rank(ep_group, rank) for rank in range(min_ep_size)]
+    owner_global_ranks = [dist.get_global_rank(ep_group, rank) for rank in range(min_ep_size)]
     edp_group = dist.new_group(ranks=owner_global_ranks)
     local_expert_indices = [int(expert) for expert in placement[ep_rank]]
     return {

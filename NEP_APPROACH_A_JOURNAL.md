@@ -3868,3 +3868,41 @@ Append a dated entry whenever we do something new: code changes, job submissions
   position outliers were not reproducible, while the clean repeat and paired median are within the
   measured +1.442% same-code ordering calibration. The active training path and all traced GPU work
   are unchanged.
+
+
+## 2026-08-14 — Cleanup Stage 2g2: remove dead shared helpers and use native rank translation
+
+- Bounded `git grep` and call-site inspection established that
+  `clear_nonuniform_ep_runtime_config`, `get_nonuniform_ep_expert_to_ep_rank_map`,
+  `local_expert_indices_are_contiguous`, `CudaEventHandle`, and
+  `try_start_ordered_bucket_groups` had no live implementation callers. Removed them, updated the
+  one test teardown to use the existing setter directly, and dropped the redundant getter-only
+  assertion already covered by `build_expert_to_ep_rank_map` tests.
+- Removed the local `get_global_rank` compatibility wrapper and changed its five live calls to
+  PyTorch's native `torch.distributed.get_global_rank`, which current Megatron already uses in
+  native DDP and optimizer paths. No collective, stream, event, buffer, launch order, or device
+  dependency changed. The bounded stage is 74 deletions and 9 insertions across five files; isort's
+  only additional change was moving an existing `training_module` import into canonical order in
+  `pretrain_hybrid.py`.
+- Compute job `2696774` stopped before tests because the first wrapper unnecessarily applied a
+  whole-file Black check to the already non-Black `nonuniform_ep.py`; this was a pre-existing style
+  mismatch, not a source or runtime failure. Corrected job `2696806` passed isort, Ruff, focused
+  Black checks, py_compile, `git diff --check`, and all 65 current NEP tests on each of four ranks.
+- Frozen candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2g2_dead_common_helpers_removed_20260814`; hashes
+  `dfaa090057e6a4da7701b824328cec8c321b637f4b3dac531fac7aff0597f44a`
+  (`nonuniform_common.py`) and
+  `6d7422b63aec393e5ac14202fefa9530c497a7c971ba4ec1b9950d8371ab081b`
+  (`nonuniform_ep.py`).
+- All-rank EP8/EP4 profiler validation used 30 iterations and traces from all 12 ranks:
+  - regular ABBA job `2696926` put Stage 2g2 in the two middle positions and measured +1.641%
+    pooled (+2.282% / +1.002% paired);
+  - inverse ABBA job `2697005` put Stage 2g2 in the two outer positions and measured Stage 2g2
+    -2.537% pooled (-3.885% / -1.165% paired);
+  - the median of the four direct Stage-2g2-vs-Stage-2g1 paired deltas is -0.082%, demonstrating
+    run-position/allocation noise rather than a cleanup regression;
+  - every one of the eight cases had exactly 48,386.22 MiB peak allocation, zero skipped/NaN
+    iterations, 12/12 traces, and byte-for-byte identical per-rank collective/NEP annotation
+    signatures within and across both jobs.
+- Decision: accept Stage 2g2. The active GPU behavior and calibrated EP8 performance are unchanged,
+  while dead host helpers and a wrapper redundant with native PyTorch/Megatron code are removed.

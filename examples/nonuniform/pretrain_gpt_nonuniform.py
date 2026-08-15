@@ -24,7 +24,6 @@ import megatron.training.training as training_module
 import pretrain_gpt as gpt
 from megatron.core import parallel_state
 from megatron.core.distributed.nonuniform_common import (
-    get_global_rank,
     get_nonuniform_ep_runtime_config,
     set_nonuniform_ep_runtime_config,
 )
@@ -133,7 +132,7 @@ def _build_ep_runtime_config(args):
             f"--nonuniform-ep-min-size must be in [1, {local_ep_size}], got {min_ep_size}"
         )
 
-    owner_global_ranks = [get_global_rank(ep_group, rank) for rank in range(min_ep_size)]
+    owner_global_ranks = [dist.get_global_rank(ep_group, rank) for rank in range(min_ep_size)]
     edp_group = dist.new_group(ranks=owner_global_ranks)
     local_expert_indices = [int(expert) for expert in placement[ep_rank]]
     return {

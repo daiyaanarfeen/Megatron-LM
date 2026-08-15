@@ -9,12 +9,10 @@ from megatron.core.distributed.distributed_data_parallel_config import Distribut
 from megatron.core.distributed.nonuniform_common import (
     build_expert_axis_permutation,
     build_expert_to_ep_rank_map,
-    clear_nonuniform_ep_runtime_config,
     compute_nonuniform_ep_dispatch_slots,
     compute_nonuniform_ep_expert_placement,
     compute_nonuniform_ep_owner_expert_slots,
     get_nonuniform_ep_expert_axis_permutation,
-    get_nonuniform_ep_expert_to_ep_rank_map,
     get_nonuniform_ep_local_expert_indices,
     set_nonuniform_ep_runtime_config,
 )
@@ -560,7 +558,7 @@ def test_flex_metadata_maps_logical_experts_to_padded_ep6_slots():
 
 class TestNonuniformEPTokenRouting:
     def teardown_method(self, _method):
-        clear_nonuniform_ep_runtime_config()
+        set_nonuniform_ep_runtime_config(None)
 
     def test_physical_expert_axis_matches_round_robin_placement(self):
         placement, _ = compute_nonuniform_ep_expert_placement(8, 4, 2)
@@ -590,7 +588,6 @@ class TestNonuniformEPTokenRouting:
 
         assert get_nonuniform_ep_local_expert_indices() == [2, 6]
         assert get_nonuniform_ep_expert_axis_permutation(8) == [0, 1, 4, 5, 2, 6, 3, 7]
-        assert get_nonuniform_ep_expert_to_ep_rank_map(8) == [0, 0, 2, 3, 1, 1, 2, 3]
 
     def test_expert_placement_rejects_duplicate_holders(self):
         with pytest.raises(RuntimeError, match="one physical holder"):
