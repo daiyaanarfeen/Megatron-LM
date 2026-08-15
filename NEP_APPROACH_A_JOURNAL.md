@@ -3835,3 +3835,36 @@ Append a dated entry whenever we do something new: code changes, job submissions
 - Decision: accept Stage 2f2. Runtime code is byte-identical, and the profiler gate confirms
   unchanged GPU behavior, memory, correctness, and calibrated EP8 performance while removing stale
   test code that described deleted experiments.
+
+
+## 2026-08-14 — Cleanup Stage 2g1: remove inactive entrypoint benchmark experiments
+
+- Removed the old no-op optimizer/scheduler implementations, optimizer-step monkeypatches,
+  gradient/parameter checksum collectors, local CUDA-event iteration timer, their global state, and
+  their CLI flags from both nonuniform GPT entrypoints. These were correctness/performance
+  experiments superseded by the validated native optimizer and DistOpt paths.
+- Preserved the active topology initialization, nonuniform DDP installation, native optimizer,
+  DistOpt, and `--nonuniform-disable-nongrad-sync-collectives` path used by the EP8 gate. No core
+  NEP runtime, collective, stream, event, buffer, model, or optimizer implementation changed.
+- `examples/nonuniform/pretrain_gpt_nonuniform.py` fell from 703 to 394 lines; `pretrain_hybrid.py`
+  fell from 771 to 596 lines. The stage removes 484 lines and adds none. Import cleanup in the
+  dedicated entrypoint was passed through isort as required; unrelated whole-file Black churn in
+  the pre-existing hybrid file was intentionally restored, leaving a deletion-only final diff.
+- Compute-node job `2696300` passed Ruff, isort, Black, py_compile, and all 65 NEP tests on four
+  ranks.
+- Frozen candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2g1_entrypoint_experiments_removed_20260814`; hashes
+  `27d6eb4d7f430852165a2971aa8a8faa179a592ecf75e0ce9df6141ebf98fed4` (dedicated GPT
+  entrypoint) and `21c8bc3eb7bafd051ee74b4df7cfe93054058c1020ba764b3a1313cefdcf56bd`
+  (hybrid entrypoint).
+- All-rank EP8/EP4 profiler validation:
+  - regular ABBA `2696335` had a +0.453% first pair and an isolated +7.176% candidate-B outlier;
+  - inverse ABBA `2696457` had a +0.279% final pair and an isolated +3.086% first-edge outlier;
+  - clean regular repeat `2696532` was -0.367% pooled, with -0.945%/+0.216% paired deltas;
+  - the median across all six direct paired deltas was +0.366%;
+  - every one of the 12 cases had exactly 48,386.22 MiB peak allocation, zero skipped/NaN
+    iterations, and exact 12/12-rank collective and NEP-annotation signatures.
+- Decision: accept Stage 2g1. Four of six direct pairs were within 1%; the two contradictory
+  position outliers were not reproducible, while the clean repeat and paired median are within the
+  measured +1.442% same-code ordering calibration. The active training path and all traced GPU work
+  are unchanged.
