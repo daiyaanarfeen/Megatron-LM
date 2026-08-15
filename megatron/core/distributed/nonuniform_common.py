@@ -637,47 +637,6 @@ class NonuniformTPTopologyRankGenerator:
         return [[rank for replica in self.replicas for rank in replica.ranks]]
 
 
-@dataclass
-class PerBufferParamLayout:
-    """Layout for parameters within one opt-in contiguous DDP buffer."""
-
-    param_index_map: Dict[torch.nn.Parameter, Tuple[int, int, int]] = field(default_factory=dict)
-    side_grad_index_map: Dict[torch.nn.Parameter, Tuple[int, int, int]] = field(
-        default_factory=dict
-    )
-    bucket_indices: List[Tuple[int, int]] = field(default_factory=list)
-    per_bucket_numel_unpadded: List[int] = field(default_factory=list)
-    param_indices: List[int] = field(default_factory=list)
-
-
-@dataclass
-class FullParamLayout:
-    """Compatibility placeholder for wrappers that pass precomputed layouts."""
-
-    layouts: Dict[object, PerBufferParamLayout] = field(default_factory=dict)
-
-
-def pad_to_divisor(value: int, divisor: int) -> int:
-    """Round up ``value`` to the nearest multiple of ``divisor``."""
-    return int(math.ceil(value / divisor) * divisor)
-
-
-def pad_param_start(param_start_index: int) -> int:
-    """Align parameter start index to a 64-element boundary."""
-    return pad_to_divisor(param_start_index, 64)
-
-
-def pad_bucket_end(
-    bucket_end_index: int, data_parallel_world_size: int, pad_for_high_nccl_busbw: bool
-) -> int:
-    """Pad bucket end for DP divisibility and optionally high NCCL bus bandwidth."""
-    if pad_for_high_nccl_busbw:
-        divisor = math.lcm(data_parallel_world_size, 128, 2**16)
-    else:
-        divisor = math.lcm(data_parallel_world_size, 128)
-    return pad_to_divisor(bucket_end_index, divisor)
-
-
 class ViewCopyHandle:
     """Wait handle that copies temporary contiguous receive buffers into views."""
 

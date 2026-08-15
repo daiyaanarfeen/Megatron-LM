@@ -3940,3 +3940,42 @@ Append a dated entry whenever we do something new: code changes, job submissions
     traces, and byte-for-byte identical per-rank collective/NEP annotation signatures.
 - Decision: accept Stage 2g3. The active per-iteration path and traced GPU work are unchanged while
   redundant entrypoint runtime-config and obsolete argument-compatibility work are removed.
+
+
+## 2026-08-15 — Cleanup Stage 2h1: reuse native optimizer parameter-layout machinery
+
+- Removed the duplicate `PerBufferParamLayout`, `FullParamLayout`, and parameter/bucket padding
+  helpers from `nonuniform_common.py`. NTP now uses Megatron's existing
+  `megatron.core.optimizer.param_layout` definitions and padding functions directly.
+- Kept only the NTP-specific delta: a small `PerBufferParamLayout` subclass in
+  `nonuniform_tp.py` that adds `side_grad_index_map`. The inherited native layout retains the same
+  parameter indices, bucket indices, unpadded sizes, and per-buffer parameter ordering. No NEP
+  runtime, collective, stream, event, dependency, buffer, or launch-order code changed. The stage
+  removes 53 lines and adds 18 across two files.
+- Three initial compute jobs (`2697318`, `2697372`, and `2697412`) stopped in formatting preflight
+  before tests while the import form was made simultaneously isort- and Black-stable. No runtime
+  failure occurred. Final compute job `2697442` passed isort, Ruff, focused Black, py_compile,
+  `git diff --check`, a focused native-layout/NTP-side-layout compatibility check, and all 65 NEP
+  tests on each of four ranks.
+- Frozen candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2h1_native_param_layout_reuse_20260814`; hashes
+  `c99034d4cb4657de15ce05d6b641c9f50d6383b43a1ab1c97892c38fbe6e3cd1`
+  (`nonuniform_common.py`) and
+  `1943b2758adaaffdaf2c162f44d75efcb25eecbb1abbb9defd1ff50edc6b34e6`
+  (`nonuniform_tp.py`).
+- The first all-rank EP8/EP4 profiler ABBA (`2697542`) was rejected as a performance comparison:
+  same-code reference positions differed by about 17% and candidate positions by about 13%, while
+  all traces, memory, and correctness results matched.
+- Clean repeat ABBA `2697681` completed on `lyris[0111,0120,0123]` with 30 iterations and profiles
+  from all 12 ranks:
+  - Stage-2g3 reference pooled mean: 213.480 ms;
+  - Stage-2h1 candidate pooled mean: 206.989 ms (-3.041%);
+  - paired deltas: -6.165% for the noisy first-edge pair and +0.308% for the stable second pair;
+  - the two candidate positions differed by only 0.267%, while the first reference position was
+    the isolated slow run;
+  - every case used exactly 48,386.22 MiB peak allocation, had zero skipped/NaN iterations and
+    12/12 traces, and produced byte-for-byte identical per-rank collective/NEP annotation
+    signatures.
+- Decision: accept Stage 2h1. The stable pair is within the measured same-code calibration, the
+  pooled result has no candidate regression, and GPU behavior, memory, and correctness are
+  unchanged while duplicate Megatron parameter-layout code is removed.

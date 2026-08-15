@@ -20,7 +20,7 @@ import logging
 import math
 import sys
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -28,6 +28,7 @@ import torch
 import torch.distributed as dist
 
 from .. import parallel_state
+from ..optimizer import param_layout as optimizer_param_layout
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
@@ -36,14 +37,10 @@ from . import param_and_grad_buffer as pgb
 from .distributed_data_parallel import DistributedDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .nonuniform_common import (
-    FullParamLayout,
     NonuniformTPTopologyRankGenerator,
-    PerBufferParamLayout,
     all_to_all_with_output_views,
     configure_post_sync_handle_tracker,
     filter_kwargs_for_callable,
-    pad_bucket_end,
-    pad_param_start,
     patch_ddp_param_and_grad_buffer,
     record_post_sync_handles,
     wrap_bucket_groups_with_subclass,
@@ -51,6 +48,15 @@ from .nonuniform_common import (
 from .param_and_grad_buffer import _ParamAndGradBucketGroup, _ParamAndGradBuffer
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PerBufferParamLayout(optimizer_param_layout.PerBufferParamLayout):
+    """Native Megatron parameter layout extended with NTP side-gradient ranges."""
+
+    side_grad_index_map: Dict[torch.nn.Parameter, Tuple[int, int, int]] = field(
+        default_factory=dict
+    )
 
 
 def _ntp_all_to_all(output_tensors, input_tensors, group, async_op: bool = False):
@@ -226,7 +232,7 @@ def _compute_ntp_per_buffer_param_layout(
     def _finalize_bucket(param_end_index, bucket_start_index, bucket_id):
         per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
         if ddp_config.use_distributed_optimizer:
-            bucket_end_index = pad_bucket_end(
+            bucket_end_index = optimizer_param_layout.pad_bucket_end(
                 param_end_index,
                 data_parallel_world_size,
                 ddp_config.pad_buckets_for_high_nccl_busbw,
@@ -238,7 +244,7 @@ def _compute_ntp_per_buffer_param_layout(
 
     for param in params[::-1]:
         if ddp_config.use_distributed_optimizer:
-            param_start_index = pad_param_start(param_start_index)
+            param_start_index = optimizer_param_layout.pad_param_start(param_start_index)
 
         if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
             bucket_start_index, bucket_id = _finalize_bucket(
@@ -1063,7 +1069,7 @@ def _compute_default_per_buffer_param_layout(
         nonlocal bucket_params, bucket_id
         per_bucket_numel_unpadded.append(param_end_index - current_bucket_start_index)
         if ddp_config.use_distributed_optimizer:
-            bucket_end_index = pad_bucket_end(
+            bucket_end_index = optimizer_param_layout.pad_bucket_end(
                 param_end_index,
                 data_parallel_world_size,
                 ddp_config.pad_buckets_for_high_nccl_busbw,
@@ -1077,7 +1083,7 @@ def _compute_default_per_buffer_param_layout(
 
     for param in params[::-1]:
         if ddp_config.use_distributed_optimizer:
-            param_start_index = pad_param_start(param_start_index)
+            param_start_index = optimizer_param_layout.pad_param_start(param_start_index)
 
         if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
             bucket_start_index = _finalize_bucket(param_start_index, bucket_start_index)
@@ -1414,12 +1420,12 @@ class NonuniformTPParamAndGradBuffer(_ParamAndGradBuffer):
     def _compute_nvfp4_packed_layout(self, params_with_names):
         def _pad_start_of_param(param_start_index: int) -> int:
             if self.ddp_config.use_distributed_optimizer:
-                return pad_param_start(param_start_index)
+                return optimizer_param_layout.pad_param_start(param_start_index)
             return param_start_index
 
         def _pad_end_of_bucket(bucket_end_index: int) -> int:
             if self.ddp_config.use_distributed_optimizer:
-                return pad_bucket_end(
+                return optimizer_param_layout.pad_bucket_end(
                     bucket_end_index,
                     self.data_parallel_world_size,
                     self.ddp_config.pad_buckets_for_high_nccl_busbw,
@@ -1496,7 +1502,7 @@ class NonuniformTPDistributedDataParallel(DistributedDataParallel):
         disable_bucketing: bool = False,
         pg_collection: Optional[ProcessGroupCollection] = None,
         ntp_config: Optional[NonuniformTPConfig] = None,
-        full_param_layout: Optional[FullParamLayout] = None,
+        full_param_layout: Optional[optimizer_param_layout.FullParamLayout] = None,
     ):
         self.ntp_config = ntp_config or NonuniformTPConfig()
 
