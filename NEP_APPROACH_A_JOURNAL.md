@@ -3979,3 +3979,39 @@ Append a dated entry whenever we do something new: code changes, job submissions
 - Decision: accept Stage 2h1. The stable pair is within the measured same-code calibration, the
   pooled result has no candidate regression, and GPU behavior, memory, and correctness are
   unchanged while duplicate Megatron parameter-layout code is removed.
+
+
+## 2026-08-15 — Cleanup Stage 2h2: consolidate topology-derived NEP bootstrap
+
+- Moved the duplicated topology validation and `initialize_nonuniform_ep_process_groups` argument
+  forwarding from the dedicated GPT and hybrid entrypoints into one reusable
+  `initialize_nonuniform_ep_process_groups_from_args` helper in `nonuniform_ep.py`. Each entrypoint
+  retains its existing native-initialization fallback; the dedicated entrypoint also retains its
+  NTP-specific branch unchanged.
+- The shared helper performs the same mode/topology selection, PP/FSDP/DistOpt validation,
+  topology-derived minimum-EP calculation, expert-count checks, process-group call, and local EP
+  size update in the same order. It is called only during model-parallel initialization, so no
+  per-iteration call path changed. Focused Black formatting also removed stale runs of blank lines
+  left by earlier experiment deletion. The complete stage is 80 insertions and 140 deletions across
+  the two entrypoints and `nonuniform_ep.py`.
+- Compute job `2697923` passed mandatory isort, Ruff, focused Black, py_compile,
+  `git diff --check`, a focused mock asserting exact process-group arguments/native fallback, and
+  all 65 NEP tests on each of four ranks.
+- Frozen candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2h2_shared_topology_bootstrap_20260815`; hashes
+  `91ac9d819d122e1d5346d55b612f85dd5ab04cdb50172407002eac2ee0146668`
+  (`nonuniform_ep.py`),
+  `e99e2684a92cdf91db3bb122720e2cbcdec66d7d08bc050b5495f58f11befd7a`
+  (dedicated GPT entrypoint), and
+  `859400a47176ab415ec9c1398a51cd56bd502972120e518147b17f00726283cc`
+  (hybrid entrypoint).
+- All-rank EP8/EP4 profiler ABBA job `2697940` completed on
+  `lyris[0041-0042,0044]` with 30 iterations and profiles from all 12 ranks:
+  - Stage-2h1 reference pooled mean: 227.270 ms;
+  - Stage-2h2 candidate pooled mean: 225.178 ms (-0.920%);
+  - paired deltas: -0.756% and -1.107%, with no candidate regression in either pair;
+  - every case used exactly 48,386.22 MiB peak allocation, had zero skipped/NaN iterations and
+    12/12 traces, and produced byte-for-byte identical per-rank collective/NEP annotation
+    signatures.
+- Decision: accept Stage 2h2. Startup validation and process-group creation are consolidated with
+  unchanged traced GPU work, memory, correctness, and EP8 performance.

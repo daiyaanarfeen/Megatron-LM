@@ -15,7 +15,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -52,21 +52,6 @@ logger = logging.getLogger(__name__)
 _NEP_NCCL_DEFAULT_MAX_GATHER_BYTES = 8 * 1024 * 1024 * 1024
 _NEP_NCCL_DEFAULT_ASYNC_CHUNK_WINDOW = 2
 _NEP_NCCL_DEFAULT_EXPERT_BUCKET_GROUPS = 3
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def _nep_owner_ddp_config(
@@ -195,8 +180,6 @@ def _get_nep_nccl_async_chunk_window() -> int:
     return chunk_window
 
 
-
-
 def _get_nep_nccl_expert_bucket_group_count() -> int:
     value = os.getenv("MEGATRON_NONUNIFORM_EP_NCCL_EXPERT_BUCKET_GROUPS")
     if value is None:
@@ -205,10 +188,6 @@ def _get_nep_nccl_expert_bucket_group_count() -> int:
     if group_count <= 0:
         raise RuntimeError("MEGATRON_NONUNIFORM_EP_NCCL_EXPERT_BUCKET_GROUPS must be positive")
     return group_count
-
-
-
-
 
 
 def _nep_block_current_stream(work) -> None:
@@ -222,8 +201,6 @@ def _nep_block_current_stream(work) -> None:
         # Older torch Work objects may not expose block_current_stream. This keeps the
         # path correct, but removes overlap on those builds.
         work.wait()
-
-
 
 
 @dataclass
@@ -358,8 +335,6 @@ def _get_runtime_config(config: NonuniformEPConfig) -> dict:
     if config.runtime_config is not None:
         return dict(config.runtime_config)
     return _runtime_config_from_parallel_state()
-
-
 
 
 def _set_parallel_state_attr(name: str, value) -> None:
@@ -671,6 +646,72 @@ def initialize_nonuniform_ep_process_groups(
     }
     set_nonuniform_ep_runtime_config(runtime_config)
     return runtime_config
+
+
+def initialize_nonuniform_ep_process_groups_from_args(
+    args: Any,
+    *,
+    get_embedding_ranks: Optional[Callable[[List[int]], List[int]]] = None,
+    get_position_embedding_ranks: Optional[Callable[[List[int]], List[int]]] = None,
+) -> bool:
+    """Initialize topology-derived NEP process groups from parsed Megatron arguments.
+
+    Returns ``True`` when nonuniform EP topology initialization was selected and
+    ``False`` when the caller should use native model-parallel initialization.
+    """
+    topology = args.nonuniform_ep_num_tp_cp_per_replica
+    if args.nonuniform_mode != "ep" or topology is None:
+        return False
+
+    if args.num_experts is None:
+        raise RuntimeError("num_experts is required for nonuniform EP topology mode")
+    if args.pipeline_model_parallel_size != 1:
+        raise RuntimeError("Nonuniform EP topology mode currently supports PP=1 only")
+    if args.virtual_pipeline_model_parallel_size is not None:
+        raise RuntimeError("Nonuniform EP topology mode does not support virtual PP")
+    if args.use_torch_fsdp2:
+        raise RuntimeError("--use-torch-fsdp2 is not supported with nonuniform EP")
+    if args.num_distributed_optimizer_instances != 1:
+        raise RuntimeError("Nonuniform EP topology mode does not support partial DistOpt")
+
+    etp = args.expert_tensor_parallel_size or args.tensor_model_parallel_size
+    tp_cp = args.tensor_model_parallel_size * args.context_parallel_size
+    computed_min_ep_size = min(topology) * tp_cp // etp
+    if (
+        args.nonuniform_ep_min_size is not None
+        and args.nonuniform_ep_min_size != computed_min_ep_size
+    ):
+        raise RuntimeError(
+            "--nonuniform-ep-min-size must match the topology-derived min EP size "
+            f"({computed_min_ep_size}) when --nonuniform-ep-num-tp-cp-per-replica is set"
+        )
+    for num_tp_cp in topology:
+        if num_tp_cp * tp_cp % etp != 0:
+            raise RuntimeError(
+                "Each nonuniform EP replica must produce an integer EP size: "
+                f"num_tp_cp={num_tp_cp}, TP*CP={tp_cp}, ETP={etp}"
+            )
+        ep_size = num_tp_cp * tp_cp // etp
+        if args.num_experts < ep_size:
+            raise RuntimeError(
+                "Nonuniform EP currently requires at least one logical expert per local EP "
+                f"rank; got num_experts={args.num_experts}, local_ep_size={ep_size}"
+            )
+
+    runtime_config = initialize_nonuniform_ep_process_groups(
+        tensor_model_parallel_size=args.tensor_model_parallel_size,
+        context_parallel_size=args.context_parallel_size,
+        num_tp_cp_per_replica=topology,
+        expert_tensor_parallel_size=args.expert_tensor_parallel_size,
+        num_moe_experts=args.num_experts,
+        nccl_communicator_config_path=args.nccl_communicator_config_path,
+        distributed_timeout_minutes=args.distributed_timeout_minutes,
+        create_gloo_process_groups=args.use_gloo_process_groups,
+        get_embedding_ranks=get_embedding_ranks,
+        get_position_embedding_ranks=get_position_embedding_ranks,
+    )
+    args.expert_model_parallel_size = runtime_config["local_ep_size"]
+    return True
 
 
 def _local_expert_id_from_name(
@@ -3295,11 +3336,6 @@ def _configure_nep_end_iteration_scatter_buffers(
                     dtype,
                     device,
                 )
-
-
-
-
-
 
 
 def build_nonuniform_ep_nccl_bucket_groups(

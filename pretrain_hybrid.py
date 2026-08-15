@@ -34,7 +34,7 @@ from megatron.core.distributed.nonuniform_common import (
 from megatron.core.distributed.nonuniform_ep import (
     NonuniformEPConfig,
     NonuniformEPDistributedDataParallel,
-    initialize_nonuniform_ep_process_groups,
+    initialize_nonuniform_ep_process_groups_from_args,
 )
 from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -389,9 +389,7 @@ def _build_ep_runtime_config(args):
         'local_ep_size': local_ep_size,
         'min_ep_size': min_ep_size,
         'num_replicas': max(1, parallel_state.get_data_parallel_world_size()),
-        'dp_size': max(
-            1, parallel_state.get_data_parallel_world_size(with_context_parallel=True)
-        ),
+        'dp_size': max(1, parallel_state.get_data_parallel_world_size(with_context_parallel=True)),
         'ep_group': ep_group,
         'edp_group': edp_group,
         'ep_rank': ep_rank,
@@ -402,61 +400,13 @@ def _build_ep_runtime_config(args):
 
 def _initialize_model_parallel(*args, **kwargs):
     """Runtime replacement for standard MPU init in nonuniform EP topology mode."""
-    megatron_args = get_args()
-    nep_topology = megatron_args.nonuniform_ep_num_tp_cp_per_replica
-
-    if megatron_args.nonuniform_mode != "ep" or nep_topology is None:
-        return _ORIGINAL_INITIALIZE_MODEL_PARALLEL(*args, **kwargs)
-
-    if megatron_args.num_experts is None:
-        raise RuntimeError("num_experts is required for nonuniform EP topology mode")
-    if megatron_args.pipeline_model_parallel_size != 1:
-        raise RuntimeError("Nonuniform EP topology mode currently supports PP=1 only")
-    if megatron_args.virtual_pipeline_model_parallel_size is not None:
-        raise RuntimeError("Nonuniform EP topology mode does not support virtual PP")
-    if megatron_args.use_torch_fsdp2:
-        raise RuntimeError("--use-torch-fsdp2 is not supported with nonuniform EP")
-    if megatron_args.num_distributed_optimizer_instances != 1:
-        raise RuntimeError("Nonuniform EP topology mode does not support partial DistOpt")
-
-    etp = megatron_args.expert_tensor_parallel_size or megatron_args.tensor_model_parallel_size
-    tp_cp = megatron_args.tensor_model_parallel_size * megatron_args.context_parallel_size
-    computed_min_ep_size = min(nep_topology) * tp_cp // etp
-    if (
-        megatron_args.nonuniform_ep_min_size is not None
-        and megatron_args.nonuniform_ep_min_size != computed_min_ep_size
-    ):
-        raise RuntimeError(
-            "--nonuniform-ep-min-size must match the topology-derived min EP size "
-            f"({computed_min_ep_size}) when --nonuniform-ep-num-tp-cp-per-replica is set"
-        )
-    for num_tp_cp in nep_topology:
-        if num_tp_cp * tp_cp % etp != 0:
-            raise RuntimeError(
-                "Each nonuniform EP replica must produce an integer EP size: "
-                f"num_tp_cp={num_tp_cp}, TP*CP={tp_cp}, ETP={etp}"
-            )
-        ep_size = num_tp_cp * tp_cp // etp
-        if megatron_args.num_experts < ep_size:
-            raise RuntimeError(
-                "Nonuniform EP currently requires at least one logical expert per local EP "
-                f"rank; got num_experts={megatron_args.num_experts}, local_ep_size={ep_size}"
-            )
-
-    runtime_config = initialize_nonuniform_ep_process_groups(
-        tensor_model_parallel_size=megatron_args.tensor_model_parallel_size,
-        context_parallel_size=megatron_args.context_parallel_size,
-        num_tp_cp_per_replica=nep_topology,
-        expert_tensor_parallel_size=megatron_args.expert_tensor_parallel_size,
-        num_moe_experts=megatron_args.num_experts,
-        nccl_communicator_config_path=megatron_args.nccl_communicator_config_path,
-        distributed_timeout_minutes=megatron_args.distributed_timeout_minutes,
-        create_gloo_process_groups=megatron_args.use_gloo_process_groups,
+    if initialize_nonuniform_ep_process_groups_from_args(
+        get_args(),
         get_embedding_ranks=kwargs.get("get_embedding_ranks"),
         get_position_embedding_ranks=kwargs.get("get_position_embedding_ranks"),
-    )
-    megatron_args.expert_model_parallel_size = runtime_config['local_ep_size']
-    return None
+    ):
+        return None
+    return _ORIGINAL_INITIALIZE_MODEL_PARALLEL(*args, **kwargs)
 
 
 def _build_ep_config(args) -> NonuniformEPConfig:
