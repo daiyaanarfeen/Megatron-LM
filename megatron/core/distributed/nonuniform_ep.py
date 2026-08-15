@@ -3223,6 +3223,7 @@ def build_nonuniform_ep_nccl_bucket_groups(
     param_to_name: Dict[torch.nn.Parameter, str],
 ) -> List[NonuniformEPNCCLParamAndGradBucketGroup]:
     """Build common-layout NCCL Approach-A expert groups in backward order."""
+
     ep_group = runtime_config["ep_group"]
     specs = _build_expert_param_bucket_specs(
         buffers, runtime_config, nonuniform_ep_config, param_to_name
@@ -3241,20 +3242,7 @@ def build_nonuniform_ep_nccl_bucket_groups(
     edp_partitions = _partition_expert_bucket_specs(
         ordered_grouped_specs, _get_nep_nccl_expert_bucket_group_count()
     )
-    grouped_partitions = []
-    for edp_bucket_index, edp_partition in enumerate(edp_partitions):
-        gather_partitions = [edp_partition]
-        for gather_bucket_index, gather_partition in enumerate(gather_partitions):
-            grouped_partitions.append(
-                (edp_bucket_index, gather_bucket_index, len(gather_partitions), gather_partition)
-            )
-
-    for group_index, (
-        edp_bucket_index,
-        gather_bucket_index,
-        gather_bucket_count,
-        grouped_partition,
-    ) in enumerate(grouped_partitions):
+    for group_index, grouped_partition in enumerate(edp_partitions):
         buckets = []
         entries = []
         slot_keys = []
@@ -3318,9 +3306,7 @@ def build_nonuniform_ep_nccl_bucket_groups(
             slot_keys=tuple(slot_keys),
             slot_numels=tuple(slot_numels),
         )
-        bucket_group._nep_nccl_edp_bucket_index = edp_bucket_index
-        bucket_group._nep_nccl_gather_bucket_index = gather_bucket_index
-        bucket_group._nep_nccl_gather_bucket_count = gather_bucket_count
+        bucket_group._nep_nccl_edp_bucket_index = group_index
         bucket_groups.append(bucket_group)
 
     for buffer in buffers:
@@ -3536,12 +3522,7 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                                 torch.empty_like(template.detach()), requires_grad=True
                             )
                             _copy_nep_optimizer_parameter_attributes(template, proxy)
-                            proxy.nonuniform_ep_logical_expert_id = expert_id
-                            proxy.nonuniform_ep_owner_rank = ep_rank
-                            proxy.nonuniform_ep_group_index = bucket_group._nep_nccl_group_index
-                            proxy.nonuniform_ep_slot_index = slot_index
                             name = _nep_distopt_proxy_name(slot_key, expert_id)
-                            proxy.nonuniform_ep_logical_name = name
                             key = (bucket_group._nep_nccl_group_index, expert_id, slot_index)
                             proxy_by_key[key] = proxy
                             params_with_names.append((proxy, name))
@@ -3581,7 +3562,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                     ProcessGroupCollection(tp=self.tp_group, dp_cp=self.dp_cp_group),
                     param_layout=owner_layout,
                 )
-                owner_buffer.nonuniform_ep_owner_layout = True
                 native_group = _ParamAndGradBucketGroup(
                     owner_buffer.buckets,
                     _nep_owner_ddp_config(self.ddp_config),

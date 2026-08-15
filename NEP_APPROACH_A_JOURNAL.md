@@ -4241,3 +4241,35 @@ Append a dated entry whenever we do something new: code changes, job submissions
 - Decision: accept Stage 2i5. Current DDP argument behavior is exact, the old-version compatibility
   branch and reflection overhead are gone, and controlled EP8 behavior, memory, and performance are
   unchanged.
+
+
+## 2026-08-15 — Cleanup Stage 2i6: remove obsolete Gather partition layer and write-only metadata
+
+- State/reference auditing found two Gather-bucket ordinal attributes, five owner-proxy annotations,
+  and one owner-buffer marker that were written but never read anywhere in tracked runtime or test
+  code. Removed those assignments. The old multi-Gather experiment had also left a nested
+  `gather_partitions = [edp_partition]` flattening loop even though exactly one Gather bucket now
+  maps to each EDP bucket; replaced it with direct enumeration of the existing EDP partitions. The
+  resulting EDP/group indices are identical by construction. The stage is three insertions and 23
+  deletions in `nonuniform_ep.py`; no collective, stream, event, buffer, dependency, payload, or
+  optimizer operation changed.
+- Initial test job `2699785` stopped only at focused Black formatting. Diagnostic job `2699809`
+  reported one missing post-docstring blank line in the touched function. After applying exactly
+  that whitespace correction, compute job `2699847` passed isort check, Ruff, focused Black,
+  py_compile, `git diff --check`, exact old-vs-new single-partition flattening checks, absence checks
+  for all eight dead metadata names, and all 65 NEP tests on each of four ranks.
+- Frozen candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2i6_dead_gather_and_proxy_metadata_20260815`; hash
+  `3638a3353a7f7c19b095712ed22a89c5f43e57f1e4338daa974191d03ec58510`
+  (`nonuniform_ep.py`).
+- Controlled exact-uniform-routing EP8/EP4 all-rank profiler ABBA `2699864` completed on
+  `lyris[0254,0259,0269]` with 30 iterations and profiles from all 12 ranks:
+  - Stage-2i5 reference pooled mean: 243.728 ms;
+  - Stage-2i6 candidate pooled mean: 225.800 ms (-7.356%);
+  - paired deltas: -9.146% and -5.599%; this startup-metadata-only edit is not credited with that
+    implausibly large runtime gain, consistent with earlier demonstrated run-position variability;
+  - every case used exactly 48,386.22 MiB peak allocation, had zero skipped/NaN iterations and
+    12/12 traces, and produced byte-for-byte identical per-rank collective/NEP annotation
+    signatures.
+- Decision: accept Stage 2i6. The removed state has zero readers, partition/index outputs are exact,
+  traced GPU behavior and memory are unchanged, and no performance regression was observed.
