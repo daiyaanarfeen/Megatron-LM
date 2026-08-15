@@ -3804,3 +3804,34 @@ Append a dated entry whenever we do something new: code changes, job submissions
   - exact 12/12-rank collective and NEP-annotation signatures across every case.
 - Decision: accept Stage 2f1. Runtime GPU behavior, memory, correctness, and EP8 performance are
   unchanged while obsolete compatibility and host-bookkeeping code is gone.
+
+
+## 2026-08-14 — Cleanup Stage 2f2: remove stale experimental unit tests
+
+- Audited the NEP unit suite against the Stage-2f1 runtime surface. Removed tests and imports for
+  deleted P2P, zero-SM, readiness-gate, deferred-host-phase, causal-benchmark, debug, CUDA-graph
+  callback, and obsolete scheduler APIs. Removed one stale bounded-slot assertion for the old
+  modulo-reuse experiment; retained and updated the persistent-slot, current Gather/EDP ordering,
+  Scatter, dispatch-boundary, payload-layout, non-divisible expert, Flex, and DistOpt coverage.
+- The test file fell from 4,877 to 1,598 lines and from 126 to 50 top-level tests/classes. No runtime
+  implementation file changed; `nonuniform_ep.py` remains byte-identical to Stage 2f1 with SHA-256
+  `75b76fe60c4f0fb83d912f6980e0fb228d501515f6e83ae1c4ccca1f1386853d`.
+- Compute-node style/compile/distributed-unit job `2696033` passed: Ruff, isort, Black, py_compile,
+  and all 65 current tests on four ranks.
+- Frozen candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2f2_stale_tests_removed_20260814`; test SHA-256
+  `c9bd4d2f3b975bd214ebd747a6d3448947ce1e427ac88a9a96aa65238753a720`.
+- EP8/EP4 ABBA job `2696109` stopped in the redundant harness preflight before training because
+  unchanged `pretrain_hybrid.py` has a pre-existing isort mismatch. The focused changed-file style
+  and unit gate had already passed, so retry `2696146` disabled only that duplicate preflight and
+  made no source change.
+- All-rank EP8/EP4 ABBA retry `2696146`:
+  - Stage-2f1 reference pooled mean: 206.876 ms,
+  - Stage-2f2 candidate pooled mean: 207.507 ms (+0.305%),
+  - paired deltas: +1.054% and -0.443%, within the measured +1.442% same-code ordering calibration,
+  - exactly 48,386.22 MiB peak allocation in all four cases,
+  - zero skipped/NaN iterations,
+  - exact 12/12-rank collective and NEP-annotation signatures across every case.
+- Decision: accept Stage 2f2. Runtime code is byte-identical, and the profiler gate confirms
+  unchanged GPU behavior, memory, correctness, and calibrated EP8 performance while removing stale
+  test code that described deleted experiments.
