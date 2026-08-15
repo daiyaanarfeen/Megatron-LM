@@ -21,12 +21,7 @@ import torch
 import torch.distributed as dist
 
 from .. import parallel_state
-from ..optimizer.param_layout import (
-    FullParamLayout,
-    PerBufferParamLayout,
-    pad_bucket_end,
-    pad_param_start,
-)
+from ..optimizer.param_layout import FullParamLayout, PerBufferParamLayout
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.transformer_config import TransformerConfig
 from .distributed_data_parallel import DistributedDataParallel
@@ -261,24 +256,17 @@ def _compute_nep_distopt_owner_layout(
     data_parallel_world_size: int,
     ddp_config: DistributedDataParallelConfig,
 ) -> PerBufferParamLayout:
-    """Build one native-compatible distributed-optimizer bucket for owner params."""
+    """Build one native distributed-optimizer bucket for owner parameters."""
     if not params:
         raise RuntimeError("NEP owner DistOpt layout requires at least one logical parameter")
 
-    param_index_map = {}
-    param_end_index = 0
-    for param in params[::-1]:
-        param_start_index = pad_param_start(param_end_index)
-        param_end_index = param_start_index + param.numel()
-        param_index_map[param] = (param_start_index, param_end_index, 0)
+    from ..optimizer.distrib_optimizer import DistributedOptimizer
 
-    bucket_end_index = pad_bucket_end(
-        param_end_index, data_parallel_world_size, ddp_config.pad_buckets_for_high_nccl_busbw
-    )
-    return PerBufferParamLayout(
-        param_index_map=param_index_map,
-        bucket_indices=[(0, bucket_end_index)],
-        per_bucket_numel_unpadded=[param_end_index],
+    return DistributedOptimizer._compute_per_buffer_param_layout(
+        params,
+        bucket_size=None,
+        data_parallel_world_size=data_parallel_world_size,
+        ddp_config=ddp_config,
         param_indices=list(range(len(params))),
     )
 

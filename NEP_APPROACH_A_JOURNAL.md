@@ -4175,3 +4175,36 @@ Append a dated entry whenever we do something new: code changes, job submissions
 - Decision: accept Stage 2i3. Current and explicit-placement source-rank behavior is retained,
   traced GPU behavior and memory are exact, and controlled EP8 performance has no regression while
   stale compatibility and formatting residue are removed.
+
+
+## 2026-08-15 — Cleanup Stage 2i4: reuse native distributed-optimizer owner layout
+
+- Replaced NEP's hand-written parameter alignment, bucket-end padding, and
+  `PerBufferParamLayout` assembly with the existing
+  `DistributedOptimizer._compute_per_buffer_param_layout` machinery. The small NEP wrapper remains
+  to enforce the existing nonempty-owner invariant and request the same single bucket and parameter
+  indices. Removed the now-redundant `pad_param_start` and `pad_bucket_end` imports and 12 net lines;
+  this path runs only while constructing persistent owner buffers, not per iteration.
+- Compute job `2699262` ran the mandatory `uv run isort`, Ruff, focused Black, py_compile, and
+  `git diff --check`; proved the old and native layouts exactly equal over four parameter-shape
+  sets, DP sizes 1/2/4/6/8, and both bucket-padding modes; retained the exact empty-input failure;
+  and passed all 65 NEP tests on each of four ranks.
+- Frozen candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2i4_native_distopt_owner_layout_20260815`; hash
+  `0be76eafa7e57e885b78b3b476b45bfee161758bab883e830c0e93559598a541`
+  (`nonuniform_ep.py`).
+- Controlled exact-uniform-routing EP8/EP4 all-rank profiler ABBA `2699334` completed on
+  `theia[0067-0069]` with 30 iterations and all 12 rank traces. It reported Stage-2i3 at
+  261.374 ms and Stage-2i4 at 235.511 ms (-9.895%), with paired deltas -5.866% and -13.884%.
+  Because an initialization-only exact-layout substitution cannot credibly explain that large
+  runtime gain, it was treated as a confounded measurement rather than claimed as an optimization.
+- Inverse-order control `2699537` on `theia[0163-0165]` confirmed severe temporal/node-state drift:
+  its two identical Stage-2i4 outer cases were 206.443 ms and 256.226 ms, while its Stage-2i3 middle
+  cases were 209.943 ms and 221.757 ms. Thus pair deltas contradicted each other (+1.695% and
+  -13.453%) and did not track source identity.
+- Across all eight cases, peak allocation was exactly 48,386.22 MiB, every run had zero skipped/NaN
+  iterations and 12/12 traces, and every per-rank collective/NEP annotation signature was
+  byte-for-byte identical. Focused tests additionally established exact layout-object contents.
+- Decision: accept Stage 2i4. Native Megatron layout code replaces duplicate NEP logic with exact
+  construction behavior and traced GPU work. The large timing swings are explicitly not attributed
+  to this source change; critically, neither run order produced a reproducible Stage-2i4 regression.
