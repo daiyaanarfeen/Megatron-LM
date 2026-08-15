@@ -3754,3 +3754,27 @@ Append a dated entry whenever we do something new: code changes, job submissions
   - exact 12/12-rank collective and NEP-annotation signatures across all cases.
 - Decision: accept Stage 2e3a. Disabled diagnostics contributed no GPU work in the reference;
   removing them preserves traces, memory, correctness, and pooled EP8 performance.
+
+
+## 2026-08-14 — Cleanup Stage 2e3b: remove obsolete debug-print instrumentation
+
+- Removed the opt-in `_nep_debug_print` helper and all 47 call sites left from ordering, process-
+  group creation, Gather/EDP/Scatter launch, scheduler, and final-fence debugging. Also removed only
+  the local formatting/timing computations that fed those messages (`time.perf_counter`, group and
+  chunk labels, and related dead locals). No collective, stream, event, dependency, buffer,
+  optimizer, or model statement changed.
+- `nonuniform_ep.py` fell from 4,657 to 4,472 lines (186 deletions and one unused-loop-label
+  replacement). A targeted AST local-use audit, compile check, and diff check passed. Mandatory
+  compute-node isort/compile job `2695518` completed successfully.
+- Frozen candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2e3b_debug_prints_removed_20260814`; SHA-256
+  `a42ed2c48863da5954033509c595ee193d4de486a0b7179730d9e305ad16bfe7`.
+- All-rank EP8/EP4 ABBA job `2695546` completed on three GB200 nodes:
+  - Stage-2e3a reference pooled mean: 211.228 ms,
+  - Stage-2e3b candidate pooled mean: 206.489 ms (-2.244%),
+  - paired deltas: -0.344% and -4.068%, with no candidate regression,
+  - exactly 48,386.22 MiB peak allocation in all four cases,
+  - zero skipped/NaN iterations,
+  - exact 12/12-rank collective and NEP-annotation signatures across every case.
+- Decision: accept Stage 2e3b. The removed instrumentation was disabled in the reference and the
+  validated implementation preserves GPU work, memory, correctness, and EP8 performance.

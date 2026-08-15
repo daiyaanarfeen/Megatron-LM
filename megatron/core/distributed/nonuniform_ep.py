@@ -13,7 +13,6 @@ import copy
 import logging
 import os
 import re
-import time
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Callable, Dict, List, Optional, Tuple, Union
@@ -56,22 +55,6 @@ _NEP_NCCL_DEFAULT_ASYNC_CHUNK_WINDOW = 2
 _NEP_NCCL_DEFAULT_EXPERT_BUCKET_GROUPS = 3
 
 
-def _nep_debug_print(message: str) -> None:
-    """Print NEP debug messages when explicitly enabled."""
-    if os.getenv("MEGATRON_NONUNIFORM_EP_DEBUG", "0").lower() not in ("1", "true", "yes", "on"):
-        return
-    try:
-        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
-    except Exception:
-        rank = -1
-    rank_filter = os.getenv("MEGATRON_NONUNIFORM_EP_DEBUG_RANKS")
-    if rank_filter:
-        selected_ranks = {
-            int(part) for part in rank_filter.replace(",", " ").split() if part.strip()
-        }
-        if rank not in selected_ranks:
-            return
-    print(f"[NEP_DEBUG rank={rank}] {message}", flush=True)
 
 
 
@@ -399,14 +382,12 @@ def _get_nccl_communicator_configs(path: Optional[str]) -> dict:
 
 
 def _create_group(ranks, timeout, nccl_comm_cfgs, desc, backend=None):
-    _nep_debug_print(f"before_create_group desc={desc} backend={backend} ranks={ranks}")
     pg_options = (
         None if backend == "gloo" else parallel_state.get_nccl_options(desc, nccl_comm_cfgs)
     )
     group = parallel_state.create_group(
         ranks, timeout=timeout, backend=backend, pg_options=pg_options, group_desc=desc
     )
-    _nep_debug_print(f"after_create_group desc={desc} backend={backend} ranks={ranks}")
     return group
 
 
@@ -442,11 +423,6 @@ def initialize_nonuniform_ep_process_groups(
     tp = tensor_model_parallel_size
     cp = context_parallel_size
     etp = expert_tensor_parallel_size if expert_tensor_parallel_size is not None else tp
-    _nep_debug_print(
-        "initialize_nonuniform_ep_process_groups enter "
-        f"world_size={world_size} topology={num_tp_cp_per_replica} tp={tp} cp={cp} "
-        f"etp={etp} num_moe_experts={num_moe_experts}"
-    )
 
     generator = NonuniformEPRankGenerator(
         tp=tp, cp=cp, num_tp_cp_per_replica=num_tp_cp_per_replica, etp=etp
@@ -698,11 +674,6 @@ def initialize_nonuniform_ep_process_groups(
         "expert_gather_map": expert_gather_map,
     }
     set_nonuniform_ep_runtime_config(runtime_config)
-    _nep_debug_print(
-        "initialize_nonuniform_ep_process_groups exit "
-        f"rank={rank} local_ep_size={local_ep_size} ep_rank={ep_rank} "
-        f"local_expert_indices={runtime_config['local_expert_indices']}"
-    )
     return runtime_config
 
 
@@ -1501,8 +1472,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         """Reshard source-rank expert grads into one owner-layout chunk."""
         cfg = self._nep_runtime_config
         ep_rank = cfg["ep_rank"]
-        group_index = getattr(self, "_nep_nccl_group_index", -1)
-        chunk_size = chunk_end - chunk_start
         source_ranks = self._nep_nccl_owner_source_ranks(owner_ep_rank)
         transfer_ranks = self._nep_nccl_owner_transfer_ranks(owner_ep_rank)
         if ep_rank not in transfer_ranks:
@@ -1584,12 +1553,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         else:
             gather_output = empty
 
-        _nep_debug_print(
-            "before ep_all_to_all_owner_gather "
-            f"group={group_index} owner={owner_ep_rank} chunk={chunk_index} "
-            f"chunk_size={chunk_size} ep_rank={ep_rank} sources={source_ranks} "
-            f"transfer_sources={transfer_source_ranks}"
-        )
         work = dist.all_to_all_single(
             gather_output,
             gather_input,
@@ -1620,10 +1583,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     chunk,
                 )
                 gather_offset += source_numel
-        _nep_debug_print(
-            "after ep_all_to_all_owner_gather "
-            f"group={group_index} owner={owner_ep_rank} chunk={chunk_index}"
-        )
 
     def _prepare_nep_nccl_owner_all_to_all_scatter(
         self,
@@ -1950,13 +1909,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if kind != "all_to_all":
             raise RuntimeError(f"Unknown NEP Scatter descriptor kind: {kind}")
 
-        _nep_debug_print(
-            "before ep_all_to_all_owner_scatter "
-            f"group={descriptor['group_index']} owner={descriptor['owner_ep_rank']} "
-            f"chunk={descriptor['chunk_index']} chunk_size={descriptor['chunk_size']} "
-            f"ep_rank={descriptor['ep_rank']} destinations={descriptor['source_ranks']} "
-            f"transfer_sources={descriptor['transfer_source_ranks']}"
-        )
         work = dist.all_to_all_single(
             descriptor["scatter_output"],
             descriptor["scatter_input"],
@@ -2064,11 +2016,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     descriptor["scatter_output"][scatter_offset : scatter_offset + source_numel],
                 )
                 scatter_offset += source_numel
-        _nep_debug_print(
-            "after ep_all_to_all_owner_scatter "
-            f"group={descriptor['group_index']} owner={descriptor['owner_ep_rank']} "
-            f"chunk={descriptor['chunk_index']}"
-        )
 
     def _start_nep_nccl_owner_all_to_all_scatter(
         self,
@@ -2252,14 +2199,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             raise RuntimeError(
                 "Nonuniform EP NCCL owner rank requires runtime_config['edp_group']."
             )
-        group_index = getattr(self, "_nep_nccl_group_index", -1)
-        chunk_indices = [context["chunk_index"] for context in contexts]
-        _nep_debug_print(
-            "before native_ddp_owner_group "
-            f"group={group_index} owner={owner_ep_rank} chunks={chunk_indices} "
-            f"numel={sum(context['chunk'].numel() for context in contexts)} "
-            f"edp_rank={edp_group.rank()}"
-        )
         native_group = self._get_nep_nccl_native_edp_bucket_group(contexts)
         if self.ddp_config.use_distributed_optimizer:
             with torch.profiler.record_function("nep_distopt_stage_owner_grads"):
@@ -2282,10 +2221,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             context["native_edp_bucket_group"] = native_group
             context["native_edp_state"] = native_state
             context["native_edp_started"] = True
-        _nep_debug_print(
-            "after native_ddp_owner_group "
-            f"group={group_index} owner={owner_ep_rank} chunks={chunk_indices}"
-        )
 
     def _start_nep_nccl_owner_edp_reduce(self, context: dict) -> None:
         """Launch native EDP for a single-context path."""
@@ -2501,7 +2436,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             if native_state is not None:
                 ordered_native_states.add(id(native_state))
 
-        cfg = self._nep_runtime_config
         scatter_chunks = _get_nep_nccl_scatter_chunks()
         if scatter_contexts is not None:
             if scatter_chunks != 1:
@@ -2876,7 +2810,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
     ) -> bool:
         """Progress ordered EDP and Scatter phases after backward compute is queued."""
         for pending in pending_host_phases:
-            batch_index = pending["batch_index"]
             contexts = pending["contexts"]
             dispatch_stream = pending["dispatch_stream"]
             phase = pending.get("phase", "gather_launched")
@@ -3032,48 +2965,23 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             launch_ready_tasks_on_current_stream()
 
     def _start_nonuniform_ep_nccl_grad_sync(self, async_op: bool = False):
-        cfg = self._nep_runtime_config
         layout = self._get_nep_nccl_owner_layout()
-        local_ep_size = layout["local_ep_size"]
-        ep_rank = layout["ep_rank"]
         min_ep_size = layout["min_ep_size"]
-        is_edp_eligible = cfg.get("is_edp_eligible", ep_rank < min_ep_size)
-        group_index = getattr(self, "_nep_nccl_group_index", -1)
         owner_numel = layout["owner_numel"]
         if owner_numel == 0:
             self._nep_nccl_ready = True
             return
-        _nep_debug_print(
-            "nccl_sync enter "
-            f"group={group_index} buckets={len(self.buckets)} ep_rank={ep_rank} "
-            f"local_ep_size={local_ep_size} min_ep_size={min_ep_size} "
-            f"is_edp_eligible={is_edp_eligible} "
-            f"edp_group_present={cfg.get('edp_group') is not None} "
-            f"owner_numel={owner_numel} "
-            f"max_chunk_numel={layout['max_chunk_numel']} slot_key={self._nep_nccl_slot_key}"
-        )
         for owner_ep_rank in range(min_ep_size):
             for chunk_index, (start, end) in enumerate(layout["chunk_ranges"]):
                 self._start_nep_nccl_owner_task(
                     owner_ep_rank, chunk_index, start, end, async_op=async_op
                 )
-        _nep_debug_print(f"nccl_sync exit group={group_index}")
 
     def start_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """Start synchronous NCCL nonuniform EP gradient synchronization."""
-        group_index = getattr(self, "_nep_nccl_group_index", -1)
-        _nep_debug_print(
-            "start_grad_sync enter "
-            f"group={group_index} started={self._nep_nccl_grad_sync_started} "
-            f"ready={self._nep_nccl_ready} "
-            f"first_batch={self.is_first_batch} grad_reduce_handle={self.grad_reduce_handle is not None} "
-            f"force_all_reduce={force_all_reduce} params={len(self.params)}"
-        )
         if self._nep_nccl_ready:
-            _nep_debug_print(f"start_grad_sync skip_ready group={group_index}")
             return
         if self.is_first_batch and self.grad_reduce_handle is not None:
-            _nep_debug_print(f"start_grad_sync skip_first_batch_handle group={group_index}")
             return
         assert (
             self.grad_reduce_handle is None
@@ -3087,12 +2995,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 check_for_large=self.ddp_config.check_for_large_grads,
             )
 
-        _nep_debug_print(
-            f"start_grad_sync before_nccl_task_scheduler group={group_index} async_op={async_op}"
-        )
         self._try_start_nep_nccl_ready_tasks(force_ready=True, async_op_override=async_op)
         self.grad_reduce_handle = None
-        _nep_debug_print(f"start_grad_sync exit group={group_index}")
 
     def _finish_nonuniform_ep_nccl_grad_sync(self):
         self._drain_nep_nccl_async_window(force_all=True)
@@ -3111,14 +3015,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if not self.ddp_config.overlap_grad_reduce:
             return
 
-        group_index = getattr(self, "_nep_nccl_group_index", -1)
-        _nep_debug_print(
-            "finish_nep_pre_sync enter "
-            f"group={group_index} first_batch={self.is_first_batch} "
-            f"started={self._nep_nccl_grad_sync_started} "
-            f"ready={self._nep_nccl_ready} ready_count={len(self.per_param_grad_ready_counts)} "
-            f"params={len(self.params)}"
-        )
         if not self.is_first_batch and not self._nep_nccl_ready:
             assert self.per_param_grad_ready_counts == self.golden_per_param_grad_ready_counts, (
                 f"Communication call has not been issued for this bucket "
@@ -3126,30 +3022,18 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 "params have grad available)"
             )
             self.start_grad_sync(force_all_reduce=force_all_reduce)
-            _nep_debug_print(f"finish_nep_pre_sync after_force_start group={group_index}")
         if self.is_first_batch:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
         if not self._nep_nccl_ready:
-            _nep_debug_print(f"finish_nep_pre_sync skip_not_ready group={group_index}")
             return
         self._finish_nonuniform_ep_nccl_grad_sync()
-        _nep_debug_print(f"finish_nep_pre_sync exit group={group_index}")
 
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
-        group_index = getattr(self, "_nep_nccl_group_index", -1)
-        _nep_debug_print(
-            "finish_grad_sync enter "
-            f"group={group_index} overlap={self.ddp_config.overlap_grad_reduce} "
-            f"first_batch={self.is_first_batch} started={self._nep_nccl_grad_sync_started} "
-            f"ready={self._nep_nccl_ready} ready_count={len(self.per_param_grad_ready_counts)} "
-            f"params={len(self.params)}"
-        )
         self.param_gather_dispatched = False
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
             self._finish_nonuniform_ep_nccl_grad_sync()
             self._finish_nep_nccl_native_edp_reductions()
-            _nep_debug_print(f"finish_grad_sync exit_nonoverlap group={group_index}")
             return
 
         if not self.is_first_batch and not self._nep_nccl_ready:
@@ -3159,9 +3043,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 "params have grad available)"
             )
             self.start_grad_sync(force_all_reduce=force_all_reduce)
-            _nep_debug_print(f"finish_grad_sync after_force_start group={group_index}")
         if self.is_first_batch:
-            _nep_debug_print(f"finish_grad_sync first_batch_start group={group_index}")
             self.start_grad_sync(force_all_reduce=force_all_reduce)
         assert self._nep_nccl_ready, (
             f"Communication call has not been issued for this bucket "
@@ -3170,7 +3052,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         )
         self._finish_nonuniform_ep_nccl_grad_sync()
         self._finish_nep_nccl_native_edp_reductions()
-        _nep_debug_print(f"finish_grad_sync exit group={group_index}")
 
     def register_grad_ready(
         self, param: torch.nn.Parameter, force_all_reduce: Optional[bool] = False
@@ -3201,11 +3082,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     self._try_start_nep_nccl_ready_tasks(force_ready=False, async_op_override=True)
                 if bucket_ready:
                     assert len(self.per_param_grad_ready_counts) == len(self.params)
-                    _nep_debug_print(
-                        "register_grad_ready bucket_ready "
-                        f"group={getattr(self, '_nep_nccl_group_index', -1)} "
-                        f"params={len(self.params)} force_all_reduce={force_all_reduce}"
-                    )
 
     def reset(self):
         for native_group in getattr(self, "_nep_nccl_native_edp_bucket_groups", {}).values():
@@ -3292,11 +3168,6 @@ def _coalesce_nep_nccl_bucket_groups_for_edp_order(
         merged_group.configure_nonuniform_ep_nccl(runtime_config, nonuniform_ep_config)
         merged_groups.append(merged_group)
 
-    _nep_debug_print(
-        "coalesced nccl bucket groups "
-        f"local_count={local_count} target_count={target_count} "
-        f"merged_count={len(merged_groups)}"
-    )
     return merged_groups
 
 
@@ -3649,7 +3520,6 @@ def _configure_nep_end_iteration_scatter_buffers(
                 )
 
     state["end_iteration_scatter_buffer_slots"] = len(slots)
-    _nep_debug_print(f"preallocated end-of-iteration Scatter buffers slots={len(slots)}")
 
 
 
@@ -3804,10 +3674,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             group=parallel_state.get_data_parallel_group(with_context_parallel=True),
         )
         ddp_config.bucket_size = int(bucket_size.item())
-        _nep_debug_print(
-            "synchronized native DDP bucket size "
-            f"local={local_bucket_size} full_replica={ddp_config.bucket_size}"
-        )
 
     def __init__(
         self,
@@ -4155,7 +4021,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                         )
                     )
 
-        _nep_debug_print("synchronized logical expert and owner parameters")
 
 
 
@@ -4187,7 +4052,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         batch = self._nep_scatter_batches[0]
         while batch.get("submission_complete", False):
             self._nep_scatter_batches.pop(0)
-            _nep_debug_print(f"retired scheduled Scatter batch module={batch['module_label']}")
             if not self._nep_scatter_batches:
                 return True
             batch = self._nep_scatter_batches[0]
@@ -4219,16 +4083,8 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             if batch["next_train"] == len(batch["trains"]):
                 batch["completion_event"].record(scatter_stream)
                 batch["submission_complete"] = True
-                _nep_debug_print(
-                    f"submitted scheduled Scatter batch module={batch['module_label']}"
-                )
 
         self._nep_scatter_inflight_event = chunk_done_event
-        _nep_debug_print(
-            "submitted scheduled Scatter chunk "
-            f"group={group_index} owner={context['owner_ep_rank']} "
-            f"chunk={context['chunk_index']} scatter={descriptor_index}"
-        )
         return True
 
 
@@ -4269,9 +4125,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 if not trains:
                     batch_completion_event.record(scatter_stream)
                 self._nep_scatter_batches.append(batch)
-                _nep_debug_print(
-                    f"queued scheduled Scatter batch module={batch_label} trains={len(trains)}"
-                )
 
     def _defer_nep_scatter_context_batches_to_iteration_end(
         self,
@@ -4438,10 +4291,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             return False
         if not all(group._nep_dispatch_boundary_inputs_ready() for group in groups):
             if not all(group._nep_dispatch_boundary_wait_logged for group in groups):
-                _nep_debug_print(
-                    f"dispatch_backward_boundary_waiting_for_grads module={module_label} "
-                    f"groups={[group._nep_nccl_group_index for group in groups]}"
-                )
                 for group in groups:
                     group._nep_dispatch_boundary_wait_logged = True
             return False
@@ -4460,10 +4309,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         self._run_nep_dispatch_boundary_tasks(
             groups, module_label, compute_ready_event, completion_event
         )
-        _nep_debug_print(
-            f"launched dispatch_backward_boundary module={module_label} "
-            f"groups={[group._nep_nccl_group_index for group in groups]}"
-        )
         return True
 
     def _run_nep_dispatch_boundary_tasks(
@@ -4474,19 +4319,13 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         completion_event: Optional[torch.cuda.Event] = None,
     ) -> torch.cuda.Event:
         """Enqueue one layer batch and return its completion event."""
-        group_indices = [group._nep_nccl_group_index for group in groups]
-        _nep_debug_print(
-            f"before dispatch_backward_boundary module={module_label} groups={group_indices}"
-        )
         try:
-            launch_start = time.perf_counter()
             state = groups[0]._nep_nccl_scheduler_state
             first_task_index = state["task_next_index"]
             pending_host_phases = groups[0]._try_start_nep_nccl_ready_tasks(
                 force_ready=False, async_op_override=True, compute_ready_event=compute_ready_event
             )
             last_task_index = state["task_next_index"]
-            launch_ms = (time.perf_counter() - launch_start) * 1000.0
 
             if completion_event is None:
                 completion_event = torch.cuda.Event()
@@ -4516,12 +4355,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 )
             for group in launched_groups:
                 group._nep_dispatch_boundary_launched = True
-            _nep_debug_print(
-                f"after dispatch_backward_boundary_launched module={module_label} "
-                f"groups={[group._nep_nccl_group_index for group in launched_groups]} "
-                f"split={bool(pending_host_phases)} "
-                f"launch_ms={launch_ms:.3f}"
-            )
             return completion_event
         finally:
             for group in groups:
@@ -4550,7 +4383,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             host_phases, scatter_context_batches=scatter_context_batches
         )
         if phases_finished is False:
-            _nep_debug_print(f"progressed split dispatch host phases module={module_label}")
             return False
 
         if scatter_context_batches:
@@ -4566,7 +4398,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 f"module={module_label}, groups={not_ready}"
             )
         self._nep_dispatch_pending_host_phases = None
-        _nep_debug_print(f"finished split dispatch host phases module={module_label}")
         return True
 
 
@@ -4587,9 +4418,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 inflight_events = []
                 self._nep_dispatch_inflight_completion_events = inflight_events
             inflight_events.append((module_label, completion_event))
-            _nep_debug_print(
-                f"deferred dispatch_backward_boundary completion module={module_label}"
-            )
             self._nep_dispatch_pending_completion_event = None
         if groups is not None:
             if not all(group._nep_dispatch_boundary_launched for group in groups):
@@ -4599,18 +4427,13 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
 
         if final:
             self._nep_scatter_backward_complete = True
-            _nep_debug_print("NEP Scatter scheduler received backward-complete signal")
             self._drain_nep_scatter_scheduler()
 
             inflight_events = getattr(self, "_nep_dispatch_inflight_completion_events", None)
             if inflight_events:
                 current_stream = torch.cuda.current_stream()
-                for deferred_module_label, deferred_completion_event in inflight_events:
+                for _, deferred_completion_event in inflight_events:
                     current_stream.wait_event(deferred_completion_event)
-                    _nep_debug_print(
-                        "ordered deferred dispatch_backward_boundary completion "
-                        f"module={deferred_module_label}"
-                    )
                 inflight_events.clear()
 
     def _configure_expert_gradient_scaling(self, config: TransformerConfig, runtime_config: dict):
@@ -4644,14 +4467,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             buffer.scale_gradients(scaling_factor)
 
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
-        _nep_debug_print(
-            "NonuniformEPDDP finish_grad_sync enter "
-            f"dense_groups={len(self.bucket_groups)} "
-            f"expert_groups={len(self.expert_parallel_bucket_groups)} "
-            f"overlap={self.ddp_config.overlap_grad_reduce}"
-        )
         self._wait_for_nep_dispatch_launch(final=True)
-        _nep_debug_print("NonuniformEPDDP finish_grad_sync before_super")
         result = super().finish_grad_sync(force_all_reduce=force_all_reduce)
-        _nep_debug_print("NonuniformEPDDP finish_grad_sync after_super")
         return result
