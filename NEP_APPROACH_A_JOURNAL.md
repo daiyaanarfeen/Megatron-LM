@@ -3778,3 +3778,29 @@ Append a dated entry whenever we do something new: code changes, job submissions
   - exact 12/12-rank collective and NEP-annotation signatures across every case.
 - Decision: accept Stage 2e3b. The removed instrumentation was disabled in the reference and the
   validated implementation preserves GPU work, memory, correctness, and EP8 performance.
+
+
+## 2026-08-14 — Cleanup Stage 2f1: remove dead wrappers and host-phase state
+
+- Removed two uncalled single-task compatibility wrappers, the unused pre-sync drain method, and
+  the uncalled legacy bucket-wrapper/coalescing path. Tracked-code reference checks confirmed that
+  none had an implementation caller.
+- Removed write-only runtime keys, bucket fields, native-EDP fields, and scheduler records. The
+  split Gather/EDP host phase now retains only `contexts`, `dispatch_stream`, `phase`, and the
+  remaining task batches. The same Gather launch, Gather-completion CUDA event, EDP-stream wait,
+  native EDP launch, Scatter queueing, stream choice, task order, and final fences remain in the
+  same order. No GPU operation or device dependency was added, removed, or reordered.
+- `nonuniform_ep.py` fell from 4,472 to 4,248 lines (245 deletions, 21 simplifying insertions).
+  Static call/reference, dictionary-state, compile, and diff checks passed.
+- Frozen candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2f1_dead_host_state_removed_20260814`; SHA-256
+  `75b76fe60c4f0fb83d912f6980e0fb228d501515f6e83ae1c4ccca1f1386853d`.
+- All-rank EP8/EP4 ABBA job `2695700`:
+  - Stage-2e3b reference pooled mean: 220.396 ms,
+  - Stage-2f1 candidate pooled mean: 219.778 ms (-0.280%),
+  - paired deltas: +0.027% and -0.591%,
+  - exactly 48,386.22 MiB peak allocation in all four cases,
+  - zero skipped/NaN iterations,
+  - exact 12/12-rank collective and NEP-annotation signatures across every case.
+- Decision: accept Stage 2f1. Runtime GPU behavior, memory, correctness, and EP8 performance are
+  unchanged while obsolete compatibility and host-bookkeeping code is gone.
