@@ -4053,3 +4053,38 @@ Append a dated entry whenever we do something new: code changes, job submissions
 - Decision: accept Stage 2h3. Duplicate process-group bootstrap and NTP forwarding code are gone
   with exact launch-order equivalence and unchanged EP8 GPU behavior, memory, correctness, and
   calibrated performance.
+
+
+## 2026-08-15 — Cleanup Stage 2i1 (rejected): share explicit-placement runtime config builder
+
+- Bounded experiment: moved the identical explicit-placement runtime-config construction from the
+  dedicated GPT and hybrid entrypoints into one helper in `nonuniform_ep.py`. JSON loading remained
+  entrypoint-local, and the stage touched only those three files (44 insertions, 73 deletions).
+- Compute job `2698236` passed mandatory isort, Ruff, focused Black, py_compile,
+  `git diff --check`, an exact mock comparison of the placement/group/runtime-config result (including
+  the `placement=None` fast path), and all 65 NEP tests on each of four ranks.
+- Frozen candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2i1_shared_explicit_placement_config_20260815`; hashes
+  `88524fd1bdb1c8983eb1ec847049474db0958cdde3295e7064257de5b81e0873`
+  (`nonuniform_ep.py`),
+  `2436f662763d5af807b980b84f15ba10cb5bdda89c38de56552c31c2efc06e32`
+  (dedicated GPT entrypoint), and
+  `ad8963d6ffe072578d7584cd1dac7942bfb29a23a8eb723e376560571b66a8c7`
+  (hybrid entrypoint).
+- All-rank EP8/EP4 profiler ABBA job `2698303` completed on
+  `lyris[0168-0169,0171]` with 30 iterations:
+  - Stage-2h3 reference pooled mean: 211.124 ms;
+  - Stage-2i1 candidate pooled mean: 214.920 ms (+1.798%);
+  - paired deltas: -1.563% and +5.203%.
+- Because the first result was internally inconsistent, confirmatory all-rank profiler ABBA job
+  `2698430` ran on `lyris[0146,0150,0152]` with the same settings:
+  - Stage-2h3 reference pooled mean: 219.463 ms;
+  - Stage-2i1 candidate pooled mean: 230.522 ms (+5.039%);
+  - paired deltas: +6.118% and +3.931%.
+- Every case in both jobs used exactly 48,386.22 MiB peak allocation, had zero skipped/NaN
+  iterations and 12/12 traces, and produced byte-for-byte identical per-rank collective/NEP
+  annotation signatures. Nevertheless, the repeat showed a candidate slowdown in both order-paired
+  comparisons, so it fails the user's zero-performance-regression gate.
+- Decision: reject and revert Stage 2i1 rather than rationalize the measured slowdown. The immutable
+  snapshot and both complete trace sets are retained for diagnosis; accepted source remains at
+  Stage 2h3.
