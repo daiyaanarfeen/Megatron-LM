@@ -4088,3 +4088,51 @@ Append a dated entry whenever we do something new: code changes, job submissions
 - Decision: reject and revert Stage 2i1 rather than rationalize the measured slowdown. The immutable
   snapshot and both complete trace sets are retained for diagnosis; accepted source remains at
   Stage 2h3.
+
+
+## 2026-08-15 — Cleanup Stage 2i2: remove dead NTP spare-reporting code
+
+- Repository-wide tracked-Python and bounded AST reference audits found no callers for the old
+  `compute_uniform_tp_spares_with_parity` fault-map helper, the legacy-shaped
+  `get_non_active_ranks_per_replica` adapter, or the two inactive-rank reporting properties on
+  `NonuniformTPReplicaRanks`. Removed those APIs and the now-unused stored
+  `inactive_ranks_by_cp` lists while preserving inactive-rank entries in `rank_metadata`, every
+  active rank list, and every process-group generator path. The bounded stage is 83 deletions and
+  one import adjustment across `nonuniform_common.py` and `nonuniform_tp.py`; no NEP runtime code
+  changed.
+- Test job `2698623` stopped before semantic tests because a whole-file Black check exposed
+  pre-existing formatting in `nonuniform_tp.py`; Ruff and isort had already passed. Corrected job
+  `2698683` used focused Black ranges, passed isort, Ruff, py_compile, `git diff --check`, and all
+  65 NEP tests on each of four ranks. Its focused compatibility check extracted the Stage-2h3 NTP
+  topology classes and proved exact equality of every active TP/CP/DP rank group, world/replica
+  metadata, and active/inactive per-rank topology metadata over three representative layouts.
+- Frozen candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2i2_dead_ntp_spare_reporting_removed_20260815`; hashes
+  `87934cf3d574c122c15d0e587a2af3eac0a5e97328da7664efced380eb785368`
+  (`nonuniform_common.py`) and
+  `81fe5ef2bc72de86a1e59b2bc5acedddcb08ddf6869332d01a6eab955dde1224`
+  (`nonuniform_tp.py`).
+- The existing random-balanced EP8 profiler gate was not a reliable source-level discriminator in
+  this cycle:
+  - normal ABBA job `2698690` measured +2.685% for Stage 2i2, but the two temporal pairs themselves
+    shifted from roughly 218 ms to 244 ms;
+  - inverse ABBA job `2698769` put Stage 2i2 in the outer positions and saw those two identical
+    Stage-2i2 cases at 265.639 ms and 217.374 ms, a 22% same-source spread, while Stage 2h3's middle
+    cases were 211.030 ms and 208.387 ms;
+  - all eight cases still had identical collective/NEP trace signatures and memory, demonstrating
+    that random training/run-position variance, not changed traced work, dominated those numbers.
+- A controlled exact-uniform-routing EP8/EP4 all-rank profiler ABBA (`2698873`) retained the same
+  model, 14-stage pattern, topology, batch sizes, DistOpt, 30 iterations, and 12-rank traces while
+  fixing per-expert/per-peer routing:
+  - Stage-2h3 reference pooled mean: 219.802 ms;
+  - Stage-2i2 candidate pooled mean: 221.528 ms (+0.785%);
+  - paired deltas: +2.876% and -1.227%, with the pooled delta inside the established +1.442%
+    same-code calibration;
+  - all four cases used exactly 48,386.22 MiB peak allocation, had zero skipped/NaN iterations and
+    12/12 traces, and produced byte-for-byte identical per-rank collective/NEP annotation
+    signatures.
+- Post-decision Stage-2i1 inverse control job `2698571` likewise demonstrated strong run-position
+  drift (-3.080% and +1.127% in the reversed comparisons). Stage 2i1 remains conservatively
+  rejected; this control is recorded so its earlier result is not mistaken for a causal diagnosis.
+- Decision: accept Stage 2i2. Active topology outputs are exactly preserved, the controlled EP8
+  gate is within same-code calibration, and obsolete NTP experiment/reporting code is removed.

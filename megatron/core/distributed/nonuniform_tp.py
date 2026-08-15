@@ -340,59 +340,6 @@ class NonuniformTPConfig:
 # ======================================================================================
 
 
-def compute_uniform_tp_spares_with_parity(
-    faulty_gpu_map: Dict[int, List[int]], tp_base: int
-) -> Tuple[int, Dict[int, List[int]]]:
-    """
-    Compute uniform tp_spares across all faulty DP ranks and add additional
-    non-active ranks to achieve parity.
-
-    Strategy:
-    1. Find the maximum number of failed GPUs across all affected DP ranks
-    2. Use this as tp_spares (smallest reduced_tp that works for all)
-    3. For DP ranks with fewer failures, pad with additional healthy GPUs
-       to reach uniform tp_spares
-
-    Args:
-        faulty_gpu_map: Mapping of DP rank -> list of failed GPU IDs
-        tp_base: Base tensor parallel size
-
-    Returns:
-        Tuple of (tp_spares, non_active_ranks_per_dp)
-        where non_active_ranks_per_dp includes both failed and padded GPUs
-
-    Example:
-        Input:  {0: [2, 5], 1: [1]}  # DP rank 0 has 2 failures, DP rank 1 has 1
-        Output: (2, {0: [2, 5], 1: [1, 7]})  # Pad DP rank 1 with GPU 7 to reach 2
-    """
-    if not faulty_gpu_map:
-        return 0, {}
-
-    # Find maximum number of failures
-    max_failures = max(len(gpu_ids) for gpu_ids in faulty_gpu_map.values())
-    tp_spares = max_failures
-
-    non_active_ranks_per_dp = {}
-
-    for dp_rank, failed_gpus in faulty_gpu_map.items():
-        non_active = list(failed_gpus)  # Start with actually failed GPUs
-        num_to_pad = tp_spares - len(failed_gpus)
-
-        if num_to_pad > 0:
-            # Need to add more non-active ranks for parity
-            # Find healthy GPUs to mark as non-active
-            failed_set = set(failed_gpus)
-            healthy_gpus = [i for i in range(tp_base) if i not in failed_set]
-
-            # Take from the end of healthy GPUs (prefer keeping lower ranks active)
-            gpus_to_deactivate = healthy_gpus[-num_to_pad:]
-            non_active.extend(gpus_to_deactivate)
-
-        non_active_ranks_per_dp[dp_rank] = sorted(non_active)
-
-    return tp_spares, non_active_ranks_per_dp
-
-
 def get_active_ranks_for_dp(
     dp_rank: int, tp_base: int, ntp_config: NonuniformTPConfig, cp_rank: int = 0, pp_rank: int = 0
 ) -> List[int]:
