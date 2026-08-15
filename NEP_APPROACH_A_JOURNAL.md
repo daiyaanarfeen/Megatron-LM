@@ -4273,3 +4273,30 @@ Append a dated entry whenever we do something new: code changes, job submissions
     signatures.
 - Decision: accept Stage 2i6. The removed state has zero readers, partition/index outputs are exact,
   traced GPU behavior and memory are unchanged, and no performance regression was observed.
+
+
+## 2026-08-15 — Cleanup closeout audit
+
+- Re-ran function/method reachability, attribute-state, exact AST-body duplication, and explicit
+  legacy/experiment-marker audits after Stage 2i6. There are no remaining assigned NEP attributes
+  with only one tracked textual occurrence, no exact duplicate function bodies among the three
+  nonuniform modules, and no wholly unreferenced nonuniform function or method found by the bounded
+  tracked-Python audit.
+- The only remaining explicit legacy marker is NTP's integer-key inactive-rank map fallback. It is
+  intentionally retained because the current dedicated entrypoint still parses and supports both
+  integer DP keys and `(dp, cp, pp)` tuple keys; removing it would change a live input contract.
+- Retained the five remaining NEP NCCL sizing/count controls because each drives active payload
+  chunking, in-flight resource bounds, or expert bucket construction and is exercised by tracked
+  workloads/tests. Removing those controls would change supported behavior rather than delete dead
+  experiment code.
+- Three core files are the minimal reasonable boundary: `nonuniform_ep.py` owns EP reshard and
+  DistOpt behavior, `nonuniform_tp.py` owns TP reshard behavior, and `nonuniform_common.py` contains
+  topology/process-group and bucket utilities used by both. Merging them would couple the two
+  opt-in modes; splitting the 4,118-line EP state machine further would increase file count without
+  eliminating code.
+- Final core sizes are 883 lines (`nonuniform_common.py`), 4,118 lines (`nonuniform_ep.py`), and
+  1,479 lines (`nonuniform_tp.py`), versus 879, 8,016, and 1,639 lines at the pre-cleanup rollback
+  point. Across the complete cleanup series, 13 tracked files changed by 1,553 insertions and 9,241
+  deletions; the core/entrypoint/test subset is 762 insertions and 9,241 deletions. Every accepted
+  source stage has a rollback branch, immutable snapshot, focused compute validation, and an
+  all-rank EP8/EP4 profiler gate.
