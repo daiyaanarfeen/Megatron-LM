@@ -4136,3 +4136,42 @@ Append a dated entry whenever we do something new: code changes, job submissions
   rejected; this control is recorded so its earlier result is not mistaken for a causal diagnosis.
 - Decision: accept Stage 2i2. Active topology outputs are exactly preserved, the controlled EP8
   gate is within same-code calibration, and obsolete NTP experiment/reporting code is removed.
+
+
+## 2026-08-15 — Cleanup Stage 2i3: remove stale NEP owner-source fallback and experiment whitespace residue
+
+- Removed the legacy `_nep_nccl_owner_source_ranks` fallback that interpreted
+  `nep_owner_transfer_group_ranks` as owner source ranks. Current topology initialization always
+  supplies the narrower `nep_owner_source_ranks`; explicit-placement configurations continue to
+  derive source ranks directly from `expert_placement`, and the no-placement fallback remains the
+  owner itself. This avoids retaining a stale compatibility path whose transfer group can be a
+  strict superset of actual source ranks.
+- Removed only excessive blank-line residue left by deleted experiments in
+  `nonuniform_ep.py` and `moe_layer.py`, plus the sole implementation-only blank line in
+  `cuda_graphs.py`; applied Black's one equivalent line-wrap correction in the same NEP method.
+  No import, collective, stream, event, buffer, dependency, or launch logic changed. The complete
+  stage is one insertion and 52 deletions across those three files.
+- Initial test jobs `2698946` and `2698966` stopped only at focused Black checks, exposing further
+  duplicate class-method separators. Diagnostic job `2698991` emitted Black's exact remaining
+  diff. After applying only that diff, compute job `2699047` passed isort, Ruff, focused/full Black,
+  py_compile, `git diff --check`, focused current/explicit-placement owner-source assertions, the
+  blank-line-residue audit, and all 65 NEP tests on each of four ranks.
+- Frozen candidate snapshot:
+  `slurm_runs/nep_cleanup_snapshots/stage2i3_legacy_and_whitespace_residue_removed_20260815`;
+  hashes `fd9b0d4586763d32123d7b1edbbc95bd094eee01cf87b9520eb660664482ee4c`
+  (`nonuniform_ep.py`),
+  `f507a674aeb48f06eb8ba121f1d785ed389f4385d2c35c5abbde061cefda469c`
+  (`cuda_graphs.py`), and
+  `15e6409454ab086f639f3fe21d52f8e29e6d433debbb225ad66ce1b50ad4874b`
+  (`moe_layer.py`).
+- Controlled exact-uniform-routing EP8/EP4 all-rank profiler ABBA job `2699072` completed on
+  `lyris[0227,0229-0230]` with 30 iterations and profiles from all 12 ranks:
+  - Stage-2i2 reference pooled mean: 211.580 ms;
+  - Stage-2i3 candidate pooled mean: 208.748 ms (-1.339%);
+  - paired deltas: -1.325% and -1.353%, with no candidate regression in either pair;
+  - every case used exactly 48,386.22 MiB peak allocation, had zero skipped/NaN iterations and
+    12/12 traces, and produced byte-for-byte identical per-rank collective/NEP annotation
+    signatures.
+- Decision: accept Stage 2i3. Current and explicit-placement source-rank behavior is retained,
+  traced GPU behavior and memory are exact, and controlled EP8 performance has no regression while
+  stale compatibility and formatting residue are removed.

@@ -748,17 +748,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if block_current_stream:
             _nep_block_current_stream(work)
 
-
-
-
-
-
-
-
-
-
-
-
     def _drain_nep_nccl_async_window(self, force_all: bool = False) -> None:
         if not self._nep_nccl_async_handles:
             return
@@ -1369,10 +1358,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if source_ranks_by_owner is not None and owner_ep_rank in source_ranks_by_owner:
             return list(source_ranks_by_owner[owner_ep_rank])
 
-        legacy_source_ranks = self._nep_runtime_config.get("nep_owner_transfer_group_ranks")
-        if legacy_source_ranks is not None and owner_ep_rank in legacy_source_ranks:
-            return list(legacy_source_ranks[owner_ep_rank])
-
         placement = self._nep_runtime_config.get("expert_placement")
         if placement is None:
             return [owner_ep_rank]
@@ -1390,10 +1375,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if transfer_ranks is not None and owner_ep_rank in transfer_ranks:
             return list(transfer_ranks[owner_ep_rank])
         return self._nep_nccl_owner_source_ranks(owner_ep_rank)
-
-
-
-
 
     def _start_nep_nccl_owner_all_to_all_gather(
         self,
@@ -2380,7 +2361,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             "task_marked": False,
         }
 
-
     def _finish_nep_nccl_scatter_train_submission(self, train: dict) -> None:
         """Finish bookkeeping after every descriptor in one train is submitted."""
         context = train["context"]
@@ -2533,7 +2513,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             self._order_nep_nccl_owner_all_to_all_scatter_completion(descriptor)
             self._finish_nep_nccl_owner_all_to_all_scatter(descriptor)
         self._finish_nep_nccl_scatter_train_submission(train)
-
 
     def _start_nep_nccl_split_host_phase_batch(
         self, task_batch: List[dict], dispatch_stream: torch.cuda.Stream
@@ -3744,11 +3723,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                         )
                     )
 
-
-
-
-
-
     def _retire_nep_scatter_chunk(self, force: bool = False) -> bool:
         """Retire the last Scatter chunk without launching NCCL from another thread."""
         completion_event = self._nep_scatter_inflight_event
@@ -3761,10 +3735,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             return False
         self._nep_scatter_inflight_event = None
         return True
-
-
-
-
 
     def _submit_nep_scatter_chunk(self) -> bool:
         """Submit one end-of-iteration Scatter chunk in stream order."""
@@ -3809,7 +3779,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
 
         self._nep_scatter_inflight_event = chunk_done_event
         return True
-
 
     def _queue_nep_scatter_context_batches(
         self,
@@ -3935,14 +3904,10 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         while self._nep_scatter_batches:
             if not self._submit_nep_scatter_chunk():
                 raise RuntimeError("End-of-iteration NEP Scatter drain made no progress")
-        for completion_event in getattr(
-            self, "_nep_end_iteration_scatter_completion_events", ()
-        ):
+        for completion_event in getattr(self, "_nep_end_iteration_scatter_completion_events", ()):
             completion_event.record(self._nep_scatter_stream)
         self._nep_end_iteration_scatter_completion_events = []
         self._retire_nep_scatter_chunk(force=True)
-
-
 
     def _configure_nep_dispatch_boundary_hooks(self) -> None:
         """Map expert buckets to their AccumulateGrad launch callbacks."""
@@ -3976,8 +3941,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 "NCCL NEP could not map expert bucket groups to MoE modules: "
                 f"groups={missing_indices}"
             )
-
-
 
     def _launch_and_release_nep_two_level_gather(self, groups: tuple, module_label: str) -> None:
         """Submit one ready Gather group and release its host boundary immediately."""
@@ -4083,9 +4046,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             for group in groups:
                 group._nep_dispatch_boundary_launching = False
 
-
-
-
     def _finish_pending_nep_dispatch_host_phases(self) -> bool:
         """Finish a launched Gather/EDP pipeline and defer its packed Scatter."""
         pending_host_phases = getattr(self, "_nep_dispatch_pending_host_phases", None)
@@ -4122,7 +4082,6 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             )
         self._nep_dispatch_pending_host_phases = None
         return True
-
 
     def _wait_for_nep_dispatch_launch(self, final: bool = False) -> None:
         """Retire one host launch and optionally fence all device-inflight reshards."""

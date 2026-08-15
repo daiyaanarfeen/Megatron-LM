@@ -1521,7 +1521,6 @@ class CudaGraphManager(torch.nn.Module):
             # capture, so change to a side stream.
             torch.cuda.set_stream(torch.cuda.Stream())
 
-
     def call_ddp_preforward_hook(self, module):
         """Call any DDP pre-forward hooks which are used to launch async data parallel
         param gather. Any other pre-forward hooks are not allowed."""

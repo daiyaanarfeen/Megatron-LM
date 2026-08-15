@@ -220,13 +220,6 @@ class BaseMoELayer(MegatronModule, ABC):
         self.router.set_layer_number(layer_number)
 
 
-
-
-
-
-
-
-
 class MoELayer(BaseMoELayer):
     """Mixture of Experts layer.
 
@@ -749,8 +742,6 @@ class MoELayer(BaseMoELayer):
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.shared_experts.linear_fc1)
-
-
 
 
 class _RecordExpertDgradCompletion(torch.autograd.Function):
