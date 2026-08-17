@@ -207,6 +207,62 @@ def test_ntp_optimizer_alignment_ranks_exclude_legacy_spares():
     assert _get_ntp_optimizer_alignment_ranks(ntp_config, 1, 8) == [0, 1, 4, 5, 6, 7]
 
 
+def test_ntp_topology_validation_uses_logical_world_and_restores_active_world(monkeypatch):
+    import examples.nonuniform.pretrain_gpt_nonuniform as nonuniform_entrypoint
+
+    observed = {}
+
+    def fake_native_validate(args, defaults):
+        observed["world_size"] = args.world_size
+        observed["defaults"] = defaults
+        args.data_parallel_size = args.world_size // (
+            args.tensor_model_parallel_size
+            * args.context_parallel_size
+            * args.pipeline_model_parallel_size
+        )
+
+    monkeypatch.setattr(nonuniform_entrypoint, "_ORIGINAL_VALIDATE_ARGS", fake_native_validate)
+    args = SimpleNamespace(
+        nonuniform_mode="tp",
+        nonuniform_tp_domain_sizes=[2, 4],
+        nonuniform_tp_base=4,
+        tensor_model_parallel_size=4,
+        context_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        world_size=6,
+    )
+
+    nonuniform_entrypoint._validate_args_with_nonuniform_tp_topology(
+        args, {"tokenizer_type": "NullTokenizer"}
+    )
+
+    assert observed == {"world_size": 8, "defaults": {"tokenizer_type": "NullTokenizer"}}
+    assert args.world_size == 6
+    assert args.data_parallel_size == 2
+
+
+def test_ntp_topology_validation_rejects_wrong_active_world_size(monkeypatch):
+    import examples.nonuniform.pretrain_gpt_nonuniform as nonuniform_entrypoint
+
+    monkeypatch.setattr(
+        nonuniform_entrypoint,
+        "_ORIGINAL_VALIDATE_ARGS",
+        lambda *_args, **_kwargs: pytest.fail("native validation must not run"),
+    )
+    args = SimpleNamespace(
+        nonuniform_mode="tp",
+        nonuniform_tp_domain_sizes=[2, 4],
+        nonuniform_tp_base=4,
+        tensor_model_parallel_size=4,
+        context_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        world_size=8,
+    )
+
+    with pytest.raises(RuntimeError, match="active world size"):
+        nonuniform_entrypoint._validate_args_with_nonuniform_tp_topology(args)
+
+
 def test_optimizer_param_groups_use_ntp_active_rank_group(monkeypatch):
     active_group = object()
     model = torch.nn.Linear(2, 2, bias=False)

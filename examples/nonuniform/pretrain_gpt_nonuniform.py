@@ -13,6 +13,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+import megatron.training.arguments as training_arguments
 import megatron.training.models.dist_utils as model_dist_utils
 import megatron.training.training as training_module
 import pretrain_gpt as gpt
@@ -37,6 +38,7 @@ _EP_CONFIG_CACHE = {}
 _ORIGINAL_INITIALIZE_MODEL_PARALLEL = parallel_state.initialize_model_parallel
 _ORIGINAL_TRAINING_DDP = training_module.DDP
 _ORIGINAL_MODEL_BUILDER_DDP = model_dist_utils.DistributedDataParallel
+_ORIGINAL_VALIDATE_ARGS = training_arguments.validate_args
 
 
 def _load_json_arg(value: Optional[str], path: Optional[str], default=None):
@@ -46,6 +48,51 @@ def _load_json_arg(value: Optional[str], path: Optional[str], default=None):
         with Path(path).open(encoding="utf-8") as stream:
             return json.load(stream)
     return default
+
+
+def _validate_args_with_nonuniform_tp_topology(args, defaults=None):
+    """Validate an active-rank NTP topology using its logical replica count."""
+    defaults = {} if defaults is None else defaults
+    domain_sizes = getattr(args, "nonuniform_tp_domain_sizes", None)
+    if getattr(args, "nonuniform_mode", "none") != "tp" or domain_sizes is None:
+        return _ORIGINAL_VALIDATE_ARGS(args, defaults)
+
+    if args.tensor_model_parallel_size != args.nonuniform_tp_base:
+        raise RuntimeError(
+            "--tensor-model-parallel-size must match --nonuniform-tp-base in NTP topology mode"
+        )
+    expected_active_world_size = (
+        sum(domain_sizes) * args.context_parallel_size * args.pipeline_model_parallel_size
+    )
+    if args.world_size != expected_active_world_size:
+        raise RuntimeError(
+            f"NTP topology active world size ({args.world_size}) must equal "
+            f"sum(tp_domain_sizes) * CP * PP ({expected_active_world_size})"
+        )
+
+    # Native validation assumes every replica has the full TP width. Temporarily present that
+    # logical world so it derives the correct DP replica count and batch semantics, then restore
+    # the actual active-rank world used by torch.distributed and the topology process groups.
+    active_world_size = args.world_size
+    args.world_size = (
+        len(domain_sizes)
+        * args.tensor_model_parallel_size
+        * args.context_parallel_size
+        * args.pipeline_model_parallel_size
+    )
+    try:
+        return _ORIGINAL_VALIDATE_ARGS(args, defaults)
+    finally:
+        args.world_size = active_world_size
+
+
+def _parse_and_validate_args(*args, **kwargs):
+    """Use native argument parsing with an NTP-topology-only validation adapter."""
+    training_arguments.validate_args = _validate_args_with_nonuniform_tp_topology
+    try:
+        return gpt.parse_and_validate_args(*args, **kwargs)
+    finally:
+        training_arguments.validate_args = _ORIGINAL_VALIDATE_ARGS
 
 
 def _parse_ntp_non_active_map(args) -> Optional[Dict[object, list]]:
@@ -292,7 +339,7 @@ if __name__ == "__main__":
 
     gpt.train_valid_test_datasets_provider.is_distributed = True
     pretrain, store = gpt.inprocess_restart.maybe_wrap_for_inprocess_restart(gpt.pretrain)
-    args = gpt.parse_and_validate_args(
+    args = _parse_and_validate_args(
         extra_args_provider=_add_nonuniform_args,
         args_defaults={"tokenizer_type": "GPT2BPETokenizer"},
     )
