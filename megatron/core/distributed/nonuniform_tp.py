@@ -331,6 +331,52 @@ class NonuniformTPConfig:
     topology_rank_metadata: Optional[Dict[int, Dict[str, int]]] = None
     """Runtime mapping of global rank to topology coordinates, filled during init."""
 
+    optimizer_param_group_alignment_group: Optional[dist.ProcessGroup] = field(
+        default=None, init=False, repr=False
+    )
+    """Active-rank group used by current-main optimizer parameter-group alignment."""
+
+
+def _get_ntp_optimizer_alignment_ranks(
+    ntp_config: NonuniformTPConfig, context_parallel_size: int, world_size: int
+) -> List[int]:
+    """Return ranks that remain active after legacy NTP spare-rank exits."""
+    tp_base = ntp_config.tp_base
+    dp_replica_size = tp_base * context_parallel_size
+    active_global_ranks = []
+    for global_rank in range(world_size):
+        dp_replica_id = global_rank // dp_replica_size
+        if dp_replica_id >= ntp_config.num_reduced_tp_dp_ranks:
+            active_global_ranks.append(global_rank)
+            continue
+
+        local_rank_in_dp = global_rank % dp_replica_size
+        cp_rank = local_rank_in_dp // tp_base if context_parallel_size > 1 else 0
+        local_tp_rank = local_rank_in_dp % tp_base
+        active_local_ranks = get_active_ranks_for_dp(
+            dp_replica_id, tp_base, ntp_config, cp_rank=cp_rank
+        )
+        if local_tp_rank in active_local_ranks:
+            active_global_ranks.append(global_rank)
+    return active_global_ranks
+
+
+def _initialize_ntp_optimizer_alignment_group(
+    ntp_config: NonuniformTPConfig, context_parallel_size: int
+) -> None:
+    """Create one optimizer metadata group that excludes ranks NTP will terminate."""
+    world_size = dist.get_world_size()
+    active_ranks = _get_ntp_optimizer_alignment_ranks(ntp_config, context_parallel_size, world_size)
+    if len(active_ranks) == world_size:
+        group = dist.group.WORLD
+    else:
+        # Every rank must create this group before inactive ranks exit. Inactive ranks receive
+        # NON_GROUP_MEMBER and never expose the group through a DDP wrapper.
+        group = dist.new_group(ranks=active_ranks)
+    ntp_config.optimizer_param_group_alignment_group = (
+        group if dist.get_rank() in active_ranks else None
+    )
+
 
 # ======================================================================================
 # Utility Functions for NTP Configuration
@@ -513,6 +559,9 @@ def initialize_nonuniform_tp_process_groups(
                     and optionally non_active_ranks_per_dp
     """
     if ntp_config.tp_domain_sizes is not None:
+        # Topology mode launches only active ranks, so current-main optimizer metadata may use
+        # the existing world group directly.
+        ntp_config.optimizer_param_group_alignment_group = dist.group.WORLD
         return _initialize_nonuniform_tp_topology_process_groups(
             ntp_config,
             exit_spares=exit_spares,
@@ -530,6 +579,7 @@ def initialize_nonuniform_tp_process_groups(
 
     tp_base = ntp_config.tp_base
     cp_size = parallel_state.get_context_parallel_world_size()
+    _initialize_ntp_optimizer_alignment_group(ntp_config, cp_size)
     rank = dist.get_rank()
 
     # Calculate which DP replicas use reduced TP
@@ -1013,6 +1063,10 @@ class NonuniformTPDistributedDataParallel(DistributedDataParallel):
             self._wrap_bucket_groups_for_ntp()
         else:
             _call_parent_init()
+
+        self._optimizer_param_group_alignment_group = (
+            self.ntp_config.optimizer_param_group_alignment_group
+        )
 
     def _wrap_bucket_groups_for_ntp(self):
         """Replace DDP bucket groups with NTP-aware groups and rebuild param lookup."""

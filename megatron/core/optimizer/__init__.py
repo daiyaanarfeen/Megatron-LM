@@ -361,9 +361,32 @@ def _get_param_groups(
     # Distributed checkpoint requires all ranks to have the same param groups,
     # so we need to align the param groups across ranks, otherwise we may have
     # runtime error when loading the checkpoint or numerical error when resuming training.
+    alignment_groups = [
+        getattr(model_chunk, '_optimizer_param_group_alignment_group', None)
+        for model_chunk in model_chunks
+    ]
+    non_default_alignment_groups = [group for group in alignment_groups if group is not None]
+    if non_default_alignment_groups:
+        if len(non_default_alignment_groups) != len(model_chunks):
+            raise RuntimeError("Cannot mix custom and default optimizer parameter-group alignment")
+        alignment_group = non_default_alignment_groups[0]
+        if any(group is not alignment_group for group in non_default_alignment_groups[1:]):
+            raise RuntimeError(
+                "All model chunks must use the same optimizer parameter-group alignment group"
+            )
+    else:
+        alignment_group = None
+
     params_key = list(params_map.keys())
-    gathered_params_key = [None for _ in range(torch.distributed.get_world_size())]
-    torch.distributed.all_gather_object(gathered_params_key, params_key)
+    if alignment_group is None:
+        # Preserve the native call path exactly when NTP has not supplied an active-rank group.
+        gathered_params_key = [None for _ in range(torch.distributed.get_world_size())]
+        torch.distributed.all_gather_object(gathered_params_key, params_key)
+    else:
+        gathered_params_key = [
+            None for _ in range(torch.distributed.get_world_size(group=alignment_group))
+        ]
+        torch.distributed.all_gather_object(gathered_params_key, params_key, group=alignment_group)
     for keys in gathered_params_key:
         for key in keys:
             if key not in params_key:

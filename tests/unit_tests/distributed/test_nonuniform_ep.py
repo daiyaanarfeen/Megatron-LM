@@ -34,9 +34,10 @@ from megatron.core.distributed.nonuniform_tp import (
     NonuniformTPConfig,
     NonuniformTPDistributedDataParallel,
     NonuniformTPParamAndGradBuffer,
+    _get_ntp_optimizer_alignment_ranks,
 )
 from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer
-from megatron.core.optimizer import _get_param_groups_and_buffers
+from megatron.core.optimizer import _get_param_groups, _get_param_groups_and_buffers
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAlltoAllTokenDispatcher,
@@ -198,6 +199,57 @@ def test_ntp_rejects_distributed_optimizer_before_allocating_buffers():
         NonuniformTPDistributedDataParallel(
             config, ddp_config, torch.nn.Linear(2, 2), ntp_config=ntp_config
         )
+
+
+def test_ntp_optimizer_alignment_ranks_exclude_legacy_spares():
+    ntp_config = NonuniformTPConfig(tp_base=4, tp_spares=2, num_reduced_tp_dp_ranks=1)
+
+    assert _get_ntp_optimizer_alignment_ranks(ntp_config, 1, 8) == [0, 1, 4, 5, 6, 7]
+
+
+def test_optimizer_param_groups_use_ntp_active_rank_group(monkeypatch):
+    active_group = object()
+    model = torch.nn.Linear(2, 2, bias=False)
+    model._optimizer_param_group_alignment_group = active_group
+    calls = []
+
+    def fake_get_world_size(group=None):
+        calls.append(("size", group))
+        return 2
+
+    def fake_all_gather_object(output, value, group=None):
+        calls.append(("gather", group))
+        for index in range(len(output)):
+            output[index] = value
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", fake_get_world_size)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", fake_all_gather_object)
+
+    param_groups = _get_param_groups([model], OptimizerConfig(optimizer="adam", bf16=True), None)
+
+    assert len(param_groups) == 1
+    assert calls == [("size", active_group), ("gather", active_group)]
+
+
+def test_native_optimizer_param_group_alignment_keeps_default_world_calls(monkeypatch):
+    model = torch.nn.Linear(2, 2, bias=False)
+    calls = []
+
+    def fake_get_world_size():
+        calls.append("size")
+        return 1
+
+    def fake_all_gather_object(output, value):
+        calls.append("gather")
+        output[0] = value
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", fake_get_world_size)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", fake_all_gather_object)
+
+    param_groups = _get_param_groups([model], OptimizerConfig(optimizer="adam", bf16=True), None)
+
+    assert len(param_groups) == 1
+    assert calls == ["size", "gather"]
 
 
 def test_nep_distopt_owner_layout_uses_only_real_params_and_native_padding():
