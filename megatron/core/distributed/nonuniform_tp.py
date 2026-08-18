@@ -14,7 +14,6 @@ Usage:
     - Call initialize_nonuniform_tp_process_groups() after initialize_model_parallel()
 """
 
-import fnmatch
 import functools
 import logging
 import sys
@@ -30,7 +29,7 @@ from ..optimizer import param_layout as optimizer_param_layout
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
-from ..utils import PARAM_READY_CALLBACK_ATTR, log_on_each_pipeline_stage
+from ..utils import PARAM_READY_CALLBACK_ATTR
 from .distributed_data_parallel import DistributedDataParallel, _BucketParamReadyCallback
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .nonuniform_common import (

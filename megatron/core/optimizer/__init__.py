@@ -498,6 +498,7 @@ def _get_param_groups_and_buffers(
 
         class _NamedParametersView:
             def named_parameters(self):
+                """Iterate the preselected NEP owner parameters with their model names."""
                 return iter(params_with_names)
 
         param_groups = _get_param_groups([_NamedParametersView()], config, config_overrides)

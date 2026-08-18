@@ -280,6 +280,8 @@ def _install_opt_in_ddp(args):
         _NTP_CONFIG_CACHE["config"] = ntp_config
 
         class BenchmarkNonuniformTPDDP(NonuniformTPDistributedDataParallel):
+            """Bind the parsed benchmark NTP configuration to Megatron DDP."""
+
             def __init__(self, *ddp_args, **kwargs):
                 super().__init__(*ddp_args, ntp_config=ntp_config, **kwargs)
 
@@ -288,6 +290,8 @@ def _install_opt_in_ddp(args):
         return ntp_config
 
     class BenchmarkNonuniformEPDDP(NonuniformEPDistributedDataParallel):
+        """Bind the parsed benchmark NEP configuration to Megatron DDP."""
+
         def __init__(self, *ddp_args, **kwargs):
             super().__init__(*ddp_args, nonuniform_ep_config=_get_ep_config(args), **kwargs)
 

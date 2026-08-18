@@ -634,6 +634,7 @@ def _local_expert_id_from_name(
 
 
 def _expert_slot_key_from_name(name: str, pattern: re.Pattern) -> str:
+    """Replace the expert-index capture in a parameter name with a stable placeholder."""
     match = pattern.search(name)
     if match is None:
         return name
@@ -656,6 +657,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         slot_keys: Optional[Tuple[Tuple[str, ...], ...]] = None,
         slot_numels: Optional[Tuple[int, ...]] = None,
     ) -> None:
+        """Attach ordered owner-layout metadata and runtime state to this bucket group."""
         self._nep_runtime_config = runtime_config
         self._nep_nccl_entries = entries or []
         if slot_keys is None:

@@ -802,6 +802,7 @@ class ViewCopyHandle:
         self.output_copies = output_copies
 
     def wait(self):
+        """Wait for communication, then copy temporary outputs into target views."""
         self.handle.wait()
         for dst, src in self.output_copies:
             dst.copy_(src)
