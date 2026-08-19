@@ -348,7 +348,7 @@ def test_nep_distopt_owner_task_skips_gradient_scatter():
     bucket_group.ddp_config = SimpleNamespace(use_distributed_optimizer=True)
     completed = []
     bucket_group._mark_nep_distopt_task_complete = completed.append
-    context = {"owner_ep_rank": 0, "chunk_index": 0}
+    context = {"owner_ep_rank": 0}
 
     bucket_group._start_nep_nccl_owner_task_scatter(context)
 
@@ -429,12 +429,11 @@ def test_nep_distopt_allocates_owner_layout_scratch_only_on_owner(
     bucket_group._nep_nccl_async_tensors = []
     state = {"gather_buf_cache": {}, "buffer_slot_handles": {}, "buffer_slot_events": {}}
     bucket_group._nep_nccl_scheduler_state = state
-    bucket_group._get_nep_nccl_task_buffer_slot = lambda owner, chunk: 7
+    bucket_group._get_nep_nccl_owner_layout = lambda: {"owner_numel": 8}
+    bucket_group._get_nep_nccl_task_buffer_slot = lambda owner: 7
     bucket_group._prep_nep_nccl_owner_entries_for_sync = lambda owner: None
 
-    context = bucket_group._prepare_nep_nccl_owner_task_context(
-        owner_ep_rank=0, chunk_index=0, chunk_start=0, chunk_end=8, async_op=True
-    )
+    context = bucket_group._prepare_nep_nccl_owner_task_context(0, async_op=True)
 
     assert context["chunk"].numel() == expected_numel
     full_key = ("owner_layout_gather", 7, 8, grad_data.dtype, grad_data.device)
@@ -528,7 +527,6 @@ def test_process_group_gather_selects_separate_owner_group():
         pass
 
     bucket_group._nep_runtime_config = {"ep_rank": 0, "nep_owner_gather_groups": {0: object()}}
-    bucket_group._nep_nccl_group_index = 0
     bucket_group._nep_nccl_owner_source_ranks = lambda owner: [0, 4]
     bucket_group._nep_nccl_owner_transfer_ranks = lambda owner: [0, 4]
     bucket_group._copy_nep_nccl_owner_chunk = lambda *args: None
@@ -540,9 +538,7 @@ def test_process_group_gather_selects_separate_owner_group():
     bucket_group._get_nep_nccl_transfer_group_info = select_group
 
     with pytest.raises(GroupSelected):
-        bucket_group._start_nep_nccl_owner_all_to_all_gather(
-            0, 0, 16, object(), (0,), async_op=True
-        )
+        bucket_group._start_nep_nccl_owner_all_to_all_gather(0, object(), (0,), async_op=True)
 
     assert calls == [(0, "nep_owner_gather_groups")]
 
@@ -812,35 +808,29 @@ def test_nep_end_iteration_scatter_uses_persistent_task_slots():
     bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
         NonuniformEPNCCLParamAndGradBucketGroup
     )
-    bucket_group._nep_nccl_owner_layout = {"min_ep_size": 3, "num_chunks": 1}
     bucket_group._nep_nccl_scheduler_state = {"group_slot_offsets": (0, 3)}
     bucket_group._nep_nccl_group_index = 0
+    first_group_slots = [bucket_group._get_nep_nccl_task_buffer_slot(owner) for owner in range(3)]
 
-    first_group_slots = [
-        bucket_group._get_nep_nccl_task_buffer_slot(owner_ep_rank, 0) for owner_ep_rank in range(3)
-    ]
     bucket_group._nep_nccl_group_index = 1
-    second_group_slots = [
-        bucket_group._get_nep_nccl_task_buffer_slot(owner_ep_rank, 0) for owner_ep_rank in range(3)
-    ]
+    second_group_slots = [bucket_group._get_nep_nccl_task_buffer_slot(owner) for owner in range(3)]
 
     assert first_group_slots == list(range(3))
     assert second_group_slots == list(range(3, 6))
 
 
 @pytest.mark.parametrize("target_chunks", (None, "1"))
-def test_nep_nccl_owner_layout_uses_validated_single_chunk(monkeypatch, target_chunks):
+def test_nep_nccl_owner_layout_uses_validated_single_payload(monkeypatch, target_chunks):
     if target_chunks is None:
         monkeypatch.delenv("MEGATRON_NONUNIFORM_EP_NCCL_TARGET_CHUNKS", raising=False)
     else:
         monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_TARGET_CHUNKS", target_chunks)
-    bucket_group = _make_single_chunk_owner_layout_group()
 
-    layout = bucket_group._get_nep_nccl_owner_layout()
+    layout = _make_single_chunk_owner_layout_group()._get_nep_nccl_owner_layout()
 
     assert layout["owner_numel"] == 80
-    assert layout["num_chunks"] == 1
-    assert layout["chunk_ranges"] == [(0, 80)]
+    assert "num_chunks" not in layout
+    assert "chunk_ranges" not in layout
 
 
 def _make_single_chunk_owner_layout_group():
@@ -879,8 +869,7 @@ def test_nep_nccl_owner_layout_rejects_payload_above_byte_cap(monkeypatch):
         _make_single_chunk_owner_layout_group()._get_nep_nccl_owner_layout()
 
 
-def test_nep_packed_scatter_orders_every_unique_edp_dependency(monkeypatch):
-    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_SCATTER_CHUNKS", "1")
+def test_nep_packed_scatter_orders_every_unique_edp_dependency():
     calls = []
     first_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
         NonuniformEPNCCLParamAndGradBucketGroup
@@ -889,14 +878,13 @@ def test_nep_packed_scatter_orders_every_unique_edp_dependency(monkeypatch):
         NonuniformEPNCCLParamAndGradBucketGroup
     )
     for index, group in enumerate((first_group, second_group)):
-        group._nep_runtime_config = {}
         group._order_nep_nccl_owner_edp_before_scatter = lambda context, index=index: calls.append(
             ("order", index)
         )
 
     contexts = [
-        {"group": first_group, "owner_ep_rank": 0, "chunk_index": 0, "native_edp_state": object()},
-        {"group": second_group, "owner_ep_rank": 0, "chunk_index": 1, "native_edp_state": object()},
+        {"group": first_group, "owner_ep_rank": 0, "native_edp_state": object()},
+        {"group": second_group, "owner_ep_rank": 0, "native_edp_state": object()},
     ]
     scatter_context = dict(contexts[0])
     scatter_context["scatter_contexts"] = tuple(contexts)
@@ -927,11 +915,11 @@ def test_nep_two_level_scatter_batch_combines_and_splits_payloads():
         group._nep_runtime_config = runtime_config
         group._nep_nccl_owner_source_ranks = lambda owner: [0, 1]
         group._nep_nccl_owner_transfer_ranks = lambda owner: [0, 1]
-        group._nep_nccl_owner_source_payload_numel = lambda owner, source, start, end: (
+        group._nep_nccl_owner_source_payload_numel = lambda owner, source: (
             payload_numel if source == 1 else 0
         )
 
-        def copy_payload(operation, owner, rank, start, end, payload, chunk=None):
+        def copy_payload(operation, owner, rank, payload, chunk=None):
             if operation == "pack_scatter":
                 payload.copy_(torch.arange(payload_numel, dtype=payload.dtype) + payload_base)
             elif operation == "copy_scatter":
@@ -956,9 +944,6 @@ def test_nep_two_level_scatter_batch_combines_and_splits_payloads():
         {
             "group": first_group,
             "owner_ep_rank": 0,
-            "chunk_index": 0,
-            "chunk_start": 0,
-            "chunk_end": 4,
             "chunk": torch.empty(4),
             "buffer_slot_key": (0,),
             "async_op": True,
@@ -966,9 +951,6 @@ def test_nep_two_level_scatter_batch_combines_and_splits_payloads():
         {
             "group": second_group,
             "owner_ep_rank": 0,
-            "chunk_index": 0,
-            "chunk_start": 0,
-            "chunk_end": 6,
             "chunk": torch.empty(6),
             "buffer_slot_key": (1,),
             "async_op": True,
@@ -992,74 +974,25 @@ def test_nep_two_level_scatter_batch_combines_and_splits_payloads():
     assert torch.equal(received[1][1], torch.tensor([3, 4, 5]))
 
 
-def test_nep_two_level_gather_staged_phase_advances_queued_batch():
-    bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
-        NonuniformEPNCCLParamAndGradBucketGroup
-    )
-    dispatch_stream = object()
-    next_task_batch = [object()]
-    calls = []
-
-    def start_next(task_batch, stream):
-        calls.append((task_batch, stream))
-        return [{"contexts": [], "dispatch_stream": stream, "phase": "gather_staged"}]
-
-    bucket_group._start_nep_nccl_split_host_phase_batch = start_next
-    pending = [
-        {
-            "contexts": [],
-            "dispatch_stream": dispatch_stream,
-            "phase": "gather_staged",
-            "remaining_task_batches": [next_task_batch],
-        }
-    ]
-
-    scatter_context_batches = []
-    assert bucket_group._finish_nep_nccl_process_group_dispatch_batches(
-        pending, scatter_context_batches
-    )
-    assert scatter_context_batches == []
-    assert calls == [(next_task_batch, dispatch_stream)]
-    assert pending == [
-        {
-            "contexts": [],
-            "dispatch_stream": dispatch_stream,
-            "phase": "finished",
-            "remaining_task_batches": [],
-        }
-    ]
-
-
 def test_nep_nccl_scatter_uses_one_ordered_descriptor():
     bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
         NonuniformEPNCCLParamAndGradBucketGroup
     )
     calls = []
-    owner_chunk = torch.arange(16)
     context = {
+        "group": bucket_group,
         "owner_ep_rank": 0,
-        "chunk_index": 7,
-        "chunk_start": 0,
-        "chunk_end": 16,
-        "chunk": owner_chunk,
+        "chunk": torch.arange(16),
         "buffer_slot_key": ("slot",),
         "async_op": True,
     }
-    bucket_group._nep_runtime_config = {"ep_rank": 0}
     bucket_group.ddp_config = SimpleNamespace(use_distributed_optimizer=False)
-    bucket_group.is_first_batch = False
     bucket_group._order_nep_nccl_owner_edp_before_scatter = lambda task: calls.append(
         ("order", task)
     )
-
-    def prepare_scatter(owner, chunk_index, start, end, chunk, slot_key, async_op):
-        descriptor = {"index": 0}
-        calls.append(
-            ("prepare", owner, chunk_index, start, end, chunk.tolist(), slot_key, async_op)
-        )
-        return descriptor
-
-    bucket_group._prepare_nep_nccl_owner_all_to_all_scatter = prepare_scatter
+    bucket_group._prepare_nep_nccl_owner_all_to_all_scatter_batch = lambda contexts: calls.append(
+        ("prepare", contexts)
+    ) or {"index": 0}
     bucket_group._submit_nep_nccl_owner_all_to_all_scatter = lambda descriptor: calls.append(
         ("submit", descriptor["index"])
     )
@@ -1069,19 +1002,17 @@ def test_nep_nccl_scatter_uses_one_ordered_descriptor():
     bucket_group._finish_nep_nccl_owner_all_to_all_scatter = lambda descriptor: calls.append(
         ("copyback", descriptor["index"])
     )
-    bucket_group._mark_nep_nccl_task_started = lambda owner, chunk_index: calls.append(
-        ("mark", owner, chunk_index)
-    )
+    bucket_group._mark_nep_nccl_task_started = lambda owner: calls.append(("mark", owner))
 
     bucket_group._start_nep_nccl_owner_task_scatter(context)
 
     assert calls == [
         ("order", context),
-        ("prepare", 0, 7, 0, 16, owner_chunk.tolist(), ("slot",), True),
+        ("prepare", [context]),
         ("submit", 0),
         ("order_completion", 0),
         ("copyback", 0),
-        ("mark", 0, 7),
+        ("mark", 0),
     ]
 
 
@@ -1164,7 +1095,7 @@ def test_nep_nccl_owner_prep_leaves_gradient_scaling_to_native_ddp():
     assert bucket_group._nep_nccl_prepped_experts == {(3, 0)}
 
 
-def test_nep_nccl_owner_edp_batch_coalesces_chunks_per_logical_group():
+def test_nep_nccl_owner_edp_batch_starts_each_single_payload_group():
     first_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
         NonuniformEPNCCLParamAndGradBucketGroup
     )
@@ -1174,25 +1105,18 @@ def test_nep_nccl_owner_edp_batch_coalesces_chunks_per_logical_group():
     calls = []
     for index, group in enumerate((first_group, second_group)):
         group._nep_runtime_config = {"ep_rank": 0}
-        group._nep_nccl_group_index = index
-        group._nep_nccl_edp_bucket_index = index
         group._start_nep_nccl_owner_edp_reduce_contexts = (
             lambda contexts, index=index: calls.append((index, contexts))
         )
-
-    first_group._nep_nccl_scheduler_state = {
-        "pending_edp_contexts": {},
-        "expected_edp_contexts": {(0, 0): 2, (1, 0): 1},
-    }
     contexts = [
-        {"group": first_group, "owner_ep_rank": 0, "chunk_index": 0},
-        {"group": first_group, "owner_ep_rank": 0, "chunk_index": 1},
-        {"group": second_group, "owner_ep_rank": 0, "chunk_index": 0},
+        {"group": first_group, "owner_ep_rank": 0},
+        {"group": second_group, "owner_ep_rank": 0},
     ]
 
-    first_group._start_nep_nccl_owner_edp_reduce_batch(contexts)
+    batches = first_group._start_nep_nccl_owner_edp_reduce_batch(contexts)
 
-    assert calls == [(0, contexts[:2]), (1, contexts[2:])]
+    assert batches == [[contexts[0]], [contexts[1]]]
+    assert calls == [(0, [contexts[0]]), (1, [contexts[1]])]
 
 
 def test_nep_nccl_grouped_contexts_order_scatter_once_and_finish_at_final_drain():
@@ -1363,19 +1287,14 @@ def test_nep_dispatch_boundary_enqueues_without_launch_barriers(monkeypatch):
     assert all(group._nep_dispatch_boundary_launched for group in groups)
 
 
-def test_nep_end_iteration_scatter_retains_persistent_payload_without_clone(monkeypatch):
+def test_nep_end_iteration_scatter_retains_persistent_payload_without_clone():
     ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
     ddp.ddp_config = SimpleNamespace(use_distributed_optimizer=False)
     calls = []
     chunk = object()
     context = {
-        "group": SimpleNamespace(
-            _mark_nep_nccl_task_started=lambda owner, chunk_index: calls.append(
-                (owner, chunk_index)
-            )
-        ),
+        "group": SimpleNamespace(_mark_nep_nccl_task_started=lambda owner: calls.append(owner)),
         "owner_ep_rank": 0,
-        "chunk_index": 1,
         "chunk": chunk,
     }
     completion_event = object()
@@ -1387,7 +1306,7 @@ def test_nep_end_iteration_scatter_retains_persistent_payload_without_clone(monk
     assert saved_batches == [[context]]
     assert saved_batches[0][0]["chunk"] is chunk
     assert saved_completion is completion_event
-    assert calls == [(0, 1)]
+    assert calls == [0]
 
 
 def test_nep_end_iteration_scatter_marks_every_two_level_gather_context():
@@ -1397,20 +1316,18 @@ def test_nep_end_iteration_scatter_marks_every_two_level_gather_context():
     contexts = []
     for group_index in range(2):
         group = SimpleNamespace(
-            _mark_nep_nccl_task_started=lambda owner, chunk, index=group_index: calls.append(
-                (index, owner, chunk)
+            _mark_nep_nccl_task_started=lambda owner, index=group_index: calls.append(
+                (index, owner)
             )
         )
-        contexts.append(
-            {"group": group, "owner_ep_rank": 0, "chunk_index": group_index, "chunk": object()}
-        )
+        contexts.append({"group": group, "owner_ep_rank": 0, "chunk": object()})
     scatter_context = dict(contexts[0])
     scatter_context["scatter_contexts"] = tuple(contexts)
     ddp._nep_end_iteration_scatter_context_batches = []
 
     ddp._defer_nep_scatter_context_batches_to_iteration_end([[scatter_context]], object())
 
-    assert calls == [(0, 0, 0), (1, 0, 1)]
+    assert calls == [(0, 0), (1, 0)]
 
 
 def test_nep_end_iteration_scatter_materializes_canonical_order():
@@ -1434,10 +1351,10 @@ def test_nep_end_iteration_scatter_materializes_canonical_order():
     group_1 = make_group(1, 1)
     group_2 = make_group(2, 2)
     contexts = [
-        {"group": group_1, "owner_ep_rank": 0, "chunk_index": 1},
-        {"group": group_0, "owner_ep_rank": 2, "chunk_index": 0},
-        {"group": group_2, "owner_ep_rank": 1, "chunk_index": 1},
-        {"group": group_0, "owner_ep_rank": 1, "chunk_index": 0},
+        {"group": group_1, "owner_ep_rank": 0},
+        {"group": group_0, "owner_ep_rank": 2},
+        {"group": group_2, "owner_ep_rank": 1},
+        {"group": group_0, "owner_ep_rank": 1},
     ]
     first_completion_event = object()
     final_completion_event = object()
@@ -1458,7 +1375,6 @@ def test_nep_end_iteration_scatter_materializes_canonical_order():
     assert calls[0][0][1:] == (final_completion_event,)
     assert calls[0][1] == {}
     assert ddp._nep_end_iteration_scatter_completion_events == [first_completion_event]
-    assert not ddp._nep_end_iteration_scatter_context_batches
 
 
 def test_nep_finish_grad_sync_drains_deferred_dispatch_completions(monkeypatch):
@@ -1506,7 +1422,10 @@ def test_nep_nccl_combined_slot_owner_layout_round_trip():
     )
     first_grad = torch.tensor([10.0, 11.0])
     second_grad = torch.tensor([20.0, 21.0, 22.0])
-    bucket_group._nep_runtime_config = {}
+    bucket_group._nep_runtime_config = {
+        "expert_to_owner": {0: 0, 1: 0, 2: 1, 3: 1},
+        "expert_to_owner_slot": {0: 0, 1: 1, 2: 0, 3: 1},
+    }
     bucket_group._nep_nccl_owner_layout = {"owner_expert_slots": [[0, 1], [2, 3]]}
     bucket_group._nep_nccl_slot_numels = (2, 3)
     bucket_group._nep_nccl_slot_offsets = (0, 2)
@@ -1532,12 +1451,11 @@ def test_nep_nccl_combined_slot_owner_layout_round_trip():
     ]
 
     owner_chunk = torch.empty(10)
-    bucket_group._copy_nep_nccl_owner_chunk("pack_owner", 0, 0, 10, owner_chunk)
-
+    bucket_group._copy_nep_nccl_owner_chunk("pack_owner", 0, owner_chunk)
     assert torch.count_nonzero(owner_chunk[:5]) == 0
     assert torch.equal(owner_chunk[5:], torch.tensor([10.0, 11.0, 20.0, 21.0, 22.0]))
 
-    bucket_group._copy_nep_nccl_owner_chunk("copy_owner", 0, 0, 10, owner_chunk + 100.0)
+    bucket_group._copy_nep_nccl_owner_chunk("copy_owner", 0, owner_chunk + 100.0)
     assert torch.equal(first_grad, torch.tensor([110.0, 111.0]))
     assert torch.equal(second_grad, torch.tensor([120.0, 121.0, 122.0]))
 
@@ -1568,21 +1486,19 @@ def test_nep_nccl_dense_source_payload_round_trip():
     bucket_group._nep_nccl_entry_by_key = {(2, 0): bucket_group._nep_nccl_entries[0]}
 
     payload = torch.empty(4)
-    bucket_group._copy_nep_nccl_source_payload("pack_source", 0, 2, 0, 16, payload)
+    bucket_group._copy_nep_nccl_source_payload("pack_source", 0, 2, payload)
     assert torch.equal(payload, source_grad)
 
     owner_chunk = torch.zeros(16)
-    bucket_group._copy_nep_nccl_source_payload(
-        "accumulate_source", 0, 2, 0, 16, payload, owner_chunk
-    )
+    bucket_group._copy_nep_nccl_source_payload("accumulate_source", 0, 2, payload, owner_chunk)
     assert torch.equal(owner_chunk[8:12], source_grad)
     assert torch.count_nonzero(owner_chunk[:8]) == 0
     assert torch.count_nonzero(owner_chunk[12:]) == 0
 
     reduced_payload = torch.empty(4)
     bucket_group._copy_nep_nccl_source_payload(
-        "pack_scatter", 0, 2, 0, 16, reduced_payload, owner_chunk + 100.0
+        "pack_scatter", 0, 2, reduced_payload, owner_chunk + 100.0
     )
     source_grad.zero_()
-    bucket_group._copy_nep_nccl_source_payload("copy_scatter", 0, 2, 0, 16, reduced_payload)
+    bucket_group._copy_nep_nccl_source_payload("copy_scatter", 0, 2, reduced_payload)
     assert torch.equal(source_grad, torch.tensor([120.0, 121.0, 122.0, 123.0]))
