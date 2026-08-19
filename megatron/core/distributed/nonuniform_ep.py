@@ -680,12 +680,9 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         self._nep_dispatch_boundary_groups = ()
         self._nep_dispatch_boundary_module_label = None
 
-    def _get_nep_nccl_shared_buffer_state(self) -> dict:
-        return self._nep_nccl_scheduler_state
-
     def _order_nep_nccl_buffer_slot(self, slot_key: tuple) -> None:
         """Order slot reuse after prior NCCL work without blocking the host thread."""
-        state = self._get_nep_nccl_shared_buffer_state()
+        state = self._nep_nccl_scheduler_state
         slot_handles = state["buffer_slot_handles"]
         handles = slot_handles.pop(slot_key, [])
         for work in handles:
@@ -701,16 +698,10 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             return
         self._nep_nccl_async_handles.append(work)
         if buffer_slot_key is not None:
-            state = self._get_nep_nccl_shared_buffer_state()
+            state = self._nep_nccl_scheduler_state
             state["buffer_slot_handles"].setdefault(buffer_slot_key, []).append(work)
         if block_current_stream:
             _nep_block_current_stream(work)
-
-    def _drain_nep_nccl_async_work(self) -> None:
-        """Retire every outstanding NCCL work item at the final DDP drain."""
-        for work in self._nep_nccl_async_handles:
-            work.wait()
-        self._nep_nccl_async_handles.clear()
 
     def _get_nep_nccl_cached_tensor(
         self, cache: dict, key: tuple, numel: int, dtype: torch.dtype, device: torch.device
@@ -925,32 +916,45 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
 
         self._foreach_copy_(copy_destinations, copy_sources)
 
-    def _pack_nep_nccl_owner_chunk(
-        self, owner_ep_rank: int, chunk_start: int, chunk_end: int, chunk: torch.Tensor
+    def _copy_nep_nccl_owner_chunk(
+        self,
+        operation: str,
+        owner_ep_rank: int,
+        chunk_start: int,
+        chunk_end: int,
+        chunk: torch.Tensor,
     ) -> None:
-        """Pack local source grads into a common owner-rank layout chunk."""
+        """Copy between physical gradients and one owner-layout chunk."""
+        if operation not in {"pack_owner", "copy_owner"}:
+            raise RuntimeError(f"Unknown NEP owner-chunk operation: {operation}")
 
         def build_views():
             destinations = []
             sources = []
             for entry in self._nep_nccl_owner_entries(owner_ep_rank):
                 entry_start = self._nep_nccl_entry_owner_start(entry, owner_ep_rank)
-                entry_end = entry_start + entry["numel"]
                 overlap_start = max(chunk_start, entry_start)
-                overlap_end = min(chunk_end, entry_end)
+                overlap_end = min(chunk_end, entry_start + entry["numel"])
                 if overlap_start >= overlap_end:
                     continue
-
                 chunk_offset = overlap_start - chunk_start
                 entry_offset = overlap_start - entry_start
                 numel = overlap_end - overlap_start
-                destinations.append(chunk[chunk_offset : chunk_offset + numel])
-                sources.append(entry["bucket"].grad_data[entry_offset : entry_offset + numel])
+                chunk_view = chunk[chunk_offset : chunk_offset + numel]
+                grad_view = entry["bucket"].grad_data[entry_offset : entry_offset + numel]
+                destination, source = (
+                    (chunk_view, grad_view)
+                    if operation == "pack_owner"
+                    else (grad_view, chunk_view)
+                )
+                destinations.append(destination)
+                sources.append(source)
             return destinations, sources
 
-        chunk.zero_()
+        if operation == "pack_owner":
+            chunk.zero_()
         destinations, sources = self._get_nep_nccl_cached_tensor_views(
-            ("pack_owner", owner_ep_rank, chunk_start, chunk_end, chunk.data_ptr()), build_views
+            (operation, owner_ep_rank, chunk_start, chunk_end, chunk.data_ptr()), build_views
         )
         self._foreach_copy_(destinations, sources)
 
@@ -1021,12 +1025,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         for destination, source in zip(destinations, sources):
             destination.copy_(source)
 
-    def _foreach_add_(self, destinations: List[torch.Tensor], sources: List[torch.Tensor]) -> None:
-        if not destinations:
-            return
-        for destination, source in zip(destinations, sources):
-            destination.add_(source)
-
     def _nep_nccl_owner_source_payload_numel(
         self, owner_ep_rank: int, source_ep_rank: int, chunk_start: int, chunk_end: int
     ) -> int:
@@ -1055,188 +1053,75 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             chunk_start, chunk_end, remote_segments, scatter_chunks
         )
 
-    def _pack_nep_nccl_source_payload(
+    def _copy_nep_nccl_source_payload(
         self,
+        operation: str,
         owner_ep_rank: int,
         source_ep_rank: int,
         chunk_start: int,
         chunk_end: int,
         payload: torch.Tensor,
+        chunk: Optional[torch.Tensor] = None,
     ) -> None:
-        entry_by_key = self._nep_nccl_entry_by_key
+        """Copy between a source payload and its physical- or owner-layout views."""
+        if operation not in {"pack_source", "accumulate_source", "pack_scatter", "copy_scatter"}:
+            raise RuntimeError(f"Unknown NEP payload operation: {operation}")
 
         def build_views():
             destinations = []
             sources = []
             payload_offset = 0
-            for entry_key, _, entry_offset, numel in self._nep_nccl_owner_source_segments(
+            for (
+                entry_key,
+                chunk_offset,
+                entry_offset,
+                numel,
+            ) in self._nep_nccl_owner_source_segments(
                 owner_ep_rank, source_ep_rank, chunk_start, chunk_end
             ):
-                entry = entry_by_key.get(entry_key)
-                if entry is None:
-                    raise RuntimeError(
-                        f"NEP source rank {source_ep_rank} is missing expert slot {entry_key}"
+                payload_view = payload[payload_offset : payload_offset + numel]
+                if operation in {"pack_source", "copy_scatter"}:
+                    entry = self._nep_nccl_entry_by_key.get(entry_key)
+                    if entry is None:
+                        raise RuntimeError(
+                            f"NEP source rank {source_ep_rank} is missing expert slot {entry_key}"
+                        )
+                    grad_view = entry["bucket"].grad_data[entry_offset : entry_offset + numel]
+                    destination, source = (
+                        (payload_view, grad_view)
+                        if operation == "pack_source"
+                        else (grad_view, payload_view)
                     )
-                destinations.append(payload[payload_offset : payload_offset + numel])
-                sources.append(entry["bucket"].grad_data[entry_offset : entry_offset + numel])
+                else:
+                    chunk_view = chunk[chunk_offset : chunk_offset + numel]
+                    destination, source = (
+                        (chunk_view, payload_view)
+                        if operation == "accumulate_source"
+                        else (payload_view, chunk_view)
+                    )
+                destinations.append(destination)
+                sources.append(source)
                 payload_offset += numel
-            if payload_offset != payload.numel():
+            if operation == "pack_source" and payload_offset != payload.numel():
                 raise RuntimeError(
                     f"NEP packed {payload_offset} elements into a "
                     f"{payload.numel()}-element payload"
                 )
             return destinations, sources
 
-        destinations, sources = self._get_nep_nccl_cached_tensor_views(
-            (
-                "pack_source",
-                owner_ep_rank,
-                source_ep_rank,
-                chunk_start,
-                chunk_end,
-                payload.data_ptr(),
-            ),
-            build_views,
-        )
-        self._foreach_copy_(destinations, sources)
-
-    def _accumulate_nep_nccl_source_payload(
-        self,
-        owner_ep_rank: int,
-        source_ep_rank: int,
-        chunk_start: int,
-        chunk_end: int,
-        payload: torch.Tensor,
-        chunk: torch.Tensor,
-    ) -> None:
-        def build_views():
-            destinations = []
-            sources = []
-            payload_offset = 0
-            for _, chunk_offset, _, numel in self._nep_nccl_owner_source_segments(
-                owner_ep_rank, source_ep_rank, chunk_start, chunk_end
-            ):
-                destinations.append(chunk[chunk_offset : chunk_offset + numel])
-                sources.append(payload[payload_offset : payload_offset + numel])
-                payload_offset += numel
-            return destinations, sources
-
-        destinations, sources = self._get_nep_nccl_cached_tensor_views(
-            (
-                "accumulate_source",
-                owner_ep_rank,
-                source_ep_rank,
-                chunk_start,
-                chunk_end,
-                payload.data_ptr(),
-                chunk.data_ptr(),
-            ),
-            build_views,
-        )
-        self._foreach_add_(destinations, sources)
-
-    def _pack_nep_nccl_scatter_payload(
-        self,
-        owner_ep_rank: int,
-        destination_ep_rank: int,
-        chunk_start: int,
-        chunk_end: int,
-        chunk: torch.Tensor,
-        payload: torch.Tensor,
-    ) -> None:
-        def build_views():
-            destinations = []
-            sources = []
-            payload_offset = 0
-            for _, chunk_offset, _, numel in self._nep_nccl_owner_source_segments(
-                owner_ep_rank, destination_ep_rank, chunk_start, chunk_end
-            ):
-                destinations.append(payload[payload_offset : payload_offset + numel])
-                sources.append(chunk[chunk_offset : chunk_offset + numel])
-                payload_offset += numel
-            return destinations, sources
-
-        destinations, sources = self._get_nep_nccl_cached_tensor_views(
-            (
-                "pack_scatter",
-                owner_ep_rank,
-                destination_ep_rank,
-                chunk_start,
-                chunk_end,
-                chunk.data_ptr(),
-                payload.data_ptr(),
-            ),
-            build_views,
-        )
-        self._foreach_copy_(destinations, sources)
-
-    def _copy_nep_nccl_scatter_payload_to_local_grads(
-        self,
-        owner_ep_rank: int,
-        source_ep_rank: int,
-        chunk_start: int,
-        chunk_end: int,
-        payload: torch.Tensor,
-    ) -> None:
-        entry_by_key = self._nep_nccl_entry_by_key
-
-        def build_views():
-            destinations = []
-            sources = []
-            payload_offset = 0
-            for entry_key, _, entry_offset, numel in self._nep_nccl_owner_source_segments(
-                owner_ep_rank, source_ep_rank, chunk_start, chunk_end
-            ):
-                entry = entry_by_key.get(entry_key)
-                if entry is None:
-                    raise RuntimeError(
-                        f"NEP source rank {source_ep_rank} is missing expert slot {entry_key}"
-                    )
-                destinations.append(entry["bucket"].grad_data[entry_offset : entry_offset + numel])
-                sources.append(payload[payload_offset : payload_offset + numel])
-                payload_offset += numel
-            return destinations, sources
-
-        destinations, sources = self._get_nep_nccl_cached_tensor_views(
-            (
-                "copy_scatter",
-                owner_ep_rank,
-                source_ep_rank,
-                chunk_start,
-                chunk_end,
-                payload.data_ptr(),
-            ),
-            build_views,
-        )
-        self._foreach_copy_(destinations, sources)
-
-    def _copy_nep_nccl_owner_chunk_to_local_grads(
-        self, owner_ep_rank: int, chunk_start: int, chunk_end: int, chunk: torch.Tensor
-    ) -> None:
-        """Copy a reduced common owner-rank layout chunk back to local source grads."""
-
-        def build_views():
-            destinations = []
-            sources = []
-            for entry in self._nep_nccl_owner_entries(owner_ep_rank):
-                entry_start = self._nep_nccl_entry_owner_start(entry, owner_ep_rank)
-                entry_end = entry_start + entry["numel"]
-                overlap_start = max(chunk_start, entry_start)
-                overlap_end = min(chunk_end, entry_end)
-                if overlap_start >= overlap_end:
-                    continue
-
-                chunk_offset = overlap_start - chunk_start
-                entry_offset = overlap_start - entry_start
-                numel = overlap_end - overlap_start
-                destinations.append(entry["bucket"].grad_data[entry_offset : entry_offset + numel])
-                sources.append(chunk[chunk_offset : chunk_offset + numel])
-            return destinations, sources
-
-        destinations, sources = self._get_nep_nccl_cached_tensor_views(
-            ("copy_owner", owner_ep_rank, chunk_start, chunk_end, chunk.data_ptr()), build_views
-        )
-        self._foreach_copy_(destinations, sources)
+        cache_key = (operation, owner_ep_rank, source_ep_rank, chunk_start, chunk_end)
+        if operation == "pack_source" or operation == "copy_scatter":
+            cache_key += (payload.data_ptr(),)
+        elif operation == "accumulate_source":
+            cache_key += (payload.data_ptr(), chunk.data_ptr())
+        else:
+            cache_key += (chunk.data_ptr(), payload.data_ptr())
+        destinations, sources = self._get_nep_nccl_cached_tensor_views(cache_key, build_views)
+        if operation == "accumulate_source":
+            for destination, source in zip(destinations, sources):
+                destination.add_(source)
+        else:
+            self._foreach_copy_(destinations, sources)
 
     def _nep_nccl_owner_source_ranks(self, owner_ep_rank: int) -> List[int]:
         """Return EP ranks that physically hold experts for an owner-layout chunk."""
@@ -1282,7 +1167,9 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         remote_source_ranks = [rank for rank in source_ranks if rank != owner_ep_rank]
 
         if ep_rank == owner_ep_rank:
-            self._pack_nep_nccl_owner_chunk(owner_ep_rank, chunk_start, chunk_end, chunk)
+            self._copy_nep_nccl_owner_chunk(
+                "pack_owner", owner_ep_rank, chunk_start, chunk_end, chunk
+            )
 
         if not remote_source_ranks:
             return
@@ -1299,7 +1186,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         owner_transfer_rank = transfer_source_ranks.index(owner_ep_rank)
         remote_transfer_ranks = [transfer_source_ranks.index(rank) for rank in remote_source_ranks]
 
-        cache = self._get_nep_nccl_shared_buffer_state()["gather_buf_cache"]
+        cache = self._nep_nccl_scheduler_state["gather_buf_cache"]
         empty = self._get_nep_nccl_cached_tensor(
             cache, ("empty", chunk.dtype, chunk.device), 0, chunk.dtype, chunk.device
         )
@@ -1323,8 +1210,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 chunk.dtype,
                 chunk.device,
             )
-            self._pack_nep_nccl_source_payload(
-                owner_ep_rank, ep_rank, chunk_start, chunk_end, gather_input
+            self._copy_nep_nccl_source_payload(
+                "pack_source", owner_ep_rank, ep_rank, chunk_start, chunk_end, gather_input
             )
         else:
             gather_input = empty
@@ -1376,7 +1263,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 source_numel = self._nep_nccl_owner_source_payload_numel(
                     owner_ep_rank, source_ep_rank, chunk_start, chunk_end
                 )
-                self._accumulate_nep_nccl_source_payload(
+                self._copy_nep_nccl_source_payload(
+                    "accumulate_source",
                     owner_ep_rank,
                     source_ep_rank,
                     chunk_start,
@@ -1422,7 +1310,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 "chunk": chunk,
             }
 
-        cache = self._get_nep_nccl_shared_buffer_state()["gather_buf_cache"]
+        cache = self._nep_nccl_scheduler_state["gather_buf_cache"]
         empty = self._get_nep_nccl_cached_tensor(
             cache, ("empty", chunk.dtype, chunk.device), 0, chunk.dtype, chunk.device
         )
@@ -1457,13 +1345,14 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 destination_numel = self._nep_nccl_owner_source_payload_numel(
                     owner_ep_rank, destination_ep_rank, chunk_start, chunk_end
                 )
-                self._pack_nep_nccl_scatter_payload(
+                self._copy_nep_nccl_source_payload(
+                    "pack_scatter",
                     owner_ep_rank,
                     destination_ep_rank,
                     chunk_start,
                     chunk_end,
-                    chunk,
                     scatter_input[scatter_offset : scatter_offset + destination_numel],
+                    chunk,
                 )
                 scatter_offset += destination_numel
         else:
@@ -1587,7 +1476,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             if len(edp_bucket_indices) == 1
             else ("end_iteration", edp_bucket_indices)
         )
-        cache = representative._get_nep_nccl_shared_buffer_state()["gather_buf_cache"]
+        cache = representative._nep_nccl_scheduler_state["gather_buf_cache"]
         empty = representative._get_nep_nccl_cached_tensor(
             cache, ("empty", dtype, device), 0, dtype, device
         )
@@ -1627,13 +1516,14 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                         context["chunk_start"],
                         context["chunk_end"],
                     )
-                    group._pack_nep_nccl_scatter_payload(
+                    group._copy_nep_nccl_source_payload(
+                        "pack_scatter",
                         owner_ep_rank,
                         destination_ep_rank,
                         context["chunk_start"],
                         context["chunk_end"],
-                        context["chunk"],
                         scatter_input[scatter_offset : scatter_offset + destination_numel],
+                        context["chunk"],
                     )
                     scatter_offset += destination_numel
         else:
@@ -1735,7 +1625,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if kind == "local":
             scatter_contexts = descriptor.get("scatter_contexts")
             if scatter_contexts is None:
-                self._copy_nep_nccl_owner_chunk_to_local_grads(
+                self._copy_nep_nccl_owner_chunk(
+                    "copy_owner",
                     descriptor["owner_ep_rank"],
                     descriptor["chunk_start"],
                     descriptor["chunk_end"],
@@ -1743,7 +1634,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 )
             else:
                 for context in scatter_contexts:
-                    context["group"]._copy_nep_nccl_owner_chunk_to_local_grads(
+                    context["group"]._copy_nep_nccl_owner_chunk(
+                        "copy_owner",
                         context["owner_ep_rank"],
                         context["chunk_start"],
                         context["chunk_end"],
@@ -1755,7 +1647,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
 
         scatter_contexts = descriptor.get("scatter_contexts")
         if scatter_contexts is None and descriptor["ep_rank"] == descriptor["owner_ep_rank"]:
-            self._copy_nep_nccl_owner_chunk_to_local_grads(
+            self._copy_nep_nccl_owner_chunk(
+                "copy_owner",
                 descriptor["owner_ep_rank"],
                 descriptor["chunk_start"],
                 descriptor["chunk_end"],
@@ -1764,7 +1657,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         elif (
             scatter_contexts is None and descriptor["ep_rank"] in descriptor["remote_source_ranks"]
         ):
-            self._copy_nep_nccl_scatter_payload_to_local_grads(
+            self._copy_nep_nccl_source_payload(
+                "copy_scatter",
                 descriptor["owner_ep_rank"],
                 descriptor["ep_rank"],
                 descriptor["chunk_start"],
@@ -1773,7 +1667,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             )
         elif scatter_contexts is not None and descriptor["ep_rank"] == descriptor["owner_ep_rank"]:
             for context in scatter_contexts:
-                context["group"]._copy_nep_nccl_owner_chunk_to_local_grads(
+                context["group"]._copy_nep_nccl_owner_chunk(
+                    "copy_owner",
                     context["owner_ep_rank"],
                     context["chunk_start"],
                     context["chunk_end"],
@@ -1792,7 +1687,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     context["chunk_start"],
                     context["chunk_end"],
                 )
-                group._copy_nep_nccl_scatter_payload_to_local_grads(
+                group._copy_nep_nccl_source_payload(
+                    "copy_scatter",
                     context["owner_ep_rank"],
                     descriptor["ep_rank"],
                     context["chunk_start"],
@@ -1845,7 +1741,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
 
             copy_done = torch.cuda.Event()
             copy_done.record(torch.cuda.current_stream())
-            state = group._get_nep_nccl_shared_buffer_state()
+            state = group._nep_nccl_scheduler_state
             state["buffer_slot_events"].setdefault(context["buffer_slot_key"], []).append(copy_done)
 
     def _get_nep_nccl_native_edp_bucket_group(self, contexts):
@@ -2089,7 +1985,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         buffer_slot_key = (buffer_slot, chunk_size, chunk_dtype, chunk_device)
         self._order_nep_nccl_buffer_slot(buffer_slot_key)
 
-        gather_buf_cache = self._get_nep_nccl_shared_buffer_state()["gather_buf_cache"]
+        gather_buf_cache = self._nep_nccl_scheduler_state["gather_buf_cache"]
         if (
             self.ddp_config.use_distributed_optimizer
             and self._nep_runtime_config["ep_rank"] != owner_ep_rank
@@ -2642,7 +2538,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         self.grad_reduce_handle = None
 
     def _finish_nonuniform_ep_nccl_grad_sync(self):
-        self._drain_nep_nccl_async_work()
+        for work in self._nep_nccl_async_handles:
+            work.wait()
         for nccl_stream in self._nep_nccl_streams.values():
             torch.cuda.current_stream().wait_stream(nccl_stream)
         self._nep_nccl_async_handles = []
@@ -2891,7 +2788,7 @@ def _configure_nep_end_iteration_scatter_buffers(
         # it never scatters reduced gradients back to physical expert holders.
         return
 
-    state = bucket_groups[0]._get_nep_nccl_shared_buffer_state()
+    state = bucket_groups[0]._nep_nccl_scheduler_state
     cache = state["gather_buf_cache"]
     slots = set()
     scatter_chunks = _get_nep_nccl_scatter_chunks()

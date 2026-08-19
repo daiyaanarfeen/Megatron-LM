@@ -463,7 +463,7 @@ def test_nep_scatter_work_defers_stream_dependency_until_train_is_submitted():
     state = {"buffer_slot_handles": {}}
     slot_key = ("slot", 0)
     bucket_group._nep_nccl_async_handles = []
-    bucket_group._get_nep_nccl_shared_buffer_state = lambda: state
+    bucket_group._nep_nccl_scheduler_state = state
 
     bucket_group._record_nep_nccl_work(work, slot_key, block_current_stream=False)
 
@@ -533,7 +533,7 @@ def test_process_group_gather_selects_separate_owner_group():
     bucket_group._nep_nccl_group_index = 0
     bucket_group._nep_nccl_owner_source_ranks = lambda owner: [0, 4]
     bucket_group._nep_nccl_owner_transfer_ranks = lambda owner: [0, 4]
-    bucket_group._pack_nep_nccl_owner_chunk = lambda *args: None
+    bucket_group._copy_nep_nccl_owner_chunk = lambda *args: None
 
     def select_group(owner, group_key):
         calls.append((owner, group_key))
@@ -978,16 +978,16 @@ def test_nep_two_level_scatter_batch_combines_and_splits_payloads():
         group._nep_nccl_owner_source_payload_numel = lambda owner, source, start, end: (
             payload_numel if source == 1 else 0
         )
-        group._pack_nep_nccl_scatter_payload = (
-            lambda owner, destination, start, end, chunk, output: output.copy_(
-                torch.arange(payload_numel, dtype=output.dtype) + payload_base
-            )
-        )
-        group._copy_nep_nccl_scatter_payload_to_local_grads = (
-            lambda owner, source, start, end, payload, index=group_index: received.append(
-                (index, payload.clone())
-            )
-        )
+
+        def copy_payload(operation, owner, rank, start, end, payload, chunk=None):
+            if operation == "pack_scatter":
+                payload.copy_(torch.arange(payload_numel, dtype=payload.dtype) + payload_base)
+            elif operation == "copy_scatter":
+                received.append((group_index, payload.clone()))
+            else:
+                raise AssertionError(f"Unexpected payload operation: {operation}")
+
+        group._copy_nep_nccl_source_payload = copy_payload
 
     first_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
         NonuniformEPNCCLParamAndGradBucketGroup
@@ -998,7 +998,7 @@ def test_nep_two_level_scatter_batch_combines_and_splits_payloads():
     configure_group(first_group, 4, 2, 2, 10)
     configure_group(second_group, 5, 3, 3, 20)
     first_group._get_nep_nccl_transfer_group_info = lambda owner: (object(), 0, 2, [0, 1])
-    first_group._get_nep_nccl_shared_buffer_state = lambda: {"gather_buf_cache": cache}
+    first_group._nep_nccl_scheduler_state = {"gather_buf_cache": cache}
     first_group._get_nep_nccl_cached_tensor = cached_tensor
     contexts = [
         {
@@ -1654,12 +1654,12 @@ def test_nep_nccl_combined_slot_owner_layout_round_trip():
     ]
 
     owner_chunk = torch.empty(10)
-    bucket_group._pack_nep_nccl_owner_chunk(0, 0, 10, owner_chunk)
+    bucket_group._copy_nep_nccl_owner_chunk("pack_owner", 0, 0, 10, owner_chunk)
 
     assert torch.count_nonzero(owner_chunk[:5]) == 0
     assert torch.equal(owner_chunk[5:], torch.tensor([10.0, 11.0, 20.0, 21.0, 22.0]))
 
-    bucket_group._copy_nep_nccl_owner_chunk_to_local_grads(0, 0, 10, owner_chunk + 100.0)
+    bucket_group._copy_nep_nccl_owner_chunk("copy_owner", 0, 0, 10, owner_chunk + 100.0)
     assert torch.equal(first_grad, torch.tensor([110.0, 111.0]))
     assert torch.equal(second_grad, torch.tensor([120.0, 121.0, 122.0]))
 
@@ -1690,17 +1690,21 @@ def test_nep_nccl_dense_source_payload_round_trip():
     bucket_group._nep_nccl_entry_by_key = {(2, 0): bucket_group._nep_nccl_entries[0]}
 
     payload = torch.empty(4)
-    bucket_group._pack_nep_nccl_source_payload(0, 2, 0, 16, payload)
+    bucket_group._copy_nep_nccl_source_payload("pack_source", 0, 2, 0, 16, payload)
     assert torch.equal(payload, source_grad)
 
     owner_chunk = torch.zeros(16)
-    bucket_group._accumulate_nep_nccl_source_payload(0, 2, 0, 16, payload, owner_chunk)
+    bucket_group._copy_nep_nccl_source_payload(
+        "accumulate_source", 0, 2, 0, 16, payload, owner_chunk
+    )
     assert torch.equal(owner_chunk[8:12], source_grad)
     assert torch.count_nonzero(owner_chunk[:8]) == 0
     assert torch.count_nonzero(owner_chunk[12:]) == 0
 
     reduced_payload = torch.empty(4)
-    bucket_group._pack_nep_nccl_scatter_payload(0, 2, 0, 16, owner_chunk + 100.0, reduced_payload)
+    bucket_group._copy_nep_nccl_source_payload(
+        "pack_scatter", 0, 2, 0, 16, reduced_payload, owner_chunk + 100.0
+    )
     source_grad.zero_()
-    bucket_group._copy_nep_nccl_scatter_payload_to_local_grads(0, 2, 0, 16, reduced_payload)
+    bucket_group._copy_nep_nccl_source_payload("copy_scatter", 0, 2, 0, 16, reduced_payload)
     assert torch.equal(source_grad, torch.tensor([120.0, 121.0, 122.0, 123.0]))
