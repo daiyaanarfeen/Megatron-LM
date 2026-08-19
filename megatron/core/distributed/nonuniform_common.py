@@ -1,23 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Shared helpers for opt-in nonuniform distributed wrappers.
-
-The helpers in this file intentionally avoid modifying the generic DDP, optimizer,
-or param-buffer implementations.  NTP and NEP wrappers import this module to share
-DDP subclass construction, bucket-group wrapping, handle tracking, and local buffer
-layout utilities.
-"""
+"""Topology, expert-placement, and process-group helpers for opt-in nonuniform EP."""
 
 import math
-from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
-
-import torch
-import torch.distributed as dist
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .. import parallel_state
-from . import distributed_data_parallel as ddp_module
 
 _NONUNIFORM_EP_RUNTIME_CONFIG: Optional[dict] = None
 
@@ -173,7 +161,7 @@ def compute_nonuniform_ep_expert_placement(
     local_ep_size: int,
     min_ep_size: int,
     preferred_follower_fanout: Optional[int] = None,
-) -> Tuple[List[List[int]], Dict[int, List[Tuple[int, int, int]]]]:
+) -> List[List[int]]:
     """Compute logical expert placement for a nonuniform EP replica.
 
     Divisible configurations retain the established striped/round-robin layout.
@@ -293,23 +281,7 @@ def compute_nonuniform_ep_expert_placement(
         expert_ids.sort()
     build_expert_to_ep_rank_map(placement, num_experts)
 
-    expert_to_owner = {}
-    expert_to_owner_slot = {}
-    for owner_ep_rank, slots in enumerate(owner_slots):
-        for owner_slot, expert_id in enumerate(slots):
-            if expert_id is not None:
-                expert_to_owner[expert_id] = owner_ep_rank
-                expert_to_owner_slot[expert_id] = owner_slot
-
-    gather_map = {}
-    for follower_rank in range(min_ep_size, local_ep_size):
-        gather_map[follower_rank] = []
-        for local_index, expert_id in enumerate(placement[follower_rank]):
-            gather_map[follower_rank].append(
-                (local_index, expert_to_owner[expert_id], expert_to_owner_slot[expert_id])
-            )
-
-    return placement, gather_map
+    return placement
 
 
 class NonuniformEPRankGenerator:
@@ -319,18 +291,12 @@ class NonuniformEPRankGenerator:
     _EXPERT_KEYS = {'etp', 'ep', 'etp-ep', 'edp'}
 
     def __init__(
-        self,
-        tp: int,
-        cp: int,
-        num_tp_cp_per_replica: Sequence[int],
-        etp: Optional[int] = None,
-        rank_offset: int = 0,
+        self, tp: int, cp: int, num_tp_cp_per_replica: Sequence[int], etp: Optional[int] = None
     ) -> None:
         self.tp = tp
         self.cp = cp
         self.tp_cp = tp * cp
         self.etp = etp if etp is not None else tp
-        self.rank_offset = rank_offset
         self.num_tp_cp_per_replica = [int(value) for value in num_tp_cp_per_replica]
         self.num_replicas = len(self.num_tp_cp_per_replica)
 
@@ -372,10 +338,6 @@ class NonuniformEPRankGenerator:
         ranks = parallel_state.generate_masked_orthogonal_rank_groups(
             self.world_size, ordered_size, mask
         )
-        if self.rank_offset > 0:
-            for rank_group in ranks:
-                for index in range(len(rank_group)):
-                    rank_group[index] += self.rank_offset
         return ranks
 
     def _get_expert_ranks(self, key: str) -> List[List[int]]:
@@ -392,14 +354,14 @@ class NonuniformEPRankGenerator:
     def _get_etp_ep_ranks(self) -> List[List[int]]:
         groups = []
         for replica_index, num_tp_cp in enumerate(self.num_tp_cp_per_replica):
-            start = self.rank_offset + self.replica_offsets[replica_index]
+            start = self.replica_offsets[replica_index]
             groups.append(list(range(start, start + num_tp_cp * self.tp_cp)))
         return groups
 
     def _get_etp_ranks(self) -> List[List[int]]:
         groups = []
         for replica_index, num_tp_cp in enumerate(self.num_tp_cp_per_replica):
-            start = self.rank_offset + self.replica_offsets[replica_index]
+            start = self.replica_offsets[replica_index]
             ep_size = num_tp_cp * self.tp_cp // self.etp
             for ep_index in range(ep_size):
                 groups.append(
@@ -410,7 +372,7 @@ class NonuniformEPRankGenerator:
     def _get_ep_ranks(self) -> List[List[int]]:
         groups = []
         for replica_index, num_tp_cp in enumerate(self.num_tp_cp_per_replica):
-            start = self.rank_offset + self.replica_offsets[replica_index]
+            start = self.replica_offsets[replica_index]
             block = list(range(start, start + num_tp_cp * self.tp_cp))
             for etp_position in range(self.etp):
                 groups.append(block[etp_position :: self.etp])
@@ -421,192 +383,11 @@ class NonuniformEPRankGenerator:
         for position in range(self.min_k * self.tp_cp):
             groups.append(
                 [
-                    self.rank_offset + self.replica_offsets[replica_index] + position
+                    self.replica_offsets[replica_index] + position
                     for replica_index in range(self.num_replicas)
                 ]
             )
         return groups
-
-
-@dataclass
-class NonuniformTPReplicaRanks:
-    """Contiguous physical rank block assigned to one topology-aware NTP replica."""
-
-    replica_index: int
-    active_tp_size: int
-    physical_tp_size: int
-    ranks_by_cp: List[List[int]]
-
-    @property
-    def ranks(self) -> List[int]:
-        """Return ranks in TP-fastest, then CP order."""
-        return [rank for cp_ranks in self.ranks_by_cp for rank in cp_ranks]
-
-
-class NonuniformTPTopologyRankGenerator:
-    """Generate process groups for NTP replicas placed in explicit TP domains.
-
-    ``tp_domain_sizes`` lists the active TP size of each replica. ``physical_tp_size``
-    can reserve a larger physical block for each replica, allowing NTP to keep
-    Megatron's world-size divisibility while assigning reduced active TP groups to
-    the front of each contiguous topology domain. TP remains the fastest-changing
-    dimension inside each CP slice.
-    """
-
-    _SUPPORTED_KEYS = {'tp', 'cp', 'dp', 'dp-cp', 'tp-dp', 'tp-dp-cp', 'tp-cp'}
-
-    def __init__(
-        self,
-        tp: int,
-        cp: int,
-        tp_domain_sizes: Sequence[int],
-        rank_offset: int = 0,
-        physical_tp_size: Optional[int] = None,
-    ) -> None:
-        self.tp = int(tp)
-        self.cp = int(cp)
-        self.tp_domain_sizes = [int(size) for size in tp_domain_sizes]
-        self.rank_offset = int(rank_offset)
-        self.physical_tp_size = int(physical_tp_size) if physical_tp_size is not None else None
-
-        if self.tp < 1 or self.cp < 1:
-            raise RuntimeError(f"TP and CP sizes must be positive; got TP={tp}, CP={cp}")
-        if not self.tp_domain_sizes:
-            raise RuntimeError("NTP topology requires at least one TP domain size")
-        invalid_sizes = [size for size in self.tp_domain_sizes if size < 1 or size > self.tp]
-        if invalid_sizes:
-            raise RuntimeError(
-                "NTP TP domain sizes must be in [1, tp_base]; got "
-                f"{invalid_sizes} for tp_base={self.tp}"
-            )
-        if self.physical_tp_size is not None and self.physical_tp_size < max(self.tp_domain_sizes):
-            raise RuntimeError(
-                "NTP physical TP block size must be >= every active TP domain size; "
-                f"got physical_tp_size={self.physical_tp_size}, "
-                f"active sizes={self.tp_domain_sizes}"
-            )
-
-        self.num_replicas = len(self.tp_domain_sizes)
-        self._physical_tp_sizes = [
-            self.physical_tp_size if self.physical_tp_size is not None else size
-            for size in self.tp_domain_sizes
-        ]
-        self.world_size = sum(self._physical_tp_sizes) * self.cp
-        self.replica_offsets = [0]
-        for physical_tp_size in self._physical_tp_sizes:
-            self.replica_offsets.append(self.replica_offsets[-1] + physical_tp_size * self.cp)
-
-        self.replicas: List[NonuniformTPReplicaRanks] = []
-        self.rank_metadata: Dict[int, Dict[str, int]] = {}
-        for replica_index, active_tp_size in enumerate(self.tp_domain_sizes):
-            physical_tp_size = self._physical_tp_sizes[replica_index]
-            start = self.rank_offset + self.replica_offsets[replica_index]
-            ranks_by_cp = []
-            for cp_rank in range(self.cp):
-                cp_start = start + cp_rank * physical_tp_size
-                cp_ranks = list(range(cp_start, cp_start + active_tp_size))
-                ranks_by_cp.append(cp_ranks)
-                for tp_rank, global_rank in enumerate(cp_ranks):
-                    self.rank_metadata[global_rank] = {
-                        'replica_index': replica_index,
-                        'active_tp_size': active_tp_size,
-                        'tp_rank': tp_rank,
-                        'cp_rank': cp_rank,
-                        'is_active': 1,
-                    }
-                for tp_rank in range(active_tp_size, physical_tp_size):
-                    self.rank_metadata[cp_start + tp_rank] = {
-                        'replica_index': replica_index,
-                        'active_tp_size': active_tp_size,
-                        'tp_rank': tp_rank,
-                        'cp_rank': cp_rank,
-                        'is_active': 0,
-                    }
-            self.replicas.append(
-                NonuniformTPReplicaRanks(
-                    replica_index=replica_index,
-                    active_tp_size=active_tp_size,
-                    physical_tp_size=physical_tp_size,
-                    ranks_by_cp=ranks_by_cp,
-                )
-            )
-
-    def get_ranks(self, key: str) -> List[List[int]]:
-        """Return topology-aware NTP rank groups for ``key``."""
-        if key == 'tp':
-            return self._get_tp_ranks()
-        if key == 'cp':
-            return self._get_cp_ranks()
-        if key == 'dp':
-            return self._get_dp_ranks()
-        if key == 'dp-cp':
-            return self._get_dp_cp_ranks()
-        if key == 'tp-dp':
-            return self._get_tp_dp_ranks()
-        if key == 'tp-dp-cp':
-            return self._get_tp_dp_cp_ranks()
-        if key == 'tp-cp':
-            return self._get_tp_cp_ranks()
-        raise ValueError(
-            f"Unknown nonuniform TP rank key {key}; expected {sorted(self._SUPPORTED_KEYS)}"
-        )
-
-    def get_rank_metadata(self, rank: int) -> Dict[str, int]:
-        """Return topology coordinates for a global rank."""
-        if rank not in self.rank_metadata:
-            raise RuntimeError(f"Rank {rank} is not part of the NTP topology")
-        return dict(self.rank_metadata[rank])
-
-    def _get_tp_ranks(self) -> List[List[int]]:
-        return [list(cp_ranks) for replica in self.replicas for cp_ranks in replica.ranks_by_cp]
-
-    def _get_cp_ranks(self) -> List[List[int]]:
-        groups = []
-        for replica in self.replicas:
-            for tp_rank in range(replica.active_tp_size):
-                groups.append([replica.ranks_by_cp[cp_rank][tp_rank] for cp_rank in range(self.cp)])
-        return groups
-
-    def _get_tp_cp_ranks(self) -> List[List[int]]:
-        return [replica.ranks for replica in self.replicas]
-
-    def _get_dp_ranks(self) -> List[List[int]]:
-        groups = []
-        for cp_rank in range(self.cp):
-            for tp_rank in range(self.tp):
-                ranks = [
-                    replica.ranks_by_cp[cp_rank][tp_rank]
-                    for replica in self.replicas
-                    if tp_rank < replica.active_tp_size
-                ]
-                if ranks:
-                    groups.append(ranks)
-        return groups
-
-    def _get_dp_cp_ranks(self) -> List[List[int]]:
-        groups = []
-        for tp_rank in range(self.tp):
-            ranks = []
-            for replica in self.replicas:
-                if tp_rank >= replica.active_tp_size:
-                    continue
-                for cp_rank in range(self.cp):
-                    ranks.append(replica.ranks_by_cp[cp_rank][tp_rank])
-            if ranks:
-                groups.append(ranks)
-        return groups
-
-    def _get_tp_dp_ranks(self) -> List[List[int]]:
-        groups = []
-        for cp_rank in range(self.cp):
-            ranks = []
-            for replica in self.replicas:
-                ranks.extend(replica.ranks_by_cp[cp_rank])
-            groups.append(ranks)
-        return groups
-
-    def _get_tp_dp_cp_ranks(self) -> List[List[int]]:
-        return [[rank for replica in self.replicas for rank in replica.ranks]]
 
 
 def load_nonuniform_nccl_communicator_configs(path: Optional[str]) -> Dict[str, Any]:
@@ -792,138 +573,3 @@ def initialize_nonuniform_expert_gtp_aliases() -> None:
         "_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT",
         parallel_state._INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP,
     )
-
-
-class ViewCopyHandle:
-    """Wait handle that copies temporary contiguous receive buffers into views."""
-
-    def __init__(self, handle, output_copies):
-        self.handle = handle
-        self.output_copies = output_copies
-
-    def wait(self):
-        """Wait for communication, then copy temporary outputs into target views."""
-        self.handle.wait()
-        for dst, src in self.output_copies:
-            dst.copy_(src)
-        self.output_copies = []
-
-
-def all_to_all_with_output_views(output_tensors, input_tensors, group, async_op: bool = False):
-    """Run all_to_all, preserving non-contiguous output views via temporary buffers."""
-    output_list = []
-    output_copies = []
-    for tensor in output_tensors:
-        if tensor.is_contiguous():
-            output_list.append(tensor)
-        else:
-            contiguous = torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device)
-            output_list.append(contiguous)
-            output_copies.append((tensor, contiguous))
-
-    handle = dist.all_to_all(output_list, input_tensors, group=group, async_op=async_op)
-    if async_op:
-        return ViewCopyHandle(handle, output_copies)
-
-    for dst, src in output_copies:
-        dst.copy_(src)
-    return None
-
-
-def wait_handles(handles: Iterable[object]) -> None:
-    """Wait every non-None handle in order."""
-    for handle in handles:
-        if handle is not None:
-            handle.wait()
-
-
-def record_post_sync_handles(bucket_group, state_attr: str, handles: List[object]) -> None:
-    """Track post-sync handles and drain them when the last bucket group finishes."""
-    state = getattr(bucket_group, state_attr, None)
-    if state is None:
-        wait_handles(handles)
-        return
-
-    state['handles'].extend(handles)
-    if bucket_group is state['last_bucket_group']:
-        try:
-            wait_handles(state['handles'])
-        finally:
-            state['handles'] = []
-
-
-def configure_post_sync_handle_tracker(bucket_groups: List[object], state_attr: str) -> None:
-    """Attach a shared last-group handle tracker to ordered bucket groups."""
-    if not bucket_groups:
-        return
-    state = {'handles': [], 'last_bucket_group': bucket_groups[-1]}
-    for bucket_group in bucket_groups:
-        setattr(bucket_group, state_attr, state)
-
-
-@contextmanager
-def patch_ddp_param_and_grad_buffer(buffer_cls):
-    """Temporarily patch DDP's imported _ParamAndGradBuffer binding."""
-    original_buffer_class = ddp_module._ParamAndGradBuffer
-    ddp_module._ParamAndGradBuffer = buffer_cls
-    try:
-        yield
-    finally:
-        ddp_module._ParamAndGradBuffer = original_buffer_class
-
-
-def clone_bucket_group(bucket_group, wrapper_cls):
-    """Clone a DDP bucket group into an opt-in subclass while preserving runtime state."""
-    if isinstance(bucket_group, wrapper_cls):
-        return bucket_group
-    wrapped_bucket_group = wrapper_cls.__new__(wrapper_cls)
-    wrapped_bucket_group.__dict__ = bucket_group.__dict__.copy()
-    return wrapped_bucket_group
-
-
-def wrap_bucket_groups_with_subclass(
-    bucket_groups: List[object],
-    wrapper_cls,
-    configure_fn: Callable[[object], None],
-    param_to_bucket_group: Optional[Dict[torch.nn.Parameter, object]] = None,
-) -> List[object]:
-    """Replace generic bucket groups with opt-in subclasses and rebuild next links."""
-    wrapped_bucket_groups = []
-    old_to_new = {}
-
-    for bucket_group in bucket_groups:
-        wrapped_bucket_group = clone_bucket_group(bucket_group, wrapper_cls)
-        configure_fn(wrapped_bucket_group)
-        old_to_new[bucket_group] = wrapped_bucket_group
-        wrapped_bucket_groups.append(wrapped_bucket_group)
-
-    for bucket_group, wrapped_bucket_group in old_to_new.items():
-        next_bucket_group = getattr(bucket_group, 'next_param_gather_bucket_group', None)
-        if next_bucket_group in old_to_new:
-            wrapped_bucket_group.next_param_gather_bucket_group = old_to_new[next_bucket_group]
-
-    if param_to_bucket_group is not None:
-        for wrapped_bucket_group in wrapped_bucket_groups:
-            for bucket in wrapped_bucket_group.buckets:
-                for param in bucket.params_list:
-                    param_to_bucket_group[param] = wrapped_bucket_group
-
-    return wrapped_bucket_groups
-
-
-def configure_ordered_bucket_group_scheduler(
-    bucket_groups: List[object], state_attr: str, index_attr: str, ready_attr: str
-) -> None:
-    """Attach deterministic launch state to bucket groups that must start in list order."""
-    state = {"groups": bucket_groups, "next_index": 0}
-    for index, bucket_group in enumerate(bucket_groups):
-        setattr(bucket_group, state_attr, state)
-        setattr(bucket_group, index_attr, index)
-        setattr(bucket_group, ready_attr, False)
-
-
-def reset_ordered_bucket_group_scheduler(bucket_group, state_attr: str, index_attr: str) -> None:
-    """Reset ordered scheduler state at the first bucket group."""
-    state = getattr(bucket_group, state_attr, None)
-    if state is not None and getattr(bucket_group, index_attr, -1) == 0:
-        state["next_index"] = 0

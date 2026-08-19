@@ -504,7 +504,6 @@ def _build_ep_runtime_config(args):
     edp_group = dist.new_group(ranks=owner_global_ranks)
     local_expert_indices = [int(expert) for expert in placement[ep_rank]]
     return {
-        "needs_reshard": local_ep_size != min_ep_size,
         "local_ep_size": local_ep_size,
         "min_ep_size": min_ep_size,
         "num_replicas": max(1, parallel_state.get_data_parallel_world_size()),
@@ -686,8 +685,8 @@ if __name__ == "__main__":
     # so its mere presence is a compatible fallback signal for an agent that predates NVRX_CYCLE.
     _NVRX_CYCLE_START = _env_float('NVRX_CYCLE_START_TIME')
     _IS_NVRX_RESTART = (
-        (_NVRX_CYCLE not in ('', '0') and _NVRX_CYCLE.isdigit()) or _NVRX_CYCLE_START is not None
-    )
+        _NVRX_CYCLE not in ('', '0') and _NVRX_CYCLE.isdigit()
+    ) or _NVRX_CYCLE_START is not None
     if _NVRX_LAUNCH_TIME is not None:
         _LAUNCH_SCRIPT_PRESRUN_TIME = None
         if _IS_NVRX_RESTART:

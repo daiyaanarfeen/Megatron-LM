@@ -30,14 +30,7 @@ from megatron.core.distributed.nonuniform_ep import (
     _partition_expert_bucket_specs,
     _source_ep_ranks_for_owner,
 )
-from megatron.core.distributed.nonuniform_tp import (
-    NonuniformTPConfig,
-    NonuniformTPDistributedDataParallel,
-    NonuniformTPParamAndGradBuffer,
-    _get_ntp_optimizer_alignment_ranks,
-)
-from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer
-from megatron.core.optimizer import _get_param_groups, _get_param_groups_and_buffers
+from megatron.core.optimizer import _get_param_groups_and_buffers
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAlltoAllTokenDispatcher,
@@ -155,157 +148,6 @@ def test_nep_finished_bucket_group_is_idempotent_on_current_main():
     bucket_group.finish_grad_sync()
 
     assert not bucket_group.param_gather_dispatched
-
-
-def test_ntp_reuses_native_buffer_with_supplied_layout(monkeypatch):
-    calls = []
-
-    def fake_native_init(self, *args, **kwargs):
-        calls.append((args, kwargs))
-        self.params = []
-
-    monkeypatch.setattr(_ParamAndGradBuffer, "__init__", fake_native_init)
-    layout = object()
-    group = SimpleNamespace(size=lambda: 1)
-
-    NonuniformTPParamAndGradBuffer(
-        SimpleNamespace(),
-        torch.bfloat16,
-        torch.bfloat16,
-        [],
-        group,
-        None,
-        {},
-        1.0,
-        [],
-        False,
-        None,
-        param_layout=layout,
-        ntp_config=NonuniformTPConfig(),
-    )
-
-    assert len(calls) == 1
-    assert calls[0][1]["param_layout"] is layout
-
-
-def test_ntp_rejects_distributed_optimizer_before_allocating_buffers():
-    config = SimpleNamespace(gtp_weight_remat_size=1, expert_gtp_weight_remat_size=1)
-    ddp_config = SimpleNamespace(
-        use_distributed_optimizer=True, reduce_scatter_with_fp32_accumulation=False
-    )
-    ntp_config = NonuniformTPConfig(tp_base=2, tp_spares=1)
-
-    with pytest.raises(RuntimeError, match="does not support the distributed optimizer"):
-        NonuniformTPDistributedDataParallel(
-            config, ddp_config, torch.nn.Linear(2, 2), ntp_config=ntp_config
-        )
-
-
-def test_ntp_optimizer_alignment_ranks_exclude_legacy_spares():
-    ntp_config = NonuniformTPConfig(tp_base=4, tp_spares=2, num_reduced_tp_dp_ranks=1)
-
-    assert _get_ntp_optimizer_alignment_ranks(ntp_config, 1, 8) == [0, 1, 4, 5, 6, 7]
-
-
-def test_ntp_topology_validation_uses_logical_world_and_restores_active_world(monkeypatch):
-    import examples.nonuniform.pretrain_gpt_nonuniform as nonuniform_entrypoint
-
-    observed = {}
-
-    def fake_native_validate(args, defaults):
-        observed["world_size"] = args.world_size
-        observed["defaults"] = defaults
-        args.data_parallel_size = args.world_size // (
-            args.tensor_model_parallel_size
-            * args.context_parallel_size
-            * args.pipeline_model_parallel_size
-        )
-
-    monkeypatch.setattr(nonuniform_entrypoint, "_ORIGINAL_VALIDATE_ARGS", fake_native_validate)
-    args = SimpleNamespace(
-        nonuniform_mode="tp",
-        nonuniform_tp_domain_sizes=[2, 4],
-        nonuniform_tp_base=4,
-        tensor_model_parallel_size=4,
-        context_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        world_size=6,
-    )
-
-    nonuniform_entrypoint._validate_args_with_nonuniform_tp_topology(
-        args, {"tokenizer_type": "NullTokenizer"}
-    )
-
-    assert observed == {"world_size": 8, "defaults": {"tokenizer_type": "NullTokenizer"}}
-    assert args.world_size == 6
-    assert args.data_parallel_size == 2
-
-
-def test_ntp_topology_validation_rejects_wrong_active_world_size(monkeypatch):
-    import examples.nonuniform.pretrain_gpt_nonuniform as nonuniform_entrypoint
-
-    monkeypatch.setattr(
-        nonuniform_entrypoint,
-        "_ORIGINAL_VALIDATE_ARGS",
-        lambda *_args, **_kwargs: pytest.fail("native validation must not run"),
-    )
-    args = SimpleNamespace(
-        nonuniform_mode="tp",
-        nonuniform_tp_domain_sizes=[2, 4],
-        nonuniform_tp_base=4,
-        tensor_model_parallel_size=4,
-        context_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        world_size=8,
-    )
-
-    with pytest.raises(RuntimeError, match="active world size"):
-        nonuniform_entrypoint._validate_args_with_nonuniform_tp_topology(args)
-
-
-def test_optimizer_param_groups_use_ntp_active_rank_group(monkeypatch):
-    active_group = object()
-    model = torch.nn.Linear(2, 2, bias=False)
-    model._optimizer_param_group_alignment_group = active_group
-    calls = []
-
-    def fake_get_world_size(group=None):
-        calls.append(("size", group))
-        return 2
-
-    def fake_all_gather_object(output, value, group=None):
-        calls.append(("gather", group))
-        for index in range(len(output)):
-            output[index] = value
-
-    monkeypatch.setattr(torch.distributed, "get_world_size", fake_get_world_size)
-    monkeypatch.setattr(torch.distributed, "all_gather_object", fake_all_gather_object)
-
-    param_groups = _get_param_groups([model], OptimizerConfig(optimizer="adam", bf16=True), None)
-
-    assert len(param_groups) == 1
-    assert calls == [("size", active_group), ("gather", active_group)]
-
-
-def test_native_optimizer_param_group_alignment_keeps_default_world_calls(monkeypatch):
-    model = torch.nn.Linear(2, 2, bias=False)
-    calls = []
-
-    def fake_get_world_size():
-        calls.append("size")
-        return 1
-
-    def fake_all_gather_object(output, value):
-        calls.append("gather")
-        output[0] = value
-
-    monkeypatch.setattr(torch.distributed, "get_world_size", fake_get_world_size)
-    monkeypatch.setattr(torch.distributed, "all_gather_object", fake_all_gather_object)
-
-    param_groups = _get_param_groups([model], OptimizerConfig(optimizer="adam", bf16=True), None)
-
-    assert len(param_groups) == 1
-    assert calls == ["size", "gather"]
 
 
 def test_nep_distopt_owner_layout_uses_only_real_params_and_native_padding():
@@ -670,7 +512,6 @@ class _FakeDenseBucketGroup:
 def _make_expert_bucket_spec(layer: int, expert_id: int) -> _ExpertBucketSpec:
     return _ExpertBucketSpec(
         buffer=None,
-        source_bucket_index=0,
         expert_id=expert_id,
         params=[],
         start=0,
@@ -702,14 +543,14 @@ def test_process_group_gather_selects_separate_owner_group():
 
     with pytest.raises(GroupSelected):
         bucket_group._start_nep_nccl_owner_all_to_all_gather(
-            0, 0, 0, 16, object(), (0,), async_op=True
+            0, 0, 16, object(), (0,), async_op=True
         )
 
     assert calls == [(0, "nep_owner_gather_groups")]
 
 
 def test_nonuniform_expert_placement_keeps_low_volume_round_robin_layout():
-    placement, gather_map = compute_nonuniform_ep_expert_placement(128, 8, 4)
+    placement = compute_nonuniform_ep_expert_placement(128, 8, 4)
 
     assert placement[:4] == [
         list(range(0, 16)),
@@ -721,14 +562,10 @@ def test_nonuniform_expert_placement_keeps_low_volume_round_robin_layout():
     assert [
         _source_ep_ranks_for_owner(placement, owner_rank, 128, 4) for owner_rank in range(4)
     ] == [[0, 4, 5, 6, 7], [1, 4, 5, 6, 7], [2, 4, 5, 6, 7], [3, 4, 5, 6, 7]]
-    assert set(gather_map) == set(range(4, 8))
-    assert {owner_rank for _, owner_rank, _ in gather_map[4]} == set(range(4))
 
 
 def test_process_group_expert_placement_uses_disjoint_single_follower_groups():
-    placement, gather_map = compute_nonuniform_ep_expert_placement(
-        128, 8, 4, preferred_follower_fanout=1
-    )
+    placement = compute_nonuniform_ep_expert_placement(128, 8, 4, preferred_follower_fanout=1)
 
     assert placement == [
         list(range(0, 16)),
@@ -743,14 +580,10 @@ def test_process_group_expert_placement_uses_disjoint_single_follower_groups():
     assert [
         _source_ep_ranks_for_owner(placement, owner_rank, 128, 4) for owner_rank in range(4)
     ] == [[0, 4], [1, 5], [2, 6], [3, 7]]
-    assert all(
-        len({owner_rank for _, owner_rank, _ in gather_map[follower_rank]}) == 1
-        for follower_rank in range(4, 8)
-    )
 
 
 def test_ep64_ep48_round_robin_placement_limits_owner_source_fanout():
-    placement, _ = compute_nonuniform_ep_expert_placement(192, 64, 48)
+    placement = compute_nonuniform_ep_expert_placement(192, 64, 48)
 
     assert placement[:2] == [list(range(0, 3)), list(range(4, 7))]
     assert placement[48] == [3, 67, 131]
@@ -771,14 +604,12 @@ def test_nondivisible_ep8_ep6_uses_balanced_logical_experts_and_virtual_slots():
         [14, 15, None],
     ]
 
-    reduced_placement, reduced_gather_map = compute_nonuniform_ep_expert_placement(16, 6, 6)
+    reduced_placement = compute_nonuniform_ep_expert_placement(16, 6, 6)
     assert reduced_placement == [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11], [12, 13], [14, 15]]
-    assert reduced_gather_map == {}
     assert compute_nonuniform_ep_dispatch_slots(reduced_placement, 16) == owner_slots
 
-    full_placement, full_gather_map = compute_nonuniform_ep_expert_placement(16, 8, 6)
+    full_placement = compute_nonuniform_ep_expert_placement(16, 8, 6)
     assert full_placement == [[0, 1], [3, 4], [6, 7], [9, 10], [12, 13], [14, 15], [2, 5], [8, 11]]
-    assert full_gather_map == {6: [(0, 0, 2), (1, 1, 2)], 7: [(0, 2, 2), (1, 3, 2)]}
     assert compute_nonuniform_ep_dispatch_slots(full_placement, 16) == full_placement
     assert sorted(expert_id for experts in full_placement for expert_id in experts) == list(
         range(16)
@@ -830,7 +661,7 @@ class TestNonuniformEPTokenRouting:
         set_nonuniform_ep_runtime_config(None)
 
     def test_physical_expert_axis_matches_round_robin_placement(self):
-        placement, _ = compute_nonuniform_ep_expert_placement(8, 4, 2)
+        placement = compute_nonuniform_ep_expert_placement(8, 4, 2)
 
         assert placement == [[0, 1], [4, 5], [2, 6], [3, 7]]
         assert build_expert_axis_permutation(placement, 8) == [0, 1, 4, 5, 2, 6, 3, 7]
@@ -943,6 +774,7 @@ def test_nep_nccl_buffer_slot_reuse_does_not_block_host():
     bucket_group._nep_nccl_scheduler_state = {
         "gather_buf_cache": {},
         "buffer_slot_handles": {slot_key: works},
+        "buffer_slot_events": {},
     }
 
     bucket_group._order_nep_nccl_buffer_slot(slot_key)
@@ -1015,7 +847,9 @@ def test_nep_nccl_owner_layout_targets_balanced_chunks_with_byte_cap(
         NonuniformEPNCCLParamAndGradBucketGroup
     )
     bucket_group._nep_nccl_owner_layout = None
-    bucket_group._nep_nccl_slot_numel = 40
+    bucket_group._nep_nccl_slot_numels = (40,)
+    bucket_group._nep_nccl_slot_offsets = (0,)
+    bucket_group._nep_nccl_expert_stride = 40
     bucket_group._nep_runtime_config = {
         "ep_rank": 0,
         "local_ep_size": 8,
@@ -1027,9 +861,8 @@ def test_nep_nccl_owner_layout_targets_balanced_chunks_with_byte_cap(
     layout = bucket_group._get_nep_nccl_owner_layout()
 
     assert layout["owner_numel"] == 80
-    assert layout["target_chunks"] == target_chunks
     assert layout["num_chunks"] == expected_chunks
-    assert layout["max_chunk_numel"] == expected_chunk_numel
+    assert max(end - start for start, end in layout["chunk_ranges"]) == expected_chunk_numel
 
 
 def test_nep_nccl_one_target_has_identical_scheduler_inputs_to_original(monkeypatch):
@@ -1042,7 +875,9 @@ def test_nep_nccl_one_target_has_identical_scheduler_inputs_to_original(monkeypa
             NonuniformEPNCCLParamAndGradBucketGroup
         )
         group._nep_nccl_owner_layout = None
-        group._nep_nccl_slot_numel = 40
+        group._nep_nccl_slot_numels = (40,)
+        group._nep_nccl_slot_offsets = (0,)
+        group._nep_nccl_expert_stride = 40
         group._nep_nccl_group_index = 0
         group._nep_nccl_scheduler_state = {"group_slot_offsets": (0,)}
         group._nep_runtime_config = {
@@ -1077,7 +912,9 @@ def test_nep_nccl_owner_layout_rejects_nonpositive_target_chunks(monkeypatch):
         NonuniformEPNCCLParamAndGradBucketGroup
     )
     bucket_group._nep_nccl_owner_layout = None
-    bucket_group._nep_nccl_slot_numel = 40
+    bucket_group._nep_nccl_slot_numels = (40,)
+    bucket_group._nep_nccl_slot_offsets = (0,)
+    bucket_group._nep_nccl_expert_stride = 40
     bucket_group._nep_runtime_config = {
         "ep_rank": 0,
         "local_ep_size": 8,
@@ -1225,7 +1062,11 @@ def test_nep_two_level_gather_staged_phase_advances_queued_batch():
         }
     ]
 
-    assert bucket_group._finish_nep_nccl_process_group_dispatch_batches(pending)
+    scatter_context_batches = []
+    assert bucket_group._finish_nep_nccl_process_group_dispatch_batches(
+        pending, scatter_context_batches
+    )
+    assert scatter_context_batches == []
     assert calls == [(next_task_batch, dispatch_stream)]
     assert pending == [
         {
@@ -1373,7 +1214,7 @@ def test_nep_nccl_process_group_dispatch_tasks_share_one_ordered_stream(monkeypa
     bucket_group._nep_runtime_config = {}
     bucket_group._nep_dispatch_boundary_launch = True
     bucket_group.is_first_batch = False
-    bucket_group._nep_nccl_scheduler_state = {}
+    bucket_group._nep_nccl_scheduler_state = {"comm_streams": {}}
     bucket_group._nep_nccl_streams = {}
     created_streams = []
 
@@ -1400,7 +1241,7 @@ def test_nep_nccl_edp_uses_distinct_shared_ordered_stream(monkeypatch):
     bucket_group._nep_runtime_config = {}
     bucket_group._nep_dispatch_boundary_launch = True
     bucket_group.is_first_batch = False
-    bucket_group._nep_nccl_scheduler_state = {}
+    bucket_group._nep_nccl_scheduler_state = {"comm_streams": {}}
     bucket_group._nep_nccl_streams = {}
     created_streams = []
 
@@ -1434,7 +1275,9 @@ def test_nep_nccl_owner_prep_leaves_gradient_scaling_to_native_ddp():
         grad_data=grad_data, gradient_scaling_factor=0.25, params_with_extra_main_grads=[]
     )
     bucket_group._nep_nccl_prepped_experts = set()
-    bucket_group._nep_nccl_owner_entries = lambda owner: [{"expert_id": 3, "bucket": bucket}]
+    bucket_group._nep_nccl_owner_entries = lambda owner: [
+        {"expert_id": 3, "entry_key": (3, 0), "bucket": bucket}
+    ]
     bucket_group._foreach_copy_ = lambda destinations, sources: None
 
     bucket_group._prep_nep_nccl_owner_entries_for_sync(0)
@@ -1488,16 +1331,8 @@ def test_nep_nccl_grouped_contexts_order_scatter_once_and_finish_at_final_drain(
         native_group.grad_reduce_handle = None
 
     native_group.finish_grad_sync = finish_native_ddp
-    contexts = [
-        {"owner_ep_rank": 0, "native_edp_started": True},
-        {"owner_ep_rank": 0, "native_edp_started": True},
-    ]
-    native_state = {
-        "group": native_group,
-        "contexts": contexts,
-        "finished": False,
-        "scatter_dependency_ordered": False,
-    }
+    contexts = [{"owner_ep_rank": 0}, {"owner_ep_rank": 0}]
+    native_state = {"group": native_group, "finished": False, "scatter_dependency_ordered": False}
     for context in contexts:
         context["native_edp_state"] = native_state
     bucket_group._nep_runtime_config = {"ep_rank": 0}
@@ -1520,7 +1355,6 @@ def test_nep_nccl_grouped_contexts_order_scatter_once_and_finish_at_final_drain(
     assert calls == ["finish"]
     assert fake_work.wait_calls == 1
     assert native_state["finished"]
-    assert not any(context["native_edp_started"] for context in contexts)
     assert bucket_group._nep_nccl_active_native_edp_states == []
 
 
@@ -1603,7 +1437,6 @@ def test_nep_dispatch_boundary_enqueues_without_launch_barriers(monkeypatch):
         group._nep_dispatch_boundary_ready = False
         group._nep_dispatch_boundary_launched = False
         group._nep_dispatch_boundary_launching = False
-        group._nep_dispatch_boundary_wait_logged = False
         group._nep_nccl_ready = True
         group._nep_dispatch_boundary_inputs_ready = lambda: True
         group._get_nep_nccl_comm_stream = lambda slot: completion_stream
@@ -1670,13 +1503,12 @@ def test_nep_end_iteration_scatter_retains_persistent_payload_without_clone(monk
     completion_event = object()
     ddp._nep_end_iteration_scatter_context_batches = []
 
-    ddp._defer_nep_scatter_context_batches_to_iteration_end([[context]], completion_event, "layer")
+    ddp._defer_nep_scatter_context_batches_to_iteration_end([[context]], completion_event)
 
-    saved_batches, saved_completion, label = ddp._nep_end_iteration_scatter_context_batches[0]
+    saved_batches, saved_completion = ddp._nep_end_iteration_scatter_context_batches[0]
     assert saved_batches == [[context]]
     assert saved_batches[0][0]["chunk"] is chunk
     assert saved_completion is completion_event
-    assert label == "layer"
     assert calls == [(0, 1)]
 
 
@@ -1698,7 +1530,7 @@ def test_nep_end_iteration_scatter_marks_every_two_level_gather_context():
     scatter_context["scatter_contexts"] = tuple(contexts)
     ddp._nep_end_iteration_scatter_context_batches = []
 
-    ddp._defer_nep_scatter_context_batches_to_iteration_end([[scatter_context]], object(), "layer")
+    ddp._defer_nep_scatter_context_batches_to_iteration_end([[scatter_context]], object())
 
     assert calls == [(0, 0, 0), (1, 0, 1)]
 
@@ -1732,8 +1564,8 @@ def test_nep_end_iteration_scatter_materializes_canonical_order():
     first_completion_event = object()
     final_completion_event = object()
     ddp._nep_end_iteration_scatter_context_batches = [
-        ([contexts[:2]], first_completion_event, "decoder.layers.1.mlp"),
-        ([contexts[2:]], final_completion_event, "decoder.layers.3.mlp"),
+        ([contexts[:2]], first_completion_event),
+        ([contexts[2:]], final_completion_event),
     ]
     ddp._queue_nep_scatter_context_batches = lambda *args, **kwargs: calls.append((args, kwargs))
 
@@ -1745,7 +1577,7 @@ def test_nep_end_iteration_scatter_materializes_canonical_order():
     assert [
         context["group"]._nep_nccl_group_index for context in queued[1]["scatter_contexts"]
     ] == [0, 2]
-    assert calls[0][0][1:] == (final_completion_event, "end_iteration_scatter")
+    assert calls[0][0][1:] == (final_completion_event,)
     assert calls[0][1] == {}
     assert ddp._nep_end_iteration_scatter_completion_events == [first_completion_event]
     assert not ddp._nep_end_iteration_scatter_context_batches
@@ -1777,7 +1609,6 @@ def test_nep_dispatch_boundary_waits_for_local_inputs(monkeypatch):
     group._nep_dispatch_boundary_ready = True
     group._nep_dispatch_boundary_launched = False
     group._nep_dispatch_boundary_launching = False
-    group._nep_dispatch_boundary_wait_logged = False
     group._nep_dispatch_boundary_inputs_ready = lambda: False
     calls = []
     ddp._nep_dispatch_waiting_groups = None
@@ -1789,7 +1620,6 @@ def test_nep_dispatch_boundary_waits_for_local_inputs(monkeypatch):
 
     assert not ddp._launch_nep_dispatch_boundary_tasks((group,), "decoder.layers.1.mlp")
     assert calls == []
-    assert group._nep_dispatch_boundary_wait_logged
 
 
 def test_nep_nccl_combined_slot_owner_layout_round_trip():
@@ -1800,10 +1630,10 @@ def test_nep_nccl_combined_slot_owner_layout_round_trip():
     second_grad = torch.tensor([20.0, 21.0, 22.0])
     bucket_group._nep_runtime_config = {}
     bucket_group._nep_nccl_owner_layout = {"owner_expert_slots": [[0, 1], [2, 3]]}
-    bucket_group._nep_nccl_slot_numel = 5
     bucket_group._nep_nccl_slot_numels = (2, 3)
     bucket_group._nep_nccl_slot_offsets = (0, 2)
     bucket_group._nep_nccl_expert_stride = 5
+    bucket_group._nep_nccl_tensor_view_cache = {}
     bucket_group._nep_nccl_entries = [
         {
             "expert_id": 1,
@@ -1842,10 +1672,22 @@ def test_nep_nccl_dense_source_payload_round_trip():
     source_bucket = type("Bucket", (), {"grad_data": source_grad})()
     bucket_group._nep_runtime_config = {"expert_placement": [[0, 1], [4, 5], [2, 6], [3, 7]]}
     bucket_group._nep_nccl_owner_layout = {"owner_expert_slots": [[0, 1, 2, 3], [4, 5, 6, 7]]}
-    bucket_group._nep_nccl_slot_numel = 4
+    bucket_group._nep_nccl_slot_numels = (4,)
+    bucket_group._nep_nccl_slot_offsets = (0,)
+    bucket_group._nep_nccl_expert_stride = 4
+    bucket_group._nep_nccl_segment_cache = {}
+    bucket_group._nep_nccl_tensor_view_cache = {}
     bucket_group._nep_nccl_entries = [
-        {"expert_id": 2, "bucket": source_bucket, "numel": source_grad.numel()}
+        {
+            "expert_id": 2,
+            "slot_index": 0,
+            "slot_offset": 0,
+            "entry_key": (2, 0),
+            "bucket": source_bucket,
+            "numel": source_grad.numel(),
+        }
     ]
+    bucket_group._nep_nccl_entry_by_key = {(2, 0): bucket_group._nep_nccl_entries[0]}
 
     payload = torch.empty(4)
     bucket_group._pack_nep_nccl_source_payload(0, 2, 0, 16, payload)
