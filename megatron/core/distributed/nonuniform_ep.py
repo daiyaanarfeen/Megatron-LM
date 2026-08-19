@@ -79,91 +79,11 @@ def _get_nep_nccl_max_gather_bytes() -> int:
     return max_gather_bytes
 
 
-def _get_nep_nccl_target_chunks() -> Optional[int]:
-    value = os.getenv("MEGATRON_NONUNIFORM_EP_NCCL_TARGET_CHUNKS")
-    if value in (None, ""):
-        return None
-    target_chunks = int(value)
-    if target_chunks <= 0:
-        raise RuntimeError("MEGATRON_NONUNIFORM_EP_NCCL_TARGET_CHUNKS must be positive")
-    return target_chunks
-
-
-def _get_nep_nccl_scatter_chunks() -> int:
-    value = os.getenv("MEGATRON_NONUNIFORM_EP_NCCL_SCATTER_CHUNKS", "1")
-    scatter_chunks = int(value)
-    if scatter_chunks <= 0:
-        raise RuntimeError("MEGATRON_NONUNIFORM_EP_NCCL_SCATTER_CHUNKS must be positive")
-    return scatter_chunks
-
-
-def _build_nep_nccl_scatter_chunk_ranges(
-    chunk_start: int, chunk_end: int, remote_segments: List[Tuple[int, int]], scatter_chunks: int
-) -> List[Tuple[int, int]]:
-    """Partition cumulative remote payload while covering the full owner-layout range."""
-    if chunk_start < 0 or chunk_end < chunk_start:
-        raise RuntimeError(
-            "NEP Scatter chunk range must satisfy " f"0 <= {chunk_start} <= {chunk_end}"
-        )
-    if scatter_chunks <= 0:
-        raise RuntimeError("NEP Scatter chunk count must be positive")
-    if chunk_start == chunk_end:
-        return []
-
-    remote_segments = sorted(remote_segments)
-    previous_end = chunk_start
-    for segment_start, segment_end in remote_segments:
-        if (
-            segment_start < previous_end
-            or segment_start < chunk_start
-            or segment_end < segment_start
-            or segment_end > chunk_end
-        ):
-            raise RuntimeError(
-                "NEP Scatter remote segments must be ordered, disjoint, and "
-                "contained in the owner-layout chunk"
-            )
-        previous_end = segment_end
-
-    remote_numel = sum(end - start for start, end in remote_segments)
-    num_chunks = min(scatter_chunks, remote_numel)
-    if num_chunks <= 1:
-        return [(chunk_start, chunk_end)]
-
-    boundaries = [chunk_start]
-    segment_index = 0
-    cumulative_before_segment = 0
-    for partition_index in range(1, num_chunks):
-        target = (remote_numel * partition_index + num_chunks - 1) // num_chunks
-        while (
-            cumulative_before_segment
-            + remote_segments[segment_index][1]
-            - remote_segments[segment_index][0]
-            < target
-        ):
-            cumulative_before_segment += (
-                remote_segments[segment_index][1] - remote_segments[segment_index][0]
-            )
-            segment_index += 1
-        segment_start, _ = remote_segments[segment_index]
-        boundaries.append(segment_start + target - cumulative_before_segment)
-    boundaries.append(chunk_end)
-    return list(zip(boundaries, boundaries[1:]))
-
-
-def _build_nep_nccl_chunk_ranges(
-    owner_numel: int, max_chunk_numel: int, target_chunks: Optional[int]
-) -> List[Tuple[int, int]]:
-    """Partition one owner payload without changing the one-chunk task."""
-    if owner_numel == 0:
-        return []
-    byte_cap_chunks = (owner_numel + max_chunk_numel - 1) // max_chunk_numel
-    num_chunks = max(byte_cap_chunks, target_chunks or 1)
-    chunk_numel = (owner_numel + num_chunks - 1) // num_chunks
-    return [
-        (start, min(start + chunk_numel, owner_numel))
-        for start in range(0, owner_numel, chunk_numel)
-    ]
+def _require_single_nep_nccl_chunk(name: str) -> None:
+    """Reject chunking modes outside the single-chunk path used by NEP."""
+    value = int(os.getenv(name, "1"))
+    if value != 1:
+        raise RuntimeError(f"{name} must be 1; multi-chunk NEP is not supported")
 
 
 def _get_nep_nccl_async_chunk_window() -> int:
@@ -785,10 +705,15 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         expert_stride = self._nep_nccl_expert_stride
 
         owner_numel = experts_per_owner * expert_stride
-        target_chunks = _get_nep_nccl_target_chunks()
-        max_gather_bytes = _get_nep_nccl_max_gather_bytes()
-        byte_cap_numel = max(1, max_gather_bytes // self.buckets[0].grad_data.element_size())
-        chunk_ranges = _build_nep_nccl_chunk_ranges(owner_numel, byte_cap_numel, target_chunks)
+        _require_single_nep_nccl_chunk("MEGATRON_NONUNIFORM_EP_NCCL_TARGET_CHUNKS")
+        _require_single_nep_nccl_chunk("MEGATRON_NONUNIFORM_EP_NCCL_SCATTER_CHUNKS")
+        owner_bytes = owner_numel * self.buckets[0].grad_data.element_size()
+        if owner_bytes > _get_nep_nccl_max_gather_bytes():
+            raise RuntimeError(
+                "NEP owner payload exceeds MEGATRON_NONUNIFORM_EP_NCCL_MAX_GATHER_BYTES; "
+                "multi-chunk NEP is not supported"
+            )
+        chunk_ranges = [] if owner_numel == 0 else [(0, owner_numel)]
         num_chunks = len(chunk_ranges)
 
         self._nep_nccl_owner_layout = {
@@ -1033,24 +958,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             for _, _, _, numel in self._nep_nccl_owner_source_segments(
                 owner_ep_rank, source_ep_rank, chunk_start, chunk_end
             )
-        )
-
-    def _nep_nccl_scatter_chunk_ranges(
-        self, owner_ep_rank: int, chunk_start: int, chunk_end: int, scatter_chunks: int
-    ) -> List[Tuple[int, int]]:
-        """Return ranges with balanced network payload, including owner-local gaps."""
-        remote_segments = []
-        for source_ep_rank in self._nep_nccl_owner_source_ranks(owner_ep_rank):
-            if source_ep_rank == owner_ep_rank:
-                continue
-            remote_segments.extend(
-                (chunk_start + chunk_offset, chunk_start + chunk_offset + numel)
-                for _, chunk_offset, _, numel in self._nep_nccl_owner_source_segments(
-                    owner_ep_rank, source_ep_rank, chunk_start, chunk_end
-                )
-            )
-        return _build_nep_nccl_scatter_chunk_ranges(
-            chunk_start, chunk_end, remote_segments, scatter_chunks
         )
 
     def _copy_nep_nccl_source_payload(
@@ -2042,7 +1949,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             scatter_context["group"]._start_nep_nccl_owner_task_scatter(scatter_context)
 
     def _prepare_nep_nccl_owner_task_scatter_train(self, context: dict) -> dict:
-        """Prepare every chunk in one Scatter train without submitting collectives."""
+        """Prepare the single Scatter descriptor without submitting it."""
         scatter_contexts = context.get("scatter_contexts")
         ordered_native_states = set()
         for task_context in scatter_contexts or (context,):
@@ -2054,44 +1961,24 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             if native_state is not None:
                 ordered_native_states.add(id(native_state))
 
-        scatter_chunks = _get_nep_nccl_scatter_chunks()
-        if scatter_contexts is not None:
-            if scatter_chunks != 1:
-                raise RuntimeError(
-                    "Two-level NEP Gather currently requires "
-                    "MEGATRON_NONUNIFORM_EP_NCCL_SCATTER_CHUNKS=1"
-                )
-            descriptors = [
-                self._prepare_nep_nccl_owner_all_to_all_scatter_batch(list(scatter_contexts))
-            ]
-        else:
-            scatter_ranges = self._nep_nccl_scatter_chunk_ranges(
+        if scatter_contexts is None:
+            descriptor = self._prepare_nep_nccl_owner_all_to_all_scatter(
                 context["owner_ep_rank"],
+                context["chunk_index"],
                 context["chunk_start"],
                 context["chunk_end"],
-                scatter_chunks,
+                context["chunk"],
+                context["buffer_slot_key"],
+                async_op=context["async_op"],
             )
-            descriptors = []
-            for scatter_chunk_index, (scatter_start, scatter_end) in enumerate(scatter_ranges):
-                local_start = scatter_start - context["chunk_start"]
-                local_end = scatter_end - context["chunk_start"]
-                descriptors.append(
-                    self._prepare_nep_nccl_owner_all_to_all_scatter(
-                        context["owner_ep_rank"],
-                        context["chunk_index"],
-                        scatter_start,
-                        scatter_end,
-                        context["chunk"][local_start:local_end],
-                        context["buffer_slot_key"],
-                        async_op=context["async_op"],
-                        scatter_chunk_index=scatter_chunk_index,
-                    )
-                )
-
+        else:
+            descriptor = self._prepare_nep_nccl_owner_all_to_all_scatter_batch(
+                list(scatter_contexts)
+            )
         return {
             "group": self,
             "context": context,
-            "descriptors": descriptors,
+            "descriptors": [descriptor],
             "next_descriptor": 0,
             "task_marked": False,
         }
@@ -2791,7 +2678,6 @@ def _configure_nep_end_iteration_scatter_buffers(
     state = bucket_groups[0]._nep_nccl_scheduler_state
     cache = state["gather_buf_cache"]
     slots = set()
-    scatter_chunks = _get_nep_nccl_scatter_chunks()
     two_level_scatter_tasks = {}
     for task in state["task_sequence"]:
         group = task["group"]
@@ -2853,11 +2739,6 @@ def _configure_nep_end_iteration_scatter_buffers(
         continue
 
     if two_level_scatter_tasks:
-        if scatter_chunks != 1:
-            raise RuntimeError(
-                "Two-level NEP Gather currently requires "
-                "MEGATRON_NONUNIFORM_EP_NCCL_SCATTER_CHUNKS=1"
-            )
         for (edp_bucket_index, owner_ep_rank), tasks in two_level_scatter_tasks.items():
             representative = tasks[0]["group"]
             dtype = representative.buckets[0].grad_data.dtype

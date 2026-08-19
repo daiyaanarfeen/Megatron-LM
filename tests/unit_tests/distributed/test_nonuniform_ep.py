@@ -20,10 +20,8 @@ from megatron.core.distributed.nonuniform_common import (
 from megatron.core.distributed.nonuniform_ep import (
     NonuniformEPDistributedDataParallel,
     NonuniformEPNCCLParamAndGradBucketGroup,
-    _build_nep_nccl_scatter_chunk_ranges,
     _compute_nep_distopt_owner_layout,
     _ExpertBucketSpec,
-    _get_nep_nccl_scatter_chunks,
     _group_expert_bucket_specs_in_backward_order,
     _nep_distopt_proxy_name,
     _nep_owner_ddp_config,
@@ -814,117 +812,71 @@ def test_nep_end_iteration_scatter_uses_persistent_task_slots():
     bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
         NonuniformEPNCCLParamAndGradBucketGroup
     )
-    bucket_group._nep_nccl_owner_layout = {"min_ep_size": 3, "num_chunks": 2}
-    bucket_group._nep_nccl_scheduler_state = {"group_slot_offsets": (0, 6)}
+    bucket_group._nep_nccl_owner_layout = {"min_ep_size": 3, "num_chunks": 1}
+    bucket_group._nep_nccl_scheduler_state = {"group_slot_offsets": (0, 3)}
     bucket_group._nep_nccl_group_index = 0
 
     first_group_slots = [
-        bucket_group._get_nep_nccl_task_buffer_slot(owner_ep_rank, chunk_index)
-        for owner_ep_rank in range(3)
-        for chunk_index in range(2)
+        bucket_group._get_nep_nccl_task_buffer_slot(owner_ep_rank, 0) for owner_ep_rank in range(3)
     ]
     bucket_group._nep_nccl_group_index = 1
     second_group_slots = [
-        bucket_group._get_nep_nccl_task_buffer_slot(owner_ep_rank, chunk_index)
-        for owner_ep_rank in range(3)
-        for chunk_index in range(2)
+        bucket_group._get_nep_nccl_task_buffer_slot(owner_ep_rank, 0) for owner_ep_rank in range(3)
     ]
 
-    assert first_group_slots == list(range(6))
-    assert second_group_slots == list(range(6, 12))
+    assert first_group_slots == list(range(3))
+    assert second_group_slots == list(range(3, 6))
 
 
-@pytest.mark.parametrize(
-    ("target_chunks", "max_gather_bytes", "expected_chunks", "expected_chunk_numel"),
-    ((2, 1 << 30, 2, 40), (4, 1 << 30, 4, 20), (4, 64, 5, 16)),
-)
-def test_nep_nccl_owner_layout_targets_balanced_chunks_with_byte_cap(
-    monkeypatch, target_chunks, max_gather_bytes, expected_chunks, expected_chunk_numel
-):
-    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_TARGET_CHUNKS", str(target_chunks))
-    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_MAX_GATHER_BYTES", str(max_gather_bytes))
-    bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
-        NonuniformEPNCCLParamAndGradBucketGroup
-    )
-    bucket_group._nep_nccl_owner_layout = None
-    bucket_group._nep_nccl_slot_numels = (40,)
-    bucket_group._nep_nccl_slot_offsets = (0,)
-    bucket_group._nep_nccl_expert_stride = 40
-    bucket_group._nep_runtime_config = {
-        "ep_rank": 0,
-        "local_ep_size": 8,
-        "min_ep_size": 4,
-        "expert_placement": None,
-    }
-    bucket_group.buckets = [SimpleNamespace(grad_data=torch.empty(1, dtype=torch.float32))]
+@pytest.mark.parametrize("target_chunks", (None, "1"))
+def test_nep_nccl_owner_layout_uses_validated_single_chunk(monkeypatch, target_chunks):
+    if target_chunks is None:
+        monkeypatch.delenv("MEGATRON_NONUNIFORM_EP_NCCL_TARGET_CHUNKS", raising=False)
+    else:
+        monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_TARGET_CHUNKS", target_chunks)
+    bucket_group = _make_single_chunk_owner_layout_group()
 
     layout = bucket_group._get_nep_nccl_owner_layout()
 
     assert layout["owner_numel"] == 80
-    assert layout["num_chunks"] == expected_chunks
-    assert max(end - start for start, end in layout["chunk_ranges"]) == expected_chunk_numel
+    assert layout["num_chunks"] == 1
+    assert layout["chunk_ranges"] == [(0, 80)]
 
 
-def test_nep_nccl_one_target_has_identical_scheduler_inputs_to_original(monkeypatch):
-    def make_group(target_chunks):
-        if target_chunks is None:
-            monkeypatch.delenv("MEGATRON_NONUNIFORM_EP_NCCL_TARGET_CHUNKS", raising=False)
-        else:
-            monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_TARGET_CHUNKS", str(target_chunks))
-        group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
-            NonuniformEPNCCLParamAndGradBucketGroup
-        )
-        group._nep_nccl_owner_layout = None
-        group._nep_nccl_slot_numels = (40,)
-        group._nep_nccl_slot_offsets = (0,)
-        group._nep_nccl_expert_stride = 40
-        group._nep_nccl_group_index = 0
-        group._nep_nccl_scheduler_state = {"group_slot_offsets": (0,)}
-        group._nep_runtime_config = {
-            "ep_rank": 0,
-            "local_ep_size": 8,
-            "min_ep_size": 4,
-            "expert_placement": None,
-        }
-        group.buckets = [SimpleNamespace(grad_data=torch.empty(1, dtype=torch.float32))]
-        group._get_nep_nccl_owner_layout()
-        return group
-
-    original = make_group(None)
-    one_chunk = make_group(1)
-
-    def scheduler_inputs(group):
-        layout = group._get_nep_nccl_owner_layout()
-        return [
-            (owner, chunk, start, end, group._get_nep_nccl_task_buffer_slot(owner, chunk))
-            for owner in range(layout["min_ep_size"])
-            for chunk, (start, end) in enumerate(layout["chunk_ranges"])
-        ]
-
-    assert original._get_nep_nccl_owner_layout()["chunk_ranges"] == [(0, 80)]
-    assert one_chunk._get_nep_nccl_owner_layout()["chunk_ranges"] == [(0, 80)]
-    assert scheduler_inputs(one_chunk) == scheduler_inputs(original)
-
-
-def test_nep_nccl_owner_layout_rejects_nonpositive_target_chunks(monkeypatch):
-    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_TARGET_CHUNKS", "0")
-    bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
-        NonuniformEPNCCLParamAndGradBucketGroup
-    )
-    bucket_group._nep_nccl_owner_layout = None
-    bucket_group._nep_nccl_slot_numels = (40,)
-    bucket_group._nep_nccl_slot_offsets = (0,)
-    bucket_group._nep_nccl_expert_stride = 40
-    bucket_group._nep_runtime_config = {
+def _make_single_chunk_owner_layout_group():
+    group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(NonuniformEPNCCLParamAndGradBucketGroup)
+    group._nep_nccl_owner_layout = None
+    group._nep_nccl_slot_numels = (40,)
+    group._nep_nccl_slot_offsets = (0,)
+    group._nep_nccl_expert_stride = 40
+    group._nep_nccl_group_index = 0
+    group._nep_nccl_scheduler_state = {"group_slot_offsets": (0,)}
+    group._nep_runtime_config = {
         "ep_rank": 0,
         "local_ep_size": 8,
         "min_ep_size": 4,
         "expert_placement": None,
     }
-    bucket_group.buckets = [SimpleNamespace(grad_data=torch.empty(1, dtype=torch.float32))]
+    group.buckets = [SimpleNamespace(grad_data=torch.empty(1, dtype=torch.float32))]
+    return group
 
-    with pytest.raises(RuntimeError, match="TARGET_CHUNKS must be positive"):
-        bucket_group._get_nep_nccl_owner_layout()
+
+def test_nep_nccl_owner_layout_rejects_multichunk_modes(monkeypatch):
+    for variable in (
+        "MEGATRON_NONUNIFORM_EP_NCCL_TARGET_CHUNKS",
+        "MEGATRON_NONUNIFORM_EP_NCCL_SCATTER_CHUNKS",
+    ):
+        monkeypatch.setenv(variable, "2")
+        with pytest.raises(RuntimeError, match=f"{variable} must be 1"):
+            _make_single_chunk_owner_layout_group()._get_nep_nccl_owner_layout()
+        monkeypatch.delenv(variable)
+
+
+def test_nep_nccl_owner_layout_rejects_payload_above_byte_cap(monkeypatch):
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_MAX_GATHER_BYTES", "319")
+
+    with pytest.raises(RuntimeError, match="owner payload exceeds"):
+        _make_single_chunk_owner_layout_group()._get_nep_nccl_owner_layout()
 
 
 def test_nep_packed_scatter_orders_every_unique_edp_dependency(monkeypatch):
@@ -1078,44 +1030,7 @@ def test_nep_two_level_gather_staged_phase_advances_queued_batch():
     ]
 
 
-@pytest.mark.parametrize(
-    ("chunk_start", "chunk_end", "remote_segments", "scatter_chunks", "expected"),
-    (
-        (0, 80, [(40, 80)], 1, [(0, 80)]),
-        (0, 80, [(40, 80)], 2, [(0, 60), (60, 80)]),
-        (20, 60, [(40, 60)], 4, [(20, 45), (45, 50), (50, 55), (55, 60)]),
-        (0, 60, [(10, 20), (40, 50)], 4, [(0, 15), (15, 20), (20, 45), (45, 60)]),
-        (0, 10, [(0, 10)], 4, [(0, 3), (3, 5), (5, 8), (8, 10)]),
-    ),
-)
-def test_nep_nccl_scatter_chunk_ranges_balance_remote_payload(
-    chunk_start, chunk_end, remote_segments, scatter_chunks, expected
-):
-    assert (
-        _build_nep_nccl_scatter_chunk_ranges(
-            chunk_start, chunk_end, remote_segments, scatter_chunks
-        )
-        == expected
-    )
-
-
-@pytest.mark.parametrize(
-    ("scatter_chunks", "expected_ranges"),
-    (
-        (None, [(0, 16)]),
-        ("1", [(0, 16)]),
-        ("2", [(0, 12), (12, 16)]),
-        ("4", [(0, 10), (10, 12), (12, 14), (14, 16)]),
-    ),
-)
-def test_nep_nccl_scatter_chunks_share_one_ordered_code_path(
-    monkeypatch, scatter_chunks, expected_ranges
-):
-    if scatter_chunks is None:
-        monkeypatch.delenv("MEGATRON_NONUNIFORM_EP_NCCL_SCATTER_CHUNKS", raising=False)
-    else:
-        monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_SCATTER_CHUNKS", scatter_chunks)
-
+def test_nep_nccl_scatter_uses_one_ordered_descriptor():
     bucket_group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
         NonuniformEPNCCLParamAndGradBucketGroup
     )
@@ -1133,48 +1048,26 @@ def test_nep_nccl_scatter_chunks_share_one_ordered_code_path(
     bucket_group._nep_runtime_config = {"ep_rank": 0}
     bucket_group.ddp_config = SimpleNamespace(use_distributed_optimizer=False)
     bucket_group.is_first_batch = False
-    bucket_group._nep_nccl_scatter_chunk_ranges = (
-        lambda owner, start, end, chunks: _build_nep_nccl_scatter_chunk_ranges(
-            start, end, [(8, 16)], chunks
-        )
-    )
     bucket_group._order_nep_nccl_owner_edp_before_scatter = lambda task: calls.append(
         ("order", task)
     )
 
-    def prepare_scatter(
-        owner, chunk_index, start, end, chunk, slot_key, async_op, scatter_chunk_index=0
-    ):
-        descriptor = {
-            "scatter_chunk_index": scatter_chunk_index,
-            "start": start,
-            "end": end,
-            "chunk": chunk.tolist(),
-        }
+    def prepare_scatter(owner, chunk_index, start, end, chunk, slot_key, async_op):
+        descriptor = {"index": 0}
         calls.append(
-            (
-                "prepare",
-                owner,
-                chunk_index,
-                start,
-                end,
-                chunk.tolist(),
-                slot_key,
-                async_op,
-                scatter_chunk_index,
-            )
+            ("prepare", owner, chunk_index, start, end, chunk.tolist(), slot_key, async_op)
         )
         return descriptor
 
     bucket_group._prepare_nep_nccl_owner_all_to_all_scatter = prepare_scatter
     bucket_group._submit_nep_nccl_owner_all_to_all_scatter = lambda descriptor: calls.append(
-        ("submit", descriptor["scatter_chunk_index"])
+        ("submit", descriptor["index"])
     )
     bucket_group._order_nep_nccl_owner_all_to_all_scatter_completion = (
-        lambda descriptor: calls.append(("order_completion", descriptor["scatter_chunk_index"]))
+        lambda descriptor: calls.append(("order_completion", descriptor["index"]))
     )
     bucket_group._finish_nep_nccl_owner_all_to_all_scatter = lambda descriptor: calls.append(
-        ("copyback", descriptor["scatter_chunk_index"])
+        ("copyback", descriptor["index"])
     )
     bucket_group._mark_nep_nccl_task_started = lambda owner, chunk_index: calls.append(
         ("mark", owner, chunk_index)
@@ -1182,29 +1075,14 @@ def test_nep_nccl_scatter_chunks_share_one_ordered_code_path(
 
     bucket_group._start_nep_nccl_owner_task_scatter(context)
 
-    assert calls[0] == ("order", context)
-    prepare_calls = [call for call in calls if call[0] == "prepare"]
-    assert [(call[3], call[4]) for call in prepare_calls] == expected_ranges
-    assert [call[5] for call in prepare_calls] == [
-        owner_chunk[start:end].tolist() for start, end in expected_ranges
+    assert calls == [
+        ("order", context),
+        ("prepare", 0, 7, 0, 16, owner_chunk.tolist(), ("slot",), True),
+        ("submit", 0),
+        ("order_completion", 0),
+        ("copyback", 0),
+        ("mark", 0, 7),
     ]
-    assert [call[8] for call in prepare_calls] == list(range(len(expected_ranges)))
-    expected_chunk_indices = list(range(len(expected_ranges)))
-    expected_phases = ["prepare"] * len(expected_ranges)
-    for _ in expected_chunk_indices:
-        expected_phases.extend(["submit", "order_completion", "copyback"])
-    assert [call[0] for call in calls[1:-1]] == expected_phases
-    assert [call[1] for call in calls if call[0] == "submit"] == expected_chunk_indices
-    assert [call[1] for call in calls if call[0] == "order_completion"] == expected_chunk_indices
-    assert [call[1] for call in calls if call[0] == "copyback"] == expected_chunk_indices
-    assert calls[-1] == ("mark", 0, 7)
-
-
-def test_nep_nccl_scatter_chunks_rejects_nonpositive_value(monkeypatch):
-    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_NCCL_SCATTER_CHUNKS", "0")
-
-    with pytest.raises(RuntimeError, match="SCATTER_CHUNKS must be positive"):
-        _get_nep_nccl_scatter_chunks()
 
 
 def test_nep_nccl_process_group_dispatch_tasks_share_one_ordered_stream(monkeypatch):
