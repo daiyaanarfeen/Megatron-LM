@@ -256,6 +256,9 @@ def loss_func(
         num_tokens = loss_mask.sum().clone().detach().to(torch.int)
         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
 
+    if getattr(args, "nonuniform_disable_nongrad_sync_collectives", False):
+        report = {'lm loss': loss.clone().detach().view(1)}
+
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
     if args.check_for_nan_in_loss_and_grad:
