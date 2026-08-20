@@ -5,7 +5,10 @@ import math
 from datetime import timedelta
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+import torch
+
 from .. import parallel_state
+from ..utils import internal_api
 
 _NONUNIFORM_EP_RUNTIME_CONFIG: Optional[dict] = None
 
@@ -19,6 +22,46 @@ def set_nonuniform_ep_runtime_config(runtime_config: Optional[dict]) -> None:
 def get_nonuniform_ep_runtime_config() -> Optional[dict]:
     """Return the opt-in NEP runtime metadata registered by the entrypoint."""
     return _NONUNIFORM_EP_RUNTIME_CONFIG
+
+
+@internal_api
+class ExactUniformRoutingSTE(torch.autograd.Function):
+    """Generate deterministic logits with exactly uniform expert assignment counts."""
+
+    @staticmethod
+    def forward(ctx, logits: torch.Tensor, topk: int) -> torch.Tensor:
+        """Replace router logits while preserving an identity backward pass."""
+        if logits.dim() < 2:
+            raise ValueError(
+                f"Expected logits shaped [..., num_experts], got {logits.dim()} dimensions."
+            )
+
+        num_experts = logits.shape[-1]
+        num_tokens = logits.numel() // num_experts
+        if not 0 < topk <= num_experts:
+            raise ValueError(f"topk must be in [1, {num_experts}], got {topk}.")
+        num_assignments = num_tokens * topk
+        if num_assignments % num_experts != 0:
+            raise ValueError(
+                "Exact-uniform routing requires num_tokens * topk to be divisible by "
+                f"num_experts, got {num_tokens} * {topk} % {num_experts} != 0."
+            )
+
+        expert_indices = torch.arange(num_assignments, device=logits.device).view(num_tokens, topk)
+        expert_indices.remainder_(num_experts)
+        uniform_logits = torch.full_like(logits, -1.0)
+        uniform_logits.view(num_tokens, num_experts).scatter_(1, expert_indices, 1.0)
+        return uniform_logits
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Propagate router gradients through the benchmark logits."""
+        return grad_output, None
+
+
+def apply_exact_uniform_routing_logits(logits: torch.Tensor, topk: int) -> torch.Tensor:
+    """Apply deterministic logits that assign every expert the same number of tokens."""
+    return ExactUniformRoutingSTE.apply(logits, topk)
 
 
 def get_nonuniform_ep_local_expert_indices() -> Optional[List[int]]:

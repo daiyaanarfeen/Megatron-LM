@@ -5,6 +5,7 @@ from typing import Optional, Union
 
 import torch
 
+from megatron.core.distributed.nonuniform_common import apply_exact_uniform_routing_logits
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -16,7 +17,6 @@ from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
     ProcessGroupCollection,
     apply_biased_logits,
-    apply_exact_uniform_routing_logits,
     apply_random_logits,
     apply_router_token_dropping,
     compute_routing_scores_for_aux_loss,

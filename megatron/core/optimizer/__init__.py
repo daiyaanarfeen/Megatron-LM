@@ -479,14 +479,16 @@ def _get_param_groups_and_buffers(
                 return iter(params_with_names)
 
         param_groups = _get_param_groups([_NamedParametersView()], config, config_overrides)
-    else:
-        param_groups = _get_param_groups(model_chunks, config, config_overrides)
-        buffers = {}
-        for model_chunk_idx, model_chunk in enumerate(model_chunks):
-            if hasattr(model_chunk, buffer_name):
-                buffers[model_chunk_idx + model_chunk_offset] = getattr(model_chunk, buffer_name)
+        param_groups = list(filter(filter_fn, param_groups))
+        return param_groups, buffers
 
+    param_groups = _get_param_groups(model_chunks, config, config_overrides)
     param_groups = list(filter(filter_fn, param_groups))
+    buffers = {}
+    for model_chunk_idx, model_chunk in enumerate(model_chunks):
+        if hasattr(model_chunk, buffer_name):
+            buffers[model_chunk_idx + model_chunk_offset] = getattr(model_chunk, buffer_name)
+
     return param_groups, buffers
 
 

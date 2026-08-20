@@ -7,6 +7,7 @@ import torch
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.nonuniform_common import (
+    apply_exact_uniform_routing_logits,
     build_expert_axis_permutation,
     build_expert_to_ep_rank_map,
     compute_nonuniform_ep_dispatch_slots,
@@ -28,15 +29,128 @@ from megatron.core.distributed.nonuniform_ep import (
     _partition_expert_bucket_specs,
     _source_ep_ranks_for_owner,
 )
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.optimizer import _get_param_groups_and_buffers
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
+from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.router import Router
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAlltoAllTokenDispatcher,
     MoEFlexTokenDispatcher,
     _pad_nonuniform_flex_dispatch_slots,
 )
+from megatron.core.transformer.spec_utils import get_submodules
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import PARAM_READY_CALLBACK_ATTR
+from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_exact_uniform_routing_logits():
+    num_tokens = 4096
+    topk = 6
+    num_experts = 128
+    ep_size = 8
+    tp_size = 2
+    logits = torch.randn(num_tokens, num_experts, requires_grad=True)
+
+    uniform_logits = apply_exact_uniform_routing_logits(logits, topk)
+    selected_experts = uniform_logits.topk(topk, dim=1).indices
+    routing_map = torch.zeros_like(uniform_logits, dtype=torch.bool)
+    routing_map.scatter_(1, selected_experts, True)
+
+    expected_per_source_expert = num_tokens * topk // num_experts
+    source_expert_counts = routing_map.sum(dim=0)
+    torch.testing.assert_close(
+        source_expert_counts, torch.full_like(source_expert_counts, expected_per_source_expert)
+    )
+    torch.testing.assert_close(
+        routing_map.sum(dim=1), torch.full((num_tokens,), topk, dtype=torch.long)
+    )
+
+    num_local_experts = num_experts // ep_size
+    expected_peer_split = num_tokens * topk // ep_size
+    peer_splits = source_expert_counts.view(ep_size, num_local_experts).sum(dim=1)
+    torch.testing.assert_close(peer_splits, torch.full_like(peer_splits, expected_peer_split))
+
+    local_expert_m_splits = source_expert_counts[:num_local_experts] * tp_size * ep_size
+    torch.testing.assert_close(
+        local_expert_m_splits,
+        torch.full_like(local_expert_m_splits, expected_per_source_expert * tp_size * ep_size),
+    )
+
+    uniform_logits.sum().backward()
+    torch.testing.assert_close(logits.grad, torch.ones_like(logits))
+
+
+def test_exact_uniform_routing_requires_divisible_assignments():
+    logits = torch.empty(10, 6)
+    with pytest.raises(ValueError, match=r"num_tokens \* topk to be divisible"):
+        apply_exact_uniform_routing_logits(logits, 2)
+
+
+def test_exact_uniform_routing_config_contract():
+    base = dict(num_layers=1, hidden_size=16, num_attention_heads=4)
+    assert not TransformerConfig(**base).moe_router_force_uniform_routing
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        TransformerConfig(
+            **base, moe_router_force_uniform_routing=True, moe_router_force_load_balancing=True
+        )
+
+    with pytest.raises(ValueError, match="bias-update-rate 0"):
+        TransformerConfig(
+            **base,
+            moe_router_force_uniform_routing=True,
+            moe_router_enable_expert_bias=True,
+            moe_router_score_function="sigmoid",
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_force_uniform_routing():
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            use_cpu_initialization=True,
+            moe_router_load_balancing_type="aux_loss",
+            moe_router_topk=2,
+            moe_aux_loss_coeff=0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+        )
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(num_experts=4, moe_grouped_gemm=False).mlp
+        )
+        layer = MoELayer(config, submodules)
+        router = layer.router
+        assert isinstance(router, Router)
+        hidden_states = torch.randn(
+            (32, 2, config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        hidden_states.requires_grad = True
+        router.config.moe_router_force_uniform_routing = True
+
+        scores, routing_map = router(hidden_states)
+
+        torch.testing.assert_close(
+            routing_map.sum(dim=1), torch.full((64,), router.topk, device="cuda", dtype=torch.long)
+        )
+        torch.testing.assert_close(
+            routing_map.sum(dim=0), torch.full((4,), 32, device="cuda", dtype=torch.long)
+        )
+        expert_weights = torch.arange(router.num_experts, device="cuda", dtype=scores.dtype)
+        (scores * expert_weights).sum().backward()
+        assert hidden_states.grad is not None
+        assert router.weight.grad.norm() > 0
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_nonuniform_expert_gtp_aliases_match_inactive_egtp_groups(monkeypatch):
@@ -635,7 +749,7 @@ def test_flex_metadata_maps_logical_experts_to_padded_ep6_slots():
 
     routing_map = torch.eye(16, dtype=torch.bool)
     probs = torch.eye(16, dtype=torch.float32)
-    physical_map, physical_probs = dispatcher._initialize_metadata(routing_map, probs)
+    physical_map, physical_probs = dispatcher._initialize_nonuniform_metadata(routing_map, probs)
 
     assert physical_map.shape == (16, 6, 4)
     assert physical_probs.shape == (16, 6, 4)
