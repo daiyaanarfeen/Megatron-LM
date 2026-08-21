@@ -2,7 +2,7 @@
 """Hybrid pretraining entrypoint for opt-in nonuniform expert parallelism."""
 
 import json
-import runpy
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -223,6 +223,7 @@ def _hybrid_config_with_nonuniform_ep(args, *config_args, **config_kwargs):
 
 
 if __name__ == "__main__":
-    training_arguments.parse_and_validate_args = _parse_with_nonuniform_args
-    argument_utils.hybrid_config_from_args = _hybrid_config_with_nonuniform_ep
-    runpy.run_path(str(_REPO_ROOT / "pretrain_hybrid.py"), run_name="__main__")
+    os.environ["MEGATRON_NONUNIFORM_EP_ENTRYPOINT"] = "1"
+    os.execv(
+        sys.executable, [sys.executable, str(_REPO_ROOT / "pretrain_hybrid.py"), *sys.argv[1:]]
+    )

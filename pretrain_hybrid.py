@@ -454,6 +454,16 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     return train_ds, valid_ds, test_ds
 
 
+if os.environ.get("MEGATRON_NONUNIFORM_EP_ENTRYPOINT") == "1":
+    from examples.nonuniform.pretrain_hybrid_nonuniform import (
+        _hybrid_config_with_nonuniform_ep,
+        _parse_with_nonuniform_args,
+    )
+
+    parse_and_validate_args = _parse_with_nonuniform_args
+    hybrid_config_from_args = _hybrid_config_with_nonuniform_ep
+
+
 if __name__ == "__main__":
     # Timestamp right after entering __main__ block (after all imports/library setup)
     _MAIN_ENTRY_TIME = time.time()
