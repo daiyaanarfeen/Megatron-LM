@@ -439,6 +439,49 @@ def _get_param_groups_and_buffers(
     Returns:
         List of parameter groups and dictionary of model chunk IDs to buffers.
     """
+    use_nonuniform_ep_owner_buffers = (
+        config.use_distributed_optimizer
+        and buffer_name == 'expert_parallel_buffers'
+        and any(
+            hasattr(model_chunk, 'get_nonuniform_ep_distributed_optimizer_state')
+            for model_chunk in model_chunks
+        )
+    )
+    if use_nonuniform_ep_owner_buffers:
+        if not all(
+            hasattr(model_chunk, 'get_nonuniform_ep_distributed_optimizer_state')
+            for model_chunk in model_chunks
+        ):
+            raise RuntimeError(
+                "Cannot mix NEP owner-layout and native expert optimizer buffers in one call"
+            )
+        if config.optimizer != 'adam' or not config.bf16 or config.fp16:
+            raise RuntimeError("NEP distributed optimizer initially supports BF16 Adam only")
+        if config.optimizer_cpu_offload:
+            raise RuntimeError("NEP distributed optimizer does not support optimizer offload")
+        if config.use_precision_aware_optimizer:
+            raise RuntimeError(
+                "NEP distributed optimizer does not support precision-aware optimizer yet"
+            )
+
+        params_with_names = []
+        buffers = {}
+        for model_chunk_idx, model_chunk in enumerate(model_chunks):
+            owner_params_with_names, owner_buffers = (
+                model_chunk.get_nonuniform_ep_distributed_optimizer_state()
+            )
+            params_with_names.extend(owner_params_with_names)
+            buffers[model_chunk_idx + model_chunk_offset] = list(owner_buffers)
+
+        class _NamedParametersView:
+            def named_parameters(self):
+                """Iterate the preselected NEP owner parameters with their model names."""
+                return iter(params_with_names)
+
+        param_groups = _get_param_groups([_NamedParametersView()], config, config_overrides)
+        param_groups = list(filter(filter_fn, param_groups))
+        return param_groups, buffers
+
     param_groups = _get_param_groups(model_chunks, config, config_overrides)
     param_groups = list(filter(filter_fn, param_groups))
     buffers = {}

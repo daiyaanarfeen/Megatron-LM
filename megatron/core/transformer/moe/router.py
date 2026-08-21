@@ -5,6 +5,7 @@ from typing import Optional, Union
 
 import torch
 
+from megatron.core.distributed.nonuniform_common import apply_exact_uniform_routing_logits
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -859,6 +860,9 @@ class TopKRouter(Router):
         if self.config.moe_router_force_load_balancing:
             # Apply force load balancing with random logits for benchmark
             logits = apply_random_logits(logits)
+
+        if self.config.moe_router_force_uniform_routing:
+            logits = apply_exact_uniform_routing_logits(logits, self.topk)
 
         if self.config.moe_router_force_biased is not None:
             # Apply biased logits with shared random bias across all ranks

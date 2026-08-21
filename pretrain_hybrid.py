@@ -256,6 +256,9 @@ def loss_func(
         num_tokens = loss_mask.sum().clone().detach().to(torch.int)
         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
 
+    if getattr(args, "nonuniform_disable_nongrad_sync_collectives", False):
+        report = {'lm loss': loss.clone().detach().view(1)}
+
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
     if args.check_for_nan_in_loss_and_grad:
@@ -449,6 +452,16 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     print_rank_0("> finished creating GPT datasets ...")
 
     return train_ds, valid_ds, test_ds
+
+
+if os.environ.get("MEGATRON_NONUNIFORM_EP_ENTRYPOINT") == "1":
+    from examples.nonuniform.pretrain_hybrid_nonuniform import (
+        _hybrid_config_with_nonuniform_ep,
+        _parse_with_nonuniform_args,
+    )
+
+    parse_and_validate_args = _parse_with_nonuniform_args
+    hybrid_config_from_args = _hybrid_config_with_nonuniform_ep
 
 
 if __name__ == "__main__":
