@@ -22,6 +22,7 @@ from megatron.core.distributed.nonuniform_ep import (
     _build_nep_nccl_scatter_chunk_ranges,
     _compute_nep_distopt_owner_layout,
     _ExpertBucketSpec,
+    _get_distopt_full_param_layout_builder,
     _get_nep_nccl_scatter_chunks,
     _group_expert_bucket_specs_in_backward_order,
     _nep_distopt_proxy_name,
@@ -30,6 +31,8 @@ from megatron.core.distributed.nonuniform_ep import (
     _source_ep_ranks_for_owner,
 )
 from megatron.core.optimizer import _get_param_groups_and_buffers
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAlltoAllTokenDispatcher,
@@ -686,6 +689,20 @@ def test_nep_nccl_buffer_slot_reuse_does_not_block_host():
 def test_nep_nccl_uses_parent_ddp_backward_hook_for_dense_params():
     assert "_make_backward_post_hook" not in NonuniformEPDistributedDataParallel.__dict__
     assert "_start_delayed_dense_grad_syncs" not in NonuniformEPDistributedDataParallel.__dict__
+
+
+def test_nep_distopt_preserves_layerwise_layout_builder():
+    incoming_key = type("IncomingKey", (), {"is_managed_by_layer_wise_optimizer": True})()
+    incoming_layout = SimpleNamespace(layouts={incoming_key: object()})
+
+    assert (
+        _get_distopt_full_param_layout_builder(incoming_layout)
+        is LayerWiseDistributedOptimizer.compute_full_param_layout
+    )
+    assert (
+        _get_distopt_full_param_layout_builder(None)
+        is DistributedOptimizer.compute_full_param_layout
+    )
 
 
 def test_nep_bucket_size_uses_full_replica_native_value(monkeypatch):

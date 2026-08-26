@@ -3325,6 +3325,21 @@ def build_nonuniform_ep_nccl_bucket_groups(
     return bucket_groups
 
 
+def _get_distopt_full_param_layout_builder(
+    full_param_layout: Optional[FullParamLayout],
+) -> Callable:
+    """Select the native layout builder used by the incoming optimizer layout."""
+    from ..optimizer.distrib_optimizer import DistributedOptimizer
+
+    if full_param_layout is not None and any(
+        key.is_managed_by_layer_wise_optimizer for key in full_param_layout.layouts
+    ):
+        from ..optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+
+        return LayerWiseDistributedOptimizer.compute_full_param_layout
+    return DistributedOptimizer.compute_full_param_layout
+
+
 class NonuniformEPDistributedDataParallel(DistributedDataParallel):
     """DDP wrapper that opts expert params into nonuniform EP ownership transfer."""
 
@@ -3378,15 +3393,14 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             # bucket threshold. Reduced replicas have different physical expert
             # parameter counts, so that stale threshold can produce different dense
             # reduce-scatter bucket boundaries across DP participants. Recompute with
-            # the synchronized threshold using the native DistOpt layout machinery.
-            from ..optimizer.distrib_optimizer import DistributedOptimizer
-
+            # the synchronized threshold using the selected native optimizer layout machinery.
+            compute_full_param_layout = _get_distopt_full_param_layout_builder(full_param_layout)
             effective_bucket_size = (
                 None
                 if disable_bucketing or parallel_state.get_pipeline_model_parallel_rank() > 0
                 else ddp_config.bucket_size
             )
-            full_param_layout = DistributedOptimizer.compute_full_param_layout(
+            full_param_layout = compute_full_param_layout(
                 [param for param in module.parameters() if param.requires_grad],
                 effective_bucket_size,
                 parallel_state.get_data_parallel_world_size(with_context_parallel=True),
