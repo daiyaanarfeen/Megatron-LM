@@ -18,6 +18,15 @@ skills are mandatory context, not optional background reading.**
 Never skip or reorder these steps. Do not wait for the user to name the right
 skill keyword — infer it from the artifact you read.
 
+## Storage
+
+- Code and repository checkouts may live under `/home/darfeen`.
+- All large data and generated artifacts, including SLURM logs, profiler
+  traces, checkpoints, TensorBoard data, and benchmark output, must live under
+  `/lustre/fsw/coreai_comparch_sysarch/darfeen`.
+- Do not create large artifacts under `/home/darfeen`. Use the Lustre path
+  directly, or a symlink whose target is under the Lustre path.
+
 ## Contributing
 
 ### Pull Requests
