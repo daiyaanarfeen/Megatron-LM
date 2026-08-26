@@ -49,8 +49,7 @@ need to be adjusted on other clusters.
 | `--moe-router-topk-scaling-factor` | 2.5 | 5.0 | 5.0 |
 | `--moe-shared-expert-intermediate-size` | 3712 | 5376 | 10240 |
 | `--moe-latent-size` | — | 1024 | 2048 |
-| Dispatcher | `alltoall` | `alltoall` | `flex` (HybridEP backend, 32 SMs) |
-| `--moe-shared-expert-compute-before-router` | — | yes | — |
+| Dispatcher | `alltoall` | `flex` (HybridEP backend, 32 SMs) | `flex` (HybridEP backend, 32 SMs) |
 
 ### MTP
 
@@ -130,16 +129,16 @@ need to be adjusted on other clusters.
 | | Nano | Super | Ultra |
 |---|---|---|---|
 | Standard (`CUDA_DEVICE_MAX_CONNECTIONS`, `NVTE_*`, `TORCHINDUCTOR_WORKER_START`, `TRITON_CACHE_DIR`) | yes | yes | yes |
-| HybridEP (`NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=64`, `USE_MNNVL=1`) | — | — | yes |
+| HybridEP (`NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=64`, `USE_MNNVL=1`) | — | yes | yes |
 | CPU activation offload (`NVTE_CPU_OFFLOAD_V1=1`) | — | — | yes |
 
 ## Container requirements
 
-- Nano / Super: any image with TransformerEngine and Mamba2 support
+- Nano: any image with TransformerEngine and Mamba2 support
   (the default `nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh` works).
-- **Ultra additionally requires the HybridEP runtime** — the FlexDispatcher
-  `hybridep` backend depends on it. A comment to that effect is inline above
-  `IMAGE_PATH` in `ultra.sh`.
+- **Super and Ultra require the HybridEP runtime** — both use the FlexDispatcher
+  `hybridep` backend. A comment to that effect is inline above `IMAGE_PATH` in
+  each script.
 
 ## Smaller-scale experiments
 

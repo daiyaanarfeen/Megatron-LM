@@ -1,17 +1,17 @@
 #!/bin/bash
 
 #SBATCH -p batch
-#SBATCH --account=coreai_comparch_sysarch
-#SBATCH --nodes=128
+#SBATCH --account=nemotron_sw_pre
+#SBATCH --nodes=1536
 #SBATCH --exclusive
-#SBATCH -t 1:00:00
+#SBATCH -t 4:00:00
 #SBATCH --mem=0
 # Targets GB200/GB300 (4 GPUs/node); H100 is impractical at this scale.
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
 #SBATCH --segment=16
 #SBATCH --dependency=singleton
-#SBATCH --job-name=nemotron3_ultra_dp1_dummy
+#SBATCH --job-name=ultra
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_FWD_LAYERNORM_SM_MARGIN=16
@@ -19,16 +19,24 @@ export NVTE_BWD_LAYERNORM_SM_MARGIN=16
 export NVTE_FUSED_ATTN=0  # Disable cuDNN fused attention.
 export TORCHINDUCTOR_WORKER_START=fork
 export TRITON_CACHE_DIR="/tmp/triton_cache/"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True  # Reduce allocator fragmentation.
+# HybridEP token dispatcher (flex backend = hybridep).
+export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=64
+export USE_MNNVL=1
+# Activation offloading (used with --fine-grained-activation-offloading).
+export NVTE_CPU_OFFLOAD_V1=1
 
-# Short DP1 dummy-data benchmark defaults for this cluster.
-ASSET_ROOT="${ASSET_ROOT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report}"
-ROOT_DIR="${ROOT_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/training_scripts_dp1_dummy_runs}"
-REPO_DIR="${REPO_DIR:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/darfeen/Megatron-LM-EP}"
-TRAIN_ITERS="${TRAIN_ITERS:-10}"
-LR_WSD_DECAY_ITERS="${LR_WSD_DECAY_ITERS:-10}"
+# Set this to a path you have write permission on; it must already contain all
+# required assets (code, image, tokenizer, blend files, etc.). On OCI-HSG,
+# "/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/dnarayanan/bf16rs_technical_report"
+# is one such path.
+ROOT_DIR=""
+REPO_DIR="${ROOT_DIR}/code"
 # Run name; change this per experiment.
-NAME="nemotron3_ultra_dp1_dummy"
-IMAGE_PATH="${IMAGE_PATH:-${ASSET_ROOT}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh}"
+NAME="ultra"
+# This recipe uses HybridEP (--moe-flex-dispatcher-backend hybridep); the
+# container image must include the HybridEP runtime.
+IMAGE_PATH="${ROOT_DIR}/images/nvidia+pytorch+25.06-py3+dependencies+mamba.sqsh"
 
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 
@@ -59,6 +67,11 @@ BLEND_PATH="/lustre/fs1/portfolios/llmservice/projects/llmservice_nlp_fm/nemotro
 TE_PRECISION_CONFIG="/lustre/fs1/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6/code_ultra/te_quant.cfg"
 
 
+# HybridEP fallback: if the container image lacks the HybridEP runtime, replace
+# the --moe-token-dispatcher-type / --moe-flex-dispatcher-backend /
+# --moe-hybridep-num-sms flags below with a single
+# "--moe-token-dispatcher-type alltoall" and drop the
+# NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN / USE_MNNVL exports above.
 options=" \
     --use-mcore-models \
     --hybrid-layer-pattern MEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME/*E/*E \
@@ -83,7 +96,9 @@ options=" \
     --moe-router-topk 22 \
     --moe-shared-expert-intermediate-size 10240 \
     --moe-latent-size 2048 \
-    --moe-token-dispatcher-type alltoall \
+    --moe-token-dispatcher-type flex \
+    --moe-flex-dispatcher-backend hybridep \
+    --moe-hybridep-num-sms 32 \
     --moe-router-score-function sigmoid \
     --moe-grouped-gemm \
     --moe-aux-loss-coeff 1e-4 \
@@ -91,7 +106,6 @@ options=" \
     --moe-router-enable-expert-bias \
     --moe-router-dtype fp32 \
     --moe-router-load-balancing-type seq_aux_loss \
-    --moe-router-force-load-balancing \
     --moe-permute-fusion \
     --use-fused-weighted-squared-relu \
     --cross-entropy-loss-fusion \
@@ -108,17 +122,21 @@ options=" \
     --fp4-recipe nvfp4 \
     --te-precision-config-file ${TE_PRECISION_CONFIG} \
     \
+    --fine-grained-activation-offloading \
+    --offload-modules moe_act \
+    \
     --bf16 \
     --seq-length 8192 \
     --max-position-embeddings 8192 \
-    --train-iters ${TRAIN_ITERS} \
+    --train-samples 3051757813 \
     --lr-decay-style WSD \
-    --lr-decay-iters ${TRAIN_ITERS} \
-    --lr-warmup-iters 1 \
+    --lr-decay-samples 3048706055 \
+    --lr-warmup-samples 24414063 \
     --lr-wsd-decay-style minus_sqrt \
-    --lr-wsd-decay-iters ${LR_WSD_DECAY_ITERS} \
-    --micro-batch-size 1 \
-    --global-batch-size 256 \
+    --lr-wsd-decay-samples 610351563 \
+    --phase-transition-iterations 800000 \
+    --micro-batch-size 2 \
+    --global-batch-size 3072 \
     --lr 2.5e-4 \
     --min-lr 2.5e-6 \
     --weight-decay 0.1 \
@@ -126,13 +144,19 @@ options=" \
     --adam-beta1 0.9 \
     --adam-beta2 0.95 \
     --eval-interval 1000 \
-    --eval-iters 0 \
+    --eval-iters 14 \
+    --override-opt_param-scheduler \
     \
-    --cuda-graph-impl none \
+    --cuda-graph-impl local \
+    --cuda-graph-modules mamba attn moe_router \
+    --te-rng-tracker \
     \
-    --mock-data \
-    --tokenizer-type NullTokenizer \
-    --vocab-size 131072 \
+    --per-split-data-args-path ${BLEND_PATH} \
+    --data-cache-path ${DATACACHE_DIR} \
+    --tokenizer-type TikTokenizer \
+    --tokenizer-model ${TOKENIZER_MODEL} \
+    --tiktoken-pattern v2 \
+    --no-mmap-bin-files \
     --num-workers 1 \
     --no-create-attention-mask-in-dataloader \
     \
@@ -149,8 +173,21 @@ options=" \
     --ddp-pad-buckets-for-high-nccl-busbw \
     --attention-backend flash \
     \
-    --log-interval 1 \
-    --log-memory-interval 50 \
+    --ckpt-format torch_dist \
+    --load ${CHECKPOINT_DIR} \
+    --save ${CHECKPOINT_DIR} \
+    --save-interval 125 \
+    --save-retain-interval 1000 \
+    --ckpt-fully-parallel-save \
+    --ckpt-fully-parallel-load \
+    --async-save \
+    --use-persistent-ckpt-worker \
+    --ckpt-assume-constant-structure \
+    --result-rejected-tracker-filename ${CHECKPOINT_DIR}/result_rejected_tracker.txt \
+    --rerun-mode disabled \
+    \
+    --log-interval 10 \
+    --log-memory-interval 1000 \
     --log-params-norm \
     --log-num-zeros-in-grad \
     --log-throughput \
@@ -162,9 +199,8 @@ options=" \
     --check-weight-hash-across-dp-replicas-interval 20000 \
     \
     --manual-gc \
-    --manual-gc-interval 10 \
     --distributed-timeout-minutes 10 \
-    --exit-duration-in-mins 55 \
+    --exit-duration-in-mins 5750 \
     --disable-gloo-process-groups \
     --disable-straggler-on-startup \
     --straggler-minmax-count 16 "
