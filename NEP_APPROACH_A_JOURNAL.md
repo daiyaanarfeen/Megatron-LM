@@ -4930,3 +4930,17 @@ Append a dated entry whenever we do something new: code changes, job submissions
 - Tested whether a safe 14-minute backfill window would schedule materially earlier as job
   `2808833`. Its estimate matched the existing 15-minute backfill candidate, so it was canceled
   immediately without consuming GPU time; the regular/backfill pair remains authoritative.
+- GB300 partial-graph job `2808705` started first, so duplicate `2808706` was canceled. Healthy
+  completed ten finite iterations with a 2,437.033 ms iterations 8-10 mean and confirmed graph
+  modules `[attn, moe_router]`. NEP confirmed full-rank MBS2/GA2, reduced-rank MBS1/GA4, exact
+  GBS 60, and the same graph modules, but still OOMed during FusedAdam lazy state creation before
+  iteration 1. Partial capture reduced graph-private pools from 25.61 to 10.09 GiB on full ranks
+  and from 12.61 to 4.90 GiB on reduced ranks, yet persistent optimizer/model state still filled
+  the 276.62 GiB GB300s. The job failed in 11:03 and was not treated as a benchmark result.
+- Added a second default-off harness control that emits `--cuda-graph-impl none` and removes the
+  source module list. Default, partial, and graph-free command generation; all thirteen-workload
+  matrix validation; Python compilation; `bash -n`; ShellCheck; and `git diff --check` passed.
+  Commit `c0eaeec38` is pushed to the personal fork; production NEP code remains unchanged.
+- Submitted graph-free 32-node, segment-16 GB300 Ultra candidates `2809246` (regular) and
+  `2809247` (backfill), preserving all model, DistOpt, Flex/HybridEP, batch, forced-balancing,
+  and all-rank profiler settings. The initial regular start estimate is 06:36 PDT.
