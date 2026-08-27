@@ -244,12 +244,13 @@ def replace_multi_value_option(tokens: list[str], option: str, values: list[str]
     try:
         start = tokens.index(option)
     except ValueError:
-        tokens.extend((option, *values))
+        if values:
+            tokens.extend((option, *values))
         return
     end = start + 1
     while end < len(tokens) and not tokens[end].startswith("--"):
         end += 1
-    tokens[start:end] = [option, *values]
+    tokens[start:end] = [option, *values] if values else []
 
 
 def benchmark_options(
@@ -261,11 +262,18 @@ def benchmark_options(
     profile_start: int,
     profile_end: int,
     cuda_graph_modules_override: list[str] | None = None,
+    disable_cuda_graphs: bool = False,
 ) -> list[str]:
     metadata = case_metadata(workload, case)
     tokens = strip_runtime_options(extract_options(repo / workload.source))
     if cuda_graph_modules_override is not None:
         replace_multi_value_option(tokens, "--cuda-graph-modules", cuda_graph_modules_override)
+    if disable_cuda_graphs:
+        try:
+            tokens[tokens.index("--cuda-graph-impl") + 1] = "none"
+        except ValueError:
+            tokens.extend(("--cuda-graph-impl", "none"))
+        replace_multi_value_option(tokens, "--cuda-graph-modules", [])
     for flag in (
         "--use-distributed-optimizer",
         "--overlap-grad-reduce",
@@ -483,6 +491,7 @@ def build_parser() -> argparse.ArgumentParser:
     options.add_argument("--profile-start", type=int, default=5)
     options.add_argument("--profile-end", type=int, default=7)
     options.add_argument("--cuda-graph-modules-override")
+    options.add_argument("--disable-cuda-graphs", action="store_true")
 
     analyze = subparsers.add_parser("analyze")
     analyze.add_argument("workload")
@@ -627,6 +636,7 @@ def main() -> None:
             args.profile_start,
             args.profile_end,
             cuda_graph_modules_override,
+            args.disable_cuda_graphs,
         )
         if any(re.search(r"\s", token) for token in tokens):
             raise ValueError("the direct launcher requires whitespace-free argument tokens")

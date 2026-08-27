@@ -136,6 +136,9 @@ for workload in "${workloads[@]}"; do
         if [[ -n "${CUDA_GRAPH_MODULES_OVERRIDE:-}" ]]; then
             graph_override_args+=(--cuda-graph-modules-override "${CUDA_GRAPH_MODULES_OVERRIDE}")
         fi
+        if [[ "${DISABLE_CUDA_GRAPHS:-0}" == 1 ]]; then
+            graph_override_args+=(--disable-cuda-graphs)
+        fi
         options=$(python3 "${MATRIX}" --repo "${BENCH_REPO}" options "${workload}" "${case_name}" \
             --run-dir "${run_dir}" --train-iters "${TRAIN_ITERS}" \
             --profile-start "${PROFILE_STEP_START}" --profile-end "${PROFILE_STEP_END}" \
