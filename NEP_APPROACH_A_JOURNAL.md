@@ -4944,3 +4944,21 @@ Append a dated entry whenever we do something new: code changes, job submissions
 - Submitted graph-free 32-node, segment-16 GB300 Ultra candidates `2809246` (regular) and
   `2809247` (backfill), preserving all model, DistOpt, Flex/HybridEP, batch, forced-balancing,
   and all-rank profiler settings. The initial regular start estimate is 06:36 PDT.
+
+- Graph-free GB300 Ultra job `2809246` completed its healthy case at 3,260.333 ms over
+  iterations 8-10. NEP passed FusedAdam state initialization and completed iteration 1, but
+  OOMed entering iteration 2: reduced ranks could not allocate a 1.95 GiB DistOpt parameter
+  redistribution buffer, followed by 178-180 MiB grouped-GEMM workspace failures on full ranks.
+  This isolated the remaining failure from CUDA graph pools but did not produce a valid A/B.
+- Exposed native `--empty-unused-memory-level 2` as a default-off benchmark control and submitted
+  graph-free Ultra job `2809409`. Healthy completed ten finite iterations at 7,294.533 ms over
+  iterations 8-10. NEP again completed iteration 1 and then failed on the same 1.95 GiB cached
+  parameter redistribution allocation despite 4.8-5.8 GiB being reserved but unallocated.
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` was already active, so the limiting issue is
+  live DistOpt/model memory plus two large NEP transfer slots, not a missing cache-release flag.
+- Added a default-off A/B DDP bucket-count override in the benchmark harness only. Ultra's ten
+  buckets produce two approximately 1.95 GiB alternating NEP parameter-transfer slots; using 32
+  buckets should reduce each slot to roughly 0.61 GiB while retaining the same two-slot overlap
+  design. The override applies the same bucket count to healthy and NEP. Matrix validation for all
+  thirteen MoE pairs, Python compilation, `bash -n`, ShellCheck, command-generation checks, and
+  `git diff --check` pass; no Megatron or NEP implementation file changed.

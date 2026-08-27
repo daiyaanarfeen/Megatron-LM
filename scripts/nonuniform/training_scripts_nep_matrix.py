@@ -264,6 +264,7 @@ def benchmark_options(
     cuda_graph_modules_override: list[str] | None = None,
     disable_cuda_graphs: bool = False,
     empty_unused_memory_level: int | None = None,
+    ddp_num_buckets_override: int | None = None,
 ) -> list[str]:
     metadata = case_metadata(workload, case)
     tokens = strip_runtime_options(extract_options(repo / workload.source))
@@ -331,7 +332,7 @@ def benchmark_options(
             "--expert-tensor-parallel-size",
             str(workload.expert_tensor_parallel),
             "--ddp-num-buckets",
-            str(workload.ddp_num_buckets),
+            str(ddp_num_buckets_override or workload.ddp_num_buckets),
             "--high-priority-stream-groups",
             "ep",
             "--nonuniform-mode",
@@ -501,6 +502,7 @@ def build_parser() -> argparse.ArgumentParser:
     options.add_argument("--cuda-graph-modules-override")
     options.add_argument("--disable-cuda-graphs", action="store_true")
     options.add_argument("--empty-unused-memory-level", type=int, choices=(1, 2))
+    options.add_argument("--ddp-num-buckets-override", type=int)
 
     analyze = subparsers.add_parser("analyze")
     analyze.add_argument("workload")
@@ -647,6 +649,7 @@ def main() -> None:
             cuda_graph_modules_override,
             args.disable_cuda_graphs,
             args.empty_unused_memory_level,
+            args.ddp_num_buckets_override,
         )
         if any(re.search(r"\s", token) for token in tokens):
             raise ValueError("the direct launcher requires whitespace-free argument tokens")

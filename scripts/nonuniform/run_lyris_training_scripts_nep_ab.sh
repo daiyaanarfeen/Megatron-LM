@@ -142,6 +142,14 @@ for workload in "${workloads[@]}"; do
         if [[ -n "${EMPTY_UNUSED_MEMORY_LEVEL:-}" ]]; then
             graph_override_args+=(--empty-unused-memory-level "${EMPTY_UNUSED_MEMORY_LEVEL}")
         fi
+        if [[ -n "${DDP_NUM_BUCKETS_OVERRIDE:-}" ]]; then
+            if [[ ! "${DDP_NUM_BUCKETS_OVERRIDE}" =~ ^[1-9][0-9]*$ ]]; then
+                echo "DDP_NUM_BUCKETS_OVERRIDE must be a positive integer" >&2
+                exit 2
+            fi
+            ddp_buckets="${DDP_NUM_BUCKETS_OVERRIDE}"
+            graph_override_args+=(--ddp-num-buckets-override "${ddp_buckets}")
+        fi
         options=$(python3 "${MATRIX}" --repo "${BENCH_REPO}" options "${workload}" "${case_name}" \
             --run-dir "${run_dir}" --train-iters "${TRAIN_ITERS}" \
             --profile-start "${PROFILE_STEP_START}" --profile-end "${PROFILE_STEP_END}" \
