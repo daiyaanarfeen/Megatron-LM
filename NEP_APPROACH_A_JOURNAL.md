@@ -4927,3 +4927,6 @@ Append a dated entry whenever we do something new: code changes, job submissions
   on healthy/full ranks and MBS1/GA4 on reduced ranks, profile every rank, and capture only
   `attn` and `moe_router` modules so both sides have the same graph policy while avoiding the
   dominant Mamba graph pool. Initial start estimates were 06:03 and 10:41 PDT, respectively.
+- Tested whether a safe 14-minute backfill window would schedule materially earlier as job
+  `2808833`. Its estimate matched the existing 15-minute backfill candidate, so it was canceled
+  immediately without consuming GPU time; the regular/backfill pair remains authoritative.
