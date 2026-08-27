@@ -4911,3 +4911,19 @@ Append a dated entry whenever we do something new: code changes, job submissions
   `1bfefcec3` and pushed `nep-cleanup-staging-20260814` to the personal `daiyaanarfeen` fork.
   Python compilation passed. The focused test had already passed in the NeMo container; the login
   host has neither `uv` nor `pytest`, so those commands could not be repeated there.
+- Ultra GB300 job `2807753` completed the healthy case with ten finite iterations and a
+  2,256.033 ms mean over iterations 8-10. The NEP launch correctly gave full ranks MBS2/GA2 and
+  reduced ranks MBS1/GA4, preserving GBS 60, but all ranks OOMed during FusedAdam's lazy state
+  creation at the first optimizer step. Full ranks had roughly 260.4-260.9 GiB allocated plus
+  25.61 GiB in graph-private pools; reduced ranks had roughly 262.8-263.3 GiB allocated plus
+  12.61 GiB in graph-private pools on 276.62 GiB GB300s. This proves the remaining blocker is
+  persistent optimizer/graph memory rather than reduced-replica activation capture.
+- Added a default-off benchmark-harness override that replaces only the source workload's
+  variable-length `--cuda-graph-modules` list. Matrix validation, default and override command
+  generation, Python compilation, `bash -n`, ShellCheck, and `git diff --check` passed. Commit
+  `594e4ca1e` is pushed to the personal fork. No production NEP code changed.
+- Submitted identical 32-node, segment-16, 15-minute GB300 Ultra candidates `2808705` (regular)
+  and `2808706` (backfill). Both compare healthy `[8, 8]` against NEP `[8, 7]`, retain MBS2/GA2
+  on healthy/full ranks and MBS1/GA4 on reduced ranks, profile every rank, and capture only
+  `attn` and `moe_router` modules so both sides have the same graph policy while avoiding the
+  dominant Mamba graph pool. Initial start estimates were 06:03 and 10:41 PDT, respectively.
