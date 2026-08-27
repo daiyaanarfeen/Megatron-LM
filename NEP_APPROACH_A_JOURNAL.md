@@ -4962,3 +4962,19 @@ Append a dated entry whenever we do something new: code changes, job submissions
   design. The override applies the same bucket count to healthy and NEP. Matrix validation for all
   thirteen MoE pairs, Python compilation, `bash -n`, ShellCheck, command-generation checks, and
   `git diff --check` pass; no Megatron or NEP implementation file changed.
+- Cluster-wide Lustre maintenance delayed the first corrected candidates. The initial queued pair
+  with native cache release enabled was canceled before allocation because that already-proven
+  ineffective setting more than doubled healthy steady iteration time and would confound parity.
+  The replacement kept graph capture disabled and changed only the shared A/B bucket count to 32.
+- GB300 job `2809700` completed the 32-bucket healthy case with ten finite iterations and a
+  3,250.433 ms mean over iterations 8-10. In NEP, the smaller transfer buffers passed the prior
+  1.95 GiB parameter-redistribution failure, but reduced ranks 64-71 then OOMed before iteration 1
+  on 100-248 MiB grouped-GEMM output allocations. Those ranks had only 12-76 MiB physically free;
+  the failed allocations reported roughly 264.5-264.9 GiB allocated and 4.9-5.4 GiB reserved but
+  unallocated. Thus 32 buckets leave a measured sub-0.25 GiB peak deficit rather than the prior
+  multi-GiB staging failure.
+- Submitted 15-minute, 32-node, segment-16 GB300 regular/backfill jobs `2810439`/`2810440` with
+  64 shared A/B buckets. This halves each of the two alternating NEP parameter-transfer slots
+  again and should release about 0.6 GiB beyond the 32-bucket run, while preserving graph-free
+  execution, the original model, Flex/HybridEP, DistOpt, forced balancing, replica-local batch
+  settings, ten iterations, and all-rank profiles.
