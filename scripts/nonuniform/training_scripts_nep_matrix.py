@@ -263,6 +263,7 @@ def benchmark_options(
     profile_end: int,
     cuda_graph_modules_override: list[str] | None = None,
     disable_cuda_graphs: bool = False,
+    empty_unused_memory_level: int | None = None,
 ) -> list[str]:
     metadata = case_metadata(workload, case)
     tokens = strip_runtime_options(extract_options(repo / workload.source))
@@ -274,6 +275,13 @@ def benchmark_options(
         except ValueError:
             tokens.extend(("--cuda-graph-impl", "none"))
         replace_multi_value_option(tokens, "--cuda-graph-modules", [])
+    if empty_unused_memory_level is not None:
+        try:
+            tokens[tokens.index("--empty-unused-memory-level") + 1] = str(
+                empty_unused_memory_level
+            )
+        except ValueError:
+            tokens.extend(("--empty-unused-memory-level", str(empty_unused_memory_level)))
     for flag in (
         "--use-distributed-optimizer",
         "--overlap-grad-reduce",
@@ -492,6 +500,7 @@ def build_parser() -> argparse.ArgumentParser:
     options.add_argument("--profile-end", type=int, default=7)
     options.add_argument("--cuda-graph-modules-override")
     options.add_argument("--disable-cuda-graphs", action="store_true")
+    options.add_argument("--empty-unused-memory-level", type=int, choices=(1, 2))
 
     analyze = subparsers.add_parser("analyze")
     analyze.add_argument("workload")
@@ -637,6 +646,7 @@ def main() -> None:
             args.profile_end,
             cuda_graph_modules_override,
             args.disable_cuda_graphs,
+            args.empty_unused_memory_level,
         )
         if any(re.search(r"\s", token) for token in tokens):
             raise ValueError("the direct launcher requires whitespace-free argument tokens")
