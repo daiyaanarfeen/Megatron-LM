@@ -88,6 +88,12 @@ if [[ "${DIRECT_RANK_DRY_RUN:-0}" == "1" ]]; then
 fi
 
 cd "${REPO_DIR}"
+if [[ "${PRETRAIN_ENTRYPOINT:-pretrain_hybrid.py}" != "pretrain_hybrid.py" ]]; then
+    exec python -u "${PRETRAIN_ENTRYPOINT}" ${options} \
+        --micro-batch-size "${local_mbs}" \
+        --global-batch-size "${local_calculator_gbs}"
+fi
+
 exec python -u pretrain_hybrid.py ${options} \
     --micro-batch-size "${local_mbs}" \
     --global-batch-size "${local_calculator_gbs}"

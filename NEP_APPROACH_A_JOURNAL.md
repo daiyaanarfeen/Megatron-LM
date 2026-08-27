@@ -1,3 +1,113 @@
+## 2026-08-21 - EP16/EP12 H-only/F-only expert-GEMM isolation
+
+- Added a dedicated five-case same-allocation wrapper around the validated EP16/EP12 benchmark:
+  base A (`H=2688,F=1856`), H-only (`5376,1856`), F-only (`2688,3712`), H+F
+  (`5376,3712`), and base B. Topology, exact-uniform routing, token assignments, MBS/GBS,
+  model pattern, optimizer, CUDA graphs, and all-rank profiler settings are unchanged. No Megatron
+  implementation file changed; source commit remains `99ae923603b295c72372af85bc1bffe5c39bf8b2`.
+- Submitted identical eight-node, segment-four copies as GB200-backfill job `2757394` and
+  GB300-backfill job `2757395`. GB200 started first at 15:23:32 on
+  `lyris[0163-0165,0171,0236,0239,0243-0244]`; GB300 started 34 seconds later and was canceled
+  after 26 seconds. GB200 completed all five cases successfully in 15m19s. Every case ran eight
+  finite iterations with no skipped/NaN iterations and produced all 28 requested rank traces
+  (140 total). The complete printed Megatron argument blocks differ only in H, expert/dense F,
+  the derived shared-expert F, and output path.
+- Corrected active-GEMM results (useful routed-expert FLOPs divided by the union of concurrent
+  NVJet intervals) are:
+
+  | case | H x F | forward EP12/EP16 | backward EP12/EP16 | overall EP12/EP16 |
+  |---|---:|---:|---:|---:|
+  | bracketed base | 2688 x 1856 | 91.04% | 85.15% | 86.86% |
+  | H-only | 5376 x 1856 | 97.33% | 85.86% | 88.99% |
+  | F-only | 2688 x 3712 | 93.71% | 80.77% | 84.02% |
+  | H+F | 5376 x 3712 | 106.83% | 85.05% | 90.27% |
+
+- Forward has exactly zero NCCL overlap in every rank-step, and the two base controls agree to
+  0.27 percentage points there. H is therefore the stronger forward dimension at these shapes;
+  H+F selects an EP12 shape/tiling point that is modestly faster than EP16 for equal useful work.
+  Backward is noisier: the identical base controls differ by 4.25 points because their expert
+  GEMMs encounter different asynchronous communication schedules. In particular, all F-only EP12
+  backward expert intervals overlap NCCL, so its 80.77% aggregate is not a clean isolated estimate
+  of an F-axis effect and is not used as the causal conclusion.
+- Splitting backward into equal-useful-FLOP classes identifies the persistent limiter. H-only gives
+  97.04% dgrad but only 78.83% wgrad parity; H+F gives 97.58% dgrad but only 77.96% wgrad. The prior
+  independent H+F job `2756143` gave the same result (95.54% dgrad, 78.05% wgrad), even though its
+  NCCL overlap was only 6.8%/6.5% for EP16/EP12 wgrad versus 47.7%/53.9% here. Non-NCCL overlap also
+  reverses between allocations while wgrad parity remains 78%. This rules out NCCL or background
+  fill-kernel co-residency as the primary explanation. Wgrad accounts for about 90-94% of the H+F
+  reduced-minus-full backward active-time gap.
+- Exact-uniform routing gives both roles 6,048 routed assignments/GPU/MoE layer, but EP16 owns nine
+  experts with 672 assignments/expert while EP12 owns twelve with 504. Forward and dgrad produce
+  token-shaped outputs, so larger dimensions make each launch/tile more substantial and H brings
+  dgrad close to parity. Wgrad must instead form a separate H x F gradient for both expert weights.
+  EP12 therefore creates 4/3 as many gradient matrices and writes/accumulates 4/3 as much FP32
+  gradient-output surface per GPU for the same useful multiply FLOPs. H/F scaling multiplies both
+  that surface and FLOPs together while leaving the 504-versus-672 reduction depth unchanged; the
+  wgrad efficiency ratio consequently remains near 78-81% from the 2x-product cases through H+F.
+  Further H/F growth may preserve the forward/dgrad gain but is unlikely to close backward parity.
+  Increasing tokens per expert (the GEMM reduction dimension) or improving grouped-wgrad handling
+  is the relevant next direction.
+- Artifacts are under `slurm_runs/lyris_a3b_ep16_ep12_hf_isolation/`; consolidated metrics are in
+  `analysis_2757394.json`. The wrapper and analyzer are
+  `scripts/nonuniform/run_lyris_a3b_ep16_ep12_hf_isolation.sh` and
+  `scripts/nonuniform/analyze_ep16_ep12_hf_isolation.py`.
+
+
+## 2026-08-21 - EP16/EP12 expert-GEMM dimension test
+
+- Tested whether the routed-expert GEMM efficiency loss from reducing EP persists at EP16/EP12,
+  and whether larger matrix dimensions reduce that loss. The same-allocation A-B-A uses topology
+  `8 6` with TP2/CP1 (16-rank EP16 full replica and 12-rank EP12 reduced replica), 144 experts,
+  exact-uniform routing, top-k 6, sequence length 2016, MBS1 and one microbatch per replica,
+  true GBS14, local CUDA graphs, regular non-distributed Adam, and the four-stage `MEME` pattern
+  with two MoE layers. All 28 ranks are profiled at steps 6-7.
+- This setup makes useful expert work exactly equal per GPU. Every source rank sends 42 assignments
+  to every expert; an EP16 expert receives 672 tokens and an EP12 expert receives 504. EP16 owns
+  9 experts/GPU and executes 108 routed-expert GEMMs per step; EP12 owns 12 and executes 144.
+  Both therefore process 6,048 routed token-expert assignments per GPU per MoE layer. The base case
+  is H=2,688 / expert F=1,856; the high case doubles both to H=5,376 / F=3,712, increasing routed
+  expert FLOPs by 4x without changing routing, token splits, kernel counts, or topology.
+- Added only default-preserving benchmark dimension controls, the dedicated A-B-A wrapper, and an
+  all-rank trace analyzer. No Megatron implementation file changed. Jobs `2756093` and
+  `2756124/2756125` stopped before training on stale harness values
+  (`--nonuniform-skip-optimizer-step` and an empty target-chunk environment value). The wrapper
+  now uses the supported regular optimizer, target/scatter chunk count 1, and an all-node named
+  Enroot warm. These failures produced no benchmark measurements.
+- Final GB200 job `2756143` completed `0:0` in 9m14s on
+  `lyris[0222-0228,0230]`, segment size four. All three cases completed eight finite iterations
+  with zero skipped/NaN iterations and wrote all 84 requested traces. The analyzer hard-validates
+  108/144 total routed-expert kernels and 36/48 forward plus 72/96 backward kernels in every
+  EP16/EP12 rank-step.
+
+- Useful expert FLOPs per GPU/step are 0.724153 TFLOP base and 2.896612 TFLOP high.
+  The corrected metric divides useful FLOPs by the union of routed-expert kernel intervals, so
+  concurrently executing kernels count once. The bracketed base result is 644.9/511.5 TFLOP/s for
+  EP16/EP12, or 79.30% reduced/full efficiency. The independent base legs are 80.54% and 78.07%.
+  The doubled-dimension result is 1048.9/933.1 TFLOP/s, or 88.96%, improving 9.66 percentage points
+  and narrowing, but not eliminating, the reduced-EP efficiency loss.
+- This corrects the original summed-residency analysis, which double-counted concurrent expert
+  kernels. In the high case, summed/union residency was 1.566x for EP16 and 1.373x for EP12;
+  forward-only was 1.681x versus 1.344x. That unequal double counting produced the invalid 101.44%
+  total and 128.92% forward ratios.
+- The forward-only split removes the gradient-reshard contention confound: forward expert kernels
+  have exactly 0.000 ms NCCL overlap in every case. Base forward EP16/EP12 is 731.7/647.8 TFLOP/s
+  (88.54%); high forward is 1216.5/1254.1 TFLOP/s (103.09%). Backward narrows from
+  608.9/462.8 TFLOP/s (76.01%) to 981.3/827.3 TFLOP/s (84.30%). Thus larger dimensions recover
+  some reduced-EP expert-GEMM efficiency, while the high case remains below parity overall.
+- The complete printed argument blocks differ only in H, F/MoE-F, shared-expert F, and output path.
+  Base A versus base B differs only by output path. Routing, placement, expert ownership, per-expert
+  token counts, graph mode, optimizer, profiler, image, and hardware allocation are fixed. This is
+  directional evidence at one 2x-dimension point, not a monotonicity claim. The corrected metric is
+  effective routed-expert FLOP/s from active NVJet kernel-union time, not a hardware-counter
+  tensor-core utilization measurement.
+- Artifacts are under
+  `slurm_runs/lyris_a3b_ep16_ep12_dimension_gemm_aba/{base_a,high,base_b}/.../2756143/`;
+  the consolidated result is `analysis_2756143.json`. Shell syntax, Python compilation, prior
+  MEME classifier regression checks, and `git diff --check` pass. The required
+  `uv run isort` command was attempted but `uv` is unavailable on the login host; imports are
+  already in standard-library order.
+
+
 ## 2026-08-12
 
 ### Static-capacity benchmark preflight
@@ -4300,3 +4410,504 @@ Append a dated entry whenever we do something new: code changes, job submissions
   deletions; the core/entrypoint/test subset is 762 insertions and 9,241 deletions. Every accepted
   source stage has a rollback branch, immutable snapshot, focused compute validation, and an
   all-rank EP8/EP4 profiler gate.
+
+
+## 2026-08-19 — Minimal-branch aggressive LOC reduction and EP8 no-regression gate
+
+- Preserved trusted implementation commit `67f3acd4e86183cf5ce0ec431af15268d137b3ac` and performed the cleanup only on branch `nep-main-port-loc-reduction-20260819` in `/home/darfeen/Megatron-LM-nep-main-20260817`. The trusted branch/worktree was not modified.
+- Committed three bounded cleanup stages:
+  - `ad6ebc104`: consolidated duplicate owner/source payload copy helpers;
+  - `426beeab0`: specialized the implementation to the validated one-Gather-payload/one-Scatter-payload configuration and removed inactive multi-chunk branches/tests;
+  - `1756bc0e1`: removed constant chunk metadata and partial multi-chunk EDP staging state while retaining the same owner order, streams, CUDA dependencies, native DDP EDP launch, DistOpt buffers, Flex dispatcher integration, and nondivisible placement.
+- `nonuniform_ep.py` is now 3,156 lines versus 3,881 at the trusted commit: 725 lines (18.7%) removed. The focused test file is 1,504 versus 1,706 lines, for 927 lines removed across implementation and tests.
+- Compute validation:
+  - `2739687`: 69 focused distributed tests passed after helper consolidation;
+  - `2739873`: 59 passed after single-chunk specialization;
+  - `2739915`: 58 passed after the final scheduler-state collapse, with isort, Black, Ruff, and py_compile also passing.
+- Initial EP8 all-rank A/B harness attempts `2739979` and `2740028` failed before training due, respectively, to stale NTP snapshot references and a missing compiled dataset helper in the isolated benchmark worktree. Both were harness/environment defects and were fixed without implementation changes.
+- Early-profile ABBA `2740093` (GB200) and inverse ABBA `2740181` (GB300) had exact 12-rank collective/NEP annotation signatures, exact 48,386.22 MiB peak allocation, and clean iterations, but their post-profiler timing pairs contradicted each other. The latter reported +8.767% pooled and triggered a conservative regression investigation rather than acceptance.
+- Trace-analysis attempts `2740389` and `2740409` exposed, respectively, a node-local `/tmp` path error and an analyzer assumption that Flex/HybridEP token exchange appeared as native model-EP ProcessGroup records. The corrected Flex-aware analyzer completed in `2740526` and showed identical communication payloads/service but large run-to-run participant-readiness variation.
+- Intermediate ABBA `2740563` compared `426beeab0` with the trusted implementation on GB300 and found the intermediate faster in both pairs (-2.025% and -3.461%), with exact traces and memory. This ruled out a broad regression in the first two cleanup stages.
+- Direct late-profile ABBA `2740764` compared final `1756bc0e1` against `426beeab0` on the same three GB200 nodes. The uncontaminated timing window was iterations 8–18, before profiler recording at steps 20–21:
+  - reference pooled: 188.986 ms;
+  - final candidate pooled: 189.036 ms (+0.026%);
+  - paired deltas: -0.866% and +0.969%;
+  - exact 12-rank trace signatures and exact 48,386.22 MiB peak allocation in all four cases.
+- The misleading post-profiler window was +2.047% because one candidate case retained profiler-teardown perturbation; the same candidate's two identical cases differed by 9.4%, while the pre-profiler ABBA canceled cleanly. Future gates must time before profiler activation or place profiling after the timing window.
+- All-rank trace analysis `2740917` confirmed that final-candidate profiled steps were faster than their paired references in both pairs. Gather, expert-EDP, dense-DP, TP, and parameter-transfer payloads were identical; summed matched service differed only sub-millisecond, and final-candidate NEP host annotations were no slower. Decision: accept the 3,156-line EP8 Flex+DistOpt cleanup as performance-retaining and proceed to the EP16/EP12 nondivisible-expert gate.
+
+
+## 2026-08-19 — Final EP16/EP12 Flex+DistOpt nondivisible-expert gate
+
+- Derived an eight-node, two-four-node-segment ABBA from the proven snapshot harness for the original 128-expert a3b/30b workload: TP2, EP16/EP12, 28 training ranks, MBS1, GBS14, seq8192, eight expert buckets, Flex/HybridEP, distributed optimizer with overlap-param-gather, forced load balancing, and the original hybrid layer pattern. Every case profiled all 28 ranks late in the run.
+- Job `2741000` stopped before training in the candidate-only placement preflight because the old wrapper unpacked two values from `compute_nonuniform_ep_expert_placement`, whose current API returns the placement directly. No implementation code ran or changed. The preflight was corrected to the current API.
+- Corrected ABBA `2741041` completed on `theia[0164-0168,0170-0171,0173]` in 15:06. Its explicit nondivisible invariant gate passed: EP12 receives `[11] * 8 + [10] * 4` true experts, Flex pads to eleven slots per rank, and exactly four slots are virtual `None` entries.
+- All four cases completed 22 iterations with zero skipped/NaN iterations, produced all 28 requested traces, and used exactly 64,946.01 MiB peak allocated memory. Per-rank collective/NEP annotation signatures were byte-for-byte identical between trusted and reduced source.
+- Profiler warmup became visible at iteration 16, so the uncontaminated timing window is iterations 8–15:
+  - trusted reference A: 584.500 ms;
+  - final candidate A: 574.275 ms (-1.749%);
+  - final candidate B: 577.750 ms;
+  - trusted reference B: 708.863 ms (-18.496% candidate relative to reference B);
+  - pooled trusted: 646.681 ms;
+  - pooled final candidate: 576.013 ms (-10.928%).
+  The large second-pair apparent gain is not credited to the cleanup: reference B had an 855.7 ms summed expert-EDP participant-wait outlier in the profiled steps. The no-regression conclusion is stronger and narrower: neither candidate case regressed against its paired trusted case, and the two candidate means were stable within 0.6%.
+- All-28-rank analysis `2741204` and payload-aware rerun `2741261` confirmed both final-candidate profiled spans were shorter than their paired references. Rank-0 operation counts and complete input/output/payload vectors were exact across all four cases:
+  - owner Gather: 8 operations, 688,472,064 total payload elements;
+  - owner transfer/parameter redistribution: 8 operations, 2,524,397,568 elements;
+  - expert EDP: 16 operations, 5,048,795,136 elements;
+  - dense DP: 7 operations, 2,211,191,809 elements;
+  - TP: 377 operations, 8,133,528,704 elements.
+  NEP annotation names/counts were exact, and candidate host durations for owner-gradient staging and parameter redistribution did not increase.
+- Decision: the 3,156-line implementation retains the validated Flex dispatcher, distributed optimizer, and nondivisible-expert behavior with no measurable performance regression. The aggressive cleanup is accepted.
+
+
+## 2026-08-20 — Draft PR updated to the validated minimal NEP implementation
+
+- Fast-forwarded the existing personal-fork draft PR branch `nep-main-port-20260817`
+  from trusted commit `67f3acd4e` to the validated LOC-reduced implementation. The trusted
+  commit remains in history, and the local trusted branch/worktree was not modified.
+- Added the repository-required DCO trailers to the three cleanup commits using a metadata-only
+  rebase. The source tree hash remained exactly `c1d88551a40af463a2798d4ede29d13ae0948e87`
+  before and after the rewrite. The signed cleanup head is `3c66bb82e`.
+- Updated personal-fork draft PR #1 to the NEP-only title and scope, removing stale NTP claims and
+  documenting the 3,156-line implementation, focused test/style results, EP8 parity gate, and
+  EP16/EP12 Flex+DistOpt nondivisible-expert no-regression gate.
+- The PR remains a draft against the personal fork's `main` branch. No NVIDIA remote was pushed.
+
+
+## 2026-08-20 — Additions-only native integration audit
+
+- Pinned the previously validated PR state at personal-fork branch
+  `nep-main-port-loc-reduction-validated-20260820` (`3c66bb82e`) before changing the integration
+  structure.
+- Restored `pretrain_hybrid.py` byte-for-byte to the branch merge base and moved all hybrid NEP
+  setup into the new opt-in entrypoint `examples/nonuniform/pretrain_hybrid_nonuniform.py`.
+- Restored `moe_utils.py` and `tests/unit_tests/transformer/moe/test_routers.py` to their native
+  contents. The exact-uniform benchmark helper and tests now live in the new NEP implementation
+  and test files.
+- The resulting PR modifies only five existing runtime files: optimizer construction, base MoE
+  expert placement, the router opt-in, token dispatch, and transformer configuration. The
+  merge-base audit reports zero deleted lines in every existing file; all native integrations are
+  additive and gated, while the normal paths remain textually intact.
+- GB200 validation job `2746862` completed in 1:31. Isort, Black, Ruff, and py_compile passed, and
+  all 62 tests in `tests/unit_tests/distributed/test_nonuniform_ep.py` passed. Black's two scoped
+  formatting edits retained the zero-deletion invariant.
+- EP8 and EP16/EP12 runtime/performance equivalence gates remain required before this refactor is
+  pushed to the draft PR branch.
+
+
+## 2026-08-20 — Additions-only EP8 equivalence investigation
+
+- The first EP8/EP4 rollback-versus-additive ABBA, job `2747006`, measured a pooled candidate
+  regression of 4.649%. It also exposed a semantic omission: the isolated benchmark loss report
+  was about 12 instead of about 99,660 because the new wrapper had not retained the gated
+  no-nongrad-collective loss-report path.
+- Restored that behavior with three additions to native `pretrain_hybrid.py`, guarded by
+  `nonuniform_disable_nongrad_sync_collectives`. Commit `64a07f1fc` contains that isolated fix.
+  GB200 job `2747214` passed isort, Black, Ruff, py_compile, and all 62 focused NEP tests.
+- Job `2747283` restored the expected loss and exact 48,386.22 MiB peak allocation, but was not a
+  valid performance gate: the two identical rollback cases drifted by 19% across the allocation.
+  The benchmark was amended with a sacrificial warmup case.
+- Warm-stabilized GB200 job `2747416` produced stable rollback repeats within 0.111% and therefore
+  exposed a real candidate regression: rollback pooled mean 204.632 ms, candidate pooled mean
+  221.727 ms, or +8.354%. Both candidate repeats were consistently slower.
+- All cases resolved identical model, batch, topology, optimizer, and DDP bucket arguments. GPU
+  kernel names/counts and per-rank collective operation, dtype, payload, participant, and count
+  signatures were exact. The candidate delay is scheduling/readiness rather than extra GPU work:
+  existing expert-DP and dense-DP collectives remained resident longer, and the final three-value
+  default-group reduction completed later because full-replica rank 7 arrived about 18 ms later.
+- Trace comparison found identical GPU sequences but a systematic host/runtime distinction. The
+  candidate used `runpy` to keep the native entrypoint untouched; the rollback executed the native
+  entrypoint directly. This is now being tested as a bounded integration variable before any
+  collective or scheduler code is changed.
+
+
+## 2026-08-20 — Strict additive native-file policy
+
+- Re-audited the complete PR against merge base
+  `574e04ebf802b3b3cfc90d97dcbfc0721e7313af`: every existing file has zero deleted lines.
+- Established zero upstream-line deletions as a hard gate for every subsequent commit. Existing
+  behavior changes must be additions behind an explicit NEP condition; any exception must be
+  discussed before editing.
+- Replaced the new wrapper's `runpy` execution with `execv` and added an environment-gated hook
+  to native `pretrain_hybrid.py`. The native-file portion is ten additions and zero deletions; no
+  upstream line was rewritten. Validation jobs `2747709` (GB200) and `2747710` (GB300) were
+  submitted, with the slower duplicate to be canceled when one starts.
+
+- The initial 20-minute validation requests were replaced by five-minute requests to improve
+  backfill eligibility. Regular-GB200 job `2747940` then reached the container and failed only
+  because Black wanted to format the newly added wrapper; no native file was changed.
+- Corrected regular-GB200 job `2747968` completed in 3:06. Isort and Black were restricted to the
+  new wrapper; Ruff and py_compile passed across every PR file, and all 62 focused NEP tests passed.
+  Warnings were container/environment deprecations only.
+- Committed the bounded integration checkpoint as `966be606b`. The complete merge-base audit
+  remains zero deletions in every existing file; the branch has 278 additions and zero deletions
+  across six existing runtime files.
+- Submitted the unchanged warm-stabilized all-rank EP8/EP4 A/B gate as `2748041` (GB200) and
+  `2748042` (GB300). The candidate and rollback worktrees are frozen while those jobs are queued
+  or running.
+- GB300 job `2748042` started first, so duplicate GB200 job `2748041` was canceled. All five cases
+  completed successfully on `theia[0014,0016,0018]`, but the allocation was not a valid
+  performance gate: rollback means drifted from 247.564 ms to 214.682 ms while candidate means
+  drifted oppositely from 223.582 ms to 242.800 ms. The pooled candidate delta of about +0.9% is
+  cancellation across run position, not evidence of parity.
+- Submitted the identical gate on regular GB200 as job `2748320`, scheduled on
+  `lyris[0163,0177,0180]` with `--segment=3`. No candidate source will be changed before this
+  hardware-specific confirmation reaches a terminal state.
+- GB200 job `2748320` completed successfully in 18:01. Rollback means were 187.591 and
+  184.700 ms; candidate means were 193.673 and 189.627 ms over iterations 8-18. Pairwise
+  candidate regressions were +3.242% and +2.668%, and the pooled regression was +2.957%.
+- The rollback and candidate repeat drifts were 1.553% and 2.111%, respectively; both pairwise
+  comparisons have the same sign. This is a real remaining EP8 performance regression, so EP16
+  validation and the draft-PR update remain blocked. Further work is source/trace localization
+  only until an additions-only, NEP-gated cause is established.
+
+
+## 2026-08-20 — Wrapper-only Flex call-shape isolation
+
+- All-rank traces from job `2748320` retain exact operation counts and payloads. The dominant
+  candidate symptom is longer reduced-replica arrival at the final three-value world reduction;
+  rank 0's scalar readback exposes that delay but does not cause it.
+- Source accounting leaves one per-iteration structural difference: validated Flex metadata ran
+  through the class method, while cleanup stores a separate bound method on each dispatcher.
+  Core NEP scheduling is byte-identical; other source differences are initialization-only or
+  textually identical routing logic.
+- Created disposable worktree `/home/darfeen/Megatron-LM-nep-flex-isolate` at `966be606b` and
+  changed only the new wrapper. An explicit disabled-by-default environment flag restores the
+  validated class-level metadata call shape; no existing repository file was edited.
+- GB200 validation job `2748723` completed in 1:41. Isort, Black, Ruff, py_compile, and all 62
+  focused NEP tests passed. Duplicate GB300 job `2748725` was canceled after GB200 started first.
+- Submitted the unchanged warm-stabilized EP8/EP4 A/B gate for this variant as `2748770` (GB200)
+  and `2748772` (GB300). GB200 is scheduled for 19:18 on `lyris[0258-0260]`; the candidate and
+  staging worktrees are frozen while the jobs are queued or running.
+- GB300 job `2748772` was invalidated before completion: identical candidate means were 233.255 and
+  193.145 ms, a 40.1 ms same-source swing. This is the second GB300 allocation with severe nonlinear
+  source drift, so it cannot establish or reject the call-shape hypothesis.
+- Canceled GB300 job `2748772` and its slower duplicate GB200 job `2748770`; neither result changes
+  candidate source or the staging branch.
+- Submitted the identical harness on GB200 only as job `2748992`, scheduled for 19:28 on
+  `lyris[0065,0069-0070]` with `--segment=3`.
+
+- GB200 job `2748992` completed successfully, but its wrapper-call-shape result was inconclusive.
+  Rollback means were 234.100 and 226.927 ms; flagged candidate means were 226.373 and
+  231.136 ms. Pairwise deltas had opposite signs (-3.301% and +1.855%), while pooled means
+  differed by -0.763%; this is not stable evidence of a performance fix.
+- Correctness remained intact in all five cases: no skipped or non-finite iterations, expected peak
+  allocations, twelve rank traces per case, and exact all-rank collective (3,392 records) and GPU
+  operation-count (87,276 events) signatures.
+- Added a direct same-source ABBA isolation harness in a new script only. It compares the cleanup
+  candidate with the Flex call-shape flag disabled/enabled, profiles all twelve ranks, and extends
+  the timing window to iterations 8-36 to reduce measurement noise.
+- Submitted the direct GB200 gate as job `2749219`, scheduled for 20:08 on
+  `lyris[0199-0200,0202]`. The staging and isolation worktrees remain frozen until completion.
+
+- Direct same-source GB200 job `2749219` completed successfully in 18:39. Over iterations
+  8-36, unflagged means were 207.390 and 207.486 ms; flagged means were 208.717 and
+  196.966 ms. Pairwise effects had opposite signs (+0.640% and -5.071%), and flagged-repeat
+  drift was 5.794%. The pooled -2.216% is cancellation, not evidence of a fix.
+- Every case had zero nonzero skipped/non-finite iterations, expected 48,386.22 MiB peak
+  allocation, twelve traces, 3,368 collective records, and 87,276 GPU events. All-rank
+  collective and GPU operation-count signatures were exact. The Flex call-shape hypothesis is
+  therefore discarded without changing the staging branch.
+- The original source-level gate used only eleven timing samples per case. Added a new harness
+  only, extending rollback-versus-cleanup ABBA timing to iterations 8-36 while retaining all-rank
+  profiling. Submitted GB200 job `2749495`, scheduled for 20:30 on
+  `lyris[0041-0042,0045]`; both implementation worktrees remain frozen.
+
+- Longer source-level GB200 ABBA job `2749495` completed successfully in 16:16. Over
+  iterations 8-36, rollback means were 198.000 and 197.421 ms; additive-cleanup means were
+  191.848 and 193.093 ms. Pairwise candidate deltas were -3.107% and -2.192%, with rollback
+  repeat drift 0.293% and candidate repeat drift 0.647%.
+- This reverses the sign of both pairs from job `2748320`. Across the four independent paired
+  ratios, the geometric-mean cleanup delta is +0.113%, establishing parity rather than a
+  reproducible source regression.
+- All five cases had zero nonzero skipped/non-finite iterations, exact 48,386.22 MiB peak
+  allocation, twelve traces, 3,368 collective records, and 87,276 GPU events. Per-rank
+  collective and GPU operation-to-stream signatures were exact. EP8 therefore clears the
+  additive-integration no-regression gate.
+- Added a new validation harness only for the exact accepted EP16/EP12 nondivisible-expert
+  workload: 128 experts, TP2, 28 training ranks on seven of eight allocated GB200 nodes, MBS1,
+  GBS14, seq8192, eight expert buckets, Flex/HybridEP, DistOpt with overlap-param-gather, forced
+  balancing, and all-rank late profiling. Submitted regular job `2749743` and identical
+  backfill duplicate `2749754`; the slower copy will be canceled when either starts.
+
+- Regular GB200 EP16/EP12 source ABBA `2749743` started first, so pending backfill copy
+  `2749754` was canceled. Job `2749743` completed successfully in 21:44. Over the established
+  uncontaminated iterations 8-15, rollback means were 758.888 and 748.063 ms; additive means
+  were 751.750 and 760.088 ms. Pair deltas were -0.941% and +1.607%; pooled additive delta was
+  +0.324%, with opposite pair signs and comparable repeat drift.
+- All five EP16/EP12 cases resolved Flex, HybridEP, DistOpt, overlap-param-gather, and topology
+  `8 6`; they had zero nonzero skipped/non-finite iterations, no capacity overflow, 28 traces,
+  and exact 64,946.01 MiB peak allocation. Every case had exactly 24,672 collective records and
+  574,408 GPU events, with exact per-rank collective and GPU operation-to-stream signatures.
+  The additions-only integration therefore clears the nondivisible-expert no-regression gate.
+- Fetched the personal fork current `main` (`0980313cb`) and re-audited the prospective PR
+  against its unchanged merge base `574e04ebf`: every file still has zero deleted lines. The
+  draft PR update is a non-force fast-forward from `3c66bb82e` to `966be606b`.
+- Pushed only to personal-fork PR head `nep-main-port-20260817` and updated the draft description
+  with the additions-only invariant and current validation. Live PR #1 now reports 11 files,
+  6,096 additions, zero deletions, draft/open/mergeable-clean state, and head `966be606b`:
+  https://github.com/daiyaanarfeen/Megatron-LM/pull/1
+
+
+## 2026-08-21 - EP32 all-feature parity rerun on the additive staging branch
+
+- Added only a disposable SLURM wrapper and ran the original a3b/30b hybrid workload from
+  staging head `966be606b`: 128 experts, top-k 6, TP2, seq8192, MBS1, one microbatch per
+  replica, Flex/HybridEP, forced balancing, BF16 Adam DistOpt, overlap-grad-reduce,
+  overlap-param-gather, and all-rank profiling at iterations 20-22. Healthy used EP32/EP32,
+  64 ranks, and GBS32; NEP used EP32/EP28, 60 ranks, and GBS30.
+- Discarded completed GB300 job `2754866` as a benchmark configuration error. It forced eight
+  NEP expert bucket groups while native healthy construction produced four expert buckets, so
+  its approximately 90% parity result was not bucket-isomorphic and says nothing about the
+  staging implementation.
+- Corrected the wrapper to four NEP expert bucket groups and submitted both node types. GB200
+  job `2755111` started first on two complete eight-node NVLink segments, the pending GB300
+  duplicate `2755112` was canceled, and the corrected job completed `0:0` in 18:15.
+- Over uncontaminated iterations 8-15, healthy A/B means were 677.263/680.075 ms and NEP A/B
+  means were 703.763/680.750 ms. Pairwise owner-time parity was 96.235% and 99.901%; the
+  geometric A/B parity was 98.051% (pooled means 678.669 versus 692.256 ms, +13.587 ms or
+  +2.002% NEP iteration time). This clears the >=95% parity gate.
+- Every case completed all 22 iterations with finite final loss and gradient norm, zero skipped
+  iterations, zero NaN iterations, and no capacity overflow. Trace counts were 64 per healthy
+  case and 60 per NEP case. Rank 0's NEP trace contains HybridEP kernels plus native DistOpt
+  owner-gradient staging, reduce-scatter launch/finalization, parameter all-gather, and parameter
+  scatter markers.
+- The exercised EP28 placement is the nondivisible branch: 128 logical experts are distributed
+  as sixteen ranks with five experts and twelve ranks with four; fixed-width virtual slots are
+  used only by Flex communication and do not create dummy expert parameters. Logged peak
+  allocation was 22,035.98 MiB for healthy owners and 36,335.85 MiB for NEP owners; this run
+  establishes timing parity, not memory parity.
+
+
+## 2026-08-25 - Upstream training-script NEP matrix
+
+- Fetched `deepakn94/Megatron-LM` branch `dnarayanan/training_scripts` at source commit
+  `8643ab867049f71fb751121366c078ac58f17326` and restored its complete
+  `examples/training_scripts` tree into this branch. An index comparison against that commit is
+  empty, so the imported tree is exact. It contains thirteen MoE workloads and two dense 8B
+  workloads; the latter have no expert topology and are explicitly not applicable to NEP.
+- Added a benchmark-only matrix and Lyris wrapper under `scripts/nonuniform`. Each MoE source
+  keeps its architecture, MBS, and gradient-accumulation depth; healthy uses two equal expert-DP
+  replicas and NEP replaces the second with EP6/12/28/56 at source EP8/16/32/64. GBS is scaled
+  to the actual replica topology. Runs use mock data with forced load balancing, Flex/HybridEP,
+  DistOpt with gradient-reduce and parameter-gather overlap, ten iterations, and all-rank
+  PyTorch profiles for iterations 5-7; timing uses iterations 8-10.
+- Initial EP8 NEP job `2786414` exposed a harness-only HybridEP configuration bug: a single
+  domain-size environment value was invalid for the reduced replica. A rank launcher now sets
+  the HybridEP domain size independently to each replica's actual EP size; no NEP runtime code
+  changed.
+- Job `2786484` showed that an added static expert-capacity factor triggered HybridEP overflow
+  and forward/backward reruns, so the non-source option was removed. Subsequent diagnostic jobs
+  proved the eager Flex path runs with complete finite iterations and expected all-rank traces.
+- Final diagnostic jobs `2786752` and `2786759` revealed a second non-source option still present:
+  `--use-transformer-engine-op-fuser`. It makes the latent-MoE configuration fail construction
+  with `Fused GroupedMLP is not supported`. The EP8 job was canceled to avoid spending more GPU
+  time on invalid data; the option was removed, and the static validator now explicitly rejects
+  both it and the capacity-factor override.
+- The corrected matrix passes Python syntax validation, all thirteen topology/option checks,
+  `bash -n`, and ShellCheck. Corrected EP8 jobs `2786858`/`2786859` and EP16 jobs
+  `2786860`/`2786861` were submitted to GB300/GB200 respectively; the first starter at each
+  scale will be retained and its duplicate canceled.
+- GB300 started both corrected groups first, so the GB200 duplicates were canceled. EP8 job
+  `2786858` completed all four pairs with finite iterations and complete all-rank traces. Owner
+  iteration-time parity was 84.679% for a1b/7b, 96.114% for a315m/1b, 80.544% for a500m/2b,
+  and 84.332% for a770m/4b.
+- EP16 job `2786860` produced a valid a2b/14b pair at 89.334% owner-time parity. The a8b/120b
+  healthy case failed before iteration 1 in `HybridEPBuffer`: native Flex detected 32 ranks but
+  the benchmark rank shim forced 16. The NEP case and its per-replica 16/12 overrides worked.
+- Kept the runtime implementation unchanged and narrowed the launcher behavior to prior proven
+  semantics: native healthy unsets the HybridEP domain override and NEP alone sets each local
+  replica size. Shell tests verified healthy unsetting and reduced-rank size 12; `bash -n` and
+  ShellCheck pass. Dedicated a8b reruns `2787055`/`2787057` are queued on GB300/GB200.
+- GB300 a8b rerun `2787055` started first and the pending GB200 duplicate was canceled. Both
+  cases completed all ten finite iterations with 32/28 all-rank traces. Healthy averaged
+  6,035.833 ms and NEP averaged 8,035.333 ms, yielding 75.116% owner-time parity. This closes
+  the launcher-correctness gate; the result is retained as measured rather than tuned.
+- EP32 backfill job `2787177` started first on contiguous GB200 nodes `lyris[0001-0016]`; all
+  other EP32 candidates were canceled. It completed all four A/B pairs in 25:40 with exit 0,
+  finite iterations, and exact 64/60 healthy/NEP trace counts per pair. Healthy/NEP means and
+  owner-time parity were: a3b hybrid 505.433/568.633 ms (88.886%), a3b transformer
+  634.800/709.533 ms (89.467%), Nemotron Nano 1,129.800/1,252.200 ms (90.225%), and
+  scaling-ladder a3b 1,794.933/1,899.767 ms (94.482%).
+- Submitted the three-workload EP64 matrix to regular and backfill GB200/GB300 partitions with
+  `afterok:2787177`, preventing a premature scale-up. The dependency released only after the
+  complete EP32 success; regular GB200 job `2787265` currently has the earliest start estimate.
+
+- EP64 GB200 job `2787265` ran on 32 nodes and exposed three independent blockers. The healthy
+  Muon workload completed ten iterations, but NEP replaced its caller-supplied layerwise,
+  shard-aligned parameter layout with the ordinary byte-level DistOpt layout and failed when a
+  9,977,856-element matrix crossed an optimizer shard boundary. Nemotron Super healthy crashed
+  in `HybridEPBuffer` because the harness discarded the source's explicit 64-rank NVLink-domain
+  setting; its NEP half completed. Nemotron Ultra healthy and NEP both rejected the 128/120-rank
+  worlds because the harness stripped source expert TP 1 and let it default to attention TP 8.
+- Auditing that Ultra error found that every source MoE script explicitly uses expert TP 1. The
+  benchmark harness had stripped the option without restoring it. TP1 workloads are unaffected,
+  but all prior TP2 measurements are invalid: they resolved expert TP 2, exercised half the named
+  local EP degree, and healthy had one rather than two expert-DP replicas. The a8b result and all
+  four EP32 results above are retained only as failed-attempt history and will not be reported.
+- Corrected only the benchmark translation layer: source expert TP is now parsed and restored,
+  topology derivation includes expert TP, the validator proves every healthy MoE case has exactly
+  two expert-DP replicas, and healthy Super/Ultra preserve their explicit source HybridEP domain
+  while NEP still applies rank-local 64/56 domains. Python compilation, matrix validation,
+  `bash -n`, ShellCheck, and direct healthy/reduced domain tests pass. Host `uv` is unavailable;
+  imports were not changed. Submitted identical TP1 EP8 smoke jobs `2788214` (GB200 backfill) and
+  `2788215` (GB300); both are pending with no estimated start time.
+
+- Both smoke copies started simultaneously; retained GB300 job `2788215` and canceled GB200
+  duplicate `2788214`. Job `2788215` completed exit 0 in 8:46. Runtime resolved EP8/ETP1,
+  both cases completed ten finite iterations with 16/14 all-rank traces, and the analyzer passed.
+  Healthy averaged 467.933 ms and NEP 558.000 ms, or 83.859% owner-time parity.
+- Submitted corrected TP2 a8b EP16/EP12 jobs `2788305` (GB300) and `2788306` (GB200 backfill).
+  GB300 started immediately; the GB200 copy had a 14:16 estimate and was canceled.
+
+- Corrected GB300 a8b job `2788305` completed exit 0 in 12:34. Runtime resolved source ETP1,
+  both cases completed ten finite iterations with exact 32/28 traces, and analysis passed.
+  Healthy averaged 5,621.067 ms and NEP 6,303.133 ms, giving 89.179% owner-time parity.
+- Submitted the four corrected TP2 EP32/EP28 workload pairs as jobs `2788798` (GB200 backfill)
+  and `2788799` (GB300), each requesting 16 nodes in one 16-node segment. Both are pending with
+  no estimated start time; the first starter will be retained.
+
+- Tightened both EP32 limits to 35 minutes based on the prior 25:40 sweep. GB300 job `2788799`
+  started on one 16-node segment and the pending GB200 duplicate was canceled. The corrected job
+  completed all four pairs exit 0 in 27:33, with finite iterations and exact 64/60 traces.
+  Healthy/NEP means and owner-time parity were: a3b hybrid 422.867/480.233 ms (88.054%), a3b
+  transformer 518.233/588.900 ms (88.000%), Nemotron Nano 1,067.333/1,125.467 ms (94.835%),
+  and scaling-ladder a3b 1,531.300/1,541.633 ms (99.330%).
+- Submitted corrected Nemotron Super alone at EP64/EP56 as jobs `2788988` (GB300) and `2788989`
+  (GB200 backfill), 32 nodes in 16-node segments, with a measured-safe 20-minute limit. Current
+  estimates are 15:29 and 17:36 respectively; the first starter will be retained.
+
+
+## 2026-08-26 - Lustre artifact policy and EP64 retries
+
+- Added and committed repository policy `85eec1b89` requiring all large generated artifacts under
+  `/lustre/fsw/coreai_comparch_sysarch/darfeen`; code and checkouts may remain under
+  `/home/darfeen`. The commit contains only `AGENTS.md` and excludes the staged workload import.
+- Updated the training-script benchmark wrapper so SLURM stdout/stderr, result JSON, TensorBoard
+  data, and all-rank PyTorch traces default directly to the Lustre artifact root. The Lustre root
+  is mounted explicitly into the Pyxis container. Matrix validation for all thirteen MoE pairs,
+  Python compilation, `bash -n`, and ShellCheck pass.
+- GB300 Super job `2788988` had completed six finite healthy iterations and emitted 128 rank
+  traces before its step received `SIGTERM`; there is no Python, NCCL, or OOM traceback. It did
+  not complete the healthy timing window or start NEP, so it is not a benchmark result.
+- Resubmitted Super as `2798130` (GB300 backfill, estimated 13:42) and `2798132` (GB200
+  backfill, estimated 19:21), and Ultra as `2798174` (GB300 backfill) and `2798230` (GB200
+  backfill). Each requests 32 nodes, `segment=16`, source ETP1, ten iterations, and all-rank
+  profiles, with all outputs rooted on Lustre. The first valid architecture copy will be kept.
+
+
+## 2026-08-26 - Muon LayerWise DistOpt layout compatibility
+
+- Diagnosed the EP64 Muon NEP failure from job `2787265`: the caller supplied a mixed
+  `LayerWiseDistributedOptimizer` layout, but `NonuniformEPDistributedDataParallel` recomputed it
+  with the ordinary `DistributedOptimizer` builder after synchronizing the bucket threshold. A
+  9,977,856-element Muon-managed matrix then crossed an ordinary optimizer shard boundary.
+- Implemented the minimal two-file fix in isolated worktree
+  `/home/darfeen/Megatron-LM-nep-layerwise-20260826`: select the native LayerWise layout builder
+  only when the incoming layout contains LayerWise-managed keys; ordinary DistOpt remains on its
+  existing builder. Container isort/Black checks and focused unit job `2800426` passed. Committed
+  the rollback point as `bf1362ae6` (`Preserve layer-wise optimizer layout in NEP DDP`).
+- Initial EP8/EP6 smoke jobs `2800538`/`2800539` stopped before model construction because the new
+  wrapper referenced three checksum-only CLI flags absent from the implementation branch. Those
+  unsupported wrapper arguments and their analyzer dependency were removed; no production API was
+  added or changed.
+- Corrected GB300 smoke `2800572` exercised EP8/EP6, 16 true experts (nondivisible on EP6),
+  Flex/HybridEP, Muon LayerWise DistOpt, gradient-reduce and parameter-gather overlap, four updates,
+  and all-rank profiling. All four iterations were finite with zero skips/NaNs and all 14 traces
+  were written. SLURM recorded exit 1 only because the wrapper expected a DDP config repr that
+  Megatron does not log; removing that invalid assertion and re-running only the analyzer produced
+  a valid result. Native code confirms LayerWise mode re-enables `ddp_config.use_distributed_optimizer`
+  before DDP construction.
+- Parameterized only the smoke wrapper while preserving EP8/EP6 defaults. Submitted the required
+  EP16/EP12 intermediate on GB300 as `2800652` (estimated 11:48) and GB200 as `2800653`
+  (estimated 14:56), using 32 true experts, four iterations, and 28 all-rank traces. The first
+  starter will be retained.
+
+- GB300 EP16/EP12 job `2800652` started first; GB200 `2800653` and its dependent copy were
+  canceled. The run completed exit 0 in 4:20 with topology `[16, 12]`, four finite optimizer
+  updates, zero skips/NaNs, and exactly 28 all-rank traces. This is the required intermediate
+  validation between EP8 and EP32.
+- Queued EP32/EP28 smoke candidates on GB300/GB200 regular and backfill partitions. Each uses
+  64 true experts, 60 ranks, four iterations, and all-rank traces. Final original Muon healthy/NEP
+  A/B jobs are linked by `afterok` to their corresponding EP32 analyzer, so a 32-node benchmark
+  cannot run before its own gate passes. Per-case timeout is 12 minutes, derived from the prior
+  healthy case completing end to end in 5:08.
+- Added regular-partition Ultra candidates `2801307` (GB300) and `2801313` (GB200) alongside
+  backfill jobs `2798174`/`2798230` after the prior estimates slipped. All outputs remain rooted
+  under `/lustre/fsw/coreai_comparch_sysarch/darfeen`; only the first starter will be retained.
+- Added matching regular-partition Super candidates `2801790` (GB300) and `2801792` (GB200)
+  alongside backfill jobs `2798130`/`2798132`, preserving the exact ten-iteration, all-rank-profiled
+  A/B configuration. At the 11:50 PDT poll, every outstanding EP32 gate, Muon A/B dependency,
+  Super, and Ultra candidate remained pending; SLURM exposed no start estimate through `squeue`,
+  although `scontrol` projected GB300 Super backfill job `2798130` for 14:29 PDT.
+
+- GB300 EP32/EP28 gate `2801121` started at 13:34 PDT and completed exit 0 in 5:26. It
+  validated topology `[32, 28]`, four finite Muon optimizer updates, zero reported skips/NaNs,
+  and exactly 60 all-rank profiler traces. Teardown-only TCPStore warnings occurred after rank exit.
+  The three duplicate smoke jobs and only their matching dependent full jobs were canceled; full
+  original-workload Muon A/B job `2801263` passed its dependency and is now eligible on GB300.
+- Because the released regular full Muon job `2801263` received a next-day estimate after its
+  dependency reset eligibility, submitted equivalent post-gate candidates `2802393` (GB300
+  backfill), `2802396` (GB200 regular), and `2802397` (GB200 backfill). All preserve the same
+  32-node, segment-16, ten-iteration, all-rank-profiled healthy/NEP A/B; only the first starter
+  will be retained.
+
+- Ultra GB300 job `2801307` completed the healthy case with ten finite iterations and a
+  2,139.0 ms mean over iterations 8-10, then NEP OOMed during local CUDA graph capture. Healthy
+  entered capture at 109.2 GiB allocated; NEP entered at 216.5 GiB and exhausted 276.6 GiB while
+  capturing the same 324 graphs. Because PP=1 local capture uses one microbatch independent of
+  accumulation count, added a launch-only reduced-replica batch override with an exact GBS check.
+  Resubmitted Ultra as `2802741`/`2802744` (GB300 regular/backfill) and `2802745`/`2802746`
+  (GB200 regular/backfill): healthy remains MBS2/GA2; NEP full replica remains MBS2/GA2 and its
+  reduced replica uses MBS1/GA4, preserving four samples per rank and GBS 60.
+- Scheduler estimates for the 25-30 minute EP64 candidates moved to the next day. Prior elapsed
+  times show that paired runs should fit a truthful 20-minute window: Super reached steady
+  training in under seven minutes, the EP32/EP28 Muon gate completed in 5:26, and Ultra reached
+  its NEP case by minute twelve. Initially submitted shorter duplicates `2803520`/`2803522`,
+  `2803524`/`2803526`, and `2803527`/`2803528` (Super, Muon, and Ultra on GB300/GB200), then
+  replaced that with the cleaner scheduler operation: reduce all twelve older pending candidates
+  to a 20-minute limit in place so they retain accrued priority. Canceled the six redundant newer
+  candidates. No model, batch, profile, placement, implementation, or artifact setting changed.
+
+
+## 2026-08-27 - Nemotron Super full A/B completion
+
+- GB200 regular job `2801792` was the first Super candidate to start, on
+  `lyris[0037-0040,0043-0070]` with two 16-node segments. The other three Super candidates were
+  canceled immediately. It completed exit 0 in 10:41: healthy used topology `[32, 32]`, GBS 128,
+  and 128 ranks; NEP used `[32, 28]`, GBS 120, and 120 ranks. Both cases completed ten finite
+  iterations and produced exactly one profile per rank.
+- The standard iterations 8-10 comparison is 1,652.167 ms healthy versus 1,591.367 ms NEP,
+  yielding 103.821% owner-time parity. Healthy iteration 8 was noisy after profiler finalization;
+  using iterations 9-10 gives 1,610.950 ms healthy versus 1,592.800 ms NEP, or 101.140% parity.
+  Therefore this run establishes performance parity, not a statistically defensible NEP speedup.
+  The finalized artifact is
+  `/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/training_scripts_nep_ab/super_retry_gb200_regular/ep64/nemotron3__super/comparison_2801792.json`.
+- Tested whether an NEP-only EP64/EP56 case could request only its 30 active nodes and reuse the
+  exact prior healthy baselines. Lyris rejected all attempted submissions before assigning job IDs:
+  a segment-16 allocation cannot request 30 nodes. Removed the temporary default-off case filter;
+  no benchmark or production behavior remains changed by this attempt.
+- Muon GB200 candidate `2802396` started but exited after 21 seconds, before container startup,
+  because its original submission omitted `GROUP=ep64`. The three remaining Muon candidates had
+  the same captured submission and were canceled. Replacements `2807728`/`2807729` (GB200
+  regular/backfill) and `2807730`/`2807731` (GB300 regular/backfill) explicitly export `GROUP=ep64`
+  and otherwise preserve the same 32-node, segment-16, ten-iteration profiled A/B configuration.
+- Ultra GB200 regular candidate `2802745` started at 01:04 PDT on
+  `lyris[0055-0070,0127,0129-0141,0143-0144]`; its three duplicate candidates were canceled.
+- Ultra `2802745` proved that GB200 cannot host the original healthy MBS2 case: every rank OOMed
+  during CUDA graph capture at the 184.31 GiB device limit, with roughly 168.5 GiB allocated by
+  PyTorch plus 25.42 GiB in graph-private pools. The job was stopped before spending more time on
+  an unusable NEP comparison. Requeueing the canceled GB300 jobs was unsupported, so replacement
+  GB300 regular/backfill jobs `2807753`/`2807755` preserve healthy MBS2/GA2, full-replica NEP
+  MBS2/GA2, and reduced-replica NEP MBS1/GA4.
+- Corrected Muon GB200 job `2807728` started immediately and completed exit 0 in 13:16. Healthy
+  topology `[64, 64]` used GBS 512 and averaged 2,701.500 ms over iterations 8-10; NEP topology
+  `[64, 56]` used GBS 480 and averaged 2,849.400 ms. Owner-time parity is 94.809% (5.475%
+  slowdown). Both cases completed ten finite LayerWise optimizer updates and emitted exactly
+  128/120 all-rank traces. The finalized artifact is
+  `/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/training_scripts_nep_ab/muon_full_gb200_groupfix_regular/ep64/a3b_30b_gdp_latentmoe_muon_3t/comparison_2807728.json`.
+- Cherry-picked the now full-scale-validated LayerWise layout fix into the current branch as
+  `1bfefcec3` and pushed `nep-cleanup-staging-20260814` to the personal `daiyaanarfeen` fork.
+  Python compilation passed. The focused test had already passed in the NeMo container; the login
+  host has neither `uv` nor `pytest`, so those commands could not be repeated there.
