@@ -132,9 +132,14 @@ for workload in "${workloads[@]}"; do
         fi
         run_dir="${ROOT_DIR}/${GROUP}/${slug}/${case_name}/${SLURM_JOB_ID}"
         mkdir -p "${run_dir}/tensorboard" "${run_dir}/torch_profile"
+        graph_override_args=()
+        if [[ -n "${CUDA_GRAPH_MODULES_OVERRIDE:-}" ]]; then
+            graph_override_args+=(--cuda-graph-modules-override "${CUDA_GRAPH_MODULES_OVERRIDE}")
+        fi
         options=$(python3 "${MATRIX}" --repo "${BENCH_REPO}" options "${workload}" "${case_name}" \
             --run-dir "${run_dir}" --train-iters "${TRAIN_ITERS}" \
-            --profile-start "${PROFILE_STEP_START}" --profile-end "${PROFILE_STEP_END}")
+            --profile-start "${PROFILE_STEP_START}" --profile-end "${PROFILE_STEP_END}" \
+            "${graph_override_args[@]}")
         run_nodelist=$(IFS=,; echo "${allocated_nodes[*]:0:run_nodes}")
         master_port=$((32100 + case_index))
         case_index=$((case_index + 1))

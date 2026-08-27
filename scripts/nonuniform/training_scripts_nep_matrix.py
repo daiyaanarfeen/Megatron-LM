@@ -240,6 +240,18 @@ def append_flag_once(tokens: list[str], flag: str) -> None:
         tokens.append(flag)
 
 
+def replace_multi_value_option(tokens: list[str], option: str, values: list[str]) -> None:
+    try:
+        start = tokens.index(option)
+    except ValueError:
+        tokens.extend((option, *values))
+        return
+    end = start + 1
+    while end < len(tokens) and not tokens[end].startswith("--"):
+        end += 1
+    tokens[start:end] = [option, *values]
+
+
 def benchmark_options(
     repo: Path,
     workload: Workload,
@@ -248,9 +260,12 @@ def benchmark_options(
     train_iters: int,
     profile_start: int,
     profile_end: int,
+    cuda_graph_modules_override: list[str] | None = None,
 ) -> list[str]:
     metadata = case_metadata(workload, case)
     tokens = strip_runtime_options(extract_options(repo / workload.source))
+    if cuda_graph_modules_override is not None:
+        replace_multi_value_option(tokens, "--cuda-graph-modules", cuda_graph_modules_override)
     for flag in (
         "--use-distributed-optimizer",
         "--overlap-grad-reduce",
@@ -467,6 +482,7 @@ def build_parser() -> argparse.ArgumentParser:
     options.add_argument("--train-iters", type=int, default=10)
     options.add_argument("--profile-start", type=int, default=5)
     options.add_argument("--profile-end", type=int, default=7)
+    options.add_argument("--cuda-graph-modules-override")
 
     analyze = subparsers.add_parser("analyze")
     analyze.add_argument("workload")
@@ -597,6 +613,11 @@ def main() -> None:
         )
         return
     if args.command == "options":
+        cuda_graph_modules_override = None
+        if args.cuda_graph_modules_override:
+            cuda_graph_modules_override = args.cuda_graph_modules_override.split(",")
+            if any(not module for module in cuda_graph_modules_override):
+                raise ValueError("CUDA graph module override contains an empty module")
         tokens = benchmark_options(
             repo,
             workload,
@@ -605,6 +626,7 @@ def main() -> None:
             args.train_iters,
             args.profile_start,
             args.profile_end,
+            cuda_graph_modules_override,
         )
         if any(re.search(r"\s", token) for token in tokens):
             raise ValueError("the direct launcher requires whitespace-free argument tokens")
