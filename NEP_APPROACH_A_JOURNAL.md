@@ -4978,3 +4978,16 @@ Append a dated entry whenever we do something new: code changes, job submissions
   again and should release about 0.6 GiB beyond the 32-bucket run, while preserving graph-free
   execution, the original model, Flex/HybridEP, DistOpt, forced balancing, replica-local batch
   settings, ten iterations, and all-rank profiles.
+- Regular job `2810439` started at 10:12:30 PDT; duplicate backfill job `2810440` was canceled.
+  Healthy completed ten finite iterations and averaged 3,299.867 ms over iterations 8-10. NEP
+  initialized DistOpt and completed iteration 1, but reduced-replica ranks OOMed entering
+  iteration 2: rank 68 could not allocate a 400 MiB DistOpt parameter-transfer buffer, while
+  ranks 66 and 69 could not allocate 100 MiB grouped-GEMM outputs. Reported physical free memory
+  was only 10-350 MiB, with roughly 264.3-264.9 GiB allocated and 4.9-5.2 GiB reserved but
+  unallocated. The failed job was canceled after diagnostics to release its 32 nodes.
+- The 64-bucket log shows 104,857,600-element expert parameter buckets, so the 400 MiB transfer
+  allocation is now at a single-parameter owner-layout floor; increasing only `ddp_num_buckets`
+  cannot reliably reduce it further. The remaining bounded option is to use one persistent NEP
+  DistOpt transfer slot instead of two, saving one 400 MiB slot at the cost of removing adjacent
+  parameter-bucket staging concurrency. This requires an explicit implementation decision before
+  another full-scale retry.
