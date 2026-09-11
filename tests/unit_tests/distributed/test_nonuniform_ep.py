@@ -501,11 +501,13 @@ def test_nep_distopt_param_transfer_slots_preserve_adjacent_storage():
             "min_ep_size": 1,
             "owner_numel": physical_param.numel(),
         }
-        group._get_nep_nccl_transfer_group_info = lambda owner: (None, None, 1, (0,))
+        group._get_nep_nccl_transfer_group_info = lambda owner: (None, None, 2, (0, 1))
         group._nep_nccl_owner_entries = lambda owner: [
             {
                 "bucket": SimpleNamespace(params_list=[physical_param]),
                 "numel": physical_param.numel(),
+                "expert_id": 0,
+                "slot_index": 0,
             }
         ]
         group._nep_nccl_owner_expert_ids = lambda owner: ()

@@ -1625,10 +1625,12 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         for task_context in context.get("scatter_contexts") or (context,):
             task_context["group"]._mark_nep_nccl_task_started(task_context["owner_ep_rank"])
 
-    @torch.no_grad()
-    def _scatter_nep_distopt_owner_params_to_physical_holders(self) -> None:
-        """Redistribute all-gathered logical owner parameters within each EP replica."""
+    def _get_nep_distopt_param_transfer_plan(self) -> tuple:
+        """Cache static copy metadata, never tensor views or transfer storage."""
         bundle = self._nep_distopt_owner_bundle
+        if "param_transfer_plan" in bundle:
+            return bundle["param_transfer_plan"]
+        plan = []
         ep_rank = self._nep_runtime_config["ep_rank"]
         ep_group = self._nep_runtime_config["ep_group"]
         for bucket_group in bundle["groups"]:
@@ -1645,19 +1647,17 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     raise RuntimeError(
                         "NEP DistOpt parameter Scatter found no local physical entries"
                     )
-                reference_param = local_entries[0]["bucket"].params_list[0]
-                transfer_slot = bundle["param_transfer_slot"]
-                cache_key = (transfer_slot, reference_param.dtype, reference_param.device)
-                transfer_storage = bundle["param_transfer_buffers"].get(cache_key)
-                if transfer_storage is None:
-                    transfer_storage = torch.empty(
-                        bundle["param_transfer_numel_by_slot"][transfer_slot],
-                        dtype=reference_param.dtype,
-                        device=reference_param.device,
+                unpack = tuple(
+                    (
+                        entry["bucket"],
+                        bucket_group._nep_nccl_entry_owner_start(entry, owner_ep_rank),
+                        entry["numel"],
+                        (group_index, entry["expert_id"], entry["slot_index"]),
                     )
-                    bundle["param_transfer_buffers"][cache_key] = transfer_storage
-                owner_params = transfer_storage[: layout["owner_numel"]]
-                if ep_rank == owner_ep_rank:
+                    for entry in local_entries
+                )
+                pack = []
+                if ep_rank == owner_ep_rank and transfer_size > 1:
                     for expert_id in bucket_group._nep_nccl_owner_expert_ids(owner_ep_rank):
                         _, owner_slot = bucket_group._nep_nccl_owner_slot_for_expert(expert_id)
                         for slot_index, (slot_offset, slot_numel) in enumerate(
@@ -1666,24 +1666,75 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                                 bucket_group._nep_nccl_slot_numels,
                             )
                         ):
-                            proxy = bundle["proxy_by_key"][(group_index, expert_id, slot_index)]
-                            start = owner_slot * layout["expert_stride"] + slot_offset
-                            owner_params[start : start + slot_numel].copy_(proxy.detach().view(-1))
-
-                if transfer_group is not None and transfer_size > 1:
-                    dist.broadcast(
-                        owner_params,
-                        src=dist.get_global_rank(ep_group, owner_ep_rank),
-                        group=transfer_group,
+                            pack.append(
+                                (
+                                    (group_index, expert_id, slot_index),
+                                    owner_slot * layout["expert_stride"] + slot_offset,
+                                    slot_numel,
+                                )
+                            )
+                source = (
+                    dist.get_global_rank(ep_group, owner_ep_rank)
+                    if transfer_group is not None and transfer_size > 1
+                    else None
+                )
+                if transfer_size == 1 and ep_rank != owner_ep_rank:
+                    raise RuntimeError(
+                        "NEP singleton parameter transfer must be local to its owner"
                     )
-
-                for entry in local_entries:
-                    start = bucket_group._nep_nccl_entry_owner_start(entry, owner_ep_rank)
-                    entry["bucket"].params_list[0].copy_(
-                        owner_params[start : start + entry["numel"]].view_as(
-                            entry["bucket"].params_list[0]
-                        )
+                plan.append(
+                    (
+                        transfer_group,
+                        transfer_size,
+                        source,
+                        layout["owner_numel"],
+                        tuple(pack),
+                        unpack,
                     )
+                )
+        bundle["param_transfer_plan"] = tuple(plan)
+        return bundle["param_transfer_plan"]
+
+    @torch.no_grad()
+    def _scatter_nep_distopt_owner_params_to_physical_holders(self) -> None:
+        """Redistribute all-gathered logical owner parameters within each EP replica."""
+        bundle = self._nep_distopt_owner_bundle
+        for (
+            transfer_group,
+            transfer_size,
+            source,
+            owner_numel,
+            pack,
+            unpack,
+        ) in self._get_nep_distopt_param_transfer_plan():
+            # Resolve live tensors each time: native DistOpt can rebind their storage.
+            if transfer_size == 1:
+                for bucket, _, _, key in unpack:
+                    param = bucket.params_list[0]
+                    param.copy_(bundle["proxy_by_key"][key].detach().view_as(param))
+                continue
+            reference_param = unpack[0][0].params_list[0]
+            transfer_slot = bundle["param_transfer_slot"]
+            cache_key = (transfer_slot, reference_param.dtype, reference_param.device)
+            transfer_storage = bundle["param_transfer_buffers"].get(cache_key)
+            if transfer_storage is None:
+                transfer_storage = torch.empty(
+                    bundle["param_transfer_numel_by_slot"][transfer_slot],
+                    dtype=reference_param.dtype,
+                    device=reference_param.device,
+                )
+                bundle["param_transfer_buffers"][cache_key] = transfer_storage
+            owner_params = transfer_storage[:owner_numel]
+            for key, start, numel in pack:
+                proxy = bundle["proxy_by_key"][key]
+                owner_params[start : start + numel].copy_(proxy.detach().view(-1))
+
+            if transfer_group is not None and transfer_size > 1:
+                dist.broadcast(owner_params, src=source, group=transfer_group)
+
+            for bucket, start, numel, _ in unpack:
+                param = bucket.params_list[0]
+                param.copy_(owner_params[start : start + numel].view_as(param))
 
     def start_param_sync(self, force_sync: bool = False):
         """Start native owner parameter all-gather and redistribute when ready."""
