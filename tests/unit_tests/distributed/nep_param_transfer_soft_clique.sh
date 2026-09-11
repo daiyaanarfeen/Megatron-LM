@@ -61,8 +61,8 @@ if [[ "${SOFT_CLIQUE_PROFILE_SWEEP:-0}" == 1 ]]; then
         export ROOT_DIR="${SOFT_CLIQUE_ROOT}"
         mkdir -p "${SOFT_CLIQUE_ROOT}"/{placement,transport}
         cp "${base_root}/allocation.txt" "${SOFT_CLIQUE_ROOT}/allocation.txt"
-        bash scripts/nonuniform/run_lyris_training_scripts_nep_ab.sh
+        bash /home/darfeen/Megatron-LM-nep-param-cpu-20260911/tests/unit_tests/distributed/nep_param_transfer_cases.sh
     done
 else
-    bash scripts/nonuniform/run_lyris_training_scripts_nep_ab.sh
+    bash /home/darfeen/Megatron-LM-nep-param-cpu-20260911/tests/unit_tests/distributed/nep_param_transfer_cases.sh
 fi

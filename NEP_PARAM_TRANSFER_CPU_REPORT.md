@@ -39,3 +39,7 @@ and proxy rebinding and transfer-buffer clearing.
   profiling is pending. No claim of performance non-regression yet.
 
 Logs: `/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/lyris/coreai_comparch_sysarch-nep.paramcopy-3007847.{out,err}`.
+
+Job 3007873 exited before training: shared runner does not accept NEP-only case
+order. The isolated diagnostic runner now permits NEP-only execution and analyzes
+that case without requiring a healthy run. Production implementation unchanged.
