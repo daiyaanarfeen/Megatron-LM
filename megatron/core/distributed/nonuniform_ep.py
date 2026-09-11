@@ -48,6 +48,7 @@ from .param_and_grad_buffer import (
 _NEP_NCCL_DEFAULT_MAX_GATHER_BYTES = 8 * 1024 * 1024 * 1024
 _NEP_NCCL_DEFAULT_ASYNC_CHUNK_WINDOW = 2
 _NEP_NCCL_DEFAULT_EXPERT_BUCKET_GROUPS = 3
+_NEP_DISTOPT_DEFAULT_PARAM_TRANSFER_SLOTS = 2
 
 
 def _nep_owner_ddp_config(
@@ -104,6 +105,15 @@ def _get_nep_nccl_expert_bucket_group_count() -> int:
     if group_count <= 0:
         raise RuntimeError("MEGATRON_NONUNIFORM_EP_NCCL_EXPERT_BUCKET_GROUPS must be positive")
     return group_count
+
+
+def _get_nep_distopt_param_transfer_slot_count(num_edp_buckets: int) -> int:
+    """Return the bounded number of reusable DistOpt parameter-transfer buffers."""
+    value = os.getenv("MEGATRON_NONUNIFORM_EP_DISTOPT_PARAM_TRANSFER_SLOTS")
+    slot_count = _NEP_DISTOPT_DEFAULT_PARAM_TRANSFER_SLOTS if value is None else int(value)
+    if slot_count <= 0:
+        raise RuntimeError("MEGATRON_NONUNIFORM_EP_DISTOPT_PARAM_TRANSFER_SLOTS must be positive")
+    return min(slot_count, num_edp_buckets)
 
 
 def _nep_block_current_stream(work) -> None:
@@ -1706,6 +1716,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         with torch.profiler.record_function("nep_distopt_param_scatter"):
             self._scatter_nep_distopt_owner_params_to_physical_holders()
         bundle["param_sync_completed"] = True
+        if self.next_param_gather_bucket_group is None:
+            bundle["param_transfer_buffers"].clear()
 
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
         """Finish owner all-gather, redistribute params, and launch the next bucket."""
@@ -1729,7 +1741,9 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         bundle["param_sync_completed"] = True
 
         next_group = self.next_param_gather_bucket_group
-        if next_group is not None and not skip_next_bucket_dispatch:
+        if next_group is None:
+            bundle["param_transfer_buffers"].clear()
+        elif not skip_next_bucket_dispatch:
             next_group.start_param_sync()
 
     def _start_nep_nccl_owner_task_scatter(self, context: dict) -> None:
@@ -2547,10 +2561,12 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             edp_bucket_index = bucket_group._nep_nccl_edp_bucket_index
             groups_by_edp_bucket.setdefault(edp_bucket_index, []).append(bucket_group)
 
-        # Preserve adjacent parameter-bucket concurrency while bounding temporary
-        # physical-layout staging to two alternating slots across this DDP instance.
+        # Bound temporary physical-layout staging while retaining two-slot adjacent
+        # parameter-bucket concurrency by default.
         param_transfer_buffers = {}
-        param_transfer_slot_count = min(2, len(groups_by_edp_bucket))
+        param_transfer_slot_count = _get_nep_distopt_param_transfer_slot_count(
+            len(groups_by_edp_bucket)
+        )
         param_transfer_numel_by_slot = {
             slot: max(
                 group._get_nep_nccl_owner_layout()["owner_numel"]

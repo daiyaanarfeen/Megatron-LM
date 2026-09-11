@@ -23,6 +23,7 @@ from megatron.core.distributed.nonuniform_ep import (
     NonuniformEPNCCLParamAndGradBucketGroup,
     _compute_nep_distopt_owner_layout,
     _ExpertBucketSpec,
+    _get_nep_distopt_param_transfer_slot_count,
     _group_expert_bucket_specs_in_backward_order,
     _nep_distopt_proxy_name,
     _nep_owner_ddp_config,
@@ -354,7 +355,12 @@ def test_nep_distopt_param_sync_is_idempotent_per_iteration():
             self.posts += 1
 
     native_group = _NativeGroup()
-    bucket_group._nep_distopt_owner_bundle = {"native_group": native_group}
+    transfer_buffers = {"slot": object()}
+    bucket_group._nep_distopt_owner_bundle = {
+        "native_group": native_group,
+        "param_transfer_buffers": transfer_buffers,
+    }
+    bucket_group.next_param_gather_bucket_group = None
     scatters = []
     bucket_group._scatter_nep_distopt_owner_params_to_physical_holders = lambda: scatters.append(
         True
@@ -366,6 +372,7 @@ def test_nep_distopt_param_sync_is_idempotent_per_iteration():
     assert native_group.starts == 1
     assert native_group.posts == 1
     assert scatters == [True]
+    assert transfer_buffers == {}
 
 
 def test_nep_distopt_async_param_sync_uses_native_forward_lifecycle():
@@ -400,9 +407,11 @@ def test_nep_distopt_async_param_sync_uses_native_forward_lifecycle():
 
     native_group = _NativeGroup()
     next_group = _NextGroup()
+    transfer_buffers = {"slot": object()}
     bucket_group._nep_distopt_owner_bundle = {
         "native_group": native_group,
         "param_sync_completed": False,
+        "param_transfer_buffers": transfer_buffers,
     }
     bucket_group.next_param_gather_bucket_group = next_group
     scatters = []
@@ -420,6 +429,7 @@ def test_nep_distopt_async_param_sync_uses_native_forward_lifecycle():
     assert native_group.finishes == 1
     assert scatters == [True]
     assert next_group.starts == 1
+    assert transfer_buffers
 
     # The next forward calls finish directly. It must launch a fresh native
     # all-gather rather than returning on the previous iteration's completion.
@@ -429,6 +439,16 @@ def test_nep_distopt_async_param_sync_uses_native_forward_lifecycle():
     assert native_group.finishes == 2
     assert scatters == [True, True]
     assert next_group.starts == 2
+
+    # The final bucket releases transient staging before its forward compute.
+    bucket_group.next_param_gather_bucket_group = None
+    transfer_buffers["slot"] = object()
+    bucket_group.param_gather_dispatched = False
+    bucket_group.finish_param_sync()
+    assert native_group.starts == 3
+    assert native_group.finishes == 3
+    assert scatters == [True, True, True]
+    assert transfer_buffers == {}
 
 
 def test_nep_distopt_scale_gradients_includes_owner_buffers(monkeypatch):
@@ -524,6 +544,19 @@ def test_nep_distopt_param_transfer_slots_preserve_adjacent_storage():
     assert storage_by_group[0] is storage_by_group[2]
     assert storage_by_group[0].numel() == 6
     assert storage_by_group[1].numel() == 8
+
+
+def test_nep_distopt_param_transfer_slot_count_override(monkeypatch):
+    monkeypatch.delenv("MEGATRON_NONUNIFORM_EP_DISTOPT_PARAM_TRANSFER_SLOTS", raising=False)
+    assert _get_nep_distopt_param_transfer_slot_count(3) == 2
+    assert _get_nep_distopt_param_transfer_slot_count(1) == 1
+
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_DISTOPT_PARAM_TRANSFER_SLOTS", "1")
+    assert _get_nep_distopt_param_transfer_slot_count(3) == 1
+
+    monkeypatch.setenv("MEGATRON_NONUNIFORM_EP_DISTOPT_PARAM_TRANSFER_SLOTS", "0")
+    with pytest.raises(RuntimeError, match="must be positive"):
+        _get_nep_distopt_param_transfer_slot_count(3)
 
 
 @pytest.mark.parametrize(
