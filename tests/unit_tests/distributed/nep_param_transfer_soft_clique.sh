@@ -52,6 +52,9 @@ git -C "${CODE_REPO}" rev-parse HEAD > "${SOFT_CLIQUE_ROOT}/training_commit.txt"
 sha256sum "${CODE_REPO}/megatron/core/distributed/nonuniform_ep.py" > "${SOFT_CLIQUE_ROOT}/training_sha256.txt"
 if [[ "${SOFT_CLIQUE_PROFILE_SWEEP:-0}" == 1 ]]; then
     export PRETRAIN_DIAGNOSTIC_ENTRYPOINT=/home/darfeen/Megatron-LM/scripts/nonuniform/pretrain_profile_activity_probe.py
+    if [[ -n "${NEP_SYNC_ENTRYPOINT:-}" ]]; then
+        export PRETRAIN_DIAGNOSTIC_ENTRYPOINT="${NEP_SYNC_ENTRYPOINT}"
+    fi
     base_root="${SOFT_CLIQUE_ROOT}"
     read -r -a profile_modes <<< "${PROFILE_ACTIVITY_MODES:-cpu_cuda cuda}"
     for PROFILE_ACTIVITY_MODE in "${profile_modes[@]}"; do
@@ -61,8 +64,8 @@ if [[ "${SOFT_CLIQUE_PROFILE_SWEEP:-0}" == 1 ]]; then
         export ROOT_DIR="${SOFT_CLIQUE_ROOT}"
         mkdir -p "${SOFT_CLIQUE_ROOT}"/{placement,transport}
         cp "${base_root}/allocation.txt" "${SOFT_CLIQUE_ROOT}/allocation.txt"
-        bash /home/darfeen/Megatron-LM-nep-param-cpu-20260911/tests/unit_tests/distributed/nep_param_transfer_cases.sh
+        bash "$(dirname "${BASH_SOURCE[0]}")/nep_param_transfer_cases.sh"
     done
 else
-    bash /home/darfeen/Megatron-LM-nep-param-cpu-20260911/tests/unit_tests/distributed/nep_param_transfer_cases.sh
+    bash "$(dirname "${BASH_SOURCE[0]}")/nep_param_transfer_cases.sh"
 fi

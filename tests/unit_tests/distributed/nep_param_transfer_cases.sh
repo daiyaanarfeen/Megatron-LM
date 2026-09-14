@@ -52,9 +52,13 @@ mkdir -p "${ROOT_DIR}/${GROUP}" "${ARTIFACT_ROOT}/slurm_runs/lyris"
 mapfile -t allocated_nodes < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
 FIRST_NODE="${allocated_nodes[0]}"
 
+reference_mount=""
+if [[ -n "${NEP_SYNC_REFERENCE:-}" && "${NEP_SYNC_REFERENCE}" != "${CODE_REPO}" ]]; then
+    reference_mount=",${NEP_SYNC_REFERENCE}:${NEP_SYNC_REFERENCE}"
+fi
 container_args=(
     --container-image="${IMAGE}"
-    --container-mounts="${BENCH_REPO}:${BENCH_REPO},${CODE_REPO}:${CODE_REPO},${ARTIFACT_ROOT}:${ARTIFACT_ROOT}"
+    --container-mounts="${BENCH_REPO}:${BENCH_REPO},${CODE_REPO}:${CODE_REPO},${ARTIFACT_ROOT}:${ARTIFACT_ROOT}${reference_mount}"
     --container-workdir="${CODE_REPO}"
     --no-container-mount-home
 )
