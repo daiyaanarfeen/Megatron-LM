@@ -34,7 +34,7 @@ def load_methods(root):
     return namespace
 
 
-def run(root, device):
+def run(root, device, dtype=torch.float32):
     ns = load_methods(root)
     scatter = ns['_scatter_nep_distopt_owner_params_to_physical_holders']
     total_copies = 0
@@ -79,7 +79,9 @@ def run(root, device):
                 entries = []
                 for expert in experts:
                     for slot, shape in enumerate(((2, 3), (1, 5))):
-                        param = torch.nn.Parameter(torch.full(shape, -1.0, device=device))
+                        param = torch.nn.Parameter(
+                            torch.full(shape, -1.0, device=device, dtype=dtype)
+                        )
                         param.grad = torch.ones_like(param)
                         entries.append(
                             dict(
@@ -93,7 +95,7 @@ def run(root, device):
                 proxies = (
                     {
                         (0, e, slot): torch.nn.Parameter(
-                            torch.full(shape, float(e * 2 + slot), device=device)
+                            torch.full(shape, float(e * 2 + slot), device=device, dtype=dtype)
                         )
                         for e in slots[rank]
                         if e is not None
@@ -166,16 +168,23 @@ def run(root, device):
                     ]
                     copies = []
                     original = torch.Tensor.copy_
+                    original_foreach = torch._foreach_copy_
 
                     def copy(dest, source, *args, **kwargs):
                         copies.append(dest.numel())
                         return original(dest, source, *args, **kwargs)
 
+                    def foreach_copy(destinations, sources, *args, **kwargs):
+                        copies.extend(dest.numel() for dest in destinations)
+                        return original_foreach(destinations, sources, *args, **kwargs)
+
                     torch.Tensor.copy_ = copy
+                    torch._foreach_copy_ = foreach_copy
                     try:
                         scatter(group)
                     finally:
                         torch.Tensor.copy_ = original
+                        torch._foreach_copy_ = original_foreach
                     total_copies += len(copies)
                     if rank < reduced and len(transfers[rank]) == 1:
                         singleton_copies += len(copies)
@@ -199,7 +208,7 @@ def run(root, device):
     if device == 'cuda':
         torch.cuda.synchronize()
     print(
-        f'PASS root={root} device={device} copies={total_copies} singleton_copies={singleton_copies} broadcasts={len(broadcasts)}'
+        f'PASS root={root} device={device} dtype={dtype} copies={total_copies} singleton_copies={singleton_copies} broadcasts={len(broadcasts)}'
     )
     return broadcasts
 
@@ -207,4 +216,5 @@ def run(root, device):
 if __name__ == '__main__':
     baseline, candidate = map(Path, sys.argv[1:3])
     for device in ('cpu', 'cuda'):
-        assert run(baseline, device) == run(candidate, device)
+        for dtype in (torch.float32, torch.bfloat16):
+            assert run(baseline, device, dtype) == run(candidate, device, dtype)

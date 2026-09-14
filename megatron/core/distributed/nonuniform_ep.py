@@ -1709,9 +1709,12 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         ) in self._get_nep_distopt_param_transfer_plan():
             # Resolve live tensors each time: native DistOpt can rebind their storage.
             if transfer_size == 1:
+                destinations, sources = [], []
                 for bucket, _, _, key in unpack:
                     param = bucket.params_list[0]
-                    param.copy_(bundle["proxy_by_key"][key].detach().view_as(param))
+                    destinations.append(param)
+                    sources.append(bundle["proxy_by_key"][key].view_as(param))
+                torch._foreach_copy_(destinations, sources)
                 continue
             reference_param = unpack[0][0].params_list[0]
             transfer_slot = bundle["param_transfer_slot"]
@@ -1725,16 +1728,23 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 )
                 bundle["param_transfer_buffers"][cache_key] = transfer_storage
             owner_params = transfer_storage[:owner_numel]
+            destinations, sources = [], []
             for key, start, numel in pack:
                 proxy = bundle["proxy_by_key"][key]
-                owner_params[start : start + numel].copy_(proxy.detach().view(-1))
+                destinations.append(owner_params[start : start + numel].view_as(proxy))
+                sources.append(proxy)
+            if destinations:
+                torch._foreach_copy_(destinations, sources)
 
             if transfer_group is not None and transfer_size > 1:
                 dist.broadcast(owner_params, src=source, group=transfer_group)
 
+            destinations, sources = [], []
             for bucket, start, numel, _ in unpack:
                 param = bucket.params_list[0]
-                param.copy_(owner_params[start : start + numel].view_as(param))
+                destinations.append(param)
+                sources.append(owner_params[start : start + numel].view_as(param))
+            torch._foreach_copy_(destinations, sources)
 
     def start_param_sync(self, force_sync: bool = False):
         """Start native owner parameter all-gather and redistribute when ready."""
