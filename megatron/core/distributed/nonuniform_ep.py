@@ -1364,13 +1364,9 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 group._nep_distopt_grad_copy_plan = tuple(plan)
             # Only metadata persists: both Gather storage and native gradient
             # views can be rebound between iterations.
-            destinations, sources = [], []
             for key, start, numel in plan:
                 grad = bundle["proxy_by_key"][key].main_grad
-                destinations.append(grad)
-                sources.append(context["chunk"][start : start + numel].view_as(grad))
-            if destinations:
-                torch._foreach_copy_(destinations, sources)
+                grad.view(-1).copy_(context["chunk"][start : start + numel])
 
             copy_done = torch.cuda.Event()
             copy_done.record(torch.cuda.current_stream())

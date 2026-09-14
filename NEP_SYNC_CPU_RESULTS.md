@@ -64,7 +64,7 @@ from cached version:13 additions/3 deletions, one method in nonuniform_ep.py.
   transfer time or exclusive communication residency.
 - Existing native gradient staging remains unchanged in this gate.
 
-## Gate 3: Gradient Staging (In Progress)
+## Gate 3: Batched Gradient Staging (Rejected)
 
 Job3054926, same nodes/segment. Candidate adds cached integer/key-only gradient
 copy descriptors and one foreach copy per existing context. Preserves copy-done
@@ -73,7 +73,41 @@ events and native reduce-scatter ordering. Reference is gate2 commit2fe05a928.
 Additional tests compare actual old/new staging with padding, heterogeneous slot
 shapes, source/destination guards and rebound grad/source storage, across all
 four EP pairs and FP32/BF16 CPU/CUDA. Then live shadow and MBS1/2 A/B.
-Do not consider this gate accepted before its results are analyzed.
+All400 standalone comparisons and224 parameter/192 gradient live checks passed.
+MBS1 improved445.41->438.74ms, but MBS2 regressed718.48->723.34ms.
+Held acceptance for repeat instead of treating shorter copy scopes as success.
+
+Job3055060 completed31m04s on GB200 lyris[0113,0117,0123,0126], segment4,
+with the same replica containment and cross-replica RDMA controls. Repeated
+combined/parameter-only/combined MBS2 means:741.48/735.63/737.30ms.
+Both combined trials were slower; combined mean739.39 versus735.63ms (+0.51%).
+Post-window combined mean733.43 versus731.27ms (+0.29%). These small differences
+are not proof of a specific hardware mechanism, but fail the conservative
+incremental no-regression gate. Foreach gradient staging is not retained.
+
+## Original and Combined Comparison (Diagnostic, Not Accepted Runtime)
+
+Same job3055060, measured40-49 means:
+
+| MBS | Healthy | Original trusted | Combined candidate | Original parity | Candidate parity |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 424.54 | 485.26 | 482.42 | 87.49% | 88.00% |
+| 2 | 711.81 | 749.07 | 739.39 (two trials) | 95.03% | 96.27% |
+
+MBS1 post-profile original479.28 versus combined461.47ms shows a larger gain
+than measured485.26 versus482.42ms. Do not mix those windows or infer the
+post-profile improvement from the recorded traces. This allocation has runtime
+variation and differential profiling distortion; no correction is applied.
+Although combined improves against original, its MBS2 regression against the
+already accepted parameter-only implementation is sufficient to reject it.
+
+## Gate 4: Metadata-Only Gradient Staging (In Progress)
+
+Job3055348 restores original scalar gradient copy operations and preserves
+only the integer/key descriptor cache. Reference is gate2 commit2fe05a928.
+No other runtime changes. Standalone tests, live shadow, MBS1 A/B and repeated
+MBS2 A/B remain required before acceptance. Rejected candidate is preserved
+at dc7bb0389; the trusted runtime remains unchanged.
 
 ## Artifacts and Limits
 
