@@ -1346,27 +1346,15 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             group = context["group"]
             if group._nep_distopt_owner_bundle is not bundle:
                 raise RuntimeError("NEP DistOpt EDP batch spans different owner buffers")
-            plan = getattr(group, "_nep_distopt_grad_copy_plan", None)
-            if plan is None:
-                plan = []
-                for expert_id in group._nep_nccl_owner_expert_ids(owner_ep_rank):
-                    _, owner_slot = group._nep_nccl_owner_slot_for_expert(expert_id)
-                    for slot_index, (slot_offset, slot_numel) in enumerate(
-                        zip(group._nep_nccl_slot_offsets, group._nep_nccl_slot_numels)
-                    ):
-                        plan.append(
-                            (
-                                (group._nep_nccl_group_index, expert_id, slot_index),
-                                owner_slot * group._nep_nccl_expert_stride + slot_offset,
-                                slot_numel,
-                            )
-                        )
-                group._nep_distopt_grad_copy_plan = tuple(plan)
-            # Only metadata persists: both Gather storage and native gradient
-            # views can be rebound between iterations.
-            for key, start, numel in plan:
-                grad = bundle["proxy_by_key"][key].main_grad
-                grad.view(-1).copy_(context["chunk"][start : start + numel])
+            group_index = group._nep_nccl_group_index
+            for expert_id in group._nep_nccl_owner_expert_ids(owner_ep_rank):
+                _, owner_slot = group._nep_nccl_owner_slot_for_expert(expert_id)
+                for slot_index, (slot_offset, slot_numel) in enumerate(
+                    zip(group._nep_nccl_slot_offsets, group._nep_nccl_slot_numels)
+                ):
+                    proxy = bundle["proxy_by_key"][(group_index, expert_id, slot_index)]
+                    start = owner_slot * group._nep_nccl_expert_stride + slot_offset
+                    proxy.main_grad.view(-1).copy_(context["chunk"][start : start + slot_numel])
 
             copy_done = torch.cuda.Event()
             copy_done.record(torch.cuda.current_stream())

@@ -101,13 +101,60 @@ variation and differential profiling distortion; no correction is applied.
 Although combined improves against original, its MBS2 regression against the
 already accepted parameter-only implementation is sufficient to reject it.
 
-## Gate 4: Metadata-Only Gradient Staging (In Progress)
+## Gate 4: Metadata-Only Gradient Staging (Not Retained)
 
 Job3055348 restores original scalar gradient copy operations and preserves
 only the integer/key descriptor cache. Reference is gate2 commit2fe05a928.
-No other runtime changes. Standalone tests, live shadow, MBS1 A/B and repeated
-MBS2 A/B remain required before acceptance. Rejected candidate is preserved
-at dc7bb0389; the trusted runtime remains unchanged.
+No other runtime changes. Job completed26m53s on GB200 lyris[0075,0083,0087,0089],
+segment4, replica-contained with cross-replica RDMA. Standalone400 gradient
+comparisons and live224 parameter/192 gradient checks passed again.
+
+- MBS1 parameter-only462.84 versus metadata-only485.87ms (+4.98%).
+  Full-owner gradient CPU9.863->9.760ms: essentially no host improvement here.
+- MBS2 parameter-only723.94/728.44 versus metadata-only727.76/725.89ms.
+  Pooled run means726.19 versus726.825ms (+0.09%), no demonstrated benefit.
+- No causal claim that metadata caching itself explains the entire MBS1 gap;
+  small changes can perturb scheduling, and independent runs have variability.
+  The observed results do not justify additional code under a no-regression
+  constraint. Metadata-only experiment is preserved at30e51b754; foreach
+  gradient staging at dc7bb0389. Neither is retained in the final runtime.
+
+## Final Accepted Runtime
+
+Runtime file restored byte-for-byte to tested gate2 commit2fe05a928. Only
+nonuniform_ep.py differs from trusted0fd1e023e; gradient staging is identical
+to trusted. Retained changes are parameter-transfer metadata caching, direct
+singleton transfers, and batched parameter copies. Native DDP/DistOpt,
+dispatcher, gradients, collective groups/order, streams, prefetch and bounded
+temporary buffers are unchanged. New code caches no live tensor storage.
+
+Strongest isolated acceptance evidence is gate2 job3054823: measured MBS1
+450.10->441.84ms and MBS2 724.34->716.86ms against the already cached version.
+Those are incremental copy-batching gains, not an original-to-final or a
+healthy-to-NEP comparison. Gate1 provides separate metadata/singleton evidence.
+Same-allocation original-to-final MBS2 also exists in3055060:
+trusted749.07 versus parameter-only735.63ms, with healthy711.81ms
+(owner logged parity95.03%->96.76%). No original-to-final MBS1 value from that
+allocation exists; its combined MBS1 candidate was subsequently rejected.
+
+Remaining costs must not all be labelled unavoidable:
+
+- Necessary data delivery: Gather, owner reduce-scatter/all-gather and delivery
+  to physical expert holders. Payload is topology/model dependent; exposure
+  depends on available work and dependencies, not a fixed minimum latency.
+- Implementation costs still present: live view/list construction, bounded
+  buffer allocation, native optimizer/parameter hooks, and current prefetch
+  placement after parameter redistribution submission. No proof that these
+  are optimal. Changing storage layout, buffer lifetime or communication
+  prefetch would need a distinct memory/order/correctness/performance gate.
+- Workload-dependent native costs: more expert operations on reduced EP,
+  host launch headroom and late peer readiness. These were not changed.
+- Measurement limits: low-overhead profiles still show differential distortion
+  on some allocations; measured and post-profile windows remain separate.
+
+This removes validated redundant first-forward work, not every possible
+implementation cost. It is a better-controlled implementation baseline, not
+proof that all residual overhead is irreducible.
 
 ## Artifacts and Limits
 
@@ -118,4 +165,5 @@ Analyzer: /home/darfeen/Megatron-LM/scripts/nonuniform/analyze_nep_sync_cpu.py.
 Full-training loss trajectories differ across independent processes. Exact live
 operation replay addresses the changed copy transformations, not a general proof
 of bitwise full-training determinism. No larger-degree full-model performance
-validation or new healthy-relative parity result is claimed at this stage.
+validation is claimed. Healthy comparisons above apply only to the named
+runtime and measurement window, not to rejected/final variants interchangeably.
