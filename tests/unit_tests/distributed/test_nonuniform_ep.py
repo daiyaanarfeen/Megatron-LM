@@ -412,6 +412,8 @@ def test_nep_distopt_async_param_sync_uses_native_forward_lifecycle():
         "native_group": native_group,
         "param_sync_completed": False,
         "param_transfer_buffers": transfer_buffers,
+        "param_transfer_stream": torch.cuda.Stream(),
+        "param_sync_event": torch.cuda.Event(),
     }
     bucket_group.next_param_gather_bucket_group = next_group
     scatters = []
@@ -421,8 +423,10 @@ def test_nep_distopt_async_param_sync_uses_native_forward_lifecycle():
 
     bucket_group.start_param_sync()
     assert native_group.starts == 1
-    assert native_group.finishes == 0
-    assert scatters == []
+    assert native_group.finishes == 1
+    assert scatters == [True]
+    assert not bucket_group._nep_distopt_owner_bundle["param_sync_completed"]
+    assert next_group.starts == 0
 
     bucket_group.finish_param_sync()
     bucket_group.finish_param_sync()

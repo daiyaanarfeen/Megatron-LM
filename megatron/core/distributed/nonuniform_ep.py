@@ -1772,6 +1772,19 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     native_group._post_param_sync()
         self.param_gather_dispatched = True
         if self.ddp_config.overlap_param_gather and not force_sync:
+            # Enqueue the dependency and redistribution now, not at parameter use.
+            # One shared stream also orders reuse of the bounded transfer buffers.
+            transfer_stream = bundle["param_transfer_stream"]
+            transfer_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(transfer_stream):
+                if native_group is not None:
+                    with torch.profiler.record_function(
+                        "nep_distopt_finish_native_param_all_gather"
+                    ):
+                        native_group.finish_param_sync(skip_next_bucket_dispatch=True)
+                with torch.profiler.record_function("nep_distopt_param_scatter"):
+                    self._scatter_nep_distopt_owner_params_to_physical_holders()
+                bundle["param_sync_event"].record(transfer_stream)
             return
 
         with torch.profiler.record_function("nep_distopt_param_scatter"):
@@ -1793,12 +1806,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if bundle["param_sync_completed"]:
             return
 
-        native_group = bundle.get("native_group")
-        if native_group is not None:
-            with torch.profiler.record_function("nep_distopt_finish_native_param_all_gather"):
-                native_group.finish_param_sync(skip_next_bucket_dispatch=True)
-        with torch.profiler.record_function("nep_distopt_param_scatter"):
-            self._scatter_nep_distopt_owner_params_to_physical_holders()
+        torch.cuda.current_stream().wait_event(bundle["param_sync_event"])
         bundle["param_sync_completed"] = True
 
         next_group = self.next_param_gather_bucket_group
@@ -2625,6 +2633,9 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         # Bound temporary physical-layout staging while retaining two-slot adjacent
         # parameter-bucket concurrency by default.
         param_transfer_buffers = {}
+        param_transfer_stream = (
+            torch.cuda.Stream() if self.ddp_config.overlap_param_gather else None
+        )
         param_transfer_slot_count = _get_nep_distopt_param_transfer_slot_count(
             len(groups_by_edp_bucket)
         )
@@ -2652,6 +2663,10 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 "param_transfer_slot": edp_bucket_index % param_transfer_slot_count,
                 "param_transfer_numel_by_slot": param_transfer_numel_by_slot,
                 "param_sync_completed": False,
+                "param_transfer_stream": param_transfer_stream,
+                "param_sync_event": (
+                    torch.cuda.Event() if self.ddp_config.overlap_param_gather else None
+                ),
             }
 
             if ep_rank < min_ep_size:
