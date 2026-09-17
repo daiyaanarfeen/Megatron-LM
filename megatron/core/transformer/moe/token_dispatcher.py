@@ -1983,6 +1983,10 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         self._active_local_expert_slots = torch.tensor(
             active_local_expert_slots, dtype=torch.long, device='cuda'
         )
+        # HybridEP returns CPU counts; avoid a blocking device copy on every dispatch.
+        self._active_local_expert_slots_cpu = torch.tensor(
+            active_local_expert_slots, dtype=torch.long, device='cpu'
+        )
         num_dispatch_experts = len(flattened_slots)
 
         if backend == "deepep":
@@ -2167,6 +2171,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         tokens_per_expert = self._comm_manager.get_number_of_tokens_per_expert()
         active_local_expert_slots = getattr(self, '_active_local_expert_slots', None)
         if active_local_expert_slots is not None:
+            if tokens_per_expert.device.type == 'cpu':
+                active_local_expert_slots = self._active_local_expert_slots_cpu
             tokens_per_expert = tokens_per_expert.index_select(
                 0, active_local_expert_slots.to(tokens_per_expert.device)
             )

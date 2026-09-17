@@ -820,6 +820,43 @@ def test_flex_metadata_maps_logical_experts_to_padded_ep6_slots():
             assert torch.count_nonzero(flat_probs[:, physical_index]) == 0
 
 
+@pytest.mark.parametrize('slots', [None, [0, 1, 2, 3], [0, 1, 2], [0, 2], []])
+@pytest.mark.parametrize('counts_device', ['cpu', 'cuda'])
+def test_flex_postprocess_cached_slot_indices(slots, counts_device):
+    if counts_device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('CUDA token counts require a GPU')
+    dispatcher = MoEFlexTokenDispatcher.__new__(MoEFlexTokenDispatcher)
+    counts = torch.tensor([3, 17, 5, 11], device=counts_device)
+    hidden = torch.randn(4, 2, device=counts_device, requires_grad=True)
+    probs = torch.randn(4, device=counts_device, requires_grad=True)
+    dispatcher._comm_manager = SimpleNamespace(
+        get_permuted_hidden_states_by_experts=lambda x: (x, probs),
+        get_number_of_tokens_per_expert=lambda: counts,
+    )
+    if slots is not None:
+        dispatcher._active_local_expert_slots_cpu = torch.tensor(slots, dtype=torch.long)
+        if counts_device == 'cpu':
+            dispatcher._active_local_expert_slots = SimpleNamespace(
+                to=lambda _: pytest.fail('CPU counts must not copy device slot indices')
+            )
+        else:
+            dispatcher._active_local_expert_slots = torch.tensor(
+                slots, dtype=torch.long, device='cuda'
+            )
+    expected = (
+        counts
+        if slots is None
+        else counts.index_select(0, torch.tensor(slots, dtype=torch.long, device=counts_device))
+    )
+    for _ in range(2):
+        out_hidden, out_counts, out_probs = dispatcher.dispatch_postprocess(hidden, probs)
+        assert out_hidden is hidden and out_probs is probs
+        assert out_counts.device == counts.device
+        torch.testing.assert_close(out_counts, expected, rtol=0, atol=0)
+        if slots is None:
+            assert out_counts is counts
+
+
 class TestNonuniformEPTokenRouting:
     def teardown_method(self, _method):
         set_nonuniform_ep_runtime_config(None)
