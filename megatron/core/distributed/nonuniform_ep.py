@@ -1647,10 +1647,29 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     raise RuntimeError(
                         "NEP DistOpt parameter Scatter found no local physical entries"
                     )
+                # Keep owner-local experts out of the wire payload. All participants
+                # derive the same compact offsets from replica-wide placement.
+                placement = bucket_group._nep_runtime_config.get("expert_placement")
+                owner_local = set(
+                    placement[owner_ep_rank] if placement is not None else [owner_ep_rank]
+                )
+                remote_experts = [
+                    expert_id
+                    for expert_id in bucket_group._nep_nccl_owner_expert_ids(owner_ep_rank)
+                    if expert_id not in owner_local
+                ]
+                remote_offsets = {
+                    expert_id: index * layout["expert_stride"]
+                    for index, expert_id in enumerate(remote_experts)
+                }
                 unpack = tuple(
                     (
                         entry["bucket"],
-                        bucket_group._nep_nccl_entry_owner_start(entry, owner_ep_rank),
+                        (
+                            -1
+                            if entry["expert_id"] in owner_local
+                            else remote_offsets[entry["expert_id"]] + entry["slot_offset"]
+                        ),
                         entry["numel"],
                         (group_index, entry["expert_id"], entry["slot_index"]),
                     )
@@ -1658,8 +1677,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 )
                 pack = []
                 if ep_rank == owner_ep_rank and transfer_size > 1:
-                    for expert_id in bucket_group._nep_nccl_owner_expert_ids(owner_ep_rank):
-                        _, owner_slot = bucket_group._nep_nccl_owner_slot_for_expert(expert_id)
+                    for expert_id in remote_experts:
                         for slot_index, (slot_offset, slot_numel) in enumerate(
                             zip(
                                 bucket_group._nep_nccl_slot_offsets,
@@ -1669,7 +1687,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                             pack.append(
                                 (
                                     (group_index, expert_id, slot_index),
-                                    owner_slot * layout["expert_stride"] + slot_offset,
+                                    remote_offsets[expert_id] + slot_offset,
                                     slot_numel,
                                 )
                             )
@@ -1687,7 +1705,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                         transfer_group,
                         transfer_size,
                         source,
-                        layout["owner_numel"],
+                        len(remote_experts) * layout["expert_stride"],
                         tuple(pack),
                         unpack,
                     )
@@ -1740,10 +1758,14 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 dist.broadcast(owner_params, src=source, group=transfer_group)
 
             destinations, sources = [], []
-            for bucket, start, numel, _ in unpack:
+            for bucket, start, numel, key in unpack:
                 param = bucket.params_list[0]
                 destinations.append(param)
-                sources.append(owner_params[start : start + numel].view_as(param))
+                sources.append(
+                    bundle["proxy_by_key"][key].view_as(param)
+                    if start == -1
+                    else owner_params[start : start + numel].view_as(param)
+                )
             torch._foreach_copy_(destinations, sources)
 
     def start_param_sync(self, force_sync: bool = False):

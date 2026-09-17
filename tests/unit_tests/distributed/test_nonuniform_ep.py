@@ -530,6 +530,23 @@ def test_nep_distopt_param_transfer_slots_preserve_adjacent_storage():
             "param_transfer_buffers": shared_transfer_buffers,
             "param_transfer_slot": index % 2,
             "param_transfer_numel_by_slot": {0: 6, 1: 8},
+            "param_transfer_plan": (
+                (
+                    None,
+                    2,
+                    None,
+                    physical_params[index].numel(),
+                    (),
+                    (
+                        (
+                            SimpleNamespace(params_list=[physical_params[index]]),
+                            0,
+                            physical_params[index].numel(),
+                            (index, 0, 0),
+                        ),
+                    ),
+                ),
+            ),
         }
 
     storage_by_group = []
