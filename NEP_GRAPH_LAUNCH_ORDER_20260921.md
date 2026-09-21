@@ -99,3 +99,20 @@ Experiment harness in the main working checkout:
 `analyze_graph_launch_order.py 3121210` regenerates the phase accounting.
 The checkpoint b798119e9 plus launcher commit9212d8e9a identify the exact
 runtime and launcher behavior tested.
+
+## Saved Checkpoint (2026-09-21)
+
+- Branch: `nep-graph-launch-order-20260921` on the personal fork
+  `daiyaanarfeen/Megatron-LM`.
+- Annotated checkpoint tag: `nep-graph-order-parity-20260921`.
+- The runtime remains identical to the tested version; only this provenance
+  record was added after validation. The tag records a performance result,
+  not a claim of full training numerical equivalence.
+- Exact harness snapshot (including the local profiling/analysis dependencies,
+  launchers, storage rules, and journal as captured before this save):
+  `saved_checkpoint/harness-snapshot-20260921.tar.gz` under the artifact root
+  above. This is an archival snapshot, not a new production-code change.
+- Archive SHA-256:
+  `71a52045786db25d39f2fe01a60cd1333e03c6afcfb2f6f98171d8ba03767fb7`.
+- Raw traces and benchmark data remain on Lustre, not in Git. No unrelated
+  working-tree edits were included in the checkpoint commits.
