@@ -1070,6 +1070,8 @@ class _HybridEPManager(_DispatchManager):
         num_local_experts: int,
         num_experts: int,
         config: TransformerConfig,
+        logical_num_experts: Optional[int] = None,
+        local_expert_slot_mask: Optional[List[bool]] = None,
     ):
         """
         Initialize the HybridEP dispatcher.
@@ -1080,10 +1082,21 @@ class _HybridEPManager(_DispatchManager):
             num_local_experts (int): The number of local experts.
             num_experts (int): The total number of experts in the group.
             config (TransformerConfig): The configuration for the transformer model.
+            logical_num_experts (int): Real expert count, excluding virtual dispatch slots.
+            local_expert_slot_mask (List[bool]): Real versus dummy local dispatch slots.
         """
         self.group = group
         self.num_local_experts = num_local_experts
         self.num_experts = num_experts
+        self.capacity_num_experts = num_experts if logical_num_experts is None else logical_num_experts
+        self._capacity_slot_mask = None
+        self._capacity_metadata_key = None
+        if local_expert_slot_mask is not None:
+            assert len(local_expert_slot_mask) == num_local_experts
+            self._capacity_slot_mask = torch.tensor(
+                local_expert_slot_mask, dtype=torch.long, device='cpu'
+            )
+            self._capacity_active_experts = sum(local_expert_slot_mask)
         self.config = config
         self.permute_fusion = config.moe_permute_fusion
         self.capacity_factor = config.moe_expert_capacity_factor
@@ -1167,15 +1180,25 @@ class _HybridEPManager(_DispatchManager):
             # Drop and pad the input to capacity.
             self.capacity = get_capacity(
                 num_tokens=num_out_tokens,
-                num_experts=self.num_experts,
+                num_experts=self.capacity_num_experts,
                 capacity_factor=self.capacity_factor,
             )
             # In drop_and_pad mode, the number of tokens after the permute op
             # can be computed on the CPU
-            self.num_permuted_tokens = self.capacity * self.group.size() * self.num_local_experts
-            self.tokens_per_expert = torch.full(
-                (self.num_local_experts,), self.capacity * self.group.size(), dtype=torch.long
-            )
+            if self._capacity_slot_mask is None:
+                self.num_permuted_tokens = self.capacity * self.group.size() * self.num_local_experts
+                self.tokens_per_expert = torch.full(
+                    (self.num_local_experts,), self.capacity * self.group.size(), dtype=torch.long
+                )
+            else:
+                # Dummy slots route no tokens. Keep their routing columns, but do
+                # not allocate token rows for them or charge them expert capacity.
+                key = (self.capacity, self.group.size())
+                if key != self._capacity_metadata_key:
+                    rows_per_expert = key[0] * key[1]
+                    self.tokens_per_expert = self._capacity_slot_mask * rows_per_expert
+                    self.num_permuted_tokens = self._capacity_active_experts * rows_per_expert
+                    self._capacity_metadata_key = key
 
     def dispatch(
         self,
@@ -2005,6 +2028,12 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 num_local_experts=self.num_local_expert_slots,
                 num_experts=self.tp_size * num_dispatch_experts,
                 config=self.config,
+                logical_num_experts=self.tp_size * self.config.num_moe_experts,
+                local_expert_slot_mask=(
+                    [expert_id is not None for expert_id in local_slots]
+                    if self.config.moe_pad_expert_input_to_capacity
+                    else None
+                ),
             )
             self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.routing_map']
         else:

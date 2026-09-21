@@ -38,6 +38,7 @@ from megatron.core.transformer.moe.router import Router
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAlltoAllTokenDispatcher,
     MoEFlexTokenDispatcher,
+    _HybridEPManager,
     _pad_nonuniform_flex_dispatch_slots,
 )
 from megatron.core.transformer.spec_utils import get_submodules
@@ -778,6 +779,67 @@ def test_nondivisible_ep8_ep6_uses_balanced_logical_experts_and_virtual_slots():
     assert sorted(expert_id for experts in full_placement for expert_id in experts) == list(
         range(16)
     )
+
+
+@pytest.mark.parametrize('active_count', [42, 43])
+@pytest.mark.parametrize('num_tokens', [8192, 16384])
+def test_hybridep_static_capacity_excludes_dummy_slots(active_count, num_tokens):
+    config = SimpleNamespace(
+        moe_permute_fusion=True,
+        moe_expert_capacity_factor=1.0,
+        moe_pad_expert_input_to_capacity=True,
+        moe_expert_rank_capacity_factor=None,
+        moe_hybridep_pad_uneven_dispatch_inputs=False,
+        moe_router_topk=6,
+    )
+    mask = [True] * active_count + [False] * (43 - active_count)
+    manager = _HybridEPManager(
+        SimpleNamespace(size=lambda: 12),
+        43,
+        516,
+        config,
+        logical_num_experts=512,
+        local_expert_slot_mask=mask,
+    )
+    routing = torch.zeros(num_tokens, 516, dtype=torch.bool)
+    probs = torch.zeros(num_tokens, 516)
+    manager.setup_metadata(routing, probs)
+    rows_per_expert = num_tokens * 6 // 512 * 12
+    assert manager.capacity == num_tokens * 6 // 512
+    assert manager.num_permuted_tokens == active_count * rows_per_expert
+    expected = torch.tensor(mask, dtype=torch.long) * rows_per_expert
+    torch.testing.assert_close(manager.tokens_per_expert, expected, rtol=0, atol=0)
+    counts = manager.tokens_per_expert
+    manager.setup_metadata(routing, probs)
+    assert manager.tokens_per_expert is counts
+
+    # Every returned row belongs to a real expert; gradients need no padding copy.
+    x = torch.randn(manager.num_permuted_tokens, 2, requires_grad=True)
+    weights = torch.arange(1, active_count + 1, dtype=x.dtype)
+    chunks = x.split(counts[:active_count].tolist())
+    loss = sum((chunk * weight).sum() for chunk, weight in zip(chunks, weights))
+    loss.backward()
+    expected_grad = weights.repeat_interleave(rows_per_expert)[:, None].expand_as(x)
+    torch.testing.assert_close(x.grad, expected_grad, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('drop_and_pad', [False, True])
+def test_hybridep_static_capacity_native_default_unchanged(drop_and_pad):
+    config = SimpleNamespace(
+        moe_permute_fusion=True,
+        moe_expert_capacity_factor=1.0 if drop_and_pad else None,
+        moe_pad_expert_input_to_capacity=drop_and_pad,
+        moe_expert_rank_capacity_factor=None,
+        moe_hybridep_pad_uneven_dispatch_inputs=False,
+        moe_router_topk=6,
+    )
+    manager = _HybridEPManager(SimpleNamespace(size=lambda: 16), 32, 512, config)
+    manager.setup_metadata(torch.zeros(1024, 512, dtype=torch.bool), torch.zeros(1024, 512))
+    if drop_and_pad:
+        assert manager.num_permuted_tokens == 6144
+        torch.testing.assert_close(manager.tokens_per_expert, torch.full((32,), 192))
+    else:
+        assert manager.num_permuted_tokens is None
 
 
 def test_flex_metadata_maps_logical_experts_to_padded_ep6_slots():
