@@ -1636,7 +1636,21 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         for bucket_group in bundle["groups"]:
             layout = bucket_group._get_nep_nccl_owner_layout()
             group_index = bucket_group._nep_nccl_group_index
-            for owner_ep_rank in range(layout["min_ep_size"]):
+            # Build the same disjoint waves on every rank before local filtering.
+            # Shared followers serialize each wave; independent owners can progress
+            # together without adding streams, barriers, or transfer buffers.
+            waves = []
+            for owner in range(layout["min_ep_size"]):
+                ranks = set(bucket_group._nep_nccl_owner_transfer_ranks(owner))
+                for owners, participants in waves:
+                    if participants.isdisjoint(ranks):
+                        owners.append(owner)
+                        participants.update(ranks)
+                        break
+                else:
+                    waves.append(([owner], ranks))
+            owner_order = [owner for owners, _ in waves for owner in owners]
+            for owner_ep_rank in owner_order:
                 transfer_group, _, transfer_size, transfer_ranks = (
                     bucket_group._get_nep_nccl_transfer_group_info(owner_ep_rank)
                 )

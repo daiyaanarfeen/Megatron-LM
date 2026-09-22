@@ -541,6 +541,76 @@ def test_nep_distopt_owner_task_skips_gradient_scatter():
     assert completed == [context]
 
 
+@pytest.mark.parametrize(
+    "experts,ep,owners", [(512, 16, 12), (512, 8, 6), (128, 8, 4), (128, 6, 6), (17, 8, 6)]
+)
+def test_nep_distopt_param_transfer_plan_disjoint_order_and_cache(monkeypatch, experts, ep, owners):
+    placement = compute_nonuniform_ep_expert_placement(
+        experts, ep, owners, preferred_follower_fanout=1
+    )
+    slots = compute_nonuniform_ep_owner_expert_slots(experts, owners)
+    members = {
+        owner: [owner]
+        + [
+            rank
+            for rank, ids in enumerate(placement)
+            if rank != owner and set(ids).intersection(slots[owner])
+        ]
+        for owner in range(owners)
+    }
+    monkeypatch.setattr(torch.distributed, "get_global_rank", lambda group, rank: rank)
+    observed_orders = []
+    for rank in range(ep):
+        group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
+            NonuniformEPNCCLParamAndGradBucketGroup
+        )
+        group._nep_runtime_config = {
+            "ep_rank": rank,
+            "ep_group": None,
+            "expert_placement": placement,
+        }
+        group._nep_nccl_group_index = 0
+        group._nep_nccl_slot_offsets = [0]
+        group._nep_nccl_slot_numels = [1]
+        group._get_nep_nccl_owner_layout = lambda: {"min_ep_size": owners, "expert_stride": 1}
+        group._nep_nccl_owner_transfer_ranks = members.__getitem__
+        visited = []
+
+        def info(owner):
+            visited.append(owner)
+            return owner, None, len(members[owner]), members[owner]
+
+        group._get_nep_nccl_transfer_group_info = info
+        group._nep_nccl_owner_expert_ids = lambda owner: [e for e in slots[owner] if e is not None]
+        group._nep_nccl_owner_entries = lambda owner: [
+            {"bucket": expert, "expert_id": expert, "slot_offset": 0, "slot_index": 0, "numel": 1}
+            for expert in placement[rank]
+            if expert in slots[owner]
+        ]
+        group._nep_distopt_owner_bundle = {"groups": (group,)}
+        plan = group._get_nep_distopt_param_transfer_plan()
+        observed_orders.append(tuple(visited))
+        assert sorted(visited) == list(range(owners))
+        assert [item[0] for item in plan] == [owner for owner in visited if rank in members[owner]]
+        for owner, size, source, numel, pack, unpack in plan:
+            remote = [e for e in slots[owner] if e is not None and e not in placement[owner]]
+            assert size == len(members[owner])
+            assert numel == len(remote)
+            assert source == (owner if size > 1 else None)
+            assert len(pack) == (len(remote) if rank == owner and size > 1 else 0)
+            assert {entry[0] for entry in unpack} == set(placement[rank]).intersection(slots[owner])
+        visited.clear()
+        assert group._get_nep_distopt_param_transfer_plan() is plan
+        assert not visited
+    assert len(set(observed_orders)) == 1
+    if (experts, ep, owners) == (512, 16, 12):
+        expected_waves = [(0, 3, 6, 9), (1, 4, 7, 10), (2, 8), (5, 11)]
+        assert observed_orders[0] == tuple(owner for wave in expected_waves for owner in wave)
+        for wave in expected_waves:
+            flattened = [rank for owner in wave for rank in members[owner]]
+            assert len(flattened) == len(set(flattened))
+
+
 def test_nep_distopt_param_transfer_slots_preserve_adjacent_storage():
     physical_params = [torch.nn.Parameter(torch.empty(numel)) for numel in (5, 8, 6)]
 
