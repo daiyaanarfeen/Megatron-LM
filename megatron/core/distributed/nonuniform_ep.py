@@ -1717,6 +1717,9 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
     def _scatter_nep_distopt_owner_params_to_physical_holders(self) -> None:
         """Redistribute all-gathered logical owner parameters within each EP replica."""
         bundle = self._nep_distopt_owner_bundle
+        caller = torch.cuda.current_stream()
+        owner_streams = bundle.get("param_owner_streams")
+        active_streams = []
         for (
             transfer_group,
             transfer_size,
@@ -1725,48 +1728,68 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             pack,
             unpack,
         ) in self._get_nep_distopt_param_transfer_plan():
-            # Resolve live tensors each time: native DistOpt can rebind their storage.
-            if transfer_size == 1:
-                destinations, sources = [], []
-                for bucket, _, _, key in unpack:
-                    param = bucket.params_list[0]
-                    destinations.append(param)
-                    sources.append(bundle["proxy_by_key"][key].view_as(param))
-                torch._foreach_copy_(destinations, sources)
-                continue
-            reference_param = unpack[0][0].params_list[0]
-            transfer_slot = bundle["param_transfer_slot"]
-            cache_key = (transfer_slot, reference_param.dtype, reference_param.device)
-            transfer_storage = bundle["param_transfer_buffers"].get(cache_key)
-            if transfer_storage is None:
-                transfer_storage = torch.empty(
-                    bundle["param_transfer_numel_by_slot"][transfer_slot],
-                    dtype=reference_param.dtype,
-                    device=reference_param.device,
+            stream = caller
+            if owner_streams is not None and transfer_size > 1:
+                if source not in owner_streams:
+                    owner_streams[source] = torch.cuda.Stream()
+                stream = owner_streams[source]
+                stream.wait_stream(caller)
+                active_streams.append(stream)
+            with torch.cuda.stream(stream):
+                self._copy_nep_distopt_owner_params(
+                    transfer_group, transfer_size, source, owner_numel, pack, unpack
                 )
-                bundle["param_transfer_buffers"][cache_key] = transfer_storage
-            owner_params = transfer_storage[:owner_numel]
-            destinations, sources = [], []
-            for key, start, numel in pack:
-                proxy = bundle["proxy_by_key"][key]
-                destinations.append(owner_params[start : start + numel].view_as(proxy))
-                sources.append(proxy)
-            if destinations:
-                torch._foreach_copy_(destinations, sources)
+        # Join only after every independent owner has been submitted. Joining in
+        # the loop would reintroduce cross-owner serialization on followers.
+        for stream in active_streams:
+            caller.wait_stream(stream)
 
-            if transfer_group is not None and transfer_size > 1:
-                dist.broadcast(owner_params, src=source, group=transfer_group)
-
+    def _copy_nep_distopt_owner_params(
+        self, transfer_group, transfer_size, source, owner_numel, pack, unpack
+    ) -> None:
+        bundle = self._nep_distopt_owner_bundle
+        # Resolve live tensors each time: native DistOpt can rebind their storage.
+        if transfer_size == 1:
             destinations, sources = [], []
-            for bucket, start, numel, key in unpack:
+            for bucket, _, _, key in unpack:
                 param = bucket.params_list[0]
                 destinations.append(param)
-                sources.append(
-                    bundle["proxy_by_key"][key].view_as(param)
-                    if start == -1
-                    else owner_params[start : start + numel].view_as(param)
-                )
+                sources.append(bundle["proxy_by_key"][key].view_as(param))
             torch._foreach_copy_(destinations, sources)
+            return
+        reference_param = unpack[0][0].params_list[0]
+        transfer_slot = bundle["param_transfer_slot"]
+        cache_key = (transfer_slot, source, reference_param.dtype, reference_param.device)
+        transfer_storage = bundle["param_transfer_buffers"].get(cache_key)
+        if transfer_storage is None:
+            transfer_storage = torch.empty(
+                bundle["param_transfer_numel_by_slot"][transfer_slot],
+                dtype=reference_param.dtype,
+                device=reference_param.device,
+            )
+            bundle["param_transfer_buffers"][cache_key] = transfer_storage
+        owner_params = transfer_storage[:owner_numel]
+        destinations, sources = [], []
+        for key, start, numel in pack:
+            proxy = bundle["proxy_by_key"][key]
+            destinations.append(owner_params[start : start + numel].view_as(proxy))
+            sources.append(proxy)
+        if destinations:
+            torch._foreach_copy_(destinations, sources)
+
+        if transfer_group is not None and transfer_size > 1:
+            dist.broadcast(owner_params, src=source, group=transfer_group)
+
+        destinations, sources = [], []
+        for bucket, start, numel, key in unpack:
+            param = bucket.params_list[0]
+            destinations.append(param)
+            sources.append(
+                bundle["proxy_by_key"][key].view_as(param)
+                if start == -1
+                else owner_params[start : start + numel].view_as(param)
+            )
+        torch._foreach_copy_(destinations, sources)
 
     def start_param_sync(self, force_sync: bool = False):
         """Start native owner parameter all-gather and redistribute when ready."""
@@ -1795,7 +1818,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         self.param_gather_dispatched = True
         if self.ddp_config.overlap_param_gather and not force_sync:
             # Enqueue the dependency and redistribution now, not at parameter use.
-            # One shared stream also orders reuse of the bounded transfer buffers.
+            # The coordinator joins per-owner transfers before parameter use.
             transfer_stream = bundle["param_transfer_stream"]
             transfer_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(transfer_stream):
@@ -2656,6 +2679,7 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         # Bound temporary physical-layout staging while retaining two-slot adjacent
         # parameter-bucket concurrency by default.
         param_transfer_buffers = {}
+        param_owner_streams = {}
         param_transfer_stream = (
             torch.cuda.Stream() if self.ddp_config.overlap_param_gather else None
         )
@@ -2683,6 +2707,7 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 "native_group": None,
                 "proxy_by_key": {},
                 "param_transfer_buffers": param_transfer_buffers,
+                "param_owner_streams": param_owner_streams,
                 "param_transfer_slot": edp_bucket_index % param_transfer_slot_count,
                 "param_transfer_numel_by_slot": param_transfer_numel_by_slot,
                 "param_sync_completed": False,

@@ -569,11 +569,13 @@ def test_nep_distopt_param_transfer_slots_preserve_adjacent_storage():
 
     storage_by_group = []
     for group in groups:
-        group._scatter_nep_distopt_owner_params_to_physical_holders()
+        with torch.no_grad():
+            group._copy_nep_distopt_owner_params(*group._get_nep_distopt_param_transfer_plan()[0])
         storage_by_group.append(
             shared_transfer_buffers[
                 (
                     group._nep_distopt_owner_bundle["param_transfer_slot"],
+                    None,
                     physical_params[0].dtype,
                     physical_params[0].device,
                 )
@@ -585,6 +587,44 @@ def test_nep_distopt_param_transfer_slots_preserve_adjacent_storage():
     assert storage_by_group[0] is storage_by_group[2]
     assert storage_by_group[0].numel() == 6
     assert storage_by_group[1].numel() == 8
+
+
+def test_nep_param_owner_streams_join_after_all_submissions(monkeypatch):
+    calls = []
+
+    class Stream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_stream(self, other):
+            calls.append(('wait', self.name, other.name))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    caller = Stream('caller')
+    streams = {0: Stream('owner0'), 2: Stream('owner2')}
+    monkeypatch.setattr(torch.cuda, 'current_stream', lambda: caller)
+    monkeypatch.setattr(torch.cuda, 'stream', lambda stream: stream)
+    group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(NonuniformEPNCCLParamAndGradBucketGroup)
+    group._nep_distopt_owner_bundle = {'param_owner_streams': streams}
+    group._get_nep_distopt_param_transfer_plan = lambda: (
+        (None, 2, 0, 8, (), ()),
+        (None, 2, 2, 8, (), ()),
+    )
+    group._copy_nep_distopt_owner_params = lambda *args: calls.append(('copy', args[2]))
+    group._scatter_nep_distopt_owner_params_to_physical_holders()
+    assert calls == [
+        ('wait', 'owner0', 'caller'),
+        ('copy', 0),
+        ('wait', 'owner2', 'caller'),
+        ('copy', 2),
+        ('wait', 'caller', 'owner0'),
+        ('wait', 'caller', 'owner2'),
+    ]
 
 
 def test_nep_distopt_param_transfer_slot_count_override(monkeypatch):
