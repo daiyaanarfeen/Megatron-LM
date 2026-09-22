@@ -88,6 +88,15 @@ def main():
     for left, right in zip(groups, groups[1:]):
         left[0].next_param_gather_bucket_group = right[0]
 
+    scatter = groups[0][0]._scatter_nep_distopt_owner_params_to_physical_holders
+
+    def delayed_scatter():
+        # Make delivery remain pending long enough to prove the next AG progresses.
+        torch.cuda._sleep(20000000)
+        scatter()
+
+    groups[0][0]._scatter_nep_distopt_owner_params_to_physical_holders = delayed_scatter
+
     CudaEventCapture.install_stage_labels()
     CudaEventCapture.wrap(Probe, 'independent', 'smoke.independent')
     actions = torch.profiler.ProfilerAction
@@ -133,8 +142,8 @@ def main():
         assert not cache
         capture.step()
     capture.stop()
-    if rank == 0:
-        data = json.loads((Path(os.environ['CUPTI_OUTPUT_DIR']) / 'rank-0.json').read_text())
+    if owner:
+        data = json.loads((Path(os.environ['CUPTI_OUTPUT_DIR']) / f'rank-{rank}.json').read_text())
         for step in (1, 2):
             events = [
                 e
@@ -143,7 +152,17 @@ def main():
             ]
             ag = next(e for e in events if e['name'] == 'collective.all_gather')
             compute = next(e for e in events if e['name'] == 'smoke.independent')
-            assert compute['ts'] + compute['dur'] < ag['ts'] + ag['dur'], (ag, compute)
+            if rank == 0:
+                assert compute['ts'] + compute['dur'] < ag['ts'] + ag['dur'], (ag, compute)
+            ags = [e for e in events if e['name'] == 'collective.all_gather']
+            delivery = next(e for e in events if e['name'] == 'nep.redistribute_params')
+            assert len(ags) == 3
+            assert ags[1]['ts'] + ags[1]['dur'] < delivery['ts'] + delivery['dur'], (
+                rank,
+                step,
+                ags[1],
+                delivery,
+            )
         print(
             'PREFETCH_SMOKE_PASS: fresh values, followers, reuse, force-sync, native EP/AG/RS and independent GPU progress',
             flush=True,

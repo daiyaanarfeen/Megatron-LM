@@ -1828,14 +1828,18 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         if bundle["param_sync_completed"]:
             return
 
+        next_group = self.next_param_gather_bucket_group
+        if next_group is not None and not skip_next_bucket_dispatch:
+            # Prefetch before the compute stream waits for this bucket's delivery.
+            # Native AGs remain ordered; the shared transfer stream serializes
+            # redistribution and staging-buffer reuse after each bucket's own AG.
+            next_group.start_param_sync()
+
         torch.cuda.current_stream().wait_event(bundle["param_sync_event"])
         bundle["param_sync_completed"] = True
 
-        next_group = self.next_param_gather_bucket_group
         if next_group is None:
             bundle["param_transfer_buffers"].clear()
-        elif not skip_next_bucket_dispatch:
-            next_group.start_param_sync()
 
     def _start_nep_nccl_owner_task_scatter(self, context: dict) -> None:
         if self.ddp_config.use_distributed_optimizer:

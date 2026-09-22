@@ -461,6 +461,36 @@ def test_nep_distopt_async_param_sync_uses_native_forward_lifecycle():
     assert transfer_buffers == {}
 
 
+@pytest.mark.parametrize("skip_next", [False, True])
+@pytest.mark.parametrize("has_next", [False, True])
+def test_nep_distopt_prefetch_precedes_parameter_delivery_wait(monkeypatch, skip_next, has_next):
+    group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(NonuniformEPNCCLParamAndGradBucketGroup)
+    group.ddp_config = SimpleNamespace(use_distributed_optimizer=True)
+    group._nep_distopt_param_sync_representative = True
+    group.param_gather_dispatched = True
+    calls = []
+    event = object()
+    buffers = {"slot": object()}
+    group._nep_distopt_owner_bundle = {
+        "param_sync_completed": False,
+        "param_sync_event": event,
+        "param_transfer_buffers": buffers,
+    }
+    group.next_param_gather_bucket_group = (
+        SimpleNamespace(start_param_sync=lambda: calls.append("prefetch")) if has_next else None
+    )
+    stream = SimpleNamespace(wait_event=lambda e: calls.append(("wait", e)))
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+
+    group.finish_param_sync(skip_next_bucket_dispatch=skip_next)
+    group.finish_param_sync(skip_next_bucket_dispatch=skip_next)
+
+    expected = ["prefetch"] if has_next and not skip_next else []
+    assert calls == expected + [("wait", event)]
+    assert bool(buffers) == has_next
+    assert group._nep_distopt_owner_bundle["param_sync_completed"]
+
+
 def test_nep_distopt_scale_gradients_includes_owner_buffers(monkeypatch):
     ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
     base_scalings = []
