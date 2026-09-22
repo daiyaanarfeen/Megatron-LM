@@ -2637,6 +2637,7 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         """Create persistent logical-owner buffers consumed by native DistOpt."""
         self.nonuniform_ep_distributed_optimizer_params_with_names = []
         self.nonuniform_ep_distributed_optimizer_buffers = []
+        self._nep_distopt_grad_padding = []
         if not self.ddp_config.use_distributed_optimizer:
             return
 
@@ -2772,6 +2773,17 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 bundle.update({"native_group": native_group, "proxy_by_key": proxy_by_key})
                 self.nonuniform_ep_distributed_optimizer_params_with_names.extend(params_with_names)
                 self.nonuniform_ep_distributed_optimizer_buffers.append(owner_buffer)
+                # Staging overwrites every real owner gradient. Only native alignment
+                # padding needs clearing before the next reduce-scatter.
+                previous_end = 0
+                for start, end, _ in sorted(owner_buffer.param_index_map.values()):
+                    if start > previous_end:
+                        self._nep_distopt_grad_padding.append((owner_buffer, previous_end, start))
+                    previous_end = end
+                if previous_end < owner_buffer.grad_data.numel():
+                    self._nep_distopt_grad_padding.append(
+                        (owner_buffer, previous_end, owner_buffer.grad_data.numel())
+                    )
 
             for group_index, bucket_group in enumerate(bucket_groups):
                 bucket_group._nep_distopt_owner_bundle = bundle
@@ -3242,7 +3254,7 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 bucket.gradient_scaling_factor = expert_gradient_scaling_factor
 
     def zero_grad_buffer(self):
-        """Reset physical gradients and persistent logical-owner gradients."""
+        """Reset accumulation buffers and only the unwritten padding of owner buffers."""
         super().zero_grad_buffer()
         native_groups = {}
         for bucket_group in self.expert_parallel_bucket_groups:
@@ -3256,13 +3268,15 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             if native_group.grad_reduce_handle is not None:
                 raise RuntimeError("NEP zero_grad found an unfinished native EDP reduction")
             native_group.reset()
-        for buffer in self.nonuniform_ep_distributed_optimizer_buffers:
-            buffer.reset()
+        for buffer, start, end in self._nep_distopt_grad_padding:
+            buffer.grad_data[start:end].zero_()
 
     def scale_gradients(self, scaling_factor: float):
-        """Scale physical gradients and persistent logical-owner gradients."""
-        super().scale_gradients(scaling_factor)
-        for buffer in self.nonuniform_ep_distributed_optimizer_buffers:
+        """Scale the gradients consumed by the active optimizer."""
+        if not self.ddp_config.use_distributed_optimizer:
+            return super().scale_gradients(scaling_factor)
+        # Physical expert gradients are staging inputs, not optimizer inputs.
+        for buffer in self.buffers + self.nonuniform_ep_distributed_optimizer_buffers:
             buffer.scale_gradients(scaling_factor)
 
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):

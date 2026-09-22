@@ -240,15 +240,20 @@ def test_nep_zero_grad_resets_embedded_native_groups_once(monkeypatch):
         _nep_nccl_native_edp_bucket_groups={1: native_group}, _nep_distopt_owner_bundle=None
     )
     owner_buffer = _OwnerBuffer()
+    owner_buffer.grad_data = torch.full((12,), 7.0)
     ddp = NonuniformEPDistributedDataParallel.__new__(NonuniformEPDistributedDataParallel)
     ddp.expert_parallel_bucket_groups = [first_group, second_group]
     ddp.nonuniform_ep_distributed_optimizer_buffers = [owner_buffer]
+    ddp._nep_distopt_grad_padding = [(owner_buffer, 3, 5), (owner_buffer, 10, 12)]
 
     ddp.zero_grad_buffer()
 
     assert parent_calls == [True]
     assert native_group.reset_calls == 1
-    assert owner_buffer.reset_calls == 1
+    assert owner_buffer.reset_calls == 0
+    torch.testing.assert_close(
+        owner_buffer.grad_data, torch.tensor([7, 7, 7, 0, 0, 7, 7, 7, 7, 7, 0, 0.0])
+    )
 
 
 def test_nep_finished_bucket_group_is_idempotent_on_current_main():
@@ -473,10 +478,22 @@ def test_nep_distopt_scale_gradients_includes_owner_buffers(monkeypatch):
 
     owner_buffers = [_OwnerBuffer(), _OwnerBuffer()]
     ddp.nonuniform_ep_distributed_optimizer_buffers = owner_buffers
+    ddp.ddp_config = SimpleNamespace(use_distributed_optimizer=True)
+    dense_buffer, physical_buffer = _OwnerBuffer(), _OwnerBuffer()
+    ddp.buffers = [dense_buffer]
+    ddp.expert_parallel_buffers = [physical_buffer]
 
     ddp.scale_gradients(0.125)
 
-    assert base_scalings == [0.125]
+    assert base_scalings == []
+    assert dense_buffer.scalings == [0.125]
+    assert physical_buffer.scalings == []
+    assert [buffer.scalings for buffer in owner_buffers] == [[0.125], [0.125]]
+
+    # Regular optimizer still consumes the physical expert gradients.
+    ddp.ddp_config.use_distributed_optimizer = False
+    ddp.scale_gradients(0.25)
+    assert base_scalings == [0.25]
     assert [buffer.scalings for buffer in owner_buffers] == [[0.125], [0.125]]
 
 
