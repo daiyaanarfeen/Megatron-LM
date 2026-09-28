@@ -1650,6 +1650,11 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 else:
                     waves.append(([owner], ranks))
             owner_order = [owner for owners, _ in waves for owner in owners]
+            ablation_order = os.getenv('NEP_ABLATION_PARAM_ORDER', 'waves')
+            if ablation_order == 'ascending':
+                owner_order = list(range(layout['min_ep_size']))
+            elif ablation_order != 'waves':
+                raise ValueError(f'Unknown parameter order: {ablation_order}')
             for owner_ep_rank in owner_order:
                 transfer_group, _, transfer_size, transfer_ranks = (
                     bucket_group._get_nep_nccl_transfer_group_info(owner_ep_rank)
@@ -1948,6 +1953,15 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     break
             else:
                 owner_waves.append({"owners": {owner}, "transfer_ranks": set(transfer_ranks)})
+
+        ablation_order = os.getenv('NEP_ABLATION_GRAD_ORDER', 'waves')
+        if ablation_order == 'ascending':
+            owner_waves = [
+                {'owners': {owner}, 'transfer_ranks': set(owner_transfer_ranks[owner])}
+                for owner in sorted(owner_order)
+            ]
+        elif ablation_order != 'waves':
+            raise ValueError(f'Unknown gradient order: {ablation_order}')
 
         task_batches = []
         max_batch_size = _get_nep_nccl_async_chunk_window()

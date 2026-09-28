@@ -137,6 +137,8 @@ def main():
     exercise(16, 2)
     capture.step()
     exercise(17, 3)
+    capture.step()
+    exercise(17, 2)
     capture.stop()
     if dist.get_rank() == 0:
         print(
