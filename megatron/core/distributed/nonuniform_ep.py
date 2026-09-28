@@ -1813,6 +1813,9 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     native_group._post_param_sync()
         self.param_gather_dispatched = True
         if self.ddp_config.overlap_param_gather and not force_sync:
+            if bundle.get('ablation_param_release') == 'consumer':
+                bundle['ablation_param_pending'] = True
+                return
             # Enqueue the dependency and redistribution now, not at parameter use.
             # One shared stream also orders reuse of the bounded transfer buffers.
             transfer_stream = bundle["param_transfer_stream"]
@@ -1846,6 +1849,20 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             self.start_param_sync()
         if bundle["param_sync_completed"]:
             return
+
+        if bundle.pop('ablation_param_pending', False):
+            transfer_stream = bundle['param_transfer_stream']
+            transfer_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(transfer_stream):
+                native_group = bundle.get('native_group')
+                if native_group is not None:
+                    with torch.profiler.record_function(
+                        'nep_distopt_finish_native_param_all_gather'
+                    ):
+                        native_group.finish_param_sync(skip_next_bucket_dispatch=True)
+                with torch.profiler.record_function('nep_distopt_param_scatter'):
+                    self._scatter_nep_distopt_owner_params_to_physical_holders()
+                bundle['param_sync_event'].record(transfer_stream)
 
         next_group = self.next_param_gather_bucket_group
         if next_group is not None and not skip_next_bucket_dispatch:
@@ -2711,6 +2728,7 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 )
             )
             bundle = {
+                'ablation_param_release': os.getenv('NEP_ABLATION_PARAM_RELEASE', 'early'),
                 "groups": bucket_groups,
                 "native_group": None,
                 "proxy_by_key": {},
@@ -3069,6 +3087,10 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         """Map expert buckets to their AccumulateGrad launch callbacks."""
         from ..transformer.moe.moe_layer import BaseMoELayer
 
+        release = os.getenv('NEP_ABLATION_GRAD_RELEASE', 'early')
+        if release not in ('early', 'finish'):
+            raise ValueError(f'Unknown gradient release policy: {release}')
+        self._nep_ablation_defer_grad = release == 'finish'
         expert_groups = set(self.expert_parallel_bucket_groups)
         assigned_groups = set()
         for module_name, module in self.module.named_modules():
@@ -3100,6 +3122,8 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
 
     def _launch_and_release_nep_two_level_gather(self, groups: tuple, module_label: str) -> None:
         """Submit one ready Gather group and release its host boundary immediately."""
+        if getattr(self, '_nep_ablation_defer_grad', False):
+            return
         if len(groups) != 1:
             raise RuntimeError("Two-level NEP Gather callbacks must contain exactly one group")
         state = groups[0]._nep_nccl_scheduler_state
@@ -3312,5 +3336,19 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             buffer.scale_gradients(scaling_factor)
 
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
+        if getattr(self, '_nep_ablation_defer_grad', False):
+            first = self.expert_parallel_bucket_groups[0]
+            if not first.is_first_batch:
+                state = first._nep_nccl_scheduler_state
+                while state['task_next_index'] < len(state['task_sequence']):
+                    previous = state['task_next_index']
+                    group = state['task_sequence'][previous]['group']
+                    if not self._launch_nep_dispatch_boundary_tasks(
+                        (group,), group._nep_dispatch_boundary_module_label
+                    ):
+                        raise RuntimeError('Deferred Gather did not become ready at final sync')
+                    self._wait_for_nep_dispatch_launch()
+                    if state['task_next_index'] <= previous:
+                        raise RuntimeError('Deferred Gather made no progress')
         self._wait_for_nep_dispatch_launch(final=True)
         return super().finish_grad_sync(force_all_reduce=force_all_reduce)

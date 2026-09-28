@@ -92,6 +92,7 @@ def exercise(experts, owners):
             if e is not None
         }
         group._nep_distopt_owner_bundle = dict(
+            ablation_param_release=os.getenv('NEP_ABLATION_PARAM_RELEASE', 'early'),
             groups=(group,),
             native_group=None,
             proxy_by_key=proxies,
