@@ -35,6 +35,8 @@ def main():
         use_distributed_optimizer=True, overlap_param_gather=True, overlap_grad_reduce=True
     )
     stream = torch.cuda.Stream()
+    lane_count = int(os.getenv('NEP_ABLATION_PARAM_LANES', '0'))
+    lane_streams = (torch.cuda.Stream(), torch.cuda.Stream()) if lane_count else None
     cache = {}
     groups = []
     n = 16384
@@ -95,6 +97,20 @@ def main():
             param_sync_completed=False,
         )
         group.next_param_gather_bucket_group = None
+        if lane_streams:
+            group._nep_distopt_owner_bundle.update(
+                param_lane_streams=lane_streams,
+                param_lane_count=lane_count,
+                param_lane_ready=torch.cuda.Event(),
+                param_transfer_owners=(index % 2,),
+            )
+            for slot in range(2):
+                for lane in range(2):
+                    key = (slot, physical.dtype, physical.device, lane)
+                    if key not in cache:
+                        cache[key] = torch.empty(
+                            2 * n, dtype=physical.dtype, device=physical.device
+                        )
         groups.append((group, physical, param_data, native))
     for left, right in zip(groups, groups[1:]):
         left[0].next_param_gather_bucket_group = right[0]
@@ -150,7 +166,7 @@ def main():
             if native is not None:
                 native.start_grad_sync()
                 native.finish_grad_sync()
-        assert not cache
+        assert len(cache) == 4 if lane_streams else not cache
         capture.step()
     capture.stop()
     if owner:

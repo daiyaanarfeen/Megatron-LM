@@ -2,6 +2,7 @@
 """Topology, expert-placement, and process-group helpers for opt-in nonuniform EP."""
 
 import math
+import os
 from datetime import timedelta
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -319,6 +320,20 @@ def compute_nonuniform_ep_expert_placement(
                     follower_rank = min_ep_size + (follower_index % num_followers)
                     placement[follower_rank].append(expert_id)
                     follower_index += 1
+
+    policy = os.getenv("NEP_ABLATION_PLACEMENT", "compact")
+    if policy not in {"compact", "spread"}:
+        raise ValueError(f"Unknown NEP placement ablation: {policy}")
+    if policy == "spread" and local_ep_size > min_ep_size:
+        capacities = [len(ids) for ids in placement[min_ep_size:]]
+        remote = sorted(expert for ids in placement[min_ep_size:] for expert in ids)
+        placement[min_ep_size:] = [[] for _ in capacities]
+        cursor = 0
+        for expert in remote:
+            while len(placement[min_ep_size + cursor]) == capacities[cursor]:
+                cursor = (cursor + 1) % len(capacities)
+            placement[min_ep_size + cursor].append(expert)
+            cursor = (cursor + 1) % len(capacities)
 
     for expert_ids in placement:
         expert_ids.sort()

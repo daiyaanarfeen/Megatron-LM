@@ -39,6 +39,8 @@ def exercise(experts, owners):
     )
     buffers, groups = {}, []
     stream = torch.cuda.Stream()
+    lane_count = int(os.getenv('NEP_ABLATION_PARAM_LANES', '0'))
+    lane_streams = (torch.cuda.Stream(), torch.cuda.Stream()) if lane_count else None
     max_numel = n * max(
         len([e for e in slots[o] if e is not None and e not in placement[o]]) for o in range(owners)
     )
@@ -108,6 +110,18 @@ def exercise(experts, owners):
             param_sync_event=torch.cuda.Event(),
             param_sync_completed=False,
         )
+        if lane_streams:
+            group._nep_distopt_owner_bundle.update(
+                param_lane_streams=lane_streams,
+                param_lane_count=lane_count,
+                param_lane_ready=torch.cuda.Event(),
+            )
+            for slot in range(2):
+                for lane in range(2):
+                    key = (slot, torch.bfloat16, torch.device('cuda', rank), lane)
+                    if key not in buffers:
+                        buffers[key] = torch.empty(max_numel, device='cuda', dtype=torch.bfloat16)
+            group._get_nep_distopt_param_transfer_plan()
         groups.append((group, physical, proxies))
     for left, right in zip(groups, groups[1:]):
         left[0].next_param_gather_bucket_group = right[0]
@@ -131,7 +145,10 @@ def exercise(experts, owners):
                 assert torch.equal(
                     param, torch.full_like(param, iteration * 20 + index * 2 + expert)
                 )
-        assert not buffers
+        if lane_streams:
+            assert len(buffers) == 4
+        else:
+            assert not buffers
 
 
 def main():

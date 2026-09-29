@@ -1630,7 +1630,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         bundle = self._nep_distopt_owner_bundle
         if "param_transfer_plan" in bundle:
             return bundle["param_transfer_plan"]
-        plan = []
+        plan, plan_owners = [], []
         ep_rank = self._nep_runtime_config["ep_rank"]
         for bucket_group in bundle["groups"]:
             layout = bucket_group._get_nep_nccl_owner_layout()
@@ -1649,6 +1649,11 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 else:
                     waves.append(([owner], ranks))
             owner_order = [owner for owners, _ in waves for owner in owners]
+            order = os.getenv("NEP_ABLATION_PARAM_ORDER", "waves")
+            if order == "ascending":
+                owner_order = list(range(layout["min_ep_size"]))
+            elif order != "waves":
+                raise ValueError(f"Unknown NEP parameter order: {order}")
             for owner_ep_rank in owner_order:
                 transfer_group, _, transfer_size, transfer_ranks = (
                     bucket_group._get_nep_nccl_transfer_group_info(owner_ep_rank)
@@ -1718,14 +1723,41 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                         unpack,
                     )
                 )
+                plan_owners.append(owner_ep_rank)
         bundle["param_transfer_plan"] = tuple(plan)
+        bundle["param_transfer_owners"] = tuple(plan_owners)
         return bundle["param_transfer_plan"]
 
     @torch.no_grad()
     def _scatter_nep_distopt_owner_params_to_physical_holders(self) -> None:
         """Redistribute all-gathered logical owner parameters within each EP replica."""
         bundle = self._nep_distopt_owner_bundle
-        for (
+        plan = self._get_nep_distopt_param_transfer_plan()
+        streams = bundle.get("param_lane_streams")
+        issuing_stream = torch.cuda.current_stream() if streams else None
+        if streams:
+            bundle["param_lane_ready"].record(issuing_stream)
+            for stream in streams:
+                stream.wait_event(bundle["param_lane_ready"])
+        for index, transfer in enumerate(plan):
+            if streams:
+                lane = bundle["param_transfer_owners"][index] % bundle["param_lane_count"]
+                with torch.cuda.stream(streams[lane]):
+                    self._scatter_nep_distopt_param_transfer(transfer, lane)
+            else:
+                self._scatter_nep_distopt_param_transfer(transfer)
+        if streams:
+            # The bucket's existing completion event must include both lanes.
+            # This also bounds in-flight transfers and protects next-bucket reuse.
+            for stream in streams:
+                issuing_stream.wait_stream(stream)
+
+    def _scatter_nep_distopt_param_transfer(
+        self, transfer: tuple, lane: Optional[int] = None
+    ) -> None:
+        """Execute the same exact-payload transfer on the selected stream."""
+        bundle = self._nep_distopt_owner_bundle
+        (
             transfer_group,
             transfer_size,
             input_splits,
@@ -1734,58 +1766,59 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             output_numel,
             pack,
             unpack,
-        ) in self._get_nep_distopt_param_transfer_plan():
-            # Resolve live tensors each time: native DistOpt can rebind their storage.
-            if transfer_size == 1:
-                destinations, sources = [], []
-                for bucket, _, _, key in unpack:
-                    param = bucket.params_list[0]
-                    destinations.append(param)
-                    sources.append(bundle["proxy_by_key"][key].view_as(param))
-                torch._foreach_copy_(destinations, sources)
-                continue
-            reference_param = unpack[0][0].params_list[0]
-            transfer_slot = bundle["param_transfer_slot"]
-            cache_key = (transfer_slot, reference_param.dtype, reference_param.device)
-            transfer_storage = bundle["param_transfer_buffers"].get(cache_key)
-            if transfer_storage is None:
-                transfer_storage = torch.empty(
-                    bundle["param_transfer_numel_by_slot"][transfer_slot],
-                    dtype=reference_param.dtype,
-                    device=reference_param.device,
-                )
-                bundle["param_transfer_buffers"][cache_key] = transfer_storage
-            # Each rank either sends or receives in this owner group, never both.
-            # The existing stream orders collective completion/copyback before reuse.
-            scatter_input = transfer_storage[:input_numel]
-            scatter_output = transfer_storage[:output_numel]
+        ) = transfer
+        # Resolve live tensors each time: native DistOpt can rebind their storage.
+        if transfer_size == 1:
             destinations, sources = [], []
-            for key, start, numel in pack:
-                proxy = bundle["proxy_by_key"][key]
-                destinations.append(scatter_input[start : start + numel].view_as(proxy))
-                sources.append(proxy)
-            if destinations:
-                torch._foreach_copy_(destinations, sources)
-
-            if transfer_group is not None and transfer_size > 1:
-                dist.all_to_all_single(
-                    scatter_output,
-                    scatter_input,
-                    output_split_sizes=output_splits,
-                    input_split_sizes=input_splits,
-                    group=transfer_group,
-                )
-
-            destinations, sources = [], []
-            for bucket, start, numel, key in unpack:
+            for bucket, _, _, key in unpack:
                 param = bucket.params_list[0]
                 destinations.append(param)
-                sources.append(
-                    bundle["proxy_by_key"][key].view_as(param)
-                    if start == -1
-                    else scatter_output[start : start + numel].view_as(param)
-                )
+                sources.append(bundle["proxy_by_key"][key].view_as(param))
             torch._foreach_copy_(destinations, sources)
+            return
+        reference_param = unpack[0][0].params_list[0]
+        transfer_slot = bundle["param_transfer_slot"]
+        cache_key = (transfer_slot, reference_param.dtype, reference_param.device)
+        if lane is not None:
+            cache_key += (lane,)
+        transfer_storage = bundle["param_transfer_buffers"].get(cache_key)
+        if transfer_storage is None:
+            if lane is not None:
+                raise RuntimeError("NEP ablation transfer buffer was not preallocated")
+            transfer_storage = torch.empty(
+                bundle["param_transfer_numel_by_slot"][transfer_slot],
+                dtype=reference_param.dtype,
+                device=reference_param.device,
+            )
+            bundle["param_transfer_buffers"][cache_key] = transfer_storage
+        # Each rank either sends or receives in this owner group, never both.
+        scatter_input = transfer_storage[:input_numel]
+        scatter_output = transfer_storage[:output_numel]
+        destinations, sources = [], []
+        for key, start, numel in pack:
+            proxy = bundle["proxy_by_key"][key]
+            destinations.append(scatter_input[start : start + numel].view_as(proxy))
+            sources.append(proxy)
+        if destinations:
+            torch._foreach_copy_(destinations, sources)
+        if transfer_group is not None and transfer_size > 1:
+            dist.all_to_all_single(
+                scatter_output,
+                scatter_input,
+                output_split_sizes=output_splits,
+                input_split_sizes=input_splits,
+                group=transfer_group,
+            )
+        destinations, sources = [], []
+        for bucket, start, numel, key in unpack:
+            param = bucket.params_list[0]
+            destinations.append(param)
+            sources.append(
+                bundle["proxy_by_key"][key].view_as(param)
+                if start == -1
+                else scatter_output[start : start + numel].view_as(param)
+            )
+        torch._foreach_copy_(destinations, sources)
 
     def start_param_sync(self, force_sync: bool = False):
         """Start native owner parameter all-gather and redistribute when ready."""
@@ -1831,7 +1864,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         with torch.profiler.record_function("nep_distopt_param_scatter"):
             self._scatter_nep_distopt_owner_params_to_physical_holders()
         bundle["param_sync_completed"] = True
-        if self.next_param_gather_bucket_group is None:
+        if self.next_param_gather_bucket_group is None and not bundle.get("param_lane_streams"):
             bundle["param_transfer_buffers"].clear()
 
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
@@ -1857,7 +1890,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         torch.cuda.current_stream().wait_event(bundle["param_sync_event"])
         bundle["param_sync_completed"] = True
 
-        if next_group is None:
+        if next_group is None and not bundle.get("param_lane_streams"):
             bundle["param_transfer_buffers"].clear()
 
     def _start_nep_nccl_owner_task_scatter(self, context: dict) -> None:
@@ -1953,6 +1986,9 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     break
             else:
                 owner_waves.append({"owners": {owner}, "transfer_ranks": set(transfer_ranks)})
+
+        if os.getenv("NEP_ABLATION_FIXED_GRAD_ORDER", "0") == "1":
+            owner_waves = [{"owners": {owner}} for owner in sorted(owner_order)]
 
         task_batches = []
         max_batch_size = _get_nep_nccl_async_chunk_window()
@@ -2694,6 +2730,10 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             )
             for slot in range(param_transfer_slot_count)
         }
+        lane_count = int(os.getenv("NEP_ABLATION_PARAM_LANES", "0"))
+        if lane_count not in (0, 1, 2):
+            raise ValueError("NEP_ABLATION_PARAM_LANES must be 0, 1 or 2")
+        lane_streams = (torch.cuda.Stream(), torch.cuda.Stream()) if lane_count else None
         for edp_bucket_index in sorted(groups_by_edp_bucket):
             bucket_groups = tuple(
                 sorted(
@@ -2811,6 +2851,22 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
             for group_index, bucket_group in enumerate(bucket_groups):
                 bucket_group._nep_distopt_owner_bundle = bundle
                 bucket_group._nep_distopt_param_sync_representative = group_index == 0
+            if lane_streams:
+                bundle.update(
+                    param_lane_streams=lane_streams,
+                    param_lane_count=lane_count,
+                    param_lane_ready=torch.cuda.Event(),
+                )
+                for bucket_group in bucket_groups:
+                    reference = bucket_group._nep_nccl_entries[0]["bucket"].params_list[0]
+                    for slot, numel in param_transfer_numel_by_slot.items():
+                        for lane in range(2):
+                            key = (slot, reference.dtype, reference.device, lane)
+                            if key not in param_transfer_buffers:
+                                param_transfer_buffers[key] = torch.empty(
+                                    numel, dtype=reference.dtype, device=reference.device
+                                )
+                bucket_groups[0]._get_nep_distopt_param_transfer_plan()
 
     def get_nonuniform_ep_distributed_optimizer_state(self) -> tuple:
         """Return owner proxy parameters and buffers for the optimizer factory."""
