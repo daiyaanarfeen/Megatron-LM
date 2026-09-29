@@ -56,7 +56,13 @@ def exercise(experts, owners):
             'ep_group': dist.group.WORLD,
             'expert_placement': placement,
         }
-        group._get_nep_nccl_owner_layout = lambda: {'min_ep_size': owners, 'expert_stride': n}
+        group._get_nep_nccl_owner_layout = lambda: {
+            'min_ep_size': owners,
+            'expert_stride': n,
+            'owner_expert_slots': slots,
+        }
+        group._nep_nccl_expert_stride = n
+        group._nep_nccl_segment_cache = {}
         group._nep_nccl_slot_offsets = [0]
         group._nep_nccl_slot_numels = [n]
         group._nep_nccl_owner_transfer_ranks = members.__getitem__

@@ -1632,7 +1632,6 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             return bundle["param_transfer_plan"]
         plan = []
         ep_rank = self._nep_runtime_config["ep_rank"]
-        ep_group = self._nep_runtime_config["ep_group"]
         for bucket_group in bundle["groups"]:
             layout = bucket_group._get_nep_nccl_owner_layout()
             group_index = bucket_group._nep_nccl_group_index
@@ -1661,54 +1660,47 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     raise RuntimeError(
                         "NEP DistOpt parameter Scatter found no local physical entries"
                     )
-                # Keep owner-local experts out of the wire payload. All participants
-                # derive the same compact offsets from replica-wide placement.
-                placement = bucket_group._nep_runtime_config.get("expert_placement")
-                owner_local = set(
-                    placement[owner_ep_rank] if placement is not None else [owner_ep_rank]
-                )
-                remote_experts = [
-                    expert_id
-                    for expert_id in bucket_group._nep_nccl_owner_expert_ids(owner_ep_rank)
-                    if expert_id not in owner_local
-                ]
-                remote_offsets = {
-                    expert_id: index * layout["expert_stride"]
-                    for index, expert_id in enumerate(remote_experts)
-                }
+                # Reuse gradient Scatter's exact expert/slot mapping, but resolve
+                # live parameter proxies at launch because native DistOpt rebinds them.
+                input_splits = [0] * transfer_size
+                output_splits = [0] * transfer_size
+                pack, local_offsets = [], {}
+                input_numel = output_numel = 0
+                for destination_index, destination in enumerate(transfer_ranks):
+                    if destination == owner_ep_rank:
+                        continue
+                    offset = 0
+                    for (
+                        (expert_id, slot_index),
+                        _,
+                        _,
+                        numel,
+                    ) in bucket_group._nep_nccl_owner_source_segments(owner_ep_rank, destination):
+                        if ep_rank == owner_ep_rank:
+                            pack.append(
+                                ((group_index, expert_id, slot_index), input_numel + offset, numel)
+                            )
+                        elif ep_rank == destination:
+                            local_offsets[expert_id, slot_index] = offset
+                        offset += numel
+                    if ep_rank == owner_ep_rank:
+                        input_splits[destination_index] = offset
+                        input_numel += offset
+                    elif ep_rank == destination:
+                        output_splits[transfer_ranks.index(owner_ep_rank)] = offset
+                        output_numel = offset
                 unpack = tuple(
                     (
                         entry["bucket"],
                         (
                             -1
-                            if entry["expert_id"] in owner_local
-                            else remote_offsets[entry["expert_id"]] + entry["slot_offset"]
+                            if ep_rank == owner_ep_rank
+                            else local_offsets[entry["expert_id"], entry["slot_index"]]
                         ),
                         entry["numel"],
                         (group_index, entry["expert_id"], entry["slot_index"]),
                     )
                     for entry in local_entries
-                )
-                pack = []
-                if ep_rank == owner_ep_rank and transfer_size > 1:
-                    for expert_id in remote_experts:
-                        for slot_index, (slot_offset, slot_numel) in enumerate(
-                            zip(
-                                bucket_group._nep_nccl_slot_offsets,
-                                bucket_group._nep_nccl_slot_numels,
-                            )
-                        ):
-                            pack.append(
-                                (
-                                    (group_index, expert_id, slot_index),
-                                    remote_offsets[expert_id] + slot_offset,
-                                    slot_numel,
-                                )
-                            )
-                source = (
-                    dist.get_global_rank(ep_group, owner_ep_rank)
-                    if transfer_group is not None and transfer_size > 1
-                    else None
                 )
                 if transfer_size == 1 and ep_rank != owner_ep_rank:
                     raise RuntimeError(
@@ -1718,8 +1710,10 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     (
                         transfer_group,
                         transfer_size,
-                        source,
-                        len(remote_experts) * layout["expert_stride"],
+                        input_splits,
+                        output_splits,
+                        input_numel,
+                        output_numel,
                         tuple(pack),
                         unpack,
                     )
@@ -1734,8 +1728,10 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         for (
             transfer_group,
             transfer_size,
-            source,
-            owner_numel,
+            input_splits,
+            output_splits,
+            input_numel,
+            output_numel,
             pack,
             unpack,
         ) in self._get_nep_distopt_param_transfer_plan():
@@ -1759,17 +1755,26 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     device=reference_param.device,
                 )
                 bundle["param_transfer_buffers"][cache_key] = transfer_storage
-            owner_params = transfer_storage[:owner_numel]
+            # Each rank either sends or receives in this owner group, never both.
+            # The existing stream orders collective completion/copyback before reuse.
+            scatter_input = transfer_storage[:input_numel]
+            scatter_output = transfer_storage[:output_numel]
             destinations, sources = [], []
             for key, start, numel in pack:
                 proxy = bundle["proxy_by_key"][key]
-                destinations.append(owner_params[start : start + numel].view_as(proxy))
+                destinations.append(scatter_input[start : start + numel].view_as(proxy))
                 sources.append(proxy)
             if destinations:
                 torch._foreach_copy_(destinations, sources)
 
             if transfer_group is not None and transfer_size > 1:
-                dist.broadcast(owner_params, src=source, group=transfer_group)
+                dist.all_to_all_single(
+                    scatter_output,
+                    scatter_input,
+                    output_split_sizes=output_splits,
+                    input_split_sizes=input_splits,
+                    group=transfer_group,
+                )
 
             destinations, sources = [], []
             for bucket, start, numel, key in unpack:
@@ -1778,7 +1783,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                 sources.append(
                     bundle["proxy_by_key"][key].view_as(param)
                     if start == -1
-                    else owner_params[start : start + numel].view_as(param)
+                    else scatter_output[start : start + numel].view_as(param)
                 )
             torch._foreach_copy_(destinations, sources)
 

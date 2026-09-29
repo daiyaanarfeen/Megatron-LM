@@ -544,10 +544,23 @@ def test_nep_distopt_owner_task_skips_gradient_scatter():
 @pytest.mark.parametrize(
     "experts,ep,owners", [(512, 16, 12), (512, 8, 6), (128, 8, 4), (128, 6, 6), (17, 8, 6)]
 )
-def test_nep_distopt_param_transfer_plan_disjoint_order_and_cache(monkeypatch, experts, ep, owners):
+@pytest.mark.parametrize("spread", [False, True])
+def test_nep_distopt_param_transfer_plan_disjoint_order_and_cache(
+    monkeypatch, experts, ep, owners, spread
+):
     placement = compute_nonuniform_ep_expert_placement(
         experts, ep, owners, preferred_follower_fanout=1
     )
+    if spread and ep > owners:
+        capacities = [len(ids) for ids in placement[owners:]]
+        remote = sorted(e for ids in placement[owners:] for e in ids)
+        placement[owners:] = [[] for _ in capacities]
+        cursor = 0
+        for expert in remote:
+            while len(placement[owners + cursor]) == capacities[cursor]:
+                cursor = (cursor + 1) % len(capacities)
+            placement[owners + cursor].append(expert)
+            cursor = (cursor + 1) % len(capacities)
     slots = compute_nonuniform_ep_owner_expert_slots(experts, owners)
     members = {
         owner: [owner]
@@ -560,6 +573,7 @@ def test_nep_distopt_param_transfer_plan_disjoint_order_and_cache(monkeypatch, e
     }
     monkeypatch.setattr(torch.distributed, "get_global_rank", lambda group, rank: rank)
     observed_orders = []
+    total_received = 0
     for rank in range(ep):
         group = NonuniformEPNCCLParamAndGradBucketGroup.__new__(
             NonuniformEPNCCLParamAndGradBucketGroup
@@ -572,7 +586,13 @@ def test_nep_distopt_param_transfer_plan_disjoint_order_and_cache(monkeypatch, e
         group._nep_nccl_group_index = 0
         group._nep_nccl_slot_offsets = [0]
         group._nep_nccl_slot_numels = [1]
-        group._get_nep_nccl_owner_layout = lambda: {"min_ep_size": owners, "expert_stride": 1}
+        group._get_nep_nccl_owner_layout = lambda: {
+            "min_ep_size": owners,
+            "expert_stride": 1,
+            "owner_expert_slots": slots,
+        }
+        group._nep_nccl_expert_stride = 1
+        group._nep_nccl_segment_cache = {}
         group._nep_nccl_owner_transfer_ranks = members.__getitem__
         visited = []
 
@@ -592,18 +612,46 @@ def test_nep_distopt_param_transfer_plan_disjoint_order_and_cache(monkeypatch, e
         observed_orders.append(tuple(visited))
         assert sorted(visited) == list(range(owners))
         assert [item[0] for item in plan] == [owner for owner in visited if rank in members[owner]]
-        for owner, size, source, numel, pack, unpack in plan:
+        for owner, size, sends, receives, send_numel, recv_numel, pack, unpack in plan:
             remote = [e for e in slots[owner] if e is not None and e not in placement[owner]]
             assert size == len(members[owner])
-            assert numel == len(remote)
-            assert source == (owner if size > 1 else None)
+            expected_sends = [
+                len(set(placement[r]).intersection(remote)) if rank == owner else 0
+                for r in members[owner]
+            ]
+            expected_receives = [
+                len(set(placement[rank]).intersection(remote)) if r == owner else 0
+                for r in members[owner]
+            ]
+            assert sends == expected_sends
+            assert receives == expected_receives
+            assert send_numel == sum(sends)
+            assert recv_numel == sum(receives)
+            assert not (send_numel and recv_numel)
+            total_received += recv_numel
             assert len(pack) == (len(remote) if rank == owner and size > 1 else 0)
+            offset = 0
+            for destination, count in zip(members[owner], sends):
+                assert (
+                    [key[1] for key, _, _ in pack[offset : offset + count]]
+                    == sorted(set(placement[destination]).intersection(remote))
+                    if rank == owner
+                    else count == 0
+                )
+                offset += count
             assert {entry[0] for entry in unpack} == set(placement[rank]).intersection(slots[owner])
+            for expert, start, numel, _ in unpack:
+                if rank == owner:
+                    assert start == -1
+                else:
+                    wanted = sorted(set(placement[rank]).intersection(remote))
+                    assert start == wanted.index(expert)
         visited.clear()
         assert group._get_nep_distopt_param_transfer_plan() is plan
         assert not visited
     assert len(set(observed_orders)) == 1
-    if (experts, ep, owners) == (512, 16, 12):
+    assert total_received == sum(len(ids) for ids in placement[owners:])
+    if not spread and (experts, ep, owners) == (512, 16, 12):
         expected_waves = [(0, 3, 6, 9), (1, 4, 7, 10), (2, 8), (5, 11)]
         assert observed_orders[0] == tuple(owner for wave in expected_waves for owner in wave)
         for wave in expected_waves:
@@ -652,7 +700,9 @@ def test_nep_distopt_param_transfer_slots_preserve_adjacent_storage():
                 (
                     None,
                     2,
-                    None,
+                    [0, 0],
+                    [physical_params[index].numel(), 0],
+                    0,
                     physical_params[index].numel(),
                     (),
                     (

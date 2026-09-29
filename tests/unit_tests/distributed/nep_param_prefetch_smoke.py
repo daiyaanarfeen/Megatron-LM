@@ -65,13 +65,24 @@ def main():
         unpack = (
             (
                 type('PhysicalBucket', (), {'params_list': [physical]})(),
-                (rank % 2) * n,
+                -1 if owner else 0,
                 n,
                 (index, rank % 2),
             ),
         )
-        pack = tuple(((index, i), i * n, n) for i in range(2)) if owner else ()
-        plan = ((transfers[replica], 2, replica * 2, 2 * n, pack, unpack),)
+        pack = (((index, 1), 0, n),) if owner else ()
+        plan = (
+            (
+                transfers[replica],
+                2,
+                [0, n] if owner else [0, 0],
+                [0, 0] if owner else [n, 0],
+                n if owner else 0,
+                0 if owner else n,
+                pack,
+                unpack,
+            ),
+        )
         group._get_nep_distopt_param_transfer_plan = lambda plan=plan: plan
         group._nep_distopt_owner_bundle = dict(
             native_group=native,

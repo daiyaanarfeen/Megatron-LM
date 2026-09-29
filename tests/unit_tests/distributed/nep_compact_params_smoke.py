@@ -39,6 +39,7 @@ def main():
                 NonuniformEPNCCLParamAndGradBucketGroup
             )
             group._nep_nccl_group_index = index
+            group._nep_nccl_segment_cache = {}
             group._nep_nccl_slot_numels = (1024, 2048)
             group._nep_nccl_slot_offsets = (0, 1024)
             group._nep_nccl_expert_stride = 3072
@@ -115,15 +116,28 @@ def main():
                 for (
                     pg,
                     count,
-                    source,
-                    numel,
+                    sends,
+                    receives,
+                    send_numel,
+                    recv_numel,
                     pack,
                     unpack,
                 ) in group._get_nep_distopt_param_transfer_plan():
                     if count > 1:
-                        remote = set(owner_slots[source]) - {None} - set(placement[source])
-                        assert numel == len(remote) * 3072
-                        assert numel < len(owner_slots[0]) * 3072
+                        ranks = dist.get_process_group_ranks(pg)
+                        owner = ranks[0]
+                        remote = set(owner_slots[owner]) - {None} - set(placement[owner])
+                        assert sends == [
+                            len(remote.intersection(placement[r])) * 3072 if rank == owner else 0
+                            for r in ranks
+                        ]
+                        assert receives == [
+                            len(remote.intersection(placement[rank])) * 3072 if r == owner else 0
+                            for r in ranks
+                        ]
+                        assert send_numel == sum(sends)
+                        assert recv_numel == sum(receives)
+                        assert not (send_numel and recv_numel)
             dist.barrier()
             capture.step()
         if rank == 0:
