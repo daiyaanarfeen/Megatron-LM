@@ -34,7 +34,7 @@ srun --nodes=1 --ntasks=1 --mpi=none --container-image=nvcr.io#nvidia/nemo:26.06
     --no-container-mount-home --container-mounts="$base:$base,/lustre:/lustre" bash -c '
     set -euo pipefail
     cd "$CODE_REPO"
-    files=(tests/unit_tests/distributed/validate_nep_randomized_controls.py tests/unit_tests/distributed/validate_nep_study.py)
+    files=(tests/unit_tests/distributed/validate_nep_randomized_controls.py tests/unit_tests/distributed/validate_nep_study.py tests/unit_tests/distributed/nep_all_ready_replay.py)
     uv run --no-project --active isort "${files[@]}"
     python -m black --skip-string-normalization "${files[@]}"
     '

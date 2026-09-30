@@ -13,6 +13,11 @@ def audit(run: Path, full: int, reduced: int, mode: str, profiled: bool) -> dict
     """Check completion, native manifests, and every parameter-transfer split."""
     replay = mode == 'replay'
     world = full + reduced
+    if replay:
+        for rank in range(world):
+            record = json.loads((run / f'replay-{rank}.json').read_text())
+            assert len(record['timings']) == 8 and record['verified_parameters'] > 0
+            assert all(row['elapsed_ms'] > 0 for row in record['timings'])
     if not replay:
         log = (run / 'driver.log').read_text()
         statuses = [
@@ -24,16 +29,12 @@ def audit(run: Path, full: int, reduced: int, mode: str, profiled: bool) -> dict
         ][-25:]
         assert statuses == [(i, 25, 0, 0) for i in range(1, 26)], (run, statuses)
     if not profiled:
-        assert not replay
         return dict(profiled=False)
     steps = range(8) if replay else range(15, 21)
     traffic = defaultdict(lambda: defaultdict(list))
     source, dest, native = defaultdict(int), defaultdict(int), {}
     for rank in range(world):
         assert (run / f'nsys_profile/rank-{rank}.sqlite').is_file(), (run, rank)
-        if replay:
-            record = json.loads((run / f'replay-{rank}.json').read_text())
-            assert len(record['timings']) == 8 and record['verified_parameters'] > 0
         events = json.loads((run / f'cupti_profile/rank-{rank}.json').read_text())['traceEvents']
         for step in steps:
             gpu = [

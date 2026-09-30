@@ -41,13 +41,16 @@ def run(ddp) -> None:
         transfer_iteration(groups)
         torch.cuda.synchronize()
 
-    CudaEventCapture.install_stage_labels()
-    CudaEventCapture.wrap(sys.modules[__name__], 'transfer_iteration', 'replay.parameter_transfers')
-    schedule = lambda step: torch.profiler.ProfilerAction.RECORD
-    events = CudaEventCapture(schedule=schedule)
-    nsight = NsightCapture(schedule=schedule)
-    events.start()
-    nsight.start()
+    captures = []
+    if os.environ.get('NEP_CONTROLLED_PROFILE', 'on') != 'off':
+        CudaEventCapture.install_stage_labels()
+        CudaEventCapture.wrap(
+            sys.modules[__name__], 'transfer_iteration', 'replay.parameter_transfers'
+        )
+        schedule = lambda step: torch.profiler.ProfilerAction.RECORD
+        captures = [CudaEventCapture(schedule=schedule), NsightCapture(schedule=schedule)]
+    for capture in captures:
+        capture.start()
     timings = []
     for iteration in range(8):
         # Arrival alignment is outside the transfer range. No AG or compute is
@@ -60,10 +63,10 @@ def run(ddp) -> None:
         end.record()
         end.synchronize()
         timings.append(dict(iteration=iteration, elapsed_ms=start.elapsed_time(end)))
-        events.step()
-        nsight.step()
-    events.stop()
-    nsight.stop()
+        for capture in captures:
+            capture.step()
+    for capture in captures:
+        capture.stop()
     for name, param in ddp.module.named_parameters():
         actual = hashlib.sha256(
             param.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()

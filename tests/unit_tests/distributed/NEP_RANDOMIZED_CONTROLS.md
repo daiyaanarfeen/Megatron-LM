@@ -44,3 +44,18 @@ The EP16 gate used the EP8 wrapper with `sbatch --nodes=8 --segment=4
 --export=ALL,GRAPH_FULL_EP=16,GRAPH_REDUCED_EP=12,NCCL_PXN_DISABLE=0`.
 Both replicas must remain within individual NVLink domains. Resource selection
 is separate from the routing seed; compare policies within the same EP size.
+
+## Counterbalanced Study
+
+`run_nep_policy_study.sh` and `validate_nep_study.py` add per-case fail-closed
+checks and unique policy/seed/repeat outputs. Production transfer code is unchanged.
+Replay diagnostic companions can disable instrumentation with the explicitly
+authorized `NEP_CONTROLLED_PROFILE=off`; CUDA elapsed timers and exact final
+parameter checks remain. Profiling stays enabled by default.
+
+Jobs3200495/3200606/3200857 completed all cases with controls passing. The final
+profiled reference replay nevertheless has an unexpected host-submission stall
+on ranks9/10. Further experiments/causal attribution were stopped per user policy;
+no samples were silently dropped. See the September30 journal for measurements.
+Stable profiler-off companion results do not establish the underlying cause of
+that profiled reference anomaly.
