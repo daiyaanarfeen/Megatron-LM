@@ -9,6 +9,10 @@ from pathlib import Path
 
 def main():
     root = Path(os.environ['GRAPH_OUTPUT'])
+    if 'NEP_CONTROLLED_ROUTING_SEED' in os.environ:
+        from nep_randomized_controls import install
+
+        install()
     options = sys.argv[1:]
     if os.environ.get('NEP_CONTROLLED_PROFILE', 'on') == 'off':
         filtered = []
