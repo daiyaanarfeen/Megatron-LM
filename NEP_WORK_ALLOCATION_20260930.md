@@ -1,5 +1,8 @@
 # Work Allocation Study
 
+Status: completed. See NEP_WORK_ALLOCATION_RESULTS_20260930.md for accepted
+allocation-blocked results, profiling limitations, and memory/control evidence.
+
 Approved five-case EP16/12 experiment, isolated from the completed placement study.
 Runtime is unchanged from 4142d0bcb. Only benchmark harness/control code changes.
 
