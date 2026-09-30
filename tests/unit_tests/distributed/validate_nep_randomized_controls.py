@@ -5,7 +5,9 @@ import sys
 from pathlib import Path
 
 
-def validate(left: Path, right: Path, full_ep: int, reduced_ep: int) -> dict:
+def validate(
+    left: Path, right: Path, full_ep: int, reduced_ep: int, require_routing: bool = True
+) -> dict:
     """Compare paired placement manifests before accepting timing results."""
     world = full_ep + reduced_ep
     manifests = []
@@ -43,6 +45,9 @@ def validate(left: Path, right: Path, full_ep: int, reduced_ep: int) -> dict:
         ]
         assert dense[0] == dense[1], (rank, 'non-expert parameters differ')
         paths = [sorted((run / 'controls').glob(f'routing-{rank}-*.json')) for run in (left, right)]
+        if not require_routing:
+            assert not paths[0] and not paths[1], 'Token dispatch occurred in parameter-only replay'
+            continue
         assert paths[0] and [p.name for p in paths[0]] == [p.name for p in paths[1]], (
             rank,
             'routing shapes',
