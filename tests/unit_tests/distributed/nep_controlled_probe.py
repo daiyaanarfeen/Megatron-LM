@@ -46,4 +46,21 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    finally:
+        if os.environ.get('NEP_WORK_ALLOCATION') == '1':
+            import torch
+
+            if torch.cuda.is_initialized():
+                free, total = torch.cuda.mem_get_info()
+                record = dict(
+                    rank=int(os.environ['RANK']),
+                    peak_allocated=torch.cuda.max_memory_allocated(),
+                    peak_reserved=torch.cuda.max_memory_reserved(),
+                    end_free=free,
+                    total=total,
+                )
+                (Path(os.environ['GRAPH_OUTPUT']) / f'memory-{record["rank"]}.json').write_text(
+                    json.dumps(record, indent=2) + '\n'
+                )

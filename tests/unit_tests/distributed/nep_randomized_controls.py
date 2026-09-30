@@ -29,11 +29,24 @@ def install() -> None:
             assert (
                 not torch.cuda.is_current_stream_capturing()
             ), 'Routing cache missed during capture'
-            rows = balanced_routes(tokens, experts, topk, identity_seed(f'route:{rank}', seed))
+            unit = int(os.environ.get('NEP_CONTROLLED_ROUTE_UNIT', tokens))
+            assert tokens % unit == 0
+            rows = balanced_routes(unit, experts, topk, identity_seed(f'route:{rank}', seed))
+            rows = rows * (tokens // unit)
             cache[key] = torch.tensor(rows, device=logits.device, dtype=torch.long)
             runtime = common.get_nonuniform_ep_runtime_config()
-            assert runtime is not None
-            manifest = route_summary(rows, runtime['expert_placement'])
+            if runtime is None:
+                from megatron.core import parallel_state
+
+                ep = parallel_state.get_expert_model_parallel_world_size()
+                assert experts % ep == 0
+                placement = [
+                    list(range(i * experts // ep, (i + 1) * experts // ep)) for i in range(ep)
+                ]
+            else:
+                placement = runtime['expert_placement']
+            manifest = route_summary(rows, placement)
+            manifest['unit_route_sha256'] = route_summary(rows[:unit], placement)['route_sha256']
             manifest.update(tokens=tokens, experts=experts, topk=topk, seed=seed, rank=rank)
             (root / f'routing-{rank}-{tokens}.json').write_text(
                 json.dumps(manifest, indent=2) + '\n'
@@ -51,12 +64,23 @@ def install() -> None:
         ).hexdigest()
 
     @torch.no_grad()
-    def synchronize(self):
-        runtime = self._nonuniform_ep_runtime_config
+    def synchronize(self, healthy=False):
+        if healthy:
+            from megatron.core import parallel_state
+
+            ep = parallel_state.get_expert_model_parallel_world_size()
+            local_rank = parallel_state.get_expert_model_parallel_rank()
+            count = self.config.num_moe_experts
+            assert count % ep == 0
+            placement = [list(range(i * count // ep, (i + 1) * count // ep)) for i in range(ep)]
+            runtime = dict(local_expert_indices=placement[local_rank], expert_placement=placement)
+            pattern = nep.NonuniformEPConfig().expert_name_pattern
+        else:
+            runtime = self._nonuniform_ep_runtime_config
+            pattern = self.nonuniform_ep_config.expert_name_pattern
         assert (
             self.config.expert_tensor_parallel_size == 1
         ), 'Identity control currently requires ETP1'
-        pattern = self.nonuniform_ep_config.expert_name_pattern
         names = {}
         with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
             for name, param in self.module.named_parameters():
@@ -78,10 +102,12 @@ def install() -> None:
                 initialize(param)
                 names[identity] = param
         expected = {name: digest(param) for name, param in names.items()}
-        original(self)
+        if not healthy:
+            original(self)
         observed = {name: digest(param) for name, param in names.items()}
         assert expected == observed, 'Startup synchronization changed canonical parameter values'
         groups = self.expert_parallel_bucket_groups
+        param_names = {param: name for name, param in self.module.named_parameters()}
         manifest = dict(
             rank=rank,
             placement=runtime['expert_placement'],
@@ -89,14 +115,22 @@ def install() -> None:
                 name: dict(sha256=observed[name], shape=list(param.shape), dtype=str(param.dtype))
                 for name, param in names.items()
             },
-            expert_buckets=[
-                dict(slots=group._nep_nccl_slot_keys, numels=group._nep_nccl_slot_numels)
-                for group in groups
-            ],
+            expert_buckets=(
+                [
+                    dict(slots=group._nep_nccl_slot_keys, numels=group._nep_nccl_slot_numels)
+                    for group in groups
+                ]
+                if not healthy
+                else [
+                    dict(numel=bucket.grad_data.numel(), parameters=len(bucket.params_list))
+                    for group in groups
+                    for bucket in group.buckets
+                ]
+            ),
             dense_buckets=[
                 dict(
                     numel=bucket.grad_data.numel(),
-                    names=[self._param_to_name[param] for param in bucket.params_list],
+                    names=[param_names[param] for param in bucket.params_list],
                 )
                 for group in self.bucket_groups
                 for bucket in group.buckets
@@ -111,3 +145,14 @@ def install() -> None:
     nep.NonuniformEPDistributedDataParallel._synchronize_nondivisible_expert_parameters = (
         synchronize
     )
+    if os.environ.get('NEP_WORK_ALLOCATION') == '1':
+        from megatron.core.distributed.distributed_data_parallel import DistributedDataParallel
+
+        native_init = DistributedDataParallel.__init__
+
+        def initialize_healthy(self, *args, **kwargs):
+            native_init(self, *args, **kwargs)
+            if type(self) is DistributedDataParallel:
+                synchronize(self, healthy=True)
+
+        DistributedDataParallel.__init__ = initialize_healthy
