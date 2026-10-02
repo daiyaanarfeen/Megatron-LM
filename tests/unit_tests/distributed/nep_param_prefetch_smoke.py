@@ -95,6 +95,8 @@ def main():
             param_transfer_stream=stream,
             param_sync_event=torch.cuda.Event(),
             param_sync_completed=False,
+            param_delivery_policy=os.getenv('NEP_ABLATION_PARAM_RELEASE', 'early'),
+            param_prefetch_depth=int(os.getenv('NEP_ABLATION_PREFETCH_DEPTH', '1')),
         )
         group.next_param_gather_bucket_group = None
         if lane_streams:
@@ -148,9 +150,17 @@ def main():
             torch.cuda._sleep(100000000)
         force = iteration == 3
         groups[0][0].start_param_sync(force_sync=force)
+        if not force:
+            assert groups[0][0]._nep_distopt_owner_bundle['param_delivery_submitted'] == (
+                os.getenv('NEP_ABLATION_PARAM_RELEASE', 'early') == 'early'
+            )
         Probe.independent()
         for index, (group, physical, _, native) in enumerate(groups):
             group.finish_param_sync()
+            if index == 0 and not force:
+                assert groups[2][0].param_gather_dispatched == (
+                    int(os.getenv('NEP_ABLATION_PREFETCH_DEPTH', '1')) == 2
+                )
             group.finish_param_sync()
             expected = iteration * 10 + index * 2 + rank % 2
             assert torch.equal(physical, torch.full_like(physical, expected)), (

@@ -9,7 +9,15 @@ from pathlib import Path
 from validate_nep_randomized_controls import validate
 
 
-def audit(run: Path, full: int, reduced: int, mode: str, profiled: bool) -> dict:
+def audit(
+    run: Path,
+    full: int,
+    reduced: int,
+    mode: str,
+    profiled: bool,
+    train_iters: int = 25,
+    training_steps=range(15, 21),
+) -> dict:
     """Check completion, native manifests, and every parameter-transfer split."""
     replay = mode == 'replay'
     world = full + reduced
@@ -26,11 +34,14 @@ def audit(run: Path, full: int, reduced: int, mode: str, profiled: bool) -> dict
                 r'iteration\s+(\d+)/\s*(\d+).*?number of skipped iterations:\s*(\d+).*?number of nan iterations:\s*(\d+)',
                 log,
             )
-        ][-25:]
-        assert statuses == [(i, 25, 0, 0) for i in range(1, 26)], (run, statuses)
+        ][-train_iters:]
+        assert statuses == [(i, train_iters, 0, 0) for i in range(1, train_iters + 1)], (
+            run,
+            statuses,
+        )
     if not profiled:
         return dict(profiled=False)
-    steps = range(8) if replay else range(15, 21)
+    steps = range(8) if replay else training_steps
     traffic = defaultdict(lambda: defaultdict(list))
     source, dest, native = defaultdict(int), defaultdict(int), {}
     for rank in range(world):

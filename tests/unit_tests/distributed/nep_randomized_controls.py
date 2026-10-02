@@ -127,6 +127,21 @@ def install() -> None:
                     for bucket in group.buckets
                 ]
             ),
+            delivery_buckets=(
+                [
+                    dict(
+                        edp_bucket=group._nep_nccl_edp_bucket_index,
+                        names=[
+                            param_names[param]
+                            for bucket in group.buckets
+                            for param in bucket.params_list
+                        ],
+                    )
+                    for group in groups
+                ]
+                if not healthy
+                else []
+            ),
             dense_buckets=[
                 dict(
                     numel=bucket.grad_data.numel(),

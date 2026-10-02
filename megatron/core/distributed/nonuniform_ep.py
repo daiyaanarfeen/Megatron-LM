@@ -1838,6 +1838,7 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             return
 
         bundle["param_sync_completed"] = False
+        bundle["param_delivery_submitted"] = False
         native_group = bundle.get("native_group")
         if native_group is not None:
             with torch.profiler.record_function("nep_distopt_native_param_all_gather"):
@@ -1846,19 +1847,8 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
                     native_group._post_param_sync()
         self.param_gather_dispatched = True
         if self.ddp_config.overlap_param_gather and not force_sync:
-            # Enqueue the dependency and redistribution now, not at parameter use.
-            # One shared stream also orders reuse of the bounded transfer buffers.
-            transfer_stream = bundle["param_transfer_stream"]
-            transfer_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(transfer_stream):
-                if native_group is not None:
-                    with torch.profiler.record_function(
-                        "nep_distopt_finish_native_param_all_gather"
-                    ):
-                        native_group.finish_param_sync(skip_next_bucket_dispatch=True)
-                with torch.profiler.record_function("nep_distopt_param_scatter"):
-                    self._scatter_nep_distopt_owner_params_to_physical_holders()
-                bundle["param_sync_event"].record(transfer_stream)
+            if bundle.get("param_delivery_policy", "early") == "early":
+                self._enqueue_nep_distopt_param_delivery()
             return
 
         with torch.profiler.record_function("nep_distopt_param_scatter"):
@@ -1866,6 +1856,23 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         bundle["param_sync_completed"] = True
         if self.next_param_gather_bucket_group is None and not bundle.get("param_lane_streams"):
             bundle["param_transfer_buffers"].clear()
+
+    def _enqueue_nep_distopt_param_delivery(self) -> None:
+        """Keep the same AG dependency and exact-payload delivery in every policy."""
+        bundle = self._nep_distopt_owner_bundle
+        if bundle["param_delivery_submitted"]:
+            return
+        native_group = bundle.get("native_group")
+        transfer_stream = bundle["param_transfer_stream"]
+        transfer_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(transfer_stream):
+            if native_group is not None:
+                with torch.profiler.record_function("nep_distopt_finish_native_param_all_gather"):
+                    native_group.finish_param_sync(skip_next_bucket_dispatch=True)
+            with torch.profiler.record_function("nep_distopt_param_scatter"):
+                self._scatter_nep_distopt_owner_params_to_physical_holders()
+            bundle["param_sync_event"].record(transfer_stream)
+        bundle["param_delivery_submitted"] = True
 
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
         """Finish owner all-gather, redistribute params, and launch the next bucket."""
@@ -1885,7 +1892,15 @@ class NonuniformEPNCCLParamAndGradBucketGroup(_ParamAndGradBucketGroup):
             # Prefetch before the compute stream waits for this bucket's delivery.
             # Native AGs remain ordered; the shared transfer stream serializes
             # redistribution and staging-buffer reuse after each bucket's own AG.
-            next_group.start_param_sync()
+            following = next_group
+            for _ in range(bundle.get("param_prefetch_depth", 1)):
+                if following is None:
+                    break
+                following.start_param_sync()
+                following = following.next_param_gather_bucket_group
+
+        if not bundle.get("param_delivery_submitted", False):
+            self._enqueue_nep_distopt_param_delivery()
 
         torch.cuda.current_stream().wait_event(bundle["param_sync_event"])
         bundle["param_sync_completed"] = True
@@ -2734,6 +2749,12 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         if lane_count not in (0, 1, 2):
             raise ValueError("NEP_ABLATION_PARAM_LANES must be 0, 1 or 2")
         lane_streams = (torch.cuda.Stream(), torch.cuda.Stream()) if lane_count else None
+        delivery_policy = os.getenv("NEP_ABLATION_PARAM_RELEASE", "early")
+        prefetch_depth = int(os.getenv("NEP_ABLATION_PREFETCH_DEPTH", "1"))
+        if delivery_policy not in ("early", "consumer") or prefetch_depth not in (1, 2):
+            raise ValueError("Invalid parameter-delivery ablation policy")
+        if delivery_policy == "consumer" and prefetch_depth != 1:
+            raise ValueError("Consumer delivery must retain the baseline AG lookahead")
         for edp_bucket_index in sorted(groups_by_edp_bucket):
             bucket_groups = tuple(
                 sorted(
@@ -2749,6 +2770,8 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
                 "param_transfer_slot": edp_bucket_index % param_transfer_slot_count,
                 "param_transfer_numel_by_slot": param_transfer_numel_by_slot,
                 "param_sync_completed": False,
+                "param_delivery_policy": delivery_policy,
+                "param_prefetch_depth": prefetch_depth,
                 "param_transfer_stream": param_transfer_stream,
                 "param_sync_event": (
                     torch.cuda.Event() if self.ddp_config.overlap_param_gather else None
