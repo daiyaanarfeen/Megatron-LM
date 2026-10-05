@@ -193,7 +193,12 @@ def validate(run):
                         )
                         for x in calls
                         if x['group_desc']
-                        in ('dp_cp', 'ep_dp', 'DATA_PARALLEL_GROUP_WITH_CP', 'EXPERT_DATA_PARALLEL_GROUP')
+                        in (
+                            'dp_cp',
+                            'ep_dp',
+                            'DATA_PARALLEL_GROUP_WITH_CP',
+                            'EXPERT_DATA_PARALLEL_GROUP',
+                        )
                     )
                     for key, calls in records.items()
                 }

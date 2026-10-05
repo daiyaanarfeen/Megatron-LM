@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from cuda_event_capture_adapter import CudaEventCapture
+from nep_controlled_probe import install_native_delivery_policy
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.nonuniform_ep import NonuniformEPNCCLParamAndGradBucketGroup
@@ -117,6 +118,7 @@ def main():
     for left, right in zip(groups, groups[1:]):
         left[0].next_param_gather_bucket_group = right[0]
 
+    CudaEventCapture.install_stage_labels()
     scatter = groups[0][0]._scatter_nep_distopt_owner_params_to_physical_holders
 
     def delayed_scatter():
@@ -126,7 +128,6 @@ def main():
 
     groups[0][0]._scatter_nep_distopt_owner_params_to_physical_holders = delayed_scatter
 
-    CudaEventCapture.install_stage_labels()
     CudaEventCapture.wrap(Probe, 'independent', 'smoke.independent')
     actions = torch.profiler.ProfilerAction
     capture = CudaEventCapture(
@@ -158,6 +159,9 @@ def main():
         for index, (group, physical, _, native) in enumerate(groups):
             group.finish_param_sync()
             if index == 0 and not force:
+                assert groups[1][0].param_gather_dispatched == (
+                    int(os.getenv('NEP_ABLATION_PREFETCH_DEPTH', '1')) >= 1
+                )
                 assert groups[2][0].param_gather_dispatched == (
                     int(os.getenv('NEP_ABLATION_PREFETCH_DEPTH', '1')) == 2
                 )
@@ -192,18 +196,41 @@ def main():
             if rank == 0:
                 assert compute['ts'] + compute['dur'] < ag['ts'] + ag['dur'], (ag, compute)
             ags = [e for e in events if e['name'] == 'collective.all_gather']
-            delivery = next(e for e in events if e['name'] == 'nep.redistribute_params')
+            deliveries = [e for e in events if e['name'] == 'nep.redistribute_params']
+            assert len(deliveries) == 3
+            delivery = deliveries[0]
             assert len(ags) == 3
-            assert ags[1]['ts'] + ags[1]['dur'] < delivery['ts'] + delivery['dur'], (
-                rank,
-                step,
-                ags[1],
-                delivery,
-            )
+            if int(os.getenv('NEP_ABLATION_PREFETCH_DEPTH', '1')) > 0:
+                assert ags[1]['ts'] + ags[1]['dur'] < delivery['ts'] + delivery['dur'], (
+                    rank,
+                    step,
+                    ags[1],
+                    delivery,
+                )
+            else:
+                assert ags[1]['ts'] >= delivery['ts'] + delivery['dur']
         print(
             'PREFETCH_SMOKE_PASS: fresh values, followers, reuse, force-sync, native EP/AG/RS and independent GPU progress',
             flush=True,
         )
+    os.environ['GRAPH_CASE'] = 'healthy'
+    install_native_delivery_policy()
+    if owner:
+        for index, (_, _, param_data, native) in enumerate(groups):
+            native.reset()
+            native.param_gather_dispatched = False
+            native.next_param_gather_bucket_group = groups[index + 1][3] if index < 2 else None
+            param_data.fill_(-1)
+            param_data[replica * n : (replica + 1) * n].fill_(index * 2 + replica)
+        for index, (_, _, param_data, native) in enumerate(groups):
+            native.finish_param_sync()
+            assert torch.equal(param_data[:n], torch.full_like(param_data[:n], index * 2))
+            assert torch.equal(param_data[n:], torch.full_like(param_data[n:], index * 2 + 1))
+            if index == 0:
+                assert groups[1][3].param_gather_dispatched == (
+                    int(os.getenv('NEP_ABLATION_PREFETCH_DEPTH', '1')) > 0
+                )
+        print('HEALTHY_PREFETCH_SMOKE_PASS: native values and lookahead control', flush=True)
     dist.destroy_process_group()
 
 

@@ -9,6 +9,27 @@ from pathlib import Path
 NATIVE_ITERATION_MS = []
 
 
+def install_native_delivery_policy():
+    """Disable only healthy expert lookahead; retain native AG and bucket layout."""
+    if os.environ['GRAPH_CASE'] != 'healthy':
+        return
+    no_lookahead = int(os.environ.get('NEP_ABLATION_PREFETCH_DEPTH', '1')) == 0
+    from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBucketGroup
+
+    original = _ParamAndGradBucketGroup.finish_param_sync
+
+    def demand_only(self, skip_next_bucket_dispatch=False):
+        expert = self.intra_distributed_optimizer_instance_group.group_desc in (
+            'ep_dp',
+            'EXPERT_DATA_PARALLEL_GROUP',
+        )
+        return original(
+            self, skip_next_bucket_dispatch=skip_next_bucket_dispatch or (expert and no_lookahead)
+        )
+
+    _ParamAndGradBucketGroup.finish_param_sync = demand_only
+
+
 def install_delivery_markers():
     """Measure consumer demand/ready boundaries without extra device synchronization."""
     from cuda_event_capture_adapter import CudaEventCapture
@@ -63,6 +84,7 @@ def install_delivery_markers():
 
 def main():
     root = Path(os.environ['GRAPH_OUTPUT'])
+    install_native_delivery_policy()
     if os.environ.get('NEP_ACTUAL_A8B') == '1':
         from megatron.core.timers import Timer
 

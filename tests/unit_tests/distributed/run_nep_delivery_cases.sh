@@ -13,7 +13,7 @@
 #SBATCH --error=/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/lyris/%x-%j.err
 set -euo pipefail
 base=/home/darfeen/Megatron-LM
-runner=$base/.worktrees/nep-delivery-batching-20261002/tests/unit_tests/distributed/run_nep_delivery_cases.sh
+runner=$base/.worktrees/nep-delivery-factorial-20261005/tests/unit_tests/distributed/run_nep_delivery_cases.sh
 export CODE_REPO="${CODE_REPO:-${GRAPH_CODE_REPO:-$base/.worktrees/nep-buffer-cleanup-20260921}}"
 export GRAPH_FULL_EP=${GRAPH_FULL_EP:-8} GRAPH_REDUCED_EP=${GRAPH_REDUCED_EP:-6}
 export CUDA_DEVICE_MAX_CONNECTIONS=32 OMP_NUM_THREADS=1
@@ -173,10 +173,10 @@ srun --nodes=1 --ntasks=1 --mpi=none "${container[@]}" bash -lc "
     cd '$CODE_REPO'
     export CUPTI_OUTPUT_DIR='$root/compact_correctness'
     timeout --signal=TERM --kill-after=10s 180 python -m torch.distributed.run --standalone --nproc-per-node=4 tests/unit_tests/distributed/nep_compact_params_smoke.py
-    for policy in early consumer deep; do
+    for policy in early consumer noprefetch_early noprefetch_consumer; do
         export NEP_ABLATION_PARAM_RELEASE=early NEP_ABLATION_PREFETCH_DEPTH=1 NEP_ABLATION_PARAM_LANES=1
-        if [[ \$policy == consumer ]]; then export NEP_ABLATION_PARAM_RELEASE=consumer; fi
-        if [[ \$policy == deep ]]; then export NEP_ABLATION_PREFETCH_DEPTH=2; fi
+        if [[ \$policy == *consumer ]]; then export NEP_ABLATION_PARAM_RELEASE=consumer; fi
+        if [[ \$policy == noprefetch* ]]; then export NEP_ABLATION_PREFETCH_DEPTH=0; fi
         export CUPTI_OUTPUT_DIR='$root/prefetch_correctness'-\$policy
         timeout --signal=TERM --kill-after=10s 180 python -m torch.distributed.run --standalone --nproc-per-node=4 tests/unit_tests/distributed/nep_param_prefetch_smoke.py
     done
@@ -198,11 +198,14 @@ for implementation in ${CLEANUP_CASES:-reference cleanup}; do
                 policy=${policy%_off}
             fi
             case "$policy" in
-                delivery_early|delivery_consumer|delivery_deep)
+                delivery_*)
                     export NEP_CONTROLLED_ROUTING_SEED=101 NEP_ABLATION_FIXED_GRAD_ORDER=1
                     export NEP_CONTROLLED_REPLAY=0 NEP_CONTROLLED_ROUTE_UNIT=512
                     [[ "$policy" != delivery_consumer ]] || export NEP_ABLATION_PARAM_RELEASE=consumer
                     [[ "$policy" != delivery_deep ]] || export NEP_ABLATION_PREFETCH_DEPTH=2
+                    [[ "$policy" != *noprefetch* ]] || export NEP_ABLATION_PREFETCH_DEPTH=0
+                    [[ "$policy" != *consumer ]] || export NEP_ABLATION_PARAM_RELEASE=consumer
+                    [[ "$policy" != delivery_healthy* ]] || export GRAPH_CASES=healthy
                     ;;
                 actual_*)
                     IFS=_ read -r _ cell repeat <<< "$policy"
@@ -213,6 +216,12 @@ for implementation in ${CLEANUP_CASES:-reference cleanup}; do
                     export ABLATION_MBS=2 ABLATION_GA=8 ABLATION_REDUCED_GA=8
                     export ABLATION_SEQLEN=8192
                     case "$cell" in
+                        H0) export GRAPH_CASES=healthy ABLATION_SEQLEN=4096 NEP_ABLATION_PREFETCH_DEPTH=0 ;;
+                        H1P) export GRAPH_CASES=healthy ABLATION_SEQLEN=4096 ;;
+                        Q00) export ABLATION_SEQLEN=4096 NEP_ABLATION_PREFETCH_DEPTH=0 NEP_ABLATION_PARAM_RELEASE=consumer ;;
+                        Q01) export ABLATION_SEQLEN=4096 NEP_ABLATION_PREFETCH_DEPTH=0 ;;
+                        Q10) export ABLATION_SEQLEN=4096 NEP_ABLATION_PARAM_RELEASE=consumer ;;
+                        Q11) export ABLATION_SEQLEN=4096 ;;
                         H4K) export GRAPH_CASES=healthy ABLATION_SEQLEN=4096 ;;
                         H8K|H2) export GRAPH_CASES=healthy ;;
                         N4K) export ABLATION_SEQLEN=4096 ;;

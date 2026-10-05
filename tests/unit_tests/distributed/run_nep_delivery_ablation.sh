@@ -14,14 +14,14 @@
 set -euo pipefail
 ulimit -c 0
 base=/home/darfeen/Megatron-LM
-export CODE_REPO=$base/.worktrees/nep-delivery-batching-20261002
+export CODE_REPO=$base/.worktrees/nep-delivery-factorial-20261005
 export CONTROLLED_CODE_REPO=$CODE_REPO
 export GRAPH_ALLOW_DIRTY=1 GRAPH_SCOPES=moe
 export GRAPH_FULL_EP=16 GRAPH_REDUCED_EP=12 NCCL_PXN_DISABLE=0
 export NCCL_LAUNCH_ORDER_IMPLICIT=0 CLEANUP_CASE_TIMEOUT=15m CUDA_EVENT_POOL_SIZE=131072
 if [[ ${NEP_STUDY_STAGE:-gate} == smoke ]]; then
     export GRAPH_FULL_EP=8 GRAPH_REDUCED_EP=6 NCCL_PXN_DISABLE=1
-    export CLEANUP_CASES='controlled_delivery_deep controlled_delivery_consumer controlled_delivery_early'
+    export CLEANUP_CASES='controlled_delivery_noprefetch_consumer controlled_delivery_noprefetch_early controlled_delivery_consumer controlled_delivery_early controlled_delivery_healthy_noprefetch controlled_delivery_healthy'
 else
     export CLEANUP_CASES=${CLEANUP_CASES:-'controlled_actual_M4_r0 controlled_actual_M1_r0_off controlled_actual_M1_r0'}
 fi
@@ -56,7 +56,7 @@ import sys
 from pathlib import Path
 from validate_nep_study import audit
 root = Path(sys.argv[1])
-for run in sorted(root.glob('controlled_delivery_*')):
+for run in sorted(root.glob('controlled_delivery_*_nep_*')):
     audit(run, 8, 6, 'training', True)
     print('DELIVERY_TRAINING_SMOKE_PASS', run, flush=True)
 PY

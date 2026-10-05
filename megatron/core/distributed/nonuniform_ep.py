@@ -2751,10 +2751,8 @@ class NonuniformEPDistributedDataParallel(DistributedDataParallel):
         lane_streams = (torch.cuda.Stream(), torch.cuda.Stream()) if lane_count else None
         delivery_policy = os.getenv("NEP_ABLATION_PARAM_RELEASE", "early")
         prefetch_depth = int(os.getenv("NEP_ABLATION_PREFETCH_DEPTH", "1"))
-        if delivery_policy not in ("early", "consumer") or prefetch_depth not in (1, 2):
+        if delivery_policy not in ("early", "consumer") or prefetch_depth not in (0, 1, 2):
             raise ValueError("Invalid parameter-delivery ablation policy")
-        if delivery_policy == "consumer" and prefetch_depth != 1:
-            raise ValueError("Consumer delivery must retain the baseline AG lookahead")
         for edp_bucket_index in sorted(groups_by_edp_bucket):
             bucket_groups = tuple(
                 sorted(
