@@ -84,3 +84,59 @@ saved gateH4 deadline labels remain invalid for expert-specific attribution;
 do not rewrite them or use them as valid expert-deadline results. Fresh healthy
 profiles are required. These label-only corrections have syntax checks but
 have not yet been exercised in a new GPU job.
+
+## October 5: MBS1 Hang Isolated To Profiling Configuration
+
+Compared3215521/B (working MBS2/GA8) with3215526/S (hanging MBS1/GA16).
+Both used identical nonuniform_ep.py SHA25620feecf1025a36a... and the same
+relevant NCCL/profiling controls. The first failure therefore predates the
+delivery-policy changes. Both failed MBS1 cases stop in iteration26 after25
+completed; host stacks include CUDA-event record during graph replay and
+native TP all-gather. The unprofiled MBS1 companion completed35 iterations.
+
+The failed logs contain an explicit Nsight warning that device-side event
+tracing may introduce false dependencies across CUDA streams. Changed only
+`--cuda-event-trace=true` to `false`, retaining custom CUDA timing events,
+collective observer streams, graph-node/kernel tracing, and NVTX. No NEP,
+model, batch, routing, or native collective changes.
+
+Job3238472 completed0:0 in11m31s on GB3008nodes/segment4. All28 ranks completed
+35iterations, and all28 Nsight reports/SQLite exports and CUDA-event JSONs
+exist. WORK_VALIDATION_PASS and ACTUAL_ABLATION_PASS include required native
+AG/RS, NEP Gather/parameter transfer, routing and memory checks. Numerical
+prefetch tests passed too. No NCCL timeout, OOM, NaN or skipped iteration.
+
+Full-owner measured25-30 mean3515.274ms, sampleSD4.271ms. Pre20-23 andpost32-35
+both average3430.387ms: instrumentation still adds about2.47%. No matched
+healthy MBS1 run here, so this is a hang/profile-validity gate, not a new
+parity result. Allocation differed from the failures; exact driver-level
+dependency cycle was not recovered. The one-option successful intervention
+and the documented mechanism strongly implicate Nsight event tracing, without
+proving an exact internal wait graph or universal hang freedom.
+
+Launcher default is nowfalse. All other instrumentation remains enabled.
+Unused Nsight-only diagnostic plumbing was removed. Its initial job3238449
+was canceled during container setup before any training case (1m46s allocated).
+The old branch remains untouched, and full ablation sweeps remain unsubmitted.
+
+Artifacts: `/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/nep_cleanup_ab/3238472`.
+Shared profiler source snapshots are in `benchmark_source/scripts/nonuniform`.
+Reference: https://docs.nvidia.com/nsight-systems/UserGuide/index.html#cuda-event-trace
+
+## October 5: Resume Approved Sweeps
+
+Use two GB3008-node/segment4 allocations with the validated event-trace=false
+setting for all newly profiled healthy and NEP cases. Do not mix old event-trace
+results into the new comparisons. All cases retain35iterations and matched
+25-30 measurements, with separate authorized timing companions.
+
+- 4K delivery: cells P4K,H4K,N4K,D4K in repeat0 and reversed in repeat1.
+- 8K delivery plus batching: cells M4,H4,M1,H1,N8K,H8K,D8K,P8K in repeat0
+  and reversed in repeat1. N8K/H8K are also the MBS2/GA8 batching anchor;
+  no duplicate M2/H2 launches are needed.
+- Repeat0 runs profile then timing companion per cell; repeat1 reverses both
+  cell order and profile/companion order. Largest MBS is first at8K.
+- 16cases at4K and32cases at8K, including both profiling modes and repeats.
+  Every case must pass the existing fail-closed audit before the next starts.
+- Production implementation remains3564f1a5c. Only launcher event-trace
+  default and experiment documentation change after the completed hang gate.

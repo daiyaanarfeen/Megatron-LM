@@ -121,8 +121,10 @@ if [[ "${NATIVE_GRAPH_RANK:-0}" == 1 ]]; then
         python -u "$probe" "${args[@]}"
         exit
     fi
+    # Device-side event tracing can introduce false stream dependencies and
+    # hung the MBS1/GA16 graph run. Custom AG/RS completion events remain enabled.
     TMPDIR="$NSYS_TMPDIR" nsys profile --trace=cuda-sw,nvtx --nvtx-domain-include=nep_capture \
-        --sample=none --cpuctxsw=none --cuda-graph-trace=node --cuda-event-trace=true \
+        --sample=none --cpuctxsw=none --cuda-graph-trace=node --cuda-event-trace="${NSYS_CUDA_EVENT_TRACE:-false}" \
         --capture-range=cudaProfilerApi --capture-range-end=stop --force-overwrite=true \
         --output="$NSYS_OUTPUT_DIR/rank-$RANK" \
         env TMPDIR=/tmp python -u "$probe" "${args[@]}"
