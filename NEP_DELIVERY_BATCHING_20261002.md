@@ -140,3 +140,107 @@ results into the new comparisons. All cases retain35iterations and matched
   Every case must pass the existing fail-closed audit before the next starts.
 - Production implementation remains3564f1a5c. Only launcher event-trace
   default and experiment documentation change after the completed hang gate.
+
+## Completed Results
+
+Both jobs completed0:0:3238625 in1h11m11s and3238626 in2h42m38s. All48cases
+passed their fail-closed audits. All24profiled cases have complete every-rank
+CUDA-event JSON,Nsight report and SQLite artifacts (704rank profiles total).
+Cross-case canonical initialization, routing, native optimizer payload, exact
+NEP transfer payload, memory, deadline and RDMA/P2P transport audits pass.
+No hang or OOM recurred. Checkpoint059bbe151 was used throughout; production
+code was unchanged. Monitoring was interrupted near the end of the8K sweep;
+Slurm continued independently and completed the remaining cases successfully.
+
+Means below average the two reversed-order repeat means. Parity is the mean
+of matched healthy/full-owner NEP iteration-time ratios, not aggregate token
+throughput. Both modes use the same iteration numbers25-30; all cases train
+35iterations. Timing companions were explicitly approved and are distinct
+runs, not post-profile substitutions. Each profile uses the validated fix.
+
+### Delivery Policies
+
+MBS2/GA8 with fixed proportional local batches128/96 for NEP,128/128 healthy.
+On-demand defers parameter redistribution until consumer demand; early is
+the existing implementation; deep uses early redistribution and two-bucket
+native AG lookahead. Useful payload and storage layout are fixed.
+
+| Sequence | Policy | Companion healthy / NEP ms | Companion parity | Profiled parity |
+| --- | --- | ---: | ---: | ---: |
+| 4096 | On-demand | 1709.591 / 1804.531 | 94.739% | 93.900% |
+| 4096 | Early | 1709.591 / 1798.645 | 95.049% | 94.178% |
+| 4096 | Deep | 1709.591 / 1800.614 | 94.945% | 94.472% |
+| 8192 | On-demand | 3139.920 / 3231.179 | 97.176% | 97.319% |
+| 8192 | Early | 3139.920 / 3230.261 | 97.203% | 97.433% |
+| 8192 | Deep | 3139.920 / 3224.312 | 97.383% | 97.534% |
+
+Early saves5.886ms over on-demand at4K, consistently across repeats. Its8K
+whole-iteration advantage is only0.919ms and reverses sign across repeats.
+Deep versus early has no reliable4K benefit (1.968ms slower on average,
+opposite signs across repeats). At8K deep saves5.949ms (5.001/6.897ms per
+repeat), only0.184% of NEP latency. This is not a large policy-sensitive regime.
+
+| Sequence | Profile quantity, ms | On-demand | Early | Deep |
+| --- | --- | ---: | ---: | ---: |
+| 4096 | Owner demand-to-ready sum | 32.029 | 23.006 | 22.480 |
+| 4096 | First-forward excess versus healthy | 30.715 | 26.223 | 25.705 |
+| 8192 | Owner demand-to-ready sum | 31.523 | 22.308 | 22.091 |
+| 8192 | First-forward excess versus healthy | 31.402 | 27.398 | 25.726 |
+
+These are elapsed compute-stream dependency spans, not pure transfer service
+times or additive causal costs. Early delivery reduces observed consumer
+waiting and first-forward overhead; deep adds little further readiness
+improvement. The changes do not remove the initial parameter-delivery cost.
+
+### Fixed-Work Batching
+
+Sequence8192,current early delivery. MBS*GA stays16, so total local batches,
+global batches and tokens per iteration do not change. N8K/H8K are the
+MBS2/GA8 anchor reused from the delivery sweep.
+
+| MBS / GA | Companion healthy ms | Companion NEP ms | Extra ms | Companion parity | Profiled parity | NEP peak allocated GiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 / 16 | 3291.483 | 3421.956 | 130.472 | 96.187% | 96.114% | 127.732 |
+| 2 / 8 | 3139.920 | 3230.261 | 90.340 | 97.203% | 97.433% | 135.525 |
+| 4 / 4 | 2980.601 | 3063.546 | 82.945 | 97.293% | 97.780% | 172.115 |
+
+MBS1->2 reduces NEP extra latency by40.132ms and improves parity1.016points,
+at fixed total work. MBS2->4 reduces absolute NEP latency166.715ms, but healthy
+also improves159.319ms; parity gains only0.090points and the direction is not
+consistent between repeats. Larger microbatches primarily improve absolute
+throughput beyondMBS2, with substantially higher memory demand.
+
+| Profiled NEP-minus-healthy phase ms | MBS1 | MBS2 | MBS4 |
+| --- | ---: | ---: | ---: |
+| First forward | 26.415 | 27.398 | 27.265 |
+| All other forwards | 4.437 | 2.386 | 3.347 |
+| All nonfinal backwards | 2.893 | -0.917 | 4.381 |
+| Final backward | 41.384 | 30.347 | 29.391 |
+| Outside forward/backward | 61.372 | 24.859 | 4.083 |
+
+Within these profiles, the reduction is concentrated in final backward and
+outside-F/B, not first forward or ordinary microbatches. This is a phase
+localization, not a kernel-level proof of why the companion timing improves.
+Do not label the outside-F/B residual CPU overhead without further attribution.
+Do not allocate companion timing deltas using these separate-run phase values.
+The phase spans and native timers also have slightly different boundaries.
+
+### Limits And Artifacts
+
+Two repeats establish only within-allocation repeatability, not broad hardware
+or workload generality. Healthy/NEP expert bucket counts remain5/3 (dense3/3),
+fixed across the interventions but not an iso-bucket topology comparison.
+The actual workload is the saved memory-limited15-MoE hybrid/MTP a8b, not a
+new full-depth120B claim. The two sequence lengths used different allocations;
+compare each policy to its own same-allocation healthy/control runs.
+
+Profiling is still intrusive: profiled-versus-companion parity differs by up
+to0.871percentage points (4K early), and8K early profiled parity spans
+97.087-97.778% between repeats while companion parity spans97.173-97.234%.
+The MBS1 companion/profile parity gap is only0.073points on average. Retain
+both modes; do not claim profiling distortion is eliminated for every case.
+
+Each job root under `/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/nep_cleanup_ab`
+contains `actual-summary.json`, `delivery-batching-summary.json`,
+`work-controls-audit.json`, per-case validations and raw every-rank profiles.
+Reproduce aggregation with `scripts/nonuniform/analyze_nep_delivery_batching.py <job>`.
