@@ -86,3 +86,93 @@ is reported rather than assigned to host overhead by subtraction.
 - Full sweep order:Q00,H0,Q01,H1P,Q10,Q11 in repeat0;reverse in repeat1.
   Repeat0 profile then companion;repeat1 companion then profile. Exact model,
   bucket layout,payload,work allocation and profiler configuration stay fixed.
+
+## Completed Timing Results
+
+Job3240633 COMPLETED0:0 in1h39m20s onGB2008nodes/segment4. Replica0 used
+lyris0027,0030,0032,0033 in nvlblk02;replica1 used0075,0078,0079,0086 in
+nvlblk05. All24cases pass;all352rank profile triples exist. Cross-replica
+optimizer groups use RDMA;local redistribution groups use P2P. No hang/OOM.
+First actual case peak allocated127.733GiB,min end-free31.424GiB.
+
+Means of the two reversed-order repeats;each uses matched iterations25-30.
+All NEP parity below uses the same prefetched healthy reference H1P. H0 is a
+diagnostic for native AG prefetch,not a changing denominator for NEP parity.
+
+| Cell | Companion iteration ms | Companion parity | Profiled iteration ms | Profiled parity | Profiled first forward ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| H0 | 1817.065 | -- | 1861.109 | -- | 135.568 |
+| H1P | 1788.947 | 100% | 1834.672 | 100% | 104.492 |
+| Q00 | 1929.736 | 92.704% | 1996.103 | 91.913% | 169.948 |
+| Q01 | 1931.943 | 92.598% | 1990.190 | 92.186% | 170.002 |
+| Q10 | 1899.130 | 94.198% | 1950.910 | 94.042% | 136.484 |
+| Q11 | 1890.833 | 94.612% | 1954.725 | 93.858% | 131.464 |
+
+- AG prefetch with consumer release saves33.463ms of profiled first forward.
+  Native healthy prefetch saves31.076ms;most of the gain is ordinary AG
+  pipelining,not a NEP-specific transfer optimization.
+- Early redistribution with prefetch saves another5.020ms of first forward
+  (4.950/5.091ms across repeats). Without prefetch it saves essentially none:
+  mean -0.054ms,opposite signs across repeats. This is the interaction effect.
+- Complete pipeline saves38.484ms of profiled first forward and38.903ms in
+  separate timing companions. Companion parity increases1.907points.
+- Early release reduces summed owner consumer waits32.030->22.871ms,but
+  first forward improves only5.020ms;about4.139ms is offset elsewhere in that
+  same phase. The kernel-level accounting below closes this difference.
+- Profiler intrusion remains relevant:Q10->Q11 companion iteration improves
+  by8.297ms (11.712/4.883ms),while profiled iteration worsens by3.815ms. The
+  first-forward gain repeats in both profiled runs,but profiled whole-iteration
+  timing must not stand in for unprofiled timing. No post-window substitution.
+
+Artifacts: /lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/nep_cleanup_ab/3240633.
+Runtime checkpoint150021cbb;production defaults and prior branch unchanged.
+
+## Why Local Waiting Savings Are Not All Latency Savings
+
+For Q10->Q11,the following first-forward intervals are disjoint. Checked
+parameter-wait/native-graph intersections in every owner/iteration;none exceeds
+50us of trace-boundary tolerance. Negative means early release is faster.
+
+| First-forward component delta,ms | Repeat0 | Repeat1 | Mean |
+| --- | ---: | ---: | ---: |
+| Parameter-ready wait | -9.130 | -9.190 | -9.160 |
+| Native graph execution | +4.410 | +4.110 | +4.260 |
+| Other first-forward intervals | -0.230 | -0.011 | -0.120 |
+| Total first forward | -4.950 | -5.091 | -5.020 |
+
+The native-graph partition shifts mainly into model compute(+2.275ms) and
+model-EP(+2.064ms);other graph categories partly offset these increases.
+These are nonoverlapping categories within the native graph,not independent
+collective residencies added to compute. "Graph idle" means no native graph
+kernel,not necessarily an idle GPU:other-stream redistribution may be active.
+
+All16full-replica ranks have the same ordered105model-EP kernels per first
+forward. With consumer release,followers are the latest kernel starters for
+1.1%/6.7% of matched calls;with early release,72.7%/46.7%. Owner model-EP
+residency before the latest peer kernel starts increases2.698/1.345ms. This
+supports additional participant-arrival skew,not a claim that every extra
+millisecond is wire transfer. Cross-host clock offset was not independently
+measured;the peer-start diagnostic is not a pure-wait measurement.
+
+Interpretation:AG lookahead creates the opportunity;early redistribution uses
+it to deliver later buckets before demand. That overlap is not free in the
+profiled workload:some savings are offset by longer native execution. The
+experiment identifies the schedule-induced tradeoff,but does not isolate
+SM versus memory-bandwidth versus NVLink contention individually. Nor do we
+use profiled kernel costs as an exact decomposition of companion timings.
+
+The initial bucket remains at about22ms of consumer wait across these controls.
+These schedules do not move its initial launch boundary;this is not proof that
+startup delivery is fundamentally irreducible.
+
+## Published Artifacts
+
+Figures, numerical tables, and this report:
+https://sc.talos.nvidia.com/view/home/scratch.darfeen_coreai/nep_delivery_factorial_3240633/
+
+All 352 rank kernel caches and the completed analysis are retained under the
+job's `delivery_factorial` directory. The `analysis_source` directory archives
+the analysis scripts and their local helper dependencies. Run the entry points
+with that directory on `PYTHONPATH`; the original training data stays in the
+job directory on Lustre. SVG and PNG figures were visually checked. Production
+defaults are unchanged; no additional benchmark job is needed for this report.
