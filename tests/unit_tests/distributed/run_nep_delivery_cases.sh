@@ -13,7 +13,7 @@
 #SBATCH --error=/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/lyris/%x-%j.err
 set -euo pipefail
 base=/home/darfeen/Megatron-LM
-runner=$base/.worktrees/nep-delivery-factorial-20261005/tests/unit_tests/distributed/run_nep_delivery_cases.sh
+runner=$base/.worktrees/nep-high-parity-delivery-20261005/tests/unit_tests/distributed/run_nep_delivery_cases.sh
 export CODE_REPO="${CODE_REPO:-${GRAPH_CODE_REPO:-$base/.worktrees/nep-buffer-cleanup-20260921}}"
 export GRAPH_FULL_EP=${GRAPH_FULL_EP:-8} GRAPH_REDUCED_EP=${GRAPH_REDUCED_EP:-6}
 export CUDA_DEVICE_MAX_CONNECTIONS=32 OMP_NUM_THREADS=1
@@ -223,8 +223,10 @@ for implementation in ${CLEANUP_CASES:-reference cleanup}; do
                         Q10) export ABLATION_SEQLEN=4096 NEP_ABLATION_PARAM_RELEASE=consumer ;;
                         Q11) export ABLATION_SEQLEN=4096 ;;
                         H4K) export GRAPH_CASES=healthy ABLATION_SEQLEN=4096 ;;
+                        H2K) export GRAPH_CASES=healthy ABLATION_SEQLEN=2048 ;;
                         H8K|H2) export GRAPH_CASES=healthy ;;
                         N4K) export ABLATION_SEQLEN=4096 ;;
+                        N2K) export ABLATION_SEQLEN=2048 ;;
                         N8K|M2) ;;
                         D4K) export ABLATION_SEQLEN=4096 NEP_ABLATION_PARAM_RELEASE=consumer ;;
                         D8K) export NEP_ABLATION_PARAM_RELEASE=consumer ;;

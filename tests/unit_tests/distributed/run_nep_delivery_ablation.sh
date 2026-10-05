@@ -14,7 +14,7 @@
 set -euo pipefail
 ulimit -c 0
 base=/home/darfeen/Megatron-LM
-export CODE_REPO=$base/.worktrees/nep-delivery-factorial-20261005
+export CODE_REPO=$base/.worktrees/nep-high-parity-delivery-20261005
 export CONTROLLED_CODE_REPO=$CODE_REPO
 export GRAPH_ALLOW_DIRTY=1 GRAPH_SCOPES=moe
 export GRAPH_FULL_EP=16 GRAPH_REDUCED_EP=12 NCCL_PXN_DISABLE=0
@@ -23,7 +23,22 @@ if [[ ${NEP_STUDY_STAGE:-gate} == smoke ]]; then
     export GRAPH_FULL_EP=8 GRAPH_REDUCED_EP=6 NCCL_PXN_DISABLE=1
     export CLEANUP_CASES='controlled_delivery_noprefetch_consumer controlled_delivery_noprefetch_early controlled_delivery_consumer controlled_delivery_early controlled_delivery_healthy_noprefetch controlled_delivery_healthy'
 else
-    export CLEANUP_CASES=${CLEANUP_CASES:-'controlled_actual_M4_r0 controlled_actual_M1_r0_off controlled_actual_M1_r0'}
+    cases=()
+    for repeat in 0 1 2; do
+        case $repeat in
+            0) order='N8K H8K N4K H4K N2K H2K'; modes='on off' ;;
+            1) order='H2K N2K H4K N4K H8K N8K'; modes='off on' ;;
+            2) order='N4K H4K H8K N8K N2K H2K'; modes='on off' ;;
+        esac
+        for cell in $order; do
+            for mode in $modes; do
+                suffix=''
+                [[ $mode != off ]] || suffix='_off'
+                cases+=("controlled_actual_${cell}_r${repeat}${suffix}")
+            done
+        done
+    done
+    export CLEANUP_CASES=${CLEANUP_CASES:-"${cases[*]}"}
 fi
 files=(megatron/core/distributed/nonuniform_ep.py
        tests/unit_tests/distributed/nep_actual_ablation.py

@@ -38,7 +38,7 @@ def options():
     ]
     local_ga = ga if rank < 16 else reduced_ga
     seqlen = int(os.environ.get('ABLATION_SEQLEN', '8192'))
-    assert seqlen in (4096, 8192)
+    assert seqlen in (2048, 4096, 8192)
     replacements = {
         '--micro-batch-size': [str(mbs)],
         '--global-batch-size': [str(world // 2 * mbs * local_ga)],
