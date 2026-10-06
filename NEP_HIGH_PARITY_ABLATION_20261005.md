@@ -45,3 +45,93 @@ discarding inconvenient iterations. No post-profile timing substitution.
 
 All outputs and analysis on Lustre; final plots published to Talos. Poll
 queued/running job every300s and stop on validated hangs or audit failures.
+
+## Completed Results
+
+Job3241762 completed0:0 in2h33m30s on eight GB300 nodes. Full replica:
+theia0043,0045,0050,0053 in nvlblk19; second replica:0079,0081,0082,0090 in
+nvlblk21. All36cases pass, with540complete every-rank event/Nsight/SQLite
+triples. Runtime SHA256 was identical in every case. No hang or OOM.
+Cross-replica RDMA, native AG/RS fingerprints, exact NEP payloads, canonical
+weights, routing unit and per-topology bucket layouts all pass validation.
+Largest-case NEP peak allocated135.525GiB. No production changes were needed.
+
+Means of three repeat-level owner timings, matched steps25-30. Parity is the
+mean of the three paired healthy/NEP ratios, not the ratio of pooled means.
+
+| Sequence | Companion healthy ms | Companion NEP ms | Extra ms | Companion parity | Profiled parity |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8192 | 3164.567 | 3234.416 | 69.849 | 97.8405% | 97.8518% |
+| 4096 | 1702.920 | 1790.084 | 87.164 | 95.1308% | 93.9369% |
+| 2048 | 1035.008 | 1129.915 | 94.907 | 91.6005% | 90.2621% |
+
+Companion parity drops relative to8192:
+- 4096:2.7097pp mean; paired repeats2.4938,2.6703,2.9649pp. All exceed2pp.
+- 2048:6.2399pp mean; paired repeats5.9334,6.4117,6.3748pp. All exceed3pp.
+
+This satisfies the user's practical effect threshold within this allocation.
+Three repeats are not a statistical generalization across hardware/allocations.
+
+## What Actually Became Less Hidden
+
+All-owner means from the three profiled repeats:
+
+| Sequence | Healthy later-bucket wait ms | NEP later-bucket wait ms | Last NEP bucket ready-before-demand ms |
+| --- | ---: | ---: | ---: |
+| 8192 | 0.026 | 0.012 | +15.368 |
+| 4096 | 0.099 | 0.516 | +0.151 |
+| 2048 | 3.215 | 6.448 | -5.170 |
+
+These exclude initial-bucket waiting; negative readiness margin means late.
+The final prefetched bucket changes from comfortably early to missing its
+consumer deadline. At2048 the preceding bucket is also1.157ms late on average,
+versus22.698ms early at8192. AG completion and redistribution GPU start are
+adjacent:the existing early policy is submitting eligible work,not intentionally
+waiting for the consuming layer.
+
+Kernel-level check across all12full-replica owners, first repeat, same six
+measured steps:NEP redistribution/staging union18.281/15.946/15.187ms at
+8K/4K/2K, with0.388/0.981/4.571ms not overlapped by any other kernel. Residency
+includes participant waiting; these are not pure wire times. The lower total
+residency at2K does not negate the increased exposure or missed deadlines.
+Kernel overlap is a diagnostic,not an additive causal decomposition of latency.
+
+## Important Negative Result
+
+This is a large parity sensitivity, but NOT evidence that lost parameter
+delivery hiding caused the entire parity drop. First-forward excess remains
+26.784/26.679/26.667ms at8K/4K/2K despite later bucket waits increasing. Other
+first-forward components offset those waits. The shortened iteration makes
+the largely fixed first-forward overhead relatively more expensive.
+
+Profiled phase excesses,NEP minus healthy,ms:
+
+| Sequence | First F | Other F total | Nonfinal B total | Final B | Outside F/B |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8192 | 26.784 | 1.542 | -0.288 | 23.117 | 19.412 |
+| 4096 | 26.679 | 0.954 | 1.952 | 22.638 | 60.424 |
+| 2048 | 26.667 | 2.180 | 4.266 | 22.177 | 59.597 |
+
+Most of the additional profiled absolute gap localizes outside forward/backward,
+not to first-forward delivery. Instrumentation is itself differential:profiled
+total gaps70.576/112.649/114.881ms versus companion69.849/87.164/94.907ms.
+Do not use these separate profiled phase values to allocate companion latency,
+or claim the outside-F/B increase is entirely profiler overhead. The companion
+absolute gap still increases17.315/25.058ms relative to8K; its complete causal
+attribution is not established by this experiment.
+
+Conclusion:shorter sequences reduce delivery slack and eventually expose later
+buckets;the parity change comfortably clears the requested threshold, but much
+of it is amortization, and the measured hiding loss alone does not explain it.
+The five mechanisms are not thereby ranked or fully isolated. No further
+scheduling/transport experiments were submitted after this test.
+
+## Artifacts
+
+Root:`/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/nep_cleanup_ab/3241762`.
+Final analysis:`sequence_hiding/summary.json`; analysis sources archived under
+`analysis_source`. The three-repeat aggregate uses all owner rank timings and
+all-rank event profiles; first-repeat kernel diagnostics use owners0-11 only.
+
+Plots, tables, and this report:
+https://sc.talos.nvidia.com/view/home/scratch.darfeen_coreai/nep_sequence_hiding_3241762/
