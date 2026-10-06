@@ -6,15 +6,15 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --exclusive
 #SBATCH --mem=0
-#SBATCH --time=02:00:00
+#SBATCH --time=01:30:00
 #SBATCH --chdir=/home/darfeen/Megatron-LM
-#SBATCH --job-name=coreai_comparch_sysarch-nep.norm-headroom
+#SBATCH --job-name=coreai_comparch_sysarch-nep.gather-cta
 #SBATCH --output=/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/lyris/%x-%j.out
 #SBATCH --error=/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/lyris/%x-%j.err
 set -euo pipefail
 ulimit -c 0
 base=/home/darfeen/Megatron-LM
-export CODE_REPO=$base/.worktrees/nep-norm-headroom-20261006
+export CODE_REPO=$base/.worktrees/nep-gather-cta-20261006
 export CONTROLLED_CODE_REPO=$CODE_REPO
 export GRAPH_ALLOW_DIRTY=1 GRAPH_SCOPES=moe
 export GRAPH_FULL_EP=16 GRAPH_REDUCED_EP=12 NCCL_PXN_DISABLE=0
@@ -26,8 +26,8 @@ else
     cases=()
     for repeat in 0 1; do
         case $repeat in
-            0) order='N32 H32 N64 H64'; modes='on off' ;;
-            1) order='H64 N64 H32 N32'; modes='off on' ;;
+            0) order='GBASE HGC G16'; modes='on off' ;;
+            1) order='G16 HGC GBASE'; modes='off on' ;;
         esac
         for cell in $order; do
             for mode in $modes; do
@@ -65,7 +65,7 @@ srun --nodes=1 --ntasks=1 --mpi=none --container-image=nvcr.io#nvidia/nemo:26.06
     '
 root=/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/nep_cleanup_ab/$SLURM_JOB_ID
 mkdir -p "$root/benchmark_source"
-for file in "${files[@]}" tests/unit_tests/distributed/run_nep_delivery_ablation.sh tests/unit_tests/distributed/run_nep_delivery_cases.sh; do
+for file in "${files[@]}" tests/unit_tests/distributed/run_nep_delivery_ablation.sh tests/unit_tests/distributed/run_nep_delivery_cases.sh tests/unit_tests/distributed/nep_gather_cta16.yaml; do
     mkdir -p "$root/benchmark_source/$(dirname "$file")"
     cp "$CODE_REPO/$file" "$root/benchmark_source/$file"
 done

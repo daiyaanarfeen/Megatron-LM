@@ -6,6 +6,7 @@ import os
 import sys
 from pathlib import Path
 
+import yaml
 from validate_nep_randomized_controls import expert_slots
 from validate_nep_randomized_controls import validate as compare_placement
 from validate_nep_study import audit as audit_transfers
@@ -54,6 +55,14 @@ def options():
         '--seq-length': [str(seqlen)],
     }
     flags.update(replacements)
+    gather_ctas = int(os.environ.get('NEP_GATHER_MAX_CTAS', '0'))
+    assert gather_ctas in (0, 16)
+    assert '--nccl-communicator-config-path' not in flags
+    if gather_ctas:
+        assert os.environ['GRAPH_CASE'] == 'nep'
+        config = Path(__file__).with_name('nep_gather_cta16.yaml')
+        assert yaml.safe_load(config.read_text()) == {'nep_owner_gather': {'max_ctas': 16}}
+        flags['--nccl-communicator-config-path'] = [str(config)]
     if os.environ['GRAPH_CASE'] == 'healthy':
         for key in (
             '--nonuniform-mode',
@@ -81,6 +90,7 @@ def options():
         order=os.environ['NEP_ABLATION_PARAM_ORDER'],
         lanes=int(os.environ['NEP_ABLATION_PARAM_LANES']),
         bwd_norm_sm_margin=int(os.environ['NVTE_BWD_LAYERNORM_SM_MARGIN']),
+        gather_max_ctas=gather_ctas,
         expert_bucket_groups=(
             None
             if os.environ['GRAPH_CASE'] == 'healthy'
@@ -115,6 +125,15 @@ def validate(run):
             if '=' in line
         )
         assert int(environment['NVTE_BWD_LAYERNORM_SM_MARGIN']) == spec['bwd_norm_sm_margin']
+        assert int(environment['NEP_GATHER_MAX_CTAS']) == spec['gather_max_ctas']
+        effective = parse_options(
+            json.loads((run / f'actual-options-{rank}.json').read_text())['options']
+        )
+        if spec['gather_max_ctas']:
+            config = Path(effective['--nccl-communicator-config-path'][0])
+            assert yaml.safe_load(config.read_text()) == {'nep_owner_gather': {'max_ctas': 16}}
+        else:
+            assert '--nccl-communicator-config-path' not in effective
     result = json.loads((run / 'work-validation.json').read_text())
     profiled = result['profiled']
     if not healthy:

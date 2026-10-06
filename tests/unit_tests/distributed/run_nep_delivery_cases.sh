@@ -13,7 +13,7 @@
 #SBATCH --error=/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/lyris/%x-%j.err
 set -euo pipefail
 base=/home/darfeen/Megatron-LM
-runner=$base/.worktrees/nep-norm-headroom-20261006/tests/unit_tests/distributed/run_nep_delivery_cases.sh
+runner=$base/.worktrees/nep-gather-cta-20261006/tests/unit_tests/distributed/run_nep_delivery_cases.sh
 export CODE_REPO="${CODE_REPO:-${GRAPH_CODE_REPO:-$base/.worktrees/nep-buffer-cleanup-20260921}}"
 export GRAPH_FULL_EP=${GRAPH_FULL_EP:-8} GRAPH_REDUCED_EP=${GRAPH_REDUCED_EP:-6}
 export CUDA_DEVICE_MAX_CONNECTIONS=32 OMP_NUM_THREADS=1
@@ -193,6 +193,7 @@ for implementation in ${CLEANUP_CASES:-reference cleanup}; do
             export NEP_ABLATION_FIXED_GRAD_ORDER=0 NEP_CONTROLLED_PROFILE=on GRAPH_CASES=nep
             export NEP_ABLATION_PARAM_RELEASE=early NEP_ABLATION_PREFETCH_DEPTH=1
             export MEGATRON_NONUNIFORM_EP_NCCL_EXPERT_BUCKET_GROUPS=3
+            export NEP_GATHER_MAX_CTAS=0
             policy=${implementation#controlled_}
             if [[ "$policy" == *_off ]]; then
                 export NEP_CONTROLLED_PROFILE=off
@@ -217,6 +218,13 @@ for implementation in ${CLEANUP_CASES:-reference cleanup}; do
                     export ABLATION_MBS=2 ABLATION_GA=8 ABLATION_REDUCED_GA=8
                     export ABLATION_SEQLEN=8192
                     case "$cell" in
+                        HGC|GBASE|G16)
+                            export NVTE_BWD_LAYERNORM_SM_MARGIN=32
+                            export NEP_ABLATION_PARAM_ORDER=ascending
+                            export MEGATRON_NONUNIFORM_EP_NCCL_EXPERT_BUCKET_GROUPS=5
+                            [[ "$cell" != HGC ]] || export GRAPH_CASES=healthy
+                            [[ "$cell" != G16 ]] || export NEP_GATHER_MAX_CTAS=16
+                            ;;
                         H32|H64|N32|N64)
                             export NVTE_BWD_LAYERNORM_SM_MARGIN=${cell:1}
                             export NEP_ABLATION_PARAM_ORDER=ascending
