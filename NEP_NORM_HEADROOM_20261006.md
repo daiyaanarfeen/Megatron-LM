@@ -74,6 +74,18 @@ budget of120SMs;32+8 large NCCL CTAs can exceed the32-SM headroom. This is a
 resource-budget explanation supported by the intervention, not a direct
 hardware SM-occupancy counter measurement.
 
+Check against a timing-shift-only explanation: in margin64 repeat0, ranks
+0/4/8/10 contain5/11/19/25 norm kernels respectively whose entire execution
+is inside simultaneous Gather+RS kernel residency totaling more than32CTAs.
+For rank0 at Nsight timestamp3115222183ns, the264-CTA norm starts after a
+0.015488ms native-work gap and runs0.3752ms;32-CTA Gather spans -0.133120 to
++2.032704ms relative to norm start and24-CTA RS spans -7.169024 to+5.298624ms.
+Thus norm really can execute concurrently with the56-CTA communication
+combination, not merely start after communication finishes. Rank4 has another
+example with32-CTA Gather plus24- and8-CTA RS kernels, totaling64CTAs.
+The selected paired block10 at margin64 itself has no concurrent collective;
+do not use that individual pair alone as proof of simultaneous admission.
+
 ### End-To-End Tradeoff
 
 Owner ranks0-11, matched steps25-30, means over both profiled repeats:
@@ -134,6 +146,12 @@ with identical healthy controls/profiles, verify actual grids and unchanged
 payload/ordering/numerics, then require reduced norm gaps and improved absolute
 owner iteration time without first-forward or ordinary-backward regression.
 Do not accept an apparent parity improvement caused by a slower healthy run.
+Some traced windows have BOTH24-CTA dense RS and8-CTA expert RS as well as
+Gather. A Gather-only cap cannot guarantee that their combined resource budget
+fits32SMs. This proposal is the least-invasive first test, not a guarantee of
+eliminating every stall. If those windows remain limiting, consult before
+changing native RS communicator caps, which can also affect parameter AG on
+the same groups. Do not silently expand the scope to those collectives.
 
 ## Evidence
 
