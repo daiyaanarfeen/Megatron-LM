@@ -80,6 +80,7 @@ def options():
         placement=os.environ['NEP_ABLATION_PLACEMENT'],
         order=os.environ['NEP_ABLATION_PARAM_ORDER'],
         lanes=int(os.environ['NEP_ABLATION_PARAM_LANES']),
+        bwd_norm_sm_margin=int(os.environ['NVTE_BWD_LAYERNORM_SM_MARGIN']),
         expert_bucket_groups=(
             None
             if os.environ['GRAPH_CASE'] == 'healthy'
@@ -107,6 +108,13 @@ def validate(run):
     spec = json.loads((run / 'actual-spec.json').read_text())
     validate_work(run, spec)
     healthy = spec['cell'].startswith('H')
+    for rank in range(32 if healthy else 28):
+        environment = dict(
+            line.split('=', 1)
+            for line in (run / f'env-rank-{rank}.txt').read_text().splitlines()
+            if '=' in line
+        )
+        assert int(environment['NVTE_BWD_LAYERNORM_SM_MARGIN']) == spec['bwd_norm_sm_margin']
     result = json.loads((run / 'work-validation.json').read_text())
     profiled = result['profiled']
     if not healthy:

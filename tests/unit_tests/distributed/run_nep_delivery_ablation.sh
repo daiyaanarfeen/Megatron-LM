@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --account=coreai_comparch_sysarch
-#SBATCH --partition=gb300,gb200
+#SBATCH --partition=gb300
 #SBATCH --nodes=8
 #SBATCH --segment=4
 #SBATCH --ntasks-per-node=4
@@ -8,13 +8,13 @@
 #SBATCH --mem=0
 #SBATCH --time=02:00:00
 #SBATCH --chdir=/home/darfeen/Megatron-LM
-#SBATCH --job-name=coreai_comparch_sysarch-nep.expert-buckets
+#SBATCH --job-name=coreai_comparch_sysarch-nep.norm-headroom
 #SBATCH --output=/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/lyris/%x-%j.out
 #SBATCH --error=/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/lyris/%x-%j.err
 set -euo pipefail
 ulimit -c 0
 base=/home/darfeen/Megatron-LM
-export CODE_REPO=$base/.worktrees/nep-expert-buckets-20261006
+export CODE_REPO=$base/.worktrees/nep-norm-headroom-20261006
 export CONTROLLED_CODE_REPO=$CODE_REPO
 export GRAPH_ALLOW_DIRTY=1 GRAPH_SCOPES=moe
 export GRAPH_FULL_EP=16 GRAPH_REDUCED_EP=12 NCCL_PXN_DISABLE=0
@@ -26,8 +26,8 @@ else
     cases=()
     for repeat in 0 1; do
         case $repeat in
-            0) order='B3 H8K B6 B5'; modes='on off' ;;
-            1) order='B5 B6 H8K B3'; modes='off on' ;;
+            0) order='N32 H32 N64 H64'; modes='on off' ;;
+            1) order='H64 N64 H32 N32'; modes='off on' ;;
         esac
         for cell in $order; do
             for mode in $modes; do
@@ -47,6 +47,10 @@ files=(megatron/core/distributed/nonuniform_ep.py
        tests/unit_tests/distributed/validate_nep_work_allocation.py
        tests/unit_tests/distributed/validate_nep_randomized_controls.py
        tests/unit_tests/distributed/validate_nep_study.py)
+root=/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/nep_cleanup_ab/$SLURM_JOB_ID
+mkdir -p "$root/normalization_source"
+export NORM_SOURCE_OUTPUT="$root/normalization_source"
+files+=(tests/unit_tests/distributed/inspect_nep_norm_headroom.py)
 export STUDY_PYTHON_FILES="${files[*]}"
 srun --nodes=1 --ntasks=1 --mpi=none --container-image=nvcr.io#nvidia/nemo:26.06 --container-name=nep_nemo_26_06 \
     --no-container-mount-home --container-mounts="$base:$base,/lustre:/lustre" bash -c '
@@ -57,6 +61,7 @@ srun --nodes=1 --ntasks=1 --mpi=none --container-image=nvcr.io#nvidia/nemo:26.06
         python -m black --skip-string-normalization $STUDY_PYTHON_FILES
     fi
     python -m py_compile $STUDY_PYTHON_FILES
+    python tests/unit_tests/distributed/inspect_nep_norm_headroom.py
     '
 root=/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/nep_cleanup_ab/$SLURM_JOB_ID
 mkdir -p "$root/benchmark_source"
