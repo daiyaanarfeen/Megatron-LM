@@ -6,6 +6,7 @@ import os
 import sys
 from pathlib import Path
 
+from validate_nep_randomized_controls import expert_slots
 from validate_nep_randomized_controls import validate as compare_placement
 from validate_nep_study import audit as audit_transfers
 from validate_nep_work_allocation import validate as validate_work
@@ -79,6 +80,11 @@ def options():
         placement=os.environ['NEP_ABLATION_PLACEMENT'],
         order=os.environ['NEP_ABLATION_PARAM_ORDER'],
         lanes=int(os.environ['NEP_ABLATION_PARAM_LANES']),
+        expert_bucket_groups=(
+            None
+            if os.environ['GRAPH_CASE'] == 'healthy'
+            else int(os.environ.get('MEGATRON_NONUNIFORM_EP_NCCL_EXPERT_BUCKET_GROUPS', '3'))
+        ),
         template=str(TEMPLATE),
         template_sha256=hashlib.sha256(TEMPLATE.read_bytes()).hexdigest(),
     )
@@ -111,6 +117,8 @@ def validate(run):
         json.loads((run / f'controls/initialization-{r}.json').read_text())
         for r in range(32 if healthy else 28)
     ]
+    if not healthy:
+        assert all(len(m['expert_buckets']) == spec['expert_bucket_groups'] for m in current)
     if spec.get('native_rank_timing'):
         for rank in range(len(current)):
             timings = json.loads((run / f'native-timing-{rank}.json').read_text())
@@ -146,6 +154,11 @@ def validate(run):
         old = json.loads(previous.read_text())
         old_healthy = old_spec['cell'].startswith('H')
         same_topology = healthy == old_healthy
+        rebucketed = (
+            not healthy
+            and not old_healthy
+            and spec.get('expert_bucket_groups', 3) != old_spec.get('expert_bucket_groups', 3)
+        )
         # Expert identity is global, not the physical rank or padded local slot.
         old_manifests = [
             json.loads(p.read_text()) for p in (other / 'controls').glob('initialization-*.json')
@@ -168,7 +181,12 @@ def validate(run):
                     assert before['parameters'][name] == value, (r, name, 'dense weight drift')
             if same_topology:
                 assert before['dense_buckets'] == now['dense_buckets']
-                assert before['expert_buckets'] == now['expert_buckets']
+                if rebucketed:
+                    assert expert_slots(before['expert_buckets']) == expert_slots(
+                        now['expert_buckets']
+                    )
+                else:
+                    assert before['expert_buckets'] == now['expert_buckets']
             routes = lambda parent: [
                 json.loads(p.read_text()) for p in (parent / 'controls').glob(f'routing-{r}-*.json')
             ]
@@ -182,10 +200,12 @@ def validate(run):
             and old_spec['mbs'] == spec['mbs']
             and old_spec['seqlen'] == spec['seqlen']
         ):
-            compare_placement(other, run, 16, 12)
+            compare_placement(other, run, 16, 12, allow_expert_rebucketing=rebucketed)
         if profiled and old['profiled'] and same_topology:
 
             def fingerprint(records):
+                if rebucketed:
+                    return rebucketed_fingerprint(records)
                 result = {
                     key: sorted(
                         json.dumps(
@@ -215,6 +235,33 @@ def validate(run):
     result['transfer'] = transfer
     (run / 'actual-validation.json').write_text(json.dumps(result, indent=2) + '\n')
     print('ACTUAL_ABLATION_PASS', run, flush=True)
+
+
+def rebucketed_fingerprint(records: dict) -> dict:
+    """Keep dense calls exact; compare total expert AG/RS bytes per rank pair and dtype."""
+    result = {}
+    for key, calls in records.items():
+        dense, expert = [], {}
+        for call in calls:
+            if call['group_desc'] in ('dp_cp', 'DATA_PARALLEL_GROUP_WITH_CP'):
+                dense.append(
+                    json.dumps(
+                        {k: call[k] for k in ('group_desc', 'ranks', 'operations')}, sort_keys=True
+                    )
+                )
+            elif call['group_desc'] in ('ep_dp', 'EXPERT_DATA_PARALLEL_GROUP'):
+                for op in call['operations']:
+                    signature = json.dumps(
+                        [call['group_desc'], call['ranks'], op['op'], op['dtype']]
+                    )
+                    total = expert.setdefault(signature, [0, 0])
+                    total[0] += op['input_bytes']
+                    total[1] += op['output_bytes']
+        assert dense, (key, 'Missing native dense optimizer collectives')
+        # Followers have no native expert optimizer collective.
+        result[key] = dict(dense=sorted(dense), expert=expert)
+    assert result
+    return result
 
 
 if __name__ == '__main__':

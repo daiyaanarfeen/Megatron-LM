@@ -5,8 +5,22 @@ import sys
 from pathlib import Path
 
 
+def expert_slots(buckets: list[dict]) -> list:
+    """Preserve ordered expert identities and sizes independently of bucket boundaries."""
+    return [
+        (slot, size)
+        for bucket in buckets
+        for slot, size in zip(bucket['slots'], bucket['numels'], strict=True)
+    ]
+
+
 def validate(
-    left: Path, right: Path, full_ep: int, reduced_ep: int, require_routing: bool = True
+    left: Path,
+    right: Path,
+    full_ep: int,
+    reduced_ep: int,
+    require_routing: bool = True,
+    allow_expert_rebucketing: bool = False,
 ) -> dict:
     """Compare paired placement manifests before accepting timing results."""
     world = full_ep + reduced_ep
@@ -38,7 +52,10 @@ def validate(
     for rank in range(world):
         a, b = [manifest[0][rank] for manifest in manifests]
         for key in ('dense_buckets', 'expert_buckets'):
-            assert a[key] == b[key], (rank, key)
+            if key == 'expert_buckets' and allow_expert_rebucketing:
+                assert expert_slots(a[key]) == expert_slots(b[key]), (rank, key, 'expert drift')
+            else:
+                assert a[key] == b[key], (rank, key)
         dense = [
             {name: value for name, value in m['parameters'].items() if '.experts.' not in name}
             for m in (a, b)

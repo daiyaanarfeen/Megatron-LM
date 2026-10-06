@@ -1,20 +1,20 @@
 #!/bin/bash
 #SBATCH --account=coreai_comparch_sysarch
-#SBATCH --partition=gb300
+#SBATCH --partition=gb300,gb200
 #SBATCH --nodes=8
 #SBATCH --segment=4
 #SBATCH --ntasks-per-node=4
 #SBATCH --exclusive
 #SBATCH --mem=0
-#SBATCH --time=01:00:00
+#SBATCH --time=02:00:00
 #SBATCH --chdir=/home/darfeen/Megatron-LM
-#SBATCH --job-name=coreai_comparch_sysarch-nep.delivery-gate
+#SBATCH --job-name=coreai_comparch_sysarch-nep.expert-buckets
 #SBATCH --output=/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/lyris/%x-%j.out
 #SBATCH --error=/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/lyris/%x-%j.err
 set -euo pipefail
 ulimit -c 0
 base=/home/darfeen/Megatron-LM
-export CODE_REPO=$base/.worktrees/nep-high-parity-delivery-20261005
+export CODE_REPO=$base/.worktrees/nep-expert-buckets-20261006
 export CONTROLLED_CODE_REPO=$CODE_REPO
 export GRAPH_ALLOW_DIRTY=1 GRAPH_SCOPES=moe
 export GRAPH_FULL_EP=16 GRAPH_REDUCED_EP=12 NCCL_PXN_DISABLE=0
@@ -24,11 +24,10 @@ if [[ ${NEP_STUDY_STAGE:-gate} == smoke ]]; then
     export CLEANUP_CASES='controlled_delivery_noprefetch_consumer controlled_delivery_noprefetch_early controlled_delivery_consumer controlled_delivery_early controlled_delivery_healthy_noprefetch controlled_delivery_healthy'
 else
     cases=()
-    for repeat in 0 1 2; do
+    for repeat in 0 1; do
         case $repeat in
-            0) order='N8K H8K N4K H4K N2K H2K'; modes='on off' ;;
-            1) order='H2K N2K H4K N4K H8K N8K'; modes='off on' ;;
-            2) order='N4K H4K H8K N8K N2K H2K'; modes='on off' ;;
+            0) order='B3 H8K B6 B5'; modes='on off' ;;
+            1) order='B5 B6 H8K B3'; modes='off on' ;;
         esac
         for cell in $order; do
             for mode in $modes; do
@@ -46,6 +45,7 @@ files=(megatron/core/distributed/nonuniform_ep.py
        tests/unit_tests/distributed/nep_randomized_controls.py
        tests/unit_tests/distributed/nep_param_prefetch_smoke.py
        tests/unit_tests/distributed/validate_nep_work_allocation.py
+       tests/unit_tests/distributed/validate_nep_randomized_controls.py
        tests/unit_tests/distributed/validate_nep_study.py)
 export STUDY_PYTHON_FILES="${files[*]}"
 srun --nodes=1 --ntasks=1 --mpi=none --container-image=nvcr.io#nvidia/nemo:26.06 --container-name=nep_nemo_26_06 \
