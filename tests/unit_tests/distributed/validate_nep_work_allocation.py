@@ -63,7 +63,8 @@ def validate(run, settings=None):
         routing[rank] = [read(path) for path in files]
         for route in routing[rank]:
             assert len(set(route['expert_counts'])) == 1
-            assert route['experts'] == 512 and route['topk'] == 6
+            assert route['experts'] == (settings or {}).get('experts', 512)
+            assert route['topk'] == (settings or {}).get('topk', 6)
         if not profiled:
             continue
         assert (run / f'nsys_profile/rank-{rank}.sqlite').is_file()

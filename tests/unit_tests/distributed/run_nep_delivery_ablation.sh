@@ -6,15 +6,15 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --exclusive
 #SBATCH --mem=0
-#SBATCH --time=01:30:00
+#SBATCH --time=02:30:00
 #SBATCH --chdir=/home/darfeen/Megatron-LM
-#SBATCH --job-name=coreai_comparch_sysarch-nep.gather-cta
+#SBATCH --job-name=coreai_comparch_sysarch-nep.expert-count
 #SBATCH --output=/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/lyris/%x-%j.out
 #SBATCH --error=/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/lyris/%x-%j.err
 set -euo pipefail
 ulimit -c 0
 base=/home/darfeen/Megatron-LM
-export CODE_REPO=$base/.worktrees/nep-gather-cta-20261006
+export CODE_REPO=$base/.worktrees/nep-expert-count-20261007
 export CONTROLLED_CODE_REPO=$CODE_REPO
 export GRAPH_ALLOW_DIRTY=1 GRAPH_SCOPES=moe
 export GRAPH_FULL_EP=16 GRAPH_REDUCED_EP=12 NCCL_PXN_DISABLE=0
@@ -26,8 +26,8 @@ else
     cases=()
     for repeat in 0 1; do
         case $repeat in
-            0) order='GBASE HGC G16'; modes='on off' ;;
-            1) order='G16 HGC GBASE'; modes='off on' ;;
+            0) order='N384 H384 N256 H256 N128 H128'; modes='on off' ;;
+            1) order='H128 N128 H256 N256 H384 N384'; modes='off on' ;;
         esac
         for cell in $order; do
             for mode in $modes; do
@@ -40,6 +40,8 @@ else
     export CLEANUP_CASES=${CLEANUP_CASES:-"${cases[*]}"}
 fi
 files=(megatron/core/distributed/nonuniform_ep.py
+       tests/unit_tests/distributed/nep_expert_count_controls.py
+       tests/unit_tests/distributed/test_nep_expert_count_controls.py
        tests/unit_tests/distributed/nep_actual_ablation.py
        tests/unit_tests/distributed/nep_controlled_probe.py
        tests/unit_tests/distributed/nep_randomized_controls.py
@@ -61,6 +63,7 @@ srun --nodes=1 --ntasks=1 --mpi=none --container-image=nvcr.io#nvidia/nemo:26.06
         python -m black --skip-string-normalization $STUDY_PYTHON_FILES
     fi
     python -m py_compile $STUDY_PYTHON_FILES
+    python tests/unit_tests/distributed/test_nep_expert_count_controls.py
     python tests/unit_tests/distributed/inspect_nep_norm_headroom.py
     '
 root=/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/nep_cleanup_ab/$SLURM_JOB_ID

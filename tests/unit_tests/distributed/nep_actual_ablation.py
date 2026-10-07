@@ -40,7 +40,9 @@ def options():
     ]
     local_ga = ga if rank < 16 else reduced_ga
     seqlen = int(os.environ.get('ABLATION_SEQLEN', '8192'))
-    assert seqlen in (2048, 4096, 8192)
+    assert seqlen in (2048, 4096, 8192, 8448)
+    experts = int(os.environ.get('ABLATION_EXPERTS', '512'))
+    topk = int(os.environ.get('ABLATION_TOPK', '6'))
     replacements = {
         '--micro-batch-size': [str(mbs)],
         '--global-batch-size': [str(world // 2 * mbs * local_ga)],
@@ -53,8 +55,15 @@ def options():
         '--log-memory-interval': ['1'],
         '--distributed-timeout-minutes': ['3'],
         '--seq-length': [str(seqlen)],
+        '--max-position-embeddings': [str(seqlen)],
+        '--num-experts': [str(experts)],
+        '--moe-router-topk': [str(topk)],
     }
     flags.update(replacements)
+    if os.environ.get('NEP_EXPERT_COUNT_STUDY') == '1':
+        assert experts in (128, 256, 384) and topk == 8 and seqlen == 8448
+        flags.pop('--ddp-num-buckets')
+        flags['--ddp-bucket-size'] = ['697279864']
     gather_ctas = int(os.environ.get('NEP_GATHER_MAX_CTAS', '0'))
     assert gather_ctas in (0, 16)
     assert '--nccl-communicator-config-path' not in flags
@@ -84,6 +93,8 @@ def options():
         native_rank_timing=True,
         delivery_markers=True,
         seqlen=seqlen,
+        experts=experts,
+        topk=topk,
         delivery=os.environ.get('NEP_ABLATION_PARAM_RELEASE', 'early'),
         prefetch_depth=int(os.environ.get('NEP_ABLATION_PREFETCH_DEPTH', '1')),
         placement=os.environ['NEP_ABLATION_PLACEMENT'],
@@ -178,6 +189,10 @@ def validate(run):
     for previous in run.parent.glob('controlled_actual_*/actual-validation.json'):
         other = previous.parent
         old_spec = json.loads((other / 'actual-spec.json').read_text())
+        # Different expert counts intentionally change weights, routing, and payloads.
+        # Within each count, retain all original healthy/NEP/repeat controls.
+        if old_spec.get('experts', 512) != spec.get('experts', 512):
+            continue
         old = json.loads(previous.read_text())
         old_healthy = old_spec['cell'].startswith('H')
         same_topology = healthy == old_healthy

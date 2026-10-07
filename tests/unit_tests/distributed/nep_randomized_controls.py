@@ -108,6 +108,10 @@ def install() -> None:
         assert expected == observed, 'Startup synchronization changed canonical parameter values'
         groups = self.expert_parallel_bucket_groups
         param_names = {param: name for name, param in self.module.named_parameters()}
+        if os.environ.get('NEP_EXPERT_COUNT_STUDY') == '1':
+            from nep_expert_count_controls import validate_bucket_control
+
+            validate_bucket_control(self, param_names, root, rank)
         manifest = dict(
             rank=rank,
             placement=runtime['expert_placement'],

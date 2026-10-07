@@ -84,6 +84,10 @@ def install_delivery_markers():
 
 def main():
     root = Path(os.environ['GRAPH_OUTPUT'])
+    if os.environ.get('NEP_EXPERT_COUNT_STUDY') == '1':
+        from nep_expert_count_controls import install_bucket_control
+
+        install_bucket_control()
     install_native_delivery_policy()
     if os.environ.get('NEP_ACTUAL_A8B') == '1':
         from megatron.core.timers import Timer
