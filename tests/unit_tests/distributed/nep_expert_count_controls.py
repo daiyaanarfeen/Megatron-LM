@@ -43,10 +43,10 @@ def validate_bucket_control(ddp, param_names, root, rank):
         for group in ddp.bucket_groups
     ]
     record = dict(expert_modules=signatures, dense_names=dense)
+    (root / f'bucket-control-{rank}.json').write_text(json.dumps(record, indent=2) + '\n')
     for previous in root.parent.parent.glob('controlled_actual_*/controls/bucket-control-*.json'):
         if previous.parent == root:
             continue
         old = json.loads(previous.read_text())
         assert record == old, (rank, previous, 'Layer-to-bucket grouping changed')
-    (root / f'bucket-control-{rank}.json').write_text(json.dumps(record, indent=2) + '\n')
     print('EXPERT_COUNT_BUCKET_CONTROL_PASS', rank, os.environ['ABLATION_EXPERTS'], flush=True)

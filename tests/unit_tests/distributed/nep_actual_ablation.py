@@ -63,7 +63,7 @@ def options():
     if os.environ.get('NEP_EXPERT_COUNT_STUDY') == '1':
         assert experts in (128, 256, 384) and topk == 8 and seqlen == 8448
         flags.pop('--ddp-num-buckets')
-        flags['--ddp-bucket-size'] = ['697279864']
+        flags['--ddp-bucket-size'] = ['692000000']
     gather_ctas = int(os.environ.get('NEP_GATHER_MAX_CTAS', '0'))
     assert gather_ctas in (0, 16)
     assert '--nccl-communicator-config-path' not in flags

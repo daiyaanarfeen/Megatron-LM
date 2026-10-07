@@ -26,8 +26,8 @@ else
     cases=()
     for repeat in 0 1; do
         case $repeat in
-            0) order='N384 H384 N256 H256 N128 H128'; modes='on off' ;;
-            1) order='H128 N128 H256 N256 H384 N384'; modes='off on' ;;
+            0) order='N128 H128 N384 H384 N256 H256'; modes='on off' ;;
+            1) order='H256 N256 H384 N384 H128 N128'; modes='off on' ;;
         esac
         for cell in $order; do
             for mode in $modes; do
