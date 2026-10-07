@@ -6,15 +6,17 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --exclusive
 #SBATCH --mem=0
-#SBATCH --time=02:30:00
+#SBATCH --time=02:00:00
 #SBATCH --chdir=/home/darfeen/Megatron-LM
-#SBATCH --job-name=coreai_comparch_sysarch-nep.expert-count
+#SBATCH --job-name=coreai_comparch_sysarch-nep.expert-ga
 #SBATCH --output=/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/lyris/%x-%j.out
 #SBATCH --error=/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/lyris/%x-%j.err
 set -euo pipefail
 ulimit -c 0
 base=/home/darfeen/Megatron-LM
-export CODE_REPO=$base/.worktrees/nep-expert-count-20261007
+export CODE_REPO=$base/.worktrees/nep-expert-count-ga-20261007
+export NEP_EXPERT_COUNT_GA=${NEP_EXPERT_COUNT_GA:?Set GA to 2 or 4}
+[[ "$NEP_EXPERT_COUNT_GA" == 2 || "$NEP_EXPERT_COUNT_GA" == 4 ]]
 export CONTROLLED_CODE_REPO=$CODE_REPO
 export GRAPH_ALLOW_DIRTY=1 GRAPH_SCOPES=moe
 export GRAPH_FULL_EP=16 GRAPH_REDUCED_EP=12 NCCL_PXN_DISABLE=0
@@ -26,8 +28,8 @@ else
     cases=()
     for repeat in 0 1; do
         case $repeat in
-            0) order='N128 H128 N384 H384 N256 H256'; modes='on off' ;;
-            1) order='H256 N256 H384 N384 H128 N128'; modes='off on' ;;
+            0) order='N384 H384 N256 H256 N128 H128'; modes='on off' ;;
+            1) order='H128 N128 H256 N256 H384 N384'; modes='off on' ;;
         esac
         for cell in $order; do
             for mode in $modes; do
