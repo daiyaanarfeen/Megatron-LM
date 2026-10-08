@@ -6,9 +6,9 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --exclusive
 #SBATCH --mem=0
-#SBATCH --time=01:15:00
+#SBATCH --time=01:00:00
 #SBATCH --chdir=/home/darfeen/Megatron-LM
-#SBATCH --job-name=coreai_comparch_sysarch-nep.seq24k-ga2
+#SBATCH --job-name=coreai_comparch_sysarch-nep.seq8k-ga2
 #SBATCH --output=/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/lyris/%x-%j.out
 #SBATCH --error=/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/lyris/%x-%j.err
 set -euo pipefail
@@ -26,8 +26,8 @@ else
     cases=()
     for repeat in 0 1; do
         case $repeat in
-            0) order='N24K H24K'; modes='on off' ;;
-            1) order='H24K N24K'; modes='off on' ;;
+            0) order='N8KG2 H8KG2'; modes='on off' ;;
+            1) order='H8KG2 N8KG2'; modes='off on' ;;
         esac
         for cell in $order; do
             for mode in $modes; do
