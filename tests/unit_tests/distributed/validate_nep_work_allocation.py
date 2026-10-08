@@ -19,11 +19,16 @@ def validate(run, settings=None):
     reduced_ga = 3 if cell == 'R' else ga
     expected_gbs = 32 + (32 if healthy else 6 * mbs * reduced_ga)
     train_iters, steps = 25, range(15, 21)
+    reserve_margin_gib, free_margin_gib = 16, 8
     if settings is not None:
         mbs, ga, reduced_ga = (settings[k] for k in ('mbs', 'ga', 'reduced_ga'))
         expected_gbs = settings['true_gbs']
         train_iters = settings['train_iters']
         steps = range(settings['profile_start'], settings['profile_end'])
+        if settings.get('cell') in ('H24K', 'N24K'):
+            assert (settings['seqlen'], mbs, ga, reduced_ga) == (24576, 2, 2, 2)
+            # User-approved margins for the unchanged 24K/GA2 experiment only.
+            reserve_margin_gib, free_margin_gib = 10, 4
     profiled = '_off_' not in run.name
     log = (run / 'driver.log').read_text()
     statuses = [
@@ -55,8 +60,8 @@ def validate(run, settings=None):
         memory[rank] = read(run / f'memory-{rank}.json')
         mem = memory[rank]
         # Leave substantial space beyond the caching allocator and NCCL pools.
-        assert mem['total'] - mem['peak_reserved'] > 16 * 1024**3, (rank, mem)
-        assert mem['end_free'] > 8 * 1024**3, (rank, mem)
+        assert mem['total'] - mem['peak_reserved'] > reserve_margin_gib * 1024**3, (rank, mem)
+        assert mem['end_free'] > free_margin_gib * 1024**3, (rank, mem)
         initial[rank] = read(run / f'controls/initialization-{rank}.json')
         files = list((run / 'controls').glob(f'routing-{rank}-*.json'))
         assert files, (rank, 'missing routing')
@@ -119,6 +124,7 @@ def validate(run, settings=None):
         profiled=profiled,
         true_gbs=expected_gbs,
         memory=memory,
+        memory_guards_gib=dict(reserved=reserve_margin_gib, free=free_margin_gib),
         native_collectives=native,
     )
     (run / 'work-validation.json').write_text(json.dumps(result, indent=2) + '\n')
