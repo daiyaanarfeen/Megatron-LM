@@ -216,6 +216,10 @@ for implementation in ${CLEANUP_CASES:-reference cleanup}; do
                     export ABLATION_MBS=2 ABLATION_GA=8 ABLATION_REDUCED_GA=8
                     export ABLATION_SEQLEN=8192
                     case "$cell" in
+                        H24K|N24K)
+                            export ABLATION_SEQLEN=24576 ABLATION_GA=2 ABLATION_REDUCED_GA=2
+                            [[ "$cell" != H24K ]] || export GRAPH_CASES=healthy
+                            ;;
                         H32K|N32K)
                             export ABLATION_SEQLEN=32768 ABLATION_GA=2 ABLATION_REDUCED_GA=2
                             [[ "$cell" != H32K ]] || export GRAPH_CASES=healthy
