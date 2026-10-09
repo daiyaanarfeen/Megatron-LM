@@ -10,7 +10,7 @@ def read(path):
     return json.loads(path.read_text())
 
 
-def validate(run):
+def validate(run, settings=None):
     cell = run.name.split('_')[2]
     healthy = cell.startswith('H')
     world = 32 if healthy else 28
@@ -18,6 +18,12 @@ def validate(run):
     ga = 2 if mbs == 2 else 4
     reduced_ga = 3 if cell == 'R' else ga
     expected_gbs = 32 + (32 if healthy else 6 * mbs * reduced_ga)
+    train_iters, steps = 25, range(15, 21)
+    if settings is not None:
+        mbs, ga, reduced_ga = (settings[k] for k in ('mbs', 'ga', 'reduced_ga'))
+        expected_gbs = settings['true_gbs']
+        train_iters = settings['train_iters']
+        steps = range(settings['profile_start'], settings['profile_end'])
     profiled = '_off_' not in run.name
     log = (run / 'driver.log').read_text()
     statuses = [
@@ -26,8 +32,8 @@ def validate(run):
             r'iteration\s+(\d+)/\s*(\d+).*?number of skipped iterations:\s*(\d+).*?number of nan iterations:\s*(\d+)',
             log,
         )
-    ][-25:]
-    assert statuses == [(i, 25, 0, 0) for i in range(1, 26)], (run, statuses)
+    ][-train_iters:]
+    assert statuses == [(i, train_iters, 0, 0) for i in range(1, train_iters + 1)], (run, statuses)
     batches = {
         int(row[0]): tuple(map(int, row[1:]))
         for row in re.findall(
@@ -62,7 +68,7 @@ def validate(run):
             continue
         assert (run / f'nsys_profile/rank-{rank}.sqlite').is_file()
         events = read(run / f'cupti_profile/rank-{rank}.json')['traceEvents']
-        for step in range(15, 21):
+        for step in steps:
             gpu = [
                 e
                 for e in events

@@ -6,9 +6,23 @@ import runpy
 import sys
 from pathlib import Path
 
+NATIVE_ITERATION_MS = []
+
 
 def main():
     root = Path(os.environ['GRAPH_OUTPUT'])
+    if os.environ.get('NEP_ACTUAL_A8B') == '1':
+        from megatron.core.timers import Timer
+
+        native_elapsed = Timer.elapsed
+
+        def record_elapsed(self, *args, **kwargs):
+            value = native_elapsed(self, *args, **kwargs)
+            if self.name == 'interval-time' and kwargs.get('barrier'):
+                NATIVE_ITERATION_MS.append(value * 1000)
+            return value
+
+        Timer.elapsed = record_elapsed
     if 'NEP_CONTROLLED_ROUTING_SEED' in os.environ:
         from nep_randomized_controls import install
 
@@ -49,6 +63,10 @@ if __name__ == '__main__':
     try:
         main()
     finally:
+        if NATIVE_ITERATION_MS:
+            (
+                Path(os.environ['GRAPH_OUTPUT']) / f'native-timing-{os.environ["RANK"]}.json'
+            ).write_text(json.dumps(NATIVE_ITERATION_MS) + '\n')
         if os.environ.get('NEP_WORK_ALLOCATION') == '1':
             import torch
 
