@@ -16,7 +16,7 @@ def validate(run):
     world = 32 if healthy else 28
     mbs = 2 if cell.endswith('2') else 1
     ga = 2 if mbs == 2 else 4
-    reduced_ga = 3 if cell == 'R' else ga
+    reduced_ga = {'R': 3, 'O': 5}.get(cell, ga)
     expected_gbs = 32 + (32 if healthy else 6 * mbs * reduced_ga)
     profiled = '_off_' not in run.name
     log = (run / 'driver.log').read_text()
