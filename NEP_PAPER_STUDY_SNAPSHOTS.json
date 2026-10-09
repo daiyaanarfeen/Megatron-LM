@@ -1,0 +1,259 @@
+[
+  {
+    "local_branch": "nep-ag-red-overlap-20260922",
+    "commit": "ccb4b9726201a02239c1bc4557ef3094b7484439",
+    "remote_branch": "paper-studies/20261009/nep-ag-red-overlap-20260922",
+    "reports": [
+      "NEP_GRAPH_LAUNCH_ORDER_20260921.md"
+    ]
+  },
+  {
+    "local_branch": "nep-buffer-cleanup-20260921",
+    "commit": "ee28f09fff8c7af63870c44ad7f205c80e744349",
+    "remote_branch": "paper-studies/20261009/nep-buffer-cleanup-20260921",
+    "reports": [
+      "NEP_GRAPH_LAUNCH_ORDER_20260921.md"
+    ]
+  },
+  {
+    "local_branch": "nep-delivery-batching-20261002",
+    "commit": "2280f19114c1c03408a4bb1cd0f67b2b0f95c735",
+    "remote_branch": "paper-studies/20261009/nep-delivery-batching-20261002",
+    "reports": [
+      "NEP_DELIVERY_BATCHING_20261002.md",
+      "NEP_GRAPH_LAUNCH_ORDER_20260921.md",
+      "NEP_WORK_ALLOCATION_20260930.md",
+      "NEP_WORK_ALLOCATION_RESULTS_20260930.md"
+    ]
+  },
+  {
+    "local_branch": "nep-delivery-factorial-20261005",
+    "commit": "11e2388c6d5e17556dd9c463c177f306121cdc3f",
+    "remote_branch": "paper-studies/20261009/nep-delivery-factorial-20261005",
+    "reports": [
+      "NEP_DELIVERY_BATCHING_20261002.md",
+      "NEP_DELIVERY_FACTORIAL_20261005.md",
+      "NEP_GRAPH_LAUNCH_ORDER_20260921.md",
+      "NEP_WORK_ALLOCATION_20260930.md",
+      "NEP_WORK_ALLOCATION_RESULTS_20260930.md"
+    ]
+  },
+  {
+    "local_branch": "nep-expert-buckets-20261006",
+    "commit": "a6f90f29e263777e28757309ee7672c828781fda",
+    "remote_branch": "paper-studies/20261009/nep-expert-buckets-20261006",
+    "reports": [
+      "NEP_DELIVERY_BATCHING_20261002.md",
+      "NEP_DELIVERY_FACTORIAL_20261005.md",
+      "NEP_EXPERT_BUCKETS_20261006.md",
+      "NEP_GRAPH_LAUNCH_ORDER_20260921.md",
+      "NEP_HIGH_PARITY_ABLATION_20261005.md",
+      "NEP_WORK_ALLOCATION_20260930.md",
+      "NEP_WORK_ALLOCATION_RESULTS_20260930.md"
+    ]
+  },
+  {
+    "local_branch": "nep-expert-count-20261007",
+    "commit": "fc815d6069d5df185b37c99ce7d780e2586c40d5",
+    "remote_branch": "paper-studies/20261009/nep-expert-count-20261007",
+    "reports": [
+      "NEP_DELIVERY_BATCHING_20261002.md",
+      "NEP_DELIVERY_FACTORIAL_20261005.md",
+      "NEP_EXPERT_BUCKETS_20261006.md",
+      "NEP_EXPERT_COUNT_20261007.md",
+      "NEP_GATHER_CTA_20261006.md",
+      "NEP_GRAPH_LAUNCH_ORDER_20260921.md",
+      "NEP_HIGH_PARITY_ABLATION_20261005.md",
+      "NEP_NORM_HEADROOM_20261006.md",
+      "NEP_WORK_ALLOCATION_20260930.md",
+      "NEP_WORK_ALLOCATION_RESULTS_20260930.md"
+    ]
+  },
+  {
+    "local_branch": "nep-expert-count-ga-20261007",
+    "commit": "56e567f1cad19a301fe6b283315bb3d1b14a31d8",
+    "remote_branch": "paper-studies/20261009/nep-expert-count-ga-20261007",
+    "reports": [
+      "NEP_DELIVERY_BATCHING_20261002.md",
+      "NEP_DELIVERY_FACTORIAL_20261005.md",
+      "NEP_EXPERT_BUCKETS_20261006.md",
+      "NEP_EXPERT_COUNT_20261007.md",
+      "NEP_EXPERT_COUNT_GA_20261007.md",
+      "NEP_GATHER_CTA_20261006.md",
+      "NEP_GRAPH_LAUNCH_ORDER_20260921.md",
+      "NEP_HIGH_PARITY_ABLATION_20261005.md",
+      "NEP_NORM_HEADROOM_20261006.md",
+      "NEP_WORK_ALLOCATION_20260930.md",
+      "NEP_WORK_ALLOCATION_RESULTS_20260930.md"
+    ]
+  },
+  {
+    "local_branch": "nep-gather-cta-20261006",
+    "commit": "83c1fd9c09c51e5cb553ead76e3c3e39186cc595",
+    "remote_branch": "paper-studies/20261009/nep-gather-cta-20261006",
+    "reports": [
+      "NEP_DELIVERY_BATCHING_20261002.md",
+      "NEP_DELIVERY_FACTORIAL_20261005.md",
+      "NEP_EXPERT_BUCKETS_20261006.md",
+      "NEP_GATHER_CTA_20261006.md",
+      "NEP_GRAPH_LAUNCH_ORDER_20260921.md",
+      "NEP_HIGH_PARITY_ABLATION_20261005.md",
+      "NEP_NORM_HEADROOM_20261006.md",
+      "NEP_WORK_ALLOCATION_20260930.md",
+      "NEP_WORK_ALLOCATION_RESULTS_20260930.md"
+    ]
+  },
+  {
+    "local_branch": "nep-graph-launch-order-20260921",
+    "commit": "8abb29fca8596737b4ec8acbd7a6d4719725a080",
+    "remote_branch": "paper-studies/20261009/nep-graph-launch-order-20260921",
+    "reports": [
+      "NEP_GRAPH_LAUNCH_ORDER_20260921.md"
+    ]
+  },
+  {
+    "local_branch": "nep-high-parity-delivery-20261005",
+    "commit": "7c23ac8e257fc1ad574244e4accd623c64de4cb8",
+    "remote_branch": "paper-studies/20261009/nep-high-parity-delivery-20261005",
+    "reports": [
+      "NEP_DELIVERY_BATCHING_20261002.md",
+      "NEP_DELIVERY_FACTORIAL_20261005.md",
+      "NEP_GRAPH_LAUNCH_ORDER_20260921.md",
+      "NEP_HIGH_PARITY_ABLATION_20261005.md",
+      "NEP_WORK_ALLOCATION_20260930.md",
+      "NEP_WORK_ALLOCATION_RESULTS_20260930.md"
+    ]
+  },
+  {
+    "local_branch": "nep-norm-headroom-20261006",
+    "commit": "be5dcb32fbc443a0fb598d6a6c79b1d71611659d",
+    "remote_branch": "paper-studies/20261009/nep-norm-headroom-20261006",
+    "reports": [
+      "NEP_DELIVERY_BATCHING_20261002.md",
+      "NEP_DELIVERY_FACTORIAL_20261005.md",
+      "NEP_EXPERT_BUCKETS_20261006.md",
+      "NEP_GRAPH_LAUNCH_ORDER_20260921.md",
+      "NEP_HIGH_PARITY_ABLATION_20261005.md",
+      "NEP_NORM_HEADROOM_20261006.md",
+      "NEP_WORK_ALLOCATION_20260930.md",
+      "NEP_WORK_ALLOCATION_RESULTS_20260930.md"
+    ]
+  },
+  {
+    "local_branch": "nep-param-compact-20260917",
+    "commit": "d638286d785cea312d41e4a06b5b5e0e264e092d",
+    "remote_branch": "paper-studies/20261009/nep-param-compact-20260917",
+    "reports": []
+  },
+  {
+    "local_branch": "nep-param-destination-scatter-20260929",
+    "commit": "e0113b468db47f6f6104bcd92075ec54f2bf5f85",
+    "remote_branch": "paper-studies/20261009/nep-param-destination-scatter-20260929",
+    "reports": [
+      "NEP_GRAPH_LAUNCH_ORDER_20260921.md"
+    ]
+  },
+  {
+    "local_branch": "nep-param-owner-parallel-20260921",
+    "commit": "f57cc9a65358f557579ebb6dfef8765baa99bb54",
+    "remote_branch": "paper-studies/20261009/nep-param-owner-parallel-20260921",
+    "reports": [
+      "NEP_GRAPH_LAUNCH_ORDER_20260921.md"
+    ]
+  },
+  {
+    "local_branch": "nep/param-prefetch-20260915",
+    "commit": "51fdbbb11da3f9aa1a07f1bd52b7e3625151c7a9",
+    "remote_branch": "paper-studies/20261009/nep-param-prefetch-20260915",
+    "reports": []
+  },
+  {
+    "local_branch": "nep-param-waves-20260922",
+    "commit": "8f840ff72d23b9a0d2c4e7bdd9ca690cd6f4a706",
+    "remote_branch": "paper-studies/20261009/nep-param-waves-20260922",
+    "reports": [
+      "NEP_GRAPH_LAUNCH_ORDER_20260921.md"
+    ]
+  },
+  {
+    "local_branch": "nep-placement-ablation-20260928",
+    "commit": "1f084d5dc5acfce415cda906c71af13113a2b6b9",
+    "remote_branch": "paper-studies/20261009/nep-placement-ablation-20260928",
+    "reports": [
+      "NEP_GRAPH_LAUNCH_ORDER_20260921.md"
+    ]
+  },
+  {
+    "local_branch": "nep-placement-controlled-20260929",
+    "commit": "4142d0bcb0e87eeaac1e02b4f72287c088d1f1a6",
+    "remote_branch": "paper-studies/20261009/nep-placement-controlled-20260929",
+    "reports": [
+      "NEP_GRAPH_LAUNCH_ORDER_20260921.md"
+    ]
+  },
+  {
+    "local_branch": "nep-real-ablation-20261002",
+    "commit": "0cee1d14ad9f3113f43dad6cb47ae80530ffd566",
+    "remote_branch": "paper-studies/20261009/nep-real-ablation-20261002",
+    "reports": [
+      "NEP_GRAPH_LAUNCH_ORDER_20260921.md",
+      "NEP_REAL_ABLATIONS_20261002.md",
+      "NEP_REAL_ABLATION_RESULTS_20261002.md",
+      "NEP_WORK_ALLOCATION_20260930.md",
+      "NEP_WORK_ALLOCATION_RESULTS_20260930.md"
+    ]
+  },
+  {
+    "local_branch": "nep-release-ablation-20260928",
+    "commit": "3225f09a1ab937ac87b4e4b1592fa75341791b48",
+    "remote_branch": "paper-studies/20261009/nep-release-ablation-20260928",
+    "reports": [
+      "NEP_GRAPH_LAUNCH_ORDER_20260921.md"
+    ]
+  },
+  {
+    "local_branch": "nep-seq32k-ga2-20261008",
+    "commit": "70877f7d8b4f8f4519c7feaace39414ffd496a66",
+    "remote_branch": "paper-studies/20261009/nep-seq32k-ga2-20261008",
+    "reports": [
+      "NEP_DELIVERY_BATCHING_20261002.md",
+      "NEP_DELIVERY_FACTORIAL_20261005.md",
+      "NEP_GRAPH_LAUNCH_ORDER_20260921.md",
+      "NEP_HIGH_PARITY_ABLATION_20261005.md",
+      "NEP_SEQ24K_GA2_20261008.md",
+      "NEP_SEQ32K_GA2_20261008.md",
+      "NEP_SEQ8K_GA2_20261008.md",
+      "NEP_WORK_ALLOCATION_20260930.md",
+      "NEP_WORK_ALLOCATION_RESULTS_20260930.md"
+    ]
+  },
+  {
+    "local_branch": "nep/slot-cache-20260917",
+    "commit": "e105bd46c3966d916a6cb0276866eb85530e0529",
+    "remote_branch": "paper-studies/20261009/nep-slot-cache-20260917",
+    "reports": []
+  },
+  {
+    "local_branch": "nep/static-slot-capacity-20260921",
+    "commit": "b798119e9d8f7e04b215c708deb958016056f85f",
+    "remote_branch": "paper-studies/20261009/nep-static-slot-capacity-20260921",
+    "reports": []
+  },
+  {
+    "local_branch": "nep/sync-cpu-20260914",
+    "commit": "93d313df4d5588795ea628592668b188ed352a66",
+    "remote_branch": "paper-studies/20261009/nep-sync-cpu-20260914",
+    "reports": []
+  },
+  {
+    "local_branch": "nep-work-allocation-20260930",
+    "commit": "bdcac92326ed99cf98232ac85b2e6bcd8fa6a67f",
+    "remote_branch": "paper-studies/20261009/nep-work-allocation-20260930",
+    "reports": [
+      "NEP_GRAPH_LAUNCH_ORDER_20260921.md",
+      "NEP_WORK_ALLOCATION_20260930.md",
+      "NEP_WORK_ALLOCATION_RESULTS_20260930.md",
+      "NEP_WORK_OVERLOAD_RESULTS_20261001.md"
+    ]
+  }
+]

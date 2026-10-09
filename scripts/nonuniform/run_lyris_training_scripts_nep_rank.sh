@@ -12,6 +12,11 @@ set -euo pipefail
 : "${CONTEXT_PARALLEL_SIZE:?CONTEXT_PARALLEL_SIZE must be set}"
 : "${BASE_RANK_LAUNCHER:?BASE_RANK_LAUNCHER must be set}"
 
+if [[ -n "${NEP_PLACEMENT_METADATA_DIR:-}" ]]; then
+    python "$(dirname "${BASH_SOURCE[0]}")/nep_nvl_placement.py" \
+        --probe "${NEP_PLACEMENT_METADATA_DIR}" --domains "${NEP_PLACEMENT_DOMAIN_FILE}"
+fi
+
 if [[ "${NONUNIFORM_MODE}" == "ep" ]]; then
     read -r -a topology <<< "${NONUNIFORM_EP_TOPOLOGY}"
     tp_cp=$((TENSOR_MODEL_PARALLEL_SIZE * CONTEXT_PARALLEL_SIZE))

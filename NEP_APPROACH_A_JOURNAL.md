@@ -1,3 +1,1689 @@
+## 2026-10-09 - Publish paper materials and exact study snapshots
+
+- Dedicated branch nep-paper-studies-20261009 preserves the introduction,
+  contribution notes, journal, study reports, source launchers, profiling
+  adapters, analysis/plotting tools, and small frozen experiment inputs.
+- NEP_PAPER_STUDIES.md indexes primary evidence; JSON manifest records25
+  exact study snapshots published under paper-studies/20261009/ on the
+  personal daiyaanarfeen fork. No changes to upstream or the implementation
+  branch. Previously uncommitted real-workload and overload study sources
+  were committed before snapshotting, without runtime changes.
+- Large traces/logs/plots remain on Lustre/Talos; raw artifacts and .orig
+  backups are excluded. Syntax checks passed; no GPU jobs rerun. Login-node
+  uv unavailable, so archive operation retains existing source formatting.
+
+## 2026-10-08 - Paper introduction drafted
+
+- Added NEP_PAPER_INTRODUCTION.md: motivation, expert-aware ownership,
+  nondivisible fused-dispatch layouts, native distributed-optimizer integration,
+  scheduling and workload sensitivity, with three contribution statements.
+- Uses verified sequence/count timing-companion results; broader evaluation
+  numbers remain explicit placeholders. Separate author notes retain evidence
+  sources, scope exclusions, and unresolved attribution. No code or job changes.
+
+## 2026-10-08 - 8K/GA2 confirms a six-point parity drop from24K
+
+- Source5b3ee90ce, repeat0 from3275099 and complete reversed repeat1 from
+  retry3275392 (COMPLETED0:0,18:28). All eight selected cases validated,
+  120rank profiles; healthy/NEP paired within allocation, RDMA/P2P audited.
+  First job stopped after node failure in an unmeasured initialization;
+  its unpaired repeat1 healthy companion is excluded from final aggregation.
+- MBS2/GA2, original512expert/top-k6 a8b-derived workload, EP16/16 versus16/12,
+  GB300/segment4; sequence8192 only workload change relative to24K comparator.
+- Owner0-11 matched25-30 means: profileH851.340/N939.082ms, extra87.742ms,
+  parity90.657%; companionH839.339/N918.876ms, extra79.537ms, parity91.344%.
+  Drops versus24K:6.483pp profiled,6.002pp companion. Repeat companion
+  parities91.231/91.458%, profile90.580/90.733%; effect reproducible.
+- Profile phase excess firstF27.469,otherF0.220,nonfinalB1.620,finalB37.793,
+  outsideF/B20.662ms. FirstF/finalB penalties similar to24K while healthy
+  duration falls3x: reduced amortization supported. Additional outside-F/B
+  gap not mechanistically isolated; do not equate entire drop with lost overlap.
+- Detailed report in isolated branch NEP_SEQ8K_GA2_20261008.md. Combined JSON
+  and analysis sources on Lustre/slurm_runs/nep_cleanup_ab/3275392.
+
+## 2026-10-08 - Lower sequence GA2 comparison submitted
+
+- Update: job3275099 completed and validated the first four cases plus second
+  healthy timing companion, then second healthy profile failed in HybridEP
+  initialization: NCCL No route to host; theia0241 became NOT_RESPONDING.
+  Canceled failed allocation to avoid wasting GPUs. Retry3275392 repeats the
+  entire second A/B repeat unchanged, excludes theia0241, 40-minute limit.
+  Do not pair incomplete first-allocation repeat1 with retry measurements.
+- Job3275099, source5b3ee90ce in isolated nep-seq32k-ga2-20261008 branch.
+  S8192/MBS2/GA2 on both replicas; otherwise identical model, implementation,
+  scheduling, graph coverage and profiling to validated24K job3274487.
+- HealthyEP16/16 localBS32/32 GBS64; NEP16/12 localBS32/24 GBS56.
+  EightGB300 nodes, segment4, per-replica NVL placement and cross-replica RDMA
+  audited. Two reversed repeats, all-rank profiles plus authorized timing
+  companions, matched iterations25-30 after24warmup. Default memory guards.
+- Shell syntax, generated options and no production-code-diff checks passed.
+  Initial queue estimate14:06PDT; monitoring every300s. Results pending.
+  Logs/traces: Lustre/slurm_runs/nep_cleanup_ab/3275099.
+
+## 2026-10-08 - 24K/GA2 reaches97.35% companion and97.14% profiled parity
+
+- Retry3274487 COMPLETED0:0 in45:10; all8matched cases pass,120rank profiles.
+ Sourceb70e63d36, production identical to originalsequence sweep7c23ac8e2.
+ GB300 replicas in nvlblk24/nvlblk30, segment4; auditedcross-replicaRDMA/localP2P.
+- Original15-MoE a8b,512experts/top-k6,H4608/latent1152/F3072,TP2/CP1,
+ S24576/MBS2/GA2; healthyEP16/16 localBS32/32 GBS64, NEP16/12 localBS32/24
+ GBS56. DistOpt/Flex/HybridEP/nativegraphs and originalbuckets/scheduling unchanged.
+- Owner0-11 means measured25-30 after24warmup, two reversed repeats:
+ profileH2534.410ms/N2609.024ms, extra74.615ms,97.140%parity;
+ companionH2513.315ms/N2581.831ms, extra68.516ms,97.346%parity.
+ Repeatprofile97.008/97.273%, companion97.509/97.184%; all>97%, little
+ margin in firstprofile repeat. No post-profile substitution.
+- Profilephase excess firstF28.614,otherF2.621,nonfinalB-0.007,finalB39.817,
+ outsideF/B3.575ms; accountingresidual<0.005ms. These are phase spans, not
+ isolatedwiretimes. Profile-minus-companion excess6.098ms includesrunvariability.
+- PeakallocatedH169.779GiB/N215.820GiB; minimumNEPfree5.424GiB,
+ reservemargin13.329GiB pass user-approved4/10GiB guards. NoOOM/timeouts.
+- DetailedreportNEP_SEQ24K_GA2_20261008.md; allraw/summarydataLustre/
+ slurm_runs/nep_cleanup_ab/3274487. No further runs submitted.
+
+## 2026-10-08 - Approved24K memory margins applied; paired comparison resubmitted
+
+- User approved4GiB free/10GiB reserve margins. Commitb70e63d36 changes only
+ post-run validator for H24K/N24K atS24576/MBS2/GA2; other cases retain8/16GiB.
+ Effective guards recorded in validation JSON. Five scoped-guard checks pass.
+- Prior job3273999 NEP profile now passes ALL remaining validators under the
+ approved margins, including nativeAG/RS/reshard/routing/initialization checks.
+ Its Slurm job remains historicallyFAILED1:0 because originalguard stopped it.
+- Retry3274487 runs all8matched cases in one8GB300node/segment4 allocation.
+ Production implementation, timed code, graph coverage, profiler, buckets,
+ model and work allocation unchanged;35iters, measured25-30, two reversed repeats.
+ Monitor every300s; outputsLustre/nep_cleanup_ab/3274487.
+
+## 2026-10-08 - 24K completes training but fails conservative memory guards
+
+- Job3273999 FAILED1:0 after12:12, not an OOM: firstNEP/profile case finished
+ all35iterations, owner measured25-30 mean2602.984ms,28rank Nsight profiles.
+ Batch stopped in post-run validator before healthy; no parity available.
+- Minimum end-free5.424GiB <8GiB guard; reduced replica total-minus-peak-reserved
+13.329GiB <16GiB guard. Max allocated215.820GiB, maxreserved263.293GiB.
+ Full owners minfree5.574GiB, reserve margin16.105GiB. These are completed-run
+ memory margins, not evidence of observed runtime failure.
+- Asked user before changing guards: propose per-experiment4GiB free/10GiB
+ reserve margins, no training/profiler/model changes. No further job submitted
+ or guard bypass performed pending approval. DetailsNEP_SEQ24K_GA2_20261008.md.
+
+## 2026-10-08 - Approved24K/GA2 follow-up submitted
+
+- Following32K OOM, user approved24K. Job3273999, source4693a0ba1 on
+ isolatednep-seq32k-ga2-20261008. Only change S/maxpositions32768->24576;
+ preserve original512expert/top-k6 model, GA2/MBS2, EP16/16 vs16/12,
+ GBS64/56, proportional localBS32/32 vs32/24, originalruntime/buckets/graphs.
+- EightGB300nodes/segment4,75mincap; NEP/profile first for memory check,
+ then matchedhealthy, two reversed repeats and same-window timing companions.
+ All-rank profiles/nativeAG-RS/reshard records retained, measured25-30 after24warmup.
+- Four generated-argument checks and shell syntax pass. No production edits.
+ Monitor every300s; all large artifactsLustre/nep_cleanup_ab/3273999.
+
+## 2026-10-08 - 32K/GA2 cannot fit unchanged: no parity result
+
+- Job3273874 FAILED143:0 after12:35. Preflight correctness passed, graph
+ capture completed, onlyiteration1logged; OOM before measured25-30.
+ NEP-first gate stopped allremainingcases. Healthy never ran; allocation released.
+- Rank0 failed in process_mtp_loss -> output_layer -> torch.matmul while
+ allocating8GiB MTP vocabulary logits.1.81GiB free of276.62GiB;274.79GiB
+ process usage,264.03GiB PyTorch allocated including115.96GiB graph pools,
+ only0.426GiB reserved-unused. Capacity failure, not apparent fragmentation.
+- Explicit OOMs on full-replica owners0-11 AND reducedranks16-27.
+ Do not attribute exclusively to reducedEP, or claim healthy also cannot fit.
+- No accepted parity/profile. Preserve originalconfiguration; no fallback
+ MBS/graph/recompute/sequence changes made.24K is a candidate requiring approval,
+ not established>97% parity. ReportNEP_SEQ32K_GA2_20261008.md on isolatedbranch;
+ logs retained inLustre/nep_cleanup_ab/3273874.
+
+## 2026-10-08 - Original sequence workload at32K/GA2 submitted
+
+- User approved testing32K atGA2 before reducing sequence. Preserve original
+ 512-expert/top-k6 sequence-sweep implementation7c23ac8e2, not the newer
+ expert-count scheduling/bucket settings. Isolatednep-seq32k-ga2-20261008,
+ commita8202f949; zero production changes.
+- Change only S32768/maxpositions, GA2 on both replicas and derivedGBS;
+ MBS2, healthyEP16/16 localBS32/32 GBS64; NEP16/12 localBS32/24 GBS56.
+ Original15-MoE a8b/H4608/latent1152/F3072/TP2/CP1, DistOpt/HybridEP/graphs,
+ exact balanced routing, originalDDP8/wave ordering/early depth1 retained.
+- Job3273874,8GB300nodes/segment4,75mincap. Eight cases: healthy/NEP,
+ two reversed repeats, all-rank profile plus authorized timing companions,
+ measured25-30 after24warmup. NEP/profile first as memory gate; do not
+ silently reduce model/MBS/sequence or graph coverage if it cannot fit.
+- Four full/reduced-rank option-generation checks, shell syntax and Python
+ compilation passed. Monitor every300s; outputs onLustre/nep_cleanup_ab/3273874.
+
+## 2026-10-07 - GA2/GA4 expert-count sweeps complete
+
+- Jobs3265011(GA2) and3265012(GA4) COMPLETED0:0 in1:24:36/1:33:53;
+  all48cases validated,720new all-rank profiles. No OOM/timeouts/runtime edits.
+  Sourceabd3a9e17. Exact cross-GA weights/native AG-RS payloads/NEP bytes
+  and bucket groupings checked against GA8 job3263820.
+- Count128/256/384 owner parity, profiles:GA2 97.951/96.917/95.569%;
+  GA4 98.968/98.386/97.782%. Matched-window timing companions:
+  GA2 97.553/96.739/95.731%; GA4 98.722/99.421/98.161%.
+- 128->384 dropGA2/4/8:profile2.382/1.186/0.783pp;
+  companion1.822/0.561/0.270pp. Increased sensitivity at smallerGA, but
+  onlyGA2 PROFILED mean exceeds2pp; do not claim robust>2pp companion loss.
+  GA4/8 companion curves are nonmonotonic at256experts; retain that point.
+- GA2 profile gaps17.425/27.245/40.969ms; GA4 17.135/27.461/39.078ms.
+  Similar absolute excess within iterations about2x shorter atGA2 supports
+  amortization. FirstF/finalB account for~75% of addedGA2 count-dependent gap.
+  Later-four-bucket demand waits remain~0.026ms at allcounts/GAs, not new
+  delivery deadline failures. Do not call demand waits pure transfer times.
+- GA2 domains27/32; GA4 bothphysicaldomain23 with separate NCCL cliques.
+  All cases audit16healthy/12NEP cross-replica RDMA pairs and localP2P.
+  Max allocated111.296GiB. All initial memory/correctness controls retained.
+- Results, repeat ranges, differential profiling and phase details in
+  .worktrees/nep-expert-count-ga-20261007/NEP_EXPERT_COUNT_GA_20261007.md.
+  Large artifacts underLustre/nep_cleanup_ab/{3265011,3265012}/expert_count.
+  Plots:https://sc.talos.nvidia.com/view/home/scratch.darfeen_coreai/nep_expert_count_ga_20261007/
+
+## 2026-10-07 - Expert-count sensitivity at GA2 and GA4 submitted
+
+- User requested the same128/256/384-expert sweep at GA2 and GA4 to test
+  whether less accumulation amplifies the payload-dependent parity loss.
+- Preserve GA8 branch unchanged. Isolated branchnep-expert-count-ga-20261007,
+  commitabd3a9e17; production runtime identical to trustedfc815d606.
+  Only launcher GA and derived batches change; all count/bucket/routing,
+  model, MBS2/S8448, optimizer, dispatcher, graph and transport controls retained.
+- GA2 healthy localBS32/32 GBS64, NEP32/24 GBS56; GA4 healthy64/64 GBS128,
+  NEP64/48 GBS112. Both use proportional work with EP16/16 vsEP16/12.
+- Jobs3265011(GA2),3265012(GA4), each8GB300nodes/segment4,2hcap;
+  24cases each, two reversed repeats, largest384-expert NEP first.
+  All-rank profiles plus authorized same-window companions, measured25-30
+  after24warmup iterations. Initially pendingPriority with no start estimate.
+- CPU layout tests3/3, all12batch configurations, shell syntax/diff checks pass.
+  Monitor every300seconds. All outputs underLustre/nep_cleanup_ab/<jobid>.
+  Do not claim estimated GA2 parity as measured until both sweeps complete.
+
+## 2026-10-07 - Expert-count sweep complete: no large parity drop
+
+- Retry3263820 COMPLETED0:0 in1h57m39s,24/24cases, source26abd7a1f.
+  GB300, full replica nvlblk25 and second nvlblk26, segment4.720rank startup
+  bucket signatures identical;360all-rank profiles. Native expert cross-replica
+  AG/RS auditedRDMA; local reshardP2P. No production Megatron runtime changes.
+- Counts128/256/384, top-k8, S8448,15-MoE a8b-derived hybrid/MTP,
+  H4608/latent1152/F3072, MBS2/GA8, TP2/CP1/ETP1; healthyEP16/16 vsNEP16/12,
+  proportional localBS128/128 vs128/96. DistOpt/Flex/HybridEP/graphs retained.
+- Owner mean profile healthy/NEP ms:1283220.736/3242.027 (99.343%);
+  2563288.450/3324.297 (98.922%);3843360.116/3409.184 (98.561%).
+  Companion:1283168.788/3201.699 (98.972%);2563262.663/3280.514 (99.456%);
+  3843320.056/3363.714 (98.702%). Same measured25-30 after24warmup,
+  two reversed repeats; no substitution of post-profile timings.
+- Mean spread only0.783pp profiled/0.754pp companion, below user's>2-3pp
+  significance target. Companion count trend is not monotonic; repeat ranges
+  and profile-minus-companion gap differences are retained in the report.
+- Param redistribution summed source payload triples6.795->20.384GB/step;
+  NEP first-bucket demand wait3.861->10.185ms, but later-four-bucket waits
+  remain about0.026ms total. Delivery stays ahead of later consumers. This
+  does NOT imply zero bandwidth/SM contention, nor pure transfer service time.
+- Profiled firstF/finalB excesses:1285.467/6.676ms;2569.867/12.579ms;
+  38413.534/14.835ms. Full disjoint phase accounting matches profiled
+  iteration gap within0.014ms. Do not use it to decompose companion timing.
+- Expert count also changes GEMM shape, local expert cardinality and
+  nondivisible placement. Exact per-expert balance is not equal GPU work when
+  some reduced ranks hold an extra expert; report this as a count-dependent
+  effect, not as an isolated payload-only experiment.
+- Report: `.worktrees/nep-expert-count-20261007/NEP_EXPERT_COUNT_20261007.md`.
+  Results checkpointfc815d606 on isolated `nep-expert-count-20261007`.
+  Data/analysis: Lustre `slurm_runs/nep_cleanup_ab/3263820/expert_count`.
+  Plots: https://sc.talos.nvidia.com/view/home/scratch.darfeen_coreai/nep_expert_count_20261007/
+  PNG/PDF copied and remote checksums match. Auto-review rejected the optional
+  README/JSON upload; those remain on Lustre. No outstanding jobs remain.
+
+## 2026-10-07 - Expert-count setup gate caught dense rebucketing at128
+
+- Job3263307 completed eight valid256/384 cases then stopped at128 startup,
+  exit143,47m37s. Not an OOM or NCCL hang: dense bucket grouping assertion.
+- Smaller router weights moved one shared-expert FC1 from dense bucket2 to1
+  with threshold697279864. Preserve existing expert groups and fix ONLY the
+  common dense threshold to692000000. CPU replay of captured parameter shapes
+  through native layout validates all counts/DP sizes;256/384 layouts and
+  offsets are byte-for-byte unchanged.3/3 preflight tests pass.
+- Preliminary256 parity99.160%profile/99.057%companion;38498.516%/98.666%.
+  Same measured25-30; first repeat only, not final sweep results.
+- 384NEP peak allocated111.30GiB/reserved144.41GiB. Physical replicas shared
+  nvlblk17 but distinct cliques enforcedRDMA,12NEP/16healthy pairs verified.
+  Offline transport auditor now accepts actual two-rank local reshard groups
+  while retaining P2P assertions. No production implementation changes.
+- Full sweep will restart with128 first, reverse-order repeat retained.
+- Retry3263820 submitted from26abd7a1f, started11:41:58PDT on eightGB300
+  nodes. Same segment4/topology, profiles/companions and all gates retained.
+
+## 2026-10-07 - Launch approved expert-count sweep
+
+- User approved128/256/384 experts at fixed top-k8 and the common sequence
+  length8448 needed for exact balancing (8192 is not divisible for384/top8).
+- Isolated branch `nep-expert-count-20261007`, checkpoint `2c6a8602e`, from
+  trusted `83c1fd9c0`. No production Megatron runtime changes.
+- Same15-MoE a8b hybrid/MTP, H4608/latent1152/F3072, MBS2/GA8,
+  healthyEP16/16 vs NEPEP16/12 with proportional localBS128/128 vs128/96.
+- Fixed five expert groups of three MoE layers and fixed dense threshold;
+  startup-only benchmark wrapper delegates layout construction to native
+  DistOpt. Per-rank assertions reject any changed layer-to-bucket grouping.
+  Native owner buffers explicitly retain their existing unsplit layout.
+- Routing/native layout preflight2/2, existing bucket-control tests3/3,
+  all six case option checks and shell syntax passed. Existing GPU numerical
+  correctness preflight and memory/profile/transport gates remain enabled.
+- Submitted3263307, eightGB300 nodes, segment4,2h30limit. Initial state
+  priority pending, no start estimate. Largest384-expert NEP goes first;
+  two reverse-order repeats with all-rank profiles and authorized companions.
+  Fixed compact/ascending/one-stream/early/prefetch1/GatherCTA16 scheduling.
+- All outputs under Lustre `slurm_runs/nep_cleanup_ab/3263307`. Monitor at
+  five-minute cadence. No result accepted yet.
+
+## 2026-10-07 - Ground expert-count ablation in architecture references
+
+- User requested internal SharePoint/Confluence/Glean evidence before choosing
+  realistic parameter ranges. Used NICC's existing authenticated Glean MCP via
+  its stdio proxy, without modifying MCP configuration. Searched and retrieved
+  SharePoint and Confluence content; no GPU jobs or runtime edits.
+- Internal Nemotron Family reference confirms Nano128/top6, Super512/top22,
+  Ultra512/top22; Super/Ultra use latent widths1024/2048. The existing a8b
+  training script is separately a real recipe with512/top6, not the same as
+  production Super. Do not equate equal expert counts with equal active work.
+  Source: https://nvidia.atlassian.net/wiki/spaces/~zqian/pages/3599441885
+- Internal kernel survey lists Qwen3-235B128/top8, DeepSeek256/top8 and
+  KimiK2 384/top8. Independently checked official publisher config files:
+  https://huggingface.co/Qwen/Qwen3-235B-A22B/blob/main/config.json
+  https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json
+  https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/config.json
+  Expert input/FFN widths are4096/1536,7168/2048,7168/2048 respectively.
+- SharePoint Characterizing MoE Efficiency explicitly studies a DIFFERENT
+  granularity intervention: increasing total and active expert counts while
+  reducing expert dimensions at fixed nominal FLOPs. Its performance figures
+  are not NEP training parity results and must not be imported as such.
+  https://nvidia.sharepoint.com/:p:/t/Compute-Arch/IQCXEo8cFFDZQ6WhkNmWj0DEAXbRhd-5Y57YOB4FYsbuW3Y
+- Revised proposal, not submitted: first fixed-top8 count sweep128/256/384,
+  with all other workload/scheduling knobs and layer-to-bucket grouping fixed,
+  matched healthy per count. These are controlled variants bounded by actual
+  architectures, not full reproductions of Qwen/DeepSeek/Kimi.512/top6 remains
+  justified as the existing a8b recipe but not a typical Nemotron3 endpoint.
+  Need separate delivery waits from count-dependent GEMM shape/runtime effects.
+- Raw internal search/retrieval artifacts are stored only under Lustre:
+  /lustre/fsw/coreai_comparch_sysarch/darfeen/analysis/moe_realistic_ranges_20261007.
+  No internal documents were uploaded externally.
+
+## 2026-10-06 - Gather-only CTA cap: modest repeatable improvement
+
+- Job3254182 completed12/12 cases, exit0,1:06:40. GB300 replicas in
+  nvlblk26/32, cross-replica RDMA verified; all memory, payload, routing and
+  trace gates passed. No runtime code changes; parent remains untouched.
+- Same five expert buckets, backward norm margin32, a8b15MoE, EP16/12,
+  TP2/CP1, MBS2/GA8/S8192, proportional batches, DistOpt/Flex/graphs.
+  Two reversed-order repeats, measured25-30, all-rank profiles plus authorized
+  companions. All28-rank audits confirm only Gather grids shrink: owners32->16,
+  followers min(original,16); norm360 and unrelated collective grids unchanged.
+- Profiled healthy3198.064ms; NEP3261.268->3252.751ms, parity98.062->98.319%.
+  Companion healthy3154.082ms; NEP3213.746->3201.785ms, parity98.143->98.510%.
+  Cap improves both repeats in both modes:9.037/7.998ms profiled and
+  6.365/17.558ms companion. Do not substitute post-profile timing.
+- Owner final-backward norm-gap sum3.801->0.883ms; norm kernels8.096->8.141ms.
+  FinalB270.141->262.114ms, outsideF/B60.731->66.263ms. Owner Gather summed
+  residency30.770->41.973ms including waits; not additive e2e transfer cost.
+  Full-replica gaps>1ms180->46; maximum7.058->2.940ms. Some follower gaps remain.
+- Net win is small:0.261% profiled/0.372% companion. Retain as workload-specific
+  config, not universal default. No native RS/AG cap or other runtime change.
+  Profile-companion differential versus healthy3.540->6.984ms, reported explicitly.
+- Report: `.worktrees/nep-gather-cta-20261006/NEP_GATHER_CTA_20261006.md`.
+  Data: `/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/nep_cleanup_ab/3254182`;
+  `gather-cta-summary.json`, all-rank caches, validation, source snapshots.
+
+## 2026-10-06 - Test the approved Gather-only CTA cap
+
+- User approved `nep_owner_gather.max_ctas:16`. New isolated branch
+  `nep-gather-cta-20261006`, checkpoint9f296a7fb, parentbe5dcb32f.
+  No training runtime changes: only launcher, YAML and experiment validation.
+- Submitted3254182 on eight GB300 nodes, segment4,90-minute cap. Initial
+  Pending Priority; scontrol estimated15:16:13 cluster time. Five-minute
+  monitoring started. GB200 excluded because this unchanged workload
+  previously failed its memory-headroom guard there.
+- Healthy HGC, NEP GBASE(default), NEP G16, two reversed-order repeats;
+  twelve cases with all-rank profiles and authorized timing companions.
+  Fixed a8b15MoE H4608/latent1152/F3072/E512/topk6, EP16/12, TP2/CP1,
+  MBS2/GA8/S8192, expert buckets5, dense3, norm margins16/32, DistOpt,
+  Flex/HybridEP, graphs, placement, routing and transfer ordering.35iters,
+  measured25-30. No native RS/AG/TP/EP or parameter-delivery caps changed.
+- Three CPU invariant tests and shell syntax passed. Options dry run
+  confirms only the communicator-config argument differs GBASE versus G16
+  apart from output path. Preserve actual kernel-grid/payload/transport and
+  memory checks; do not promote if slower Gather cancels reduced launch stalls.
+
+## 2026-10-06 - Headroom mechanism supported; global margin64 not recommended
+
+- Job3253300 completed16/16 cases, exit0,1:25:12. GB300152SM, TE2.16.0+b9d690e0,
+  NCCL2.30.4; replicas nvlblk18/23, cross-replica pairs verified RDMA. No runtime
+  changes. All-rank norm grids verified360CTAs at margin32,264CTAs at64.
+- Across both repeats, full ranks0-15, steps25-30: mean final-backward norm
+  launch-gap sum3.245->0.311ms;193 graph gaps>1ms->0; maximum7.422->0.159ms.
+  Exact-version source confirms cooperative RMSNorm launch and occupancy-based
+  grid sizing. Example rank10/step28/block10 gap6.223->0.0099ms with graph
+  queued349/351ms early. Active32-CTA Gather plus8-CTA RS exceed32-SM margin.
+  Norm begins before either full collective completes, not a full wait fence.
+- Profiled NEP finalB271.213->266.006ms, otherBs1613.416->1629.686ms;
+  native NEP iteration3279.179->3286.869ms. Healthy3213.652->3237.236ms.
+  Parity98.002->98.490% improves because healthy slows MORE, not because
+  NEP accelerates. Do not adopt global margin64. It increases norm service
+  cost each microbatch. It explains part, not all, of final-backward overhead.
+- Companion N32 repeats3232.971/3278.499ms; N64 3240.709/3235.739ms.
+  N32 repeat1 has an unexplained45.527ms window-wide shift, not a single
+  outlier. Preserve all data; pooled companion gains cannot establish a net
+  speedup. Profiled repeats both show slower absolute NEP at64. No skipped
+  or NaN iterations; initial-weight/routing/payload gates pass, but later
+  dummy-training trajectories are not bitwise identical across repeats.
+- Proposed, NOT applied: preserve norm margin32 and set only communicator
+  `nep_owner_gather.max_ctas: 16` via existing NCCL YAML. No runtime LOC,
+  host scheduling or ordering changes. Separate parameter transfer, native
+  EP/TP and RS groups unchanged. NCCL2.30.4 honors maxCTAs for P2P channels.
+  Verify removed launch gaps and absolute e2e improvement; slower Gather
+  bandwidth is the risk. No guaranteed savings or universal cap claimed.
+- Report: `.worktrees/nep-norm-headroom-20261006/NEP_NORM_HEADROOM_20261006.md`.
+  Lustre jobroot `slurm_runs/nep_cleanup_ab/3253300`, summary
+  `norm-headroom-summary.json`, graph records `norm_headroom/`, pinned sources
+  `normalization_source/`. Analysis source archived alongside results.
+- Additional admission check: margin64 repeat0 ranks0/4/8/10 have5/11/19/25
+  norm kernels fully inside simultaneous Gather+RS residency totaling>32CTAs.
+  Rank0 example56CTAs still active throughout0.375ms norm, only0.015ms
+  launch gap; some ranks have64CTAs of Gather+denseRS+expertRS. This rules
+  out merely arriving after all communication completes as the explanation.
+  It also limits the proposal: a Gather-only cap may not fix windows with
+  both RS types active. Do not alter native RS caps without consulting user.
+
+## 2026-10-06 - Investigate cooperative normalization headroom
+
+- User requested investigation of the backward SM-headroom hypothesis and a
+  proposed fix only if supported. Isolated branch `nep-norm-headroom-20261006`
+  from a6f90f29e; experiment checkpoint557777453. No `megatron/` changes.
+- Submitted GB300 job3253300, eight nodes, segment4, two-hour limit. Pending
+  Priority at13:14 cluster time; no estimated start. Five-minute monitoring.
+  Prior GB200 memory-headroom failure makes GB300 necessary for this workload.
+- Fixed five NEP expert buckets, native healthy five, same a8b15-MoE
+  EP16/12 TP2 CP1 MBS2 GA8 S8192, routing, graphs, DistOpt, Flex/HybridEP,
+  topology and all-rank profiling. Only vary native backward normalization
+  margin32/64 on BOTH healthy and NEP. Two reversed-order repeats, profiles
+  and authorized timing companions, measured25-30/35 after24warmup.
+- Archive installed TE normalization source and instantiated margins before
+  training; verify changed norm kernel grids in traces. Require reduced norm
+  launch gaps AND downstream waits, not just a timing correlation, before
+  attributing interference to admission pressure. Healthy can benefit too.
+  Check normal backward/kernel service costs and total parity for regressions.
+- Three CPU invariant tests and shell syntax checks passed. Existing GPU
+  correctness, memory, payload and placement gates remain enabled.
+
+## 2026-10-06 - Expert bucket sweep completed; five buckets best mean
+
+- GB300 job3250917 completed all16 cases successfully in1:25:43, exit0.
+  Two reversed-order repeats, measured steps25-30 after24 warmup, owners0-11.
+  Replica domains nvlblk31/32; cross-replica optimizer pairs verified RDMA.
+  No training runtime changes; experiment checkpoint2e3324680 on isolated
+  `nep-expert-buckets-20261006`. Default bucket count remains3 elsewhere.
+- Matched timing-companion means: healthy3148.896ms; NEP3=3228.393ms
+  (97.5376% parity), NEP5=3209.528ms (98.1109%), NEP6=3211.069ms
+  (98.0638%). Five saves18.865ms and0.5733 parity percentage points over3.
+  Both5/6 improve over3 in both repeats; their1.54ms difference is not
+  statistically resolved by two repeats. Companions use the same numbered
+  iterations, not post-profile substitutions.
+- Profiled means: healthy3195.758ms; NEP3=3283.013ms (97.3423%),
+  NEP5=3256.904ms (98.1226%), NEP6=3259.473ms (98.0452%). Differential
+  profiling penalties are7.758/0.514/1.542ms; do not substitute the26.109ms
+  profiled3-to-5 gain for the18.865ms companion gain.
+- Profiled NEP5 phase deltas versus healthy: firstF+19.327ms,
+  otherF+0.079ms, nonfinalB-1.080ms, finalB+31.196ms, outsideFB+11.612ms.
+  Relative to3, firstF improves6.0ms, finalB7.46ms, outsideFB9.15ms.
+  Total expert AG/RS payloads are invariant across NEP counts; first AG
+  input shrinks1509.95->905.97MB; final grad-sync drain15.38->9.51ms.
+  Peak allocated memory135.525->130.990GiB. Scaling/optimizer unchanged.
+- Detailed repeat0 traces cover all16 full-replica ranks and all6 steps.
+  Final native graph-envelope sums: H187.632/N3 225.170/N5 218.249/
+  N6 223.895ms; penultimate H176.807/N3 177.186/N5 176.687/N6 176.748ms.
+  RMSNorm launch gaps propagate to TP/HybridEP waits. Graph submissions
+  already queued at least117ms ahead in these samples, ruling out late
+  host graph submission. Cooperative norm SM-admission pressure remains
+  the leading hypothesis, not isolated proof. A paired healthy/NEP SM-margin
+  control is needed; no margin or scheduling change was made.
+- Report: `.worktrees/nep-expert-buckets-20261006/NEP_EXPERT_BUCKETS_20261006.md`.
+  Artifacts: Lustre `slurm_runs/nep_cleanup_ab/3250917`, especially
+  `expert-bucket-summary.json`, `work-controls-audit.json`, per-case validation,
+  and `backward_interference_B3`, `B5`, `B6`. Overlapping kernel residency
+  and queueing ranges are not additive causal overheads or service times.
+
+## 2026-10-06 - Bucket sweep moved to GB300; backward launch-gap evidence
+
+- GB200 job3250818 completed B3 training35/35, exported all28 profiles, and
+  then stopped at the existing memory safety audit. Across ranks, minimum
+  total-minus-peak-reserved14.217GiB and end-free7.184GiB are below16/8GiB
+  guards. This was not an OOM or collective hang; do not call it an accepted
+  A/B result. Kept guards/workload unchanged and resubmitted GB300-only
+  job3250917, same commit/cases. Started11:19:19 on
+  theia[0254-0256,0263,0278-0281], replicas in nvlblk31 and nvlblk32.
+- Offline script `scripts/nonuniform/analyze_nep_backward_interference.py`
+  compares native graph kernels in final and penultimate backward, using
+  host correlation IDs rather than treating all concurrent kernels as native.
+  Original3215521 output in `backward_participants_20261006`, full-replica
+  ranks0-15, two repeats, six matched steps each. Newer3241762 output in
+  `backward_interference_v2_20261006`, owners0/8, two repeats.
+- Old3215521 repeat0 full-replica average native graph envelopes:
+  penultimate H178.576/N178.984ms; final H187.575/N222.647ms. Difference is
+  concentrated after expert sync boundaries. HybridEP device-sync residency
+  before last participant starts: H5.598/N22.777ms final; only ~0.3-0.4ms
+  remains summed after last arrivals. These are waits, not NVLink service.
+- Concrete3215521 step25 chain: owner4 backward graph12 has13.899ms gap
+  before `rmsnorm_bwd_general_kernel`; owner5 waits in native TP AG in
+  graph13, then all EP ranks converge at graph15. Rank0's first device-sync
+  there lasts14.620ms while last-arriving rank5 spends0.005ms. Do not sum
+  these sequentially propagated delays across ranks as separate e2e costs.
+- Hypothesis, not yet a tested fix: RMSNorm cooperative launch admission
+  pressure. Trace shows152SMs, norm grid360/128threads/167registers; configured
+  backward SM margin32. Concurrent Gather has32 CTAs, expert RS24 CTAs,
+  each with large register/shared-memory use. TE upstream general norm
+  launcher sizes its cooperative grid from available SMs/occupancy. Thus
+  simultaneous collectives can exceed the intended32-SM headroom. Need an
+  isolated SM-margin control to establish causality; no such change made.
+  Similar10-14ms norm launch gaps occur in3241762 and today's3250818,
+  both with Nsight cuda-event-trace=false, so old event tracing alone does
+  not explain the signature. Native graph host submission remains far ahead.
+- Extended3241762 analysis to all16 full-replica ranks and both repeats:
+  final native graph-envelope means H197.648/203.741ms versus
+  N226.786/224.218ms; penultimate H177.748/177.001 versus
+  N177.443/176.973ms. Importantly, healthy also has RMSNorm admission-like
+  gaps: summed no-native-graph-work-before-norm H12.801/18.513ms versus
+  N5.563/5.055ms. Healthy's gap is concentrated in graph9; NEP's is uneven
+  across graph12/23 and propagates through later TP/EP waits. Therefore a
+  raw sum of NEP norm gaps is neither its additional e2e overhead nor a
+  guaranteed gain from changing SM margin. That control must include healthy.
+  Source corroboration for cooperative norm launch/occupancy sizing:
+  https://github.com/NVIDIA/TransformerEngine/blob/main/transformer_engine/common/normalization/rmsnorm/rmsnorm_bwd_semi_cuda_kernel.cu
+  This upstream source is not a pinned capture of the container build.
+
+## 2026-10-06 - Expert bucket sweep and backward interference investigation
+
+- User approved testing expert buckets while investigating backward interference.
+  Created isolated branch/worktree `nep-expert-buckets-20261006`, checkpoint
+  `2e3324680`, from unchanged `nep-high-parity-delivery-20261005` (`7c23ac8e2`).
+  No changes under `megatron/`; only experiment configuration and audit controls.
+  Commit is signed off; GPG signing unavailable (no secret key on this host).
+- Submitted job3250818, started2026-10-06 11:04:47 cluster time on GB200,
+  lyris[0095-0096,0100-0101,0127-0130], eight nodes, segment4, two-hour cap.
+  Both GB200/GB300 were eligible. Logs/profiles under Lustre
+  `slurm_runs/nep_cleanup_ab/3250818`.
+- Fresh healthy H8K and NEP expert buckets3/5/6, two reversed-order repeats,
+  all-rank profiles plus previously authorized timing companions. Preserve
+  a8b memory-limited15-MoE architecture, H4608/latent1152/F3072/E512/topk6,
+  EP16/12, TP2, CP1, MBS2/GA8/S8192, local BS128/96, graphs, DistOpt,
+  Flex/HybridEP, compact ascending one-stream delivery/prefetch1, routing,
+  and dense buckets. Healthy has native expert buckets5.
+- Three CPU audit tests passed, as did syntax/whitespace/unchanged-runtime
+  checks. The audit allows expert rebucketing only: ordered slots/numels,
+  weights/routes, dense buckets, total expert AG/RS and redistribution bytes
+  must remain identical. Numerical smoke precedes the sweep. No results yet.
+
+## 2026-10-06 - Remaining overhead accounting and sensitivity limits
+
+- Extended offline analysis of job3215521 compact/ascending/one-stream versus
+  matched healthy: both repeats, steps25-30, owners0-11. No training jobs or
+  implementation changes. Scripts analyze_nep_remaining_overheads.py and
+  analyze_nep_remaining_kernels.py under scripts/nonuniform; all48 owner
+  Nsight SQLite files analyzed, with additive interval accounting assertions.
+- Profiled excess71.646ms by phase: firstF25.511ms, finalB34.384ms,
+  outsideF/B16.687ms, otherF-0.654ms, nonfinalB-4.282ms.
+- OutsideF/B breakdown: extra final sync drain4.095ms, scaling3.101ms,
+  optimizer5.836ms, sync-to-scaling3.378ms, other0.277ms. Nested parameter
+  copies are included in optimizer time, not added again. Sync-to-scaling
+  is native TP gradient reduction(+1.141ms) and int32 token-count
+  normalization(+2.239ms); it is not unexplained GPU idle or a NEP copy.
+- First native expert AG remains pending17.721ms after the preceding graph
+  versus7.180ms healthy, difference10.541ms. Initial input1509.949MB versus
+  594.543MB. Expert buckets3 versus5; total owner AG/RS payload is33.33%
+  larger. Thus this is not an iso-bucket or equal-owner-payload comparison.
+- Independent frozen-timeline illustrations from97.827% parity: normalize
+  initial AG wait to healthy ->98.141%; scaling+optimizer ->98.093%;
+  post-sync finalization ->97.928%; extra final drain ->97.949%. These are
+  conditional substitutions, not measured improvements or additive causal
+  savings. Larger owner optimizer state is expected to cost more.
+- With backward and dense RS fixed, deleting expert RS eliminates only
+  0.591ms of NEP final drain (healthy0.515ms). Gather/staging are already
+  finished by backward end, but deleting them could affect earlier graph
+  execution, so do not claim their total causal cost is zero or <=0.591ms.
+- Final-backward graph ranges add34.723ms. Additive full-backward partition
+  deltas: compute-only-19.790ms, compute/comm overlap+36.510ms,
+  comm-only+17.949ms, otherwise-exclusive staging+0.157ms, idle-0.443ms.
+  Non-additive residency: modelEP19.498->35.608ms, TP22.494->28.192ms;
+  memory0.345->14.516ms and model-compute202.063->211.716ms. These unions
+  overlap; they cannot be summed as root-cause contributions.
+- Owner final-backward graph host submissions all finish >=265.409ms before
+  their GPU graph start. Idle is0.772ms NEP versus1.214ms healthy. Evidence
+  points to GPU-side execution/readiness/interference, not direct late graph
+  submission. No unique zero-Gather/staging/RS interference counterfactual
+  is established by this analysis; retain that limitation explicitly.
+- Outputs: /lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/nep_cleanup_ab/3215521/remaining_overheads_20261006/
+
+## 2026-10-06 - Zero-cost parameter delivery trace estimate
+
+- Analyzed compact/ascending/one-stream placement job3215521, both repeats,
+  measured steps25-30. No new training jobs or runtime changes.
+- New offline script scripts/nonuniform/analyze_nep_zero_param_delivery.py
+  inspects GPU operation ranges on all28ranks and Nsight kernels on all12
+  full-replica owners. Five-MoE modules per owner bucket confirmed in the log.
+- Ideal parameter availability retains each required source owner's native
+  AG completion; it removes only owner-to-holder parameter redistribution.
+  Full-replica first-bucket readiness advances6.407ms in each repeat (step
+  range6.260-6.501ms). Reduced-replica advance1.804/1.817ms. Later delivery
+  completes >=11.043ms before its consuming expert graph in the observed trace.
+- Owner redistribution/staging kernel union19.779/19.744ms; exclusive union
+  0.503/0.507ms. Neither is the critical-path saving: other AG work can overlap
+  a redistribution that still gates the first expert's compute.
+- Fixed-schedule illustration, assuming the full6.407ms reaches iteration end:
+  profiled healthy3224.830ms, NEP3296.458ms -> estimated3290.051ms; remaining
+  excess65.221ms, parity97.827% ->98.018%. Do not apply this arithmetic to
+  unprofiled companions or call it a measured zero-cost run.
+- Limitations: no explicit parameter-demand markers in this older trace;
+  consumer mapping uses bucket contents and graph sequence. No full CPU/GPU
+  and cross-rank dependency replay or contention resimulation. Native AG/RS,
+  backward gradient Gather and optimizer work are unchanged in this estimate.
+- Outputs: /lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/nep_cleanup_ab/3215521/zero_param_delivery_20261006/
+
+## 2026-10-06 - Consolidate accepted ablation plots, including null effects
+
+- Added offline plotting script scripts/nonuniform/plot_nep_ablation_suite.py.
+  No GPU jobs submitted and no training implementation changes.
+- Validated all 152 cases from six accepted actual-a8b studies (3215521,
+  3215822, 3238625, 3238626, 3240633, 3241762), including audit status and
+  raw owner-rank native timers for measured iterations 25-30.
+- Plotted sequence length, fixed-work MBS/GA, reduced-replica work allocation,
+  delivery release/prefetch, expert placement, owner ordering, and stream count.
+  Included small/null/negative results and a separate small-effect zoom.
+- Matched healthy prefetch depth for the factorial comparison. Kept profiled
+  and authorized timing-companion runs separate. Effects are paired within
+  job/repeat; whiskers are repeat ranges, not confidence intervals.
+- Excluded invalid historical broadcast-inflated placement results, failed
+  incomplete cases, and toy workloads from the actual-a8b comparison.
+- Output: /lustre/fsw/coreai_comparch_sysarch/darfeen/plots/nep_ablation_suite_20261006
+  (PNG/SVG, CSV/JSON, source provenance, README, and gallery).
+- Publication: https://sc.talos.nvidia.com/view/home/scratch.darfeen_coreai/nep_ablation_suite_20261006/
+
+## 2026-10-05 - Prioritize a greater-than-two-point parity sensitivity
+
+- User defines meaningful as >2pp parity change,3+ strong. Prior scheduling
+  effects are sub-point,so prioritize8K/4K/2K sequence sensitivity from the
+  previously97.203%8K high-parity baseline,with matched healthy at every length.
+- Isolated branch nep-high-parity-delivery-20261005,checkpoint6e8a5d0b7.
+  No production edits;only harness sequence2048 allowance/cases and ordering.
+  MBS2/GA8,EP16/12,DistOpt/HybridEP/graphs,depth1/early/one-lane unchanged.
+- Submitted3241762,GB3008nodes/segment4,3hcap. Three counterbalanced repeats,
+  six cells,profile+authorized timing companion=36cases. Matched25-30 after
+  24warmup;all-rank AG/RS/Gather/redistribution capture. Largest8K NEP first.
+  PendingPriority,no estimated start at16:41PDT. Poll every300s.
+- Explicit limitation:sequence changes token-dispatch traffic and compute
+  shapes,not parameter-transfer bytes. Do not claim a pure compute-only causal
+  intervention or confuse unchanged absolute overhead/amortization with hiding.
+- Job3241762 COMPLETED0:0 in2h33m30s. Placement:nvlblk19/nvlblk21;all36cases
+  pass,540complete rank profile triples,identical runtime hash. PeakNEP135.525GiB.
+- Three-repeat companion parity8K/4K/2K=97.8405/95.1308/91.6005%;drops2.7097
+  and6.2399pp. Every paired repeat exceeds2pp/3pp respectively. Profiled parity
+  97.8518/93.9369/90.2621%;do not mix the modes or use post-profile samples.
+- Genuine lost hiding:NEP later-bucket consumer waits0.012/0.516/6.448ms;
+  last-bucket ready margin+15.368/+0.151/-5.170ms. First-repeat all12owner
+  redistribution/staging exclusive kernel unions0.388/0.981/4.571ms.
+- Important negative:profiled first-forward excess stays26.7ms at all lengths,
+  so lost local hiding does not explain the whole parity change. Companion
+  total gaps69.849/87.164/94.907ms;large denominator/amortization effect plus
+  additional absolute cost. Profiled additional gap mostly outsideF/B,and
+  differential profiling inflates that gap. No exact companion cost allocation.
+- Final report:NEP_HIGH_PARITY_ABLATION_20261005.md in the isolated branch.
+  Plots:https://sc.talos.nvidia.com/view/home/scratch.darfeen_coreai/nep_sequence_hiding_3241762/
+
+## 2026-10-05 - Factorial delivery scheduling attribution
+
+- User paused MBS study and requested an ablation explaining which scheduling
+  components help and why,not an artificially poor baseline.
+- New isolated branch/worktree nep-delivery-factorial-20261005 from2280f1911.
+  Cross expert AG lookahead0/1 with consumer/early NEP redistribution;matched
+  healthy lookahead0/1 controls. Actual4K a8b,MBS2/GA8,EP16/12 unchanged.
+- Only production edit permits depth0 in existing configuration validation.
+  Healthy harness passes existing native skip_next_bucket_dispatch for expert
+  buckets;no native optimizer/DDP,backward,payload,placement or buffer changes.
+- Numerical4GPU and EP8/6 training/profile gates precede full24-case sweep.
+  Matched25-30 measurements,all-rank profiling and separate approved timing
+  companions,two reversed-order repeats. No new jobs submitted yet.
+- Plan and confounder controls:NEP_DELIVERY_FACTORIAL_20261005.md in new branch.
+- Gate3240405 started immediately13:41PDT onGB200,4nodes/segment2,45min cap.
+  Six small training cases plus four policy/healthy numerical checks. Runtime
+  frozen during execution;formatting done in container before the tests.
+- Gate3240405 FAILED1:0 after6m48s,at a new ordering assertion before training.
+  Numerical values passed. The delayed smoke-only override captured the class
+  method before tracing was installed;first redistribution was unlabeled and
+  the test compared nextAG to second delivery. Correct tracing order and assert
+  three delivery ranges. No production fix. Match healthy wrapper overhead in
+  both controls before retry. Existing4K memory allows GB200 as well as GB300.
+- Retry3240472 COMPLETED0:0 in20m05s onGB2004nodes/segment2. Four numerical
+  policy tests plus healthy native-value checks pass;six25-iteration training
+  cases and all88rank profile triples complete. NEP transfer/profile audits
+  pass. No hang/OOM. Proceed to actual24-case matched sweep.
+- Checkpoint150021cbb freezes the validated factorial branch. Full3240633
+  started immediately14:16PDT onGB2008nodes/segment4,2h30cap. BothGB200/GB300
+  were eligible;GB200 allocated first. No previous-GB300 measurements will be
+  mixed into this comparison. Full case order recorded in Slurm SubmitLine.
+- Offline analysis now pairs per-bucket AG,redistribution,demand/ready and
+  first-forward events,and reuses Nsight kernel matching. Validated matching
+  on the existing consumer/early/healthy traces before new data arrives.
+- Full3240633 COMPLETED0:0 in1h39m20s;all24cases pass,all352rank profile
+  triples complete. Distinct physical domains nvlblk02/nvlblk05 with RDMA
+  cross-replica groups. No hang/OOM;GB200 peak127.733GiB,min free31.424GiB.
+- Two-repeat companion iteration means H0/H1P1817.065/1788.947ms;
+  Q00/Q01/Q10/Q11=1929.736/1931.943/1899.130/1890.833ms. Fixed-H1P parity
+  92.704/92.598/94.198/94.612%. Profiled parity91.913/92.186/94.042/93.858%.
+- Profiled first-forward170.0/170.0/136.5/131.5ms:AG prefetch saves33.46ms;
+  early redistribution adds5.02ms,versus essentially no gain without prefetch.
+  Healthy AG prefetch saves31.08ms. Full pipeline saves38.48ms first-forward,
+  38.90ms companion iteration. Do not claim all gains are NEP-specific.
+- Early release removes9.16ms owner consumer waits but advances first forward
+  by5.02ms. All-rank kernel attribution ongoing to explain remaining4.14ms.
+  Profiling still distorts small whole-iteration effects:Q10->Q11 improves
+  companion timing8.30ms but worsens profiled timing3.82ms. Keep modes separate.
+- An offline analyzer's quadratic interval intersection was replaced with an
+  equivalent linear merge;1000 randomized checks pass. No training code changed.
+- Closed the9.16->5.02ms first-forward discrepancy with disjoint intervals:
+  parameter wait-9.160,native graph execution+4.260,other-0.120 = net-5.020ms.
+  Graph partition shifts mainly to native compute+2.275ms and modelEP+2.064ms.
+  Followers become the latest full-EP kernel participants much more often in
+  early release (72.7%/46.7%,versus1.1%/6.7% consumer release). This supports
+  arrival skew plus a concurrent-delivery cost;not a pure bandwidth measurement
+  or isolation of SM/HBM/NVLink effects. Both repeats show the phase tradeoff.
+- Completed all352rank kernel caches,dependency audits,and final figures.
+  Archived analysis sources alongside the job. Published figure set:
+  https://sc.talos.nvidia.com/view/home/scratch.darfeen_coreai/nep_delivery_factorial_3240633/
+  Prior runtime checkpoint and branch remain unchanged;final report preserves
+  the profiler/companion disagreement instead of attributing it to wire time.
+
+## 2026-10-05 - Resume delivery and fixed-work batching ablations
+
+- Final:3238626 COMPLETED0:0 in2h42m38s;all32cases pass. Combined with4K,
+  all48cases accepted,24profiled cases,704complete every-rank profile triples
+  (eventJSON,Nsight,SQLite). Final cross-case transport/weight/routing/payload
+  audits pass. No hang/OOM recurred. The interrupted monitoring turn stopped
+  polling,but Slurm continued and finished; no reruns were submitted on resume.
+- 8K companion parity (two repeats):on-demand97.176%,early97.203%,deep97.383%.
+  Deep saves5.949ms overearly (0.184% NEP latency);on-demand/early difference
+  is small and changes sign between repeats. No large delivery-policy benefit.
+- Fixed-work8K MBS/GA1/16,2/8,4/4:healthy/NEP companion means3291.483/3421.956,
+  3139.920/3230.261,2980.601/3063.546ms;parity96.187%,97.203%,97.293%.
+  Extra latency130.472->90.340->82.945ms;peakNEPallocated127.732,135.525,
+  172.115GiB. MBS1->2 improvesparity1.016points;MBS2->4 primarily improves
+  absolute throughput rather than parity,at higher memory cost.
+- Profiled batching parity96.114%,97.433%,97.780%. Profiler distortion is not
+  eliminated everywhere:largest mean mode difference0.871points (4Kearly).
+  Keep modes separate. Within profiled batching runs,first-forward excess is
+  nearly unchanged26-27ms;final-backward/outside-FB gaps decrease. These are
+  phase localizations,not proof that a specific kernel/CPU cost caused the
+  companion improvement. Full tables/limitations saved in the branch's
+  NEP_DELIVERY_BATCHING_20261002.md;both roots have delivery-batching-summary.json.
+- 4K3238625 COMPLETED0:0 in1h11m11s:all16cases accepted. Both repeats pass
+  canonical weights,routing,payload,memory,deadline and cross-replica RDMA
+  audits. Companion parity means:consumer94.739%,early95.049%,deep94.945%.
+  Profiled parity:93.900%,94.178%,94.471%,respectively. Keep these separate.
+  Early saves5.886ms versusconsumer in companion timing;deep adds1.968ms
+  relative toearly,with opposite sign across repeats (no robust deep speedup).
+  Owner parameter demand-to-ready sums in profiles:32.03->23.01->22.48ms;
+  first-forward overhead versushealthy:30.72->26.22->25.70ms. These are
+  elapsed dependency spans,not pure network service times. No full overlap
+  or statistically robust general policy claim from two repeats.
+- 8K3238626 remains running. MBS1 has again passed all35iterations with
+  profiling,and the fresh healthy profiles exercise the corrected expert
+  deadline labels successfully. First-repeat MBS1 companion/profile parity
+  96.178/96.208%;no large differential profiler distortion for that point.
+- User approved continuation after the profiling fix. Checkpoint059bbe151 on
+  nep-delivery-batching-20261002 freezes the launcher default and experiment
+  record. Production NEP unchanged. No formatting/runtime edits while queued.
+- Submitted3238625:4K delivery,16cases,GB3008nodes/segment4,2hcap.
+  Initial estimate10:03PDT,Priority. CellsP4K,H4K,N4K,D4K;reverse in repeat1.
+- Submitted3238626:8K delivery plus batching,32cases,GB3008nodes/segment4,
+  3h45cap. Initial estimate10:11PDT,Priority. CellsM4,H4,M1,H1,N8K,H8K,D8K,P8K;
+  reverse in repeat1. N8K/H8K also serve as MBS2/GA8 batching anchor.
+- Each cell has a profile and an explicitly authorized timing companion.
+  Repeat0 runs profile then companion;repeat1 reverses both case and mode order.
+  Largest MBS first. Keep actual15-MoE a8b,TP2/CP1,EP16/12,512experts,
+  DistOpt/HybridEP/native graphs,proportional local batches128/96 fixed.
+- All new profiles use NSYS_CUDA_EVENT_TRACE=false with full custom AG/RS,
+  Gather/parameter redistribution and deadline measurements on everyrank.
+  Do not pool old profiler-mode observations into these matched comparisons.
+- Existing per-case topology,payload,routing,memory,iteration and profile
+  validation remains fail-closed. Monitor every300s and stop on failure.
+
+## 2026-10-05 - Audit and isolate actual MBS1/GA16 profiling hang
+
+- Result:3238472 COMPLETED0:0 in11m31s,35/35 iterations. Only active experimental
+  change was NSYS_CUDA_EVENT_TRACE=false. Same runtime SHA2569d74b274..., actual
+  15-MoE a8b,EP16/12,MBS1/GA16,S8192,GB3008nodes/segment4. All28 ranks have
+  Nsight reports/SQLite and CUDA-event JSON; native AG/RS,NEP Gather/delivery,
+  routing/transfer/memory and per-rank35-iteration validation pass. NoOOM,NaN,
+  skipped iteration or NCCL timeout. Numerical prefetch smoke also passes.
+- Strong evidence for Nsight device-event-trace-induced false dependencies,
+  not the new NEP delivery patch. Exact internal driver dependency cycle is
+  not reconstructed from the interleaved saved stacks. Do not claim that level
+  of diagnosis. NVIDIA documents this failure mechanism:
+  https://docs.nvidia.com/nsight-systems/UserGuide/index.html#cuda-event-trace
+- Full-owner native interval mean:measured25-30=3515.274ms(SD4.271),
+  pre20-23=3430.387ms,post32-35=3430.387ms. Profiling distortion~2.47%;
+  no matched healthy MBS1 case in this job,so no new parity claim.
+- Set only this isolated ablation runner's event-trace default tofalse; retain
+  kernel/graph-node/NVTX capture and existing custom collective completion
+  measurements. Removed unused Nsight-only diagnostic path. No production
+  edits. Runtime and profiler sources archived under3238472/benchmark_source.
+- Attempt to export the old rank7 failed-run report via the existing allocation
+  was too late:allocation had already completed. No extra GPU job submitted.
+- Compared working 3215521 case B (MBS2/GA8) against first failure 3215526
+  case S (MBS1/GA16): identical nonuniform_ep.py SHA256 20feecf1025a36a...
+  and identical relevant NCCL/profiling controls. Microbatch size/count changed;
+  allocation also differed. The later delivery-policy patch did not introduce
+  the first hang. Both failures finish iteration25 and stall in26; MBS1 without
+  profiling completed35 iterations in3217613. This alone does not identify cause.
+- Saved faulthandler stacks show graph-replay CUDA event recording and native
+  TP all-gather blocked. No preceding OOM or event-pool exhaustion assertion.
+- Found explicit Nsight warning in the failed logs: device-side event tracing
+  can introduce false dependencies across CUDA streams. Existing runner uses
+  --cuda-event-trace=true. Test this first by changing only that option to false,
+  retaining all custom event/collective observers and GPU kernel profiling.
+  Production NEP, model, routing, MBS1/GA16 and topology remain unchanged.
+- Initial Nsight-only diagnostic3238449 was canceled during container setup
+  (allocated1m46s; no training case) in favor of this narrower test. No accepted parity
+  claim until required all-rank records and completed iterations are validated.
+
+## 2026-10-02 - Approved delivery pipeline and fixed-work MBS/GA ablations
+
+- Checkpoint3564f1a5c on isolated branch nep-delivery-batching-20261002 saves
+  protocol controls,benchmark harness and explicit stop-point record. Prior
+  tested branch unchanged; nothing pushed. Syntax and git diff checks pass.
+- STOP:3217613 M1profile again stalls initeration26 after25completed,with
+  full-replica TP all-gather watchdog180s (seq20228/20231) and CUDA-event-record
+  stacks during graph replay. M1 timing companion passed35iterations. No OOM
+  or explicit event-pool assertion. Canceled allocation after diagnostics,
+  elapsed38m43s. No full sweeps submitted. Asked approval for Nsight-only vs
+  event-only isolation without model/NEP implementation changes. Do not call
+  the two requested ablations complete or assign failedM1 a profiled parity.
+- After cancellation,corrected healthy PG alias in profile-only markers and
+  future validation filter,with nonempty fingerprint assertion. Saved gateH4
+  expert-deadline labels cannot be used; fresh healthy profiles required.
+- Actual gate M4,P8K,H4 andM1companion pass; M1profile is next/running.
+  M4 peak allocated172.115GiB,reserved216.953GiB,min end-free52.166GiB.
+- Analysis caught a benchmark labeling/filter error: healthy group descriptors
+  are EXPERT_DATA_PARALLEL_GROUP/DATA_PARALLEL_GROUP_WITH_CP,not ep_dp/dp_cp.
+  Native healthy AG/RS records were present,but prior optimizer fingerprints
+  filtered them out,and new healthy demand markers were labeled dense.
+  Corrected offline filter with a nonempty assertion and re-audited all44cases
+  of3215521/3215822:PASS,including actual healthy optimizer payload invariance.
+  No timing numbers changed. Fix the profile-only kind label after current
+  gate exits; do not use its H4 mislabeled expert deadlines for attribution.
+- Actual gate3217613 submitted15:42:26,allocated15:46:33PDT onGB300,
+  8nodes/segment4,60mcap. Nodes theia0171/0173/0174/0180 and0280/0281/0284/0286.
+  Order M4profile,P8Kprofile,H4profile,M1companion,M1profile. Largest MBS first;
+  preserve all memory and profile gates. No full sweeps until gate completion.
+- Small gate3217536 COMPLETED0:0 in14m13s:all three numerical modes and
+  all three EP8/6 training/profile/transfer audits pass. No NCCL timeouts.
+  Proceed to actualEP16/12 memory/prefetch/MBS1 failure gate before sweeps.
+- Submitted small gate3217536,4nodes/segment2,GB200/GB300 eligible,30mcap;
+  allocated immediately15:26:41PDT onGB200 lyris0097/0107/0211/0212.
+  All three4GPU numerical prefetch modes pass including force-sync,repeated
+  buffer reuse,native AG/RS and concurrent model-EP. EP8/6 training follows.
+  Container uv-isort,Black and Python compile pass for the seven touched files.
+- New isolated branch nep-delivery-batching-20261002 from0c8ab3e39; prior
+  nep-real-ablation-20261002 remains untouched. Carry forward validated actual
+  a8b harness. Only production edit is parameter-delivery scheduling in
+  nonuniform_ep.py; no native AG/RS,optimizer,router or backward-path changes.
+- Delivery: consumer versus early versus two-bucket lookahead at4K/8K,actual
+  a8b15-MoE depth,MBS2/GA8,EP16/12. Fixed placements/bytes/buckets. Consumer
+  retains AG launch points. Shared delivery stream protects buffer reuse.
+- Batching: MBS/GA1/16,2/8,4/4 at8K,healthy comparison for each; fixed local
+  batches128/96 and trueGBS224 forNEP. Separate this from under/overloading.
+- Gate numerical4GPU tests thenEP8/6 training beforeEP16/12. Memory-stressMBS4
+  and previously failingMBS1 first. Keep profiling plus approved companions,
+  all-rank AG/RS and demand/ready markers. Stop on recurrence/new confounder;
+  no silent runtime fixes or workload reductions. Detailed plan in branch
+  NEP_DELIVERY_BATCHING_20261002.md.
+
+## 2026-10-02 - Move placement and work-allocation ablations to actual a8b workload
+
+- COMPLETE3215521(28cases,2h27m35s) and3215822(16cases,1h26m15s),exit0:0.
+  All44 case gates and cross-replica RDMA/intra-replica P2P audits pass.
+  Two reversed-order repeats,owner0-11 native measurements25-30,matched
+  profiled and separate timing companions. No production Megatron diff.
+- Actual a8b companion placement parity:compact ascending1/disjoint-first1
+  97.52/97.52%;compact ascending2/disjoint-first2 96.78/96.79%;spread1/2
+  97.04/97.34%. No benefit from extra compact streams; single-stream order
+  effect is below repeat variation. Spread has larger instrumentation penalty
+  (139-150ms versus56-59ms compact and65ms healthy),reported separately.
+- Allocation H/B/R/O companion means3149.11/3231.95/3228.40/3956.85ms;
+  NEP parity97.44/97.54/79.59%. Underload saves0.11%latency but loses10.62%
+  throughput;overload adds22.43%latency and loses9.57%throughput. Profiled
+  parity97.70/97.79/78.80%; no substitution of post-profile windows.
+- Profiled owner final backward B274.41/R273.73/O1063.17ms,with earlier
+  owner phases nearly unchanged. Extra overload cost concentrates in final
+  backward,consistent with reduced-replica work delaying synchronization.
+  Treat phase durations as elapsed ranges,not pure service or unprofiled costs.
+- Report in nep-real-ablation-20261002/NEP_REAL_ABLATION_RESULTS_20261002.md;
+  plots/CSV/JSON in Lustre plots/nep_actual_a8b_ablations_20261002, published
+  to corresponding scratch.darfeen_coreai Talos directory. MBS1S remains
+  FAILED/unresolved; H1 not run. This completes the MBS2 matrix,not rebatching
+  or generalization to other models. Host uv/isort unavailable for offline
+  scripts; executable analyses and XML validation pass.
+- Work sweep3215526 FAILED143:0 after15m25s in first S(MBS1/GA16) case.
+  Completed25iterations,then stalled in26 during active profiling. First
+  watchdogs after180s report full-replica TP all-gathers (18874368 elements,
+  seq20230/20231); reduced ranks later time out in dense/expert RS and other
+  dependent operations. No OOM evidence; no accepted complete profile/timing.
+  This is a runtime failure,not the preceding validator issues. Root cause
+  unresolved; do not claim profiler causality or assign S a parity number.
+  Placement3215521 is independent and remains running; first F profiled/off
+  cases validated. No runtime fixes are authorized or applied by this ablation.
+- Submitted3215822 for unaffected MBS2 R/O/B/H and reverse,16cases,1h50cap,
+  GB300/8nodes/segment4. Fresh healthy controls and both profile modes. Explicitly
+  exclude S/H1 from accepted work-allocation results pending timeout diagnosis;
+  keep S failed in the report,not silently removed or assigned post-window parity.
+- Submitted placement3215521(28cases,3hcap) and work3215526(24cases,2h45cap),
+  GB300,8nodes each,segment4. Allocated11:07:11/11:07:42PDT respectively.
+  Placement starts spread/two-laneF,thenE/C/A/D/B/H and reverse; work starts
+  S/H1/R/O/B/H and reverse. Every case has profiles and timing companions.
+  Work allocation nodes share physicalnvlblk25: use approved software cliques
+  and require cross-replica RDMA audit,not a claim of separate physical domains.
+- Gate3215340 trained O(on/off),H(on/off),B(on) successfully. Native optimizer
+  AG/RS manifests match; checker had incorrectly included per-microbatch TP
+  AG/RS,which correctly increase with GA10. Restrict optimizer invariant to
+  dp_cp/ep_dp; retain all TP records for workload accounting. Revalidation and
+  transport audit pass. Slurm FAILED at33m07s is post-training checker status,
+  not runtime failure; B off was never started. No third standalone gate needed.
+- Fresh profiled native owner mean H3214.334/B3287.524ms =>97.774%parity,
+  73.191ms gap. This establishes the high-parity starting point on actual a8b.
+  O4100.792ms profiled,3973.634ms timing companion; H off3155.291ms.
+  Do not substitute a missing B off value or mix timing/profile modes.
+- Gate actual bucket manifests:dense3/3,expert5/3(H/NEP),despite retained DDP
+  request8. Historical implementation had expert5/8. This is a fresh current-
+  implementation workload baseline,not an exact historical runtime replay or
+  iso-bucket comparison; preserve/check current grouping across all ablations.
+- Retry3215340 allocatedGB300 at10:27:06PDT,8nodes,segment4,60minutes.
+  Reruns O/H/B together after offline healthy revalidation passed; do not mix
+  first-attempt timing with this new native-owner-timed allocation.
+- Submitted gate3215136,8nodes,segment4,regularGB200/GB300,60minute cap.
+  Initial priority estimate10:18PDT. O/H/B each with all-rank profile and timing
+  companion. Full model options generated from saved manifest; CPU syntax and
+  healthy/proportional/overload/rebatch argument checks pass before submission.
+- Gate started09:53:08PDT onGB300, fulltheia0003/0013/0014/0017 nvlblk17,
+  secondtheia0284-0287 nvlblk32. O profiled and timing cases pass all35steps,
+  routing/initialization/profile/transfer gates. Max allocated135.525GiB,
+  reserved170.090GiB,min free99.541GiB. Subsequent sweep must useGB300:
+  this reserved peak would fail the retained16GiB headroom gate onGB200.
+- Gate3215136 stopped after healthy training at24m04s due to a checker bug:
+  routing records for healthy ranks28-31 were compared to absent NEP ranks.
+  Fixed comparison to common ranks; all logical experts still checked globally.
+  Saved healthy data now passes revalidation. No training/runtime failure.
+- Before rerun, benchmark probe retains every rank's existing interval-time
+  Timer.elapsed result (no new timer calls,CUDAsync,collectives). This makes
+  owner timing explicit: Megatron's printed iteration log is last-rank timing,
+  not rank0 as earlier work-study prose incorrectly stated. Retain old logged
+  results as logged results,not retroactively measured owner data. New spec
+  requires35 saved native timing samples/rank; final parity uses owner cohort.
+- User requested actual workloads after establishing both preceding ablations
+  used the four-layer S1024 low-parity toy. Start saved high-parity a8b with
+  retained15MoE hybrid/MTP depth,S8192,MBS2/GA8,H4608/latent1152/F3072/E512,
+  TP2/CP1,EP16/12,DistOpt/HybridEP/full graphs,vocab131072,DDP request8.
+  This is the prior memory-limited depth, not full original120B depth.
+- Isolated branch nep-real-ablation-20261002 from0c8ab3e39. No production edits.
+  Reuse saved3120733 launch manifest and established randomized routing/weight
+  controls; preserve original model/optimizer arguments, record all arg changes.
+- First memory/baseline gate O/H/B: reducedGA10,healthyGA8,proportionalGA8;
+  MBS2.35iters,profile25-30 and separate approved profiler-off companions.
+  Then six placement policies and MBS1/GA16,underloadGA6,overloadGA10, fresh
+  healthy controls and counterbalanced repeats. No toy results substituted.
+
+## 2026-10-01 - Approved reduced-replica overload experiment
+
+- COMPLETE3208136 exited0:0 in31m44s; all12cases pass initialization,routing,
+  memory,all-rank profile/native AG/RS payload and RDMA/P2P transport audits.
+  No production changes. Report: nep-work-allocation-20260930/
+  NEP_WORK_OVERLOAD_RESULTS_20261001.md.
+- Matched profiler-off means:H1=74.400ms,N1=94.933ms,O=102.608ms.
+  Owner parity78.371%->72.509%; trueGBS56->62; throughput604.045->618.744k/s.
+  Overload adds7.675ms(8.085%),improves throughput2.433%; per-repeat gains
+  2.207/2.659%. It is not latency-free spare capacity or a convergence claim.
+- Profiled H1/N1/O=94.842/121.342/134.842ms; profiled overload throughput
+  instead falls0.370%. Report differential instrumentation explicitly; do not
+  use post-profile windows or silently substitute/correct profile durations.
+- Profiled reduced-minus-full RS readiness N1=+1.506/-4.677ms;O=+14.110/
+  +14.473ms. Later O arrival is consistent with the owner completion tail;
+  not a precise decomposition of the unprofiled7.675ms increase.
+- Submitted3208136 to regular GB200/GB300,8nodes,segment4,45minute cap.
+  Initial statePENDING/Priority; scheduler first estimate14:44:54PDT.
+  Logs/profiles under Lustre slurm_runs/nep_cleanup_ab/3208136.
+- AllocatedGB300 at14:44:57PDT, full theia0110/0112/0113/0114 in nvlblk23,
+  reduced theia0145/0147/0149/0155 in nvlblk25. Compare fresh controls only,
+  not earlier GB200 absolute timings. First O profiled/off cases passed all
+  25steps and memory gates at14:55:36; maximum allocated30.117GiB.
+- Add benchmark cell O: MBS1, full/reduced GA4/5, replica batches32/30,
+  trueGBS62 versus N1 GA4/4,batches32/24,GBS56. Full-replica work unchanged.
+- Fresh H1,N1,O controls, two counterbalanced repeats, all-rank profiles and
+  separately approved profiler-off timing companions, matched steps15-20.
+  Four-layer EP16/12 S1024 workload and runtime unchanged; segment4 and
+  per-replica software cliques retain intra-domain EP and RDMA EDP.
+- Largest reduced GA runs first with existing all-rank memory/profile gates.
+  Compare latency and actual throughput separately; no assumed spare capacity.
+  Only launcher, validator, and offline analysis extended; no production edits.
+
+## 2026-09-30 - Approved work-allocation study; memory-first validation
+
+- Published performance and individual-repeat profiled phase figures,CSV/JSON
+  and full report to the requested computelab directory. Talos:
+  https://sc.talos.nvidia.com/view/home/scratch.darfeen_coreai/nep_work_allocation_20260930/
+  Figure XML/positive geometry and disjoint phase sums validated. No new jobs.
+- COMPLETE: reverse block3201438 exited0:0 in26m17s; no queued/running jobs.
+  Final evidence uses complete forwardr0 from3201203 and complete reverser1 from
+  3201438, comparing H/NEP within allocation before averaging ratios. All20
+  accepted cases pass memory,initialization,routing,bucket,native AG/RS and
+  transport controls. Canonical parameter/layout manifests match across blocks.
+- Profiler-off matched15-20 results: N1 H76.075/N96.633ms,78.723%parity;
+  N2 H64.242/N84.450ms,76.071%; R H76.075/N96.717ms,78.657%.
+  NEP throughput593.418/679.029/529.381ktokens/s. MBS2 improves throughput14.43%
+  but not parity; reducing reducedGA4->3 gives no time improvement and loses10.79%
+  throughput. Absolute gaps20.558/20.208/20.642ms. No universal fixed-cost claim.
+- Profiled gaps24.108/22.383/21.350ms are distinct; apparent R profile benefit is
+  not reproduced without profiling. N1 RS readiness flips reduced-early to late
+  (-5.451/+7.722ms) between profiled blocks, despite stable total timing. N2 reduced
+  ready leads4.473/3.238ms; R leads19.831/18.469ms. Do not generalize first-block
+  N1 early arrival or use averaged phase ranges as unprofiled causal attribution.
+- Maximum NEP/healthy peak allocated30.136/11.897GiB. Actual expert buckets3/2,
+  dense1/1, invariant within topology across batching. No iso-bucket claim.
+  Routing controls preserve exact assignment statistics/repeated route rows,
+  not bitwise trajectory or identical original sample-to-route-row association.
+  Final report: nep-work-allocation-20260930/NEP_WORK_ALLOCATION_RESULTS_20260930.md.
+- Study3201203 was PREEMPTED at30m12s, not an OOM/runtime failure. Thirteen cases
+  passed; the next healthy profile was terminated bySlurm before measurement.
+  Complete forward blockr0 is retained. Partial reverser1 is diagnostic only.
+  Submitted complete reverse block3201438 on regular/non-preemptibleGB200 with
+  all five healthy/NEP configurations and both profile modes,30minute cap.
+  Started14:27:15PDT,segment4,nodes0155/0156/0159/0162 +0235/0250/0251/0252.
+  Final comparisons must pair healthy/NEP inside each allocation, then aggregate
+  the two complete blocks. Do not pool the interrupted reverse pass into them.
+- Saved harness e86d713e7. Full study3201203 allocated13:52:24PDT on GB200
+  lyris0117/0118/0120/0123 +0262/0264/0265/0266, segment4,60minute cap.
+  Five cells x2 counterbalanced repeats xprofiled/off companions=20 short cases,
+  25iterations each, matched15-20. StartsN2/H2 again, thenN1/H1/R, reverse second
+  pass; profile mode order also reverses. No concurrent runs or production edits.
+- Memory gate3201156 completed0:0 in9m44s on GB200, domains07/16, segment4.
+  Both N2 and H2 complete25iterations with all-rank profile and control checks.
+  Max peak allocated30.136GiB NEP/11.897GiB healthy; every rank passes memory
+  headroom requirements. No OOM, skip, NaN or collective timeout. Counterbalanced
+  full study can proceed; preflight is not the final policy/performance estimate.
+- User accepted the placement/scheduling performance ablation as complete. Stable
+  counterbalanced profiler-off measurements support compact placement and no
+  meaningful compact end-to-end lane/order benefit. The profiled replay anomaly
+  does not invalidate these timings; its root cause is unknown, not a proven bug.
+- Approved five cells at EP16/12: H1/N1 MBS1 GA4, H2/N2 MBS2 GA2, and R MBS1
+  GA4/3. True GBS64/56/64/56/50. Four latent MoE layers, H4608/latent1152/F3072,
+  E512/topk6/S1024, TP2/CP1, DistOpt/HybridEP/full MoE graphs unchanged.
+- Isolated benchmark-only changes in nep-work-allocation-20260930 from4142d0bcb.
+  Production NEP modules unchanged. Extend canonical expert initialization to
+  healthy DDP; tile the same512-token route map for MBS2 to control rebatching.
+  Reuse existing rank-local surrogate-GBS scheduling and token normalization.
+- Per user request, preflight N2 then H2 with profiling/25iterations before any
+  remaining cases. Collect every rank's peak memory, require >16GiB beyond peak
+  allocator reservation and >8GiB end free. Fail closed on OOM/control mismatch.
+  All artifacts go to Lustre; no guarantees claimed before executing the gate.
+
+## 2026-09-30 - Policy measurements finished; attribution paused on host-stall confounder
+
+- Replay-check3200857 completed0:0 in21m08s. All16 cases passed parameter
+  value/initialization/bucket checks; profiled anchors passed exact traffic checks.
+  Twelve profiler-off replay companions preserve the same production transfer
+  calls and CUDA start/end timers; only instrumentation is disabled.
+- Counterbalanced profiler-off delivery replay means(ms): A5.636, B5.277,
+  C4.247, D4.479, E12.423, F7.548. Two run means perpolicy; all eight measured
+  repetitions retained. These include packing/submission/wait/unpacking, not
+  pure wire service. Full-training matched companion means remain A83.850,
+  B83.617, C83.550, D83.567, E90.075, F86.842ms from3200606.
+- New confounder found in the FINAL PROFILED B anchor: maximum-full-rank
+  replay mean increased6.013->9.306ms. This is not just the first sample: all
+  eight final-anchor repetitions have elevated8.105-11.173ms maxima.
+  Unprofiled B companions remain5.272/5.282ms. No samples are removed.
+- Existing CPU/event/Nsight records localize this to ranks9/10 on lyris0084:
+  replay CPU wall mean2.637->6.833ms and2.645->6.307ms; thread CPU means
+  2.636->3.583 and2.643->3.554ms. Non-thread-CPU elapsed time therefore grows
+  to3.250/2.753ms. Main-thread CUDA API residency perreplay grows
+  0.541->1.818ms and0.480->1.353ms. One cuLaunchKernelEx call reaches4.052ms.
+  Other owners/followers inherit waiting; this is not evidence of increased
+  parameter payload. Main-thread attribution excludes background-thread APIs.
+- The traces do not include OS scheduling records, so cannot distinguish OS
+  descheduling from CUDA-driver blocking as the underlying cause. The anomaly
+  does not prove that profiling itself caused all of the extra delay. Do not
+  derive a constant profiler correction from these anchors or silently drop B.
+- Per user stop-on-new-confounder rule, stopped further experiments and notified
+  the user immediately on detection. All jobs are terminal; none queued.
+  Training/replay companion tables are retained as measured observations; final
+  cross-protocol causal attribution and publication plots are not accepted yet.
+  The draft report/plot generator remains unexecuted; no plot was published.
+
+## 2026-09-30 - Counterbalanced EP16/12 policy study started
+
+- Training3200606 completed0:0 in56m26s. All24 cases completed25 iterations
+  without skips/NaNs and passed controls. Profiled runs retain native AG/RS and
+  NEP records on all28 ranks. Graph-range counts match on every measured step
+  and rank. Logged owner0/1 memory identical across six policies:30,066.77MiB
+  allocated,30,264.86MiB peak,31,174MiB reserved.
+- Both replicas were physically in nvlblk10, but software cliques1000/1001
+  restrict cross-replica links. Communicator-ID matching across rank logs verifies
+  all12 cross-replica two-rank communicators use RDMA; checked intra-replica
+  transfer groups use P2P. No direct cross-replica NVLink shortcut accepted.
+- Matched profiler-off rank0/owner logged iteration means oversteps15-20,
+  averaging the two counterbalanced passes: A83.850, B83.617, C83.550,
+  D83.567, E90.075, F86.842ms. These are separate timing companions, not
+  replacements for profiled iteration boundaries. Compact policies differ by
+  at most0.36%; spread one/two lanes are7.72%/3.86% slower than current B.
+- Profiled all-owner cohort means: A89.546, B89.320, C90.356, D88.652,
+  E98.853, F97.182ms. Profiled first-forward means23.448/23.010/23.232/
+  22.609/30.994/27.531ms; later forward/nonfinal backward mostly unchanged.
+  Profiling distortion varies by policy; no per-operation subtraction or
+  exact unprofiled phase attribution is made from these values.
+- Added instrumentation-off replay diagnostic mode only to the test harness;
+  the actual transfer function, warmups, eight repetitions and start/end CUDA
+  event timers are unchanged. Exact parameter checks still run on every rank.
+  Submitted replay-check3200857, started12:38:33PDT on GB200 nodes0079/0081/
+  0084/0089 and0165/0166/0168/0169, segment4,30minute cap. Run profiled B/E,
+  twelve counterbalanced all-policy timing companions, then profiled E/B anchors.
+  This prevents reporting a call-count-dependent profiler penalty as intrinsic
+  all-ready transfer cost. No production NEP/dispatcher/optimizer changes.
+
+- Replay3200495 completed0:0 in18m42s; all12 cases passed the controls.
+  Two-run mean maximum full-replica rank-local transfer latency inms:
+  A6.197, B6.235, C6.378, D6.189, E13.388, F12.884. No isolated benefit
+  from compact two-lane submission is established atEP16/12. Spread has equal
+  bytes but36 transfer calls per follower versus9-12 for compact, so launch
+  and differential instrumentation costs must be separated before attribution.
+  These are profiled component latencies, not pure bandwidth measurements.
+- Saved study-only orchestration as06f82e95a; runtime remains unchanged.
+- Submitted training3200606, allocated11:39:26PDT on eight GB200 nodes
+  lyris0165/0166/0168/0169 and0170/0171/0174/0175, segment4, 70minute cap.
+  Two counterbalanced six-policy passes with all-rank profiling; separate
+  previously approved profiler-off timing companions use the identical15-20
+  iteration window and identical model/seed/batch settings. No post-profile
+  substitution. Case order: on AEFCBD, off DBCFEA, on DBCFEA, off AEFCBD.
+  Seed101, otherwise the validated EP16/12 workload. Stop on any new confounder;
+  initialization/bucket/routing and trace/payload checks run between cases.
+
+- User approved proceeding after the randomized-routing EP8/6 and EP16/12 gates.
+  Begin with parameter-only replay, then matched full training. Stop immediately
+  on a newly discovered confounder. No production implementation edits.
+- Added benchmark orchestration for unique policy/seed/repeat/mode outputs and
+  fail-closed validation after every case. Reuses existing global-ID weight,
+  bucket and routing checks; additionally checks all-rank trace availability,
+  completion-stream metadata, exact transfer splits and unchanged native
+  collective manifests. Tested validator against accepted EP8 replay and EP16
+  training artifacts. Existing validated runtime is unchanged from db585eba4.
+- Submitted replay3200495, started11:16:27PDT on GB200
+  lyris0163/0164/0165/0166 and0257/0264/0266/0267, segment4, 30minute cap.
+  All six policies run A/E/F/C/B/D then D/B/C/F/E/A, seed101. Same EP16/12,
+  H4608/latent1152/F3072/E512/top-k6, fourMoE layers, MBS2/GA2/S1024,
+  DistOpt/Flex/HybridEP configuration. Replay exits before optimizer creation;
+  actual initialized production parameter plans, packing/A2A/unpacking remain.
+  All28 ranks profiled; eight measured repetitions after three warmups percase.
+  Artifacts in Lustre slurm_runs/nep_cleanup_ab/3200495.
+
+## 2026-09-30 - EP16/12 randomized routing gate passed
+
+- Saved benchmark-only implementation and validation notes as commitdb585eba4
+  on nep-placement-controlled-20260929. Trusted implementation branch untouched.
+- Job3200350 completed0:0 in9m20s. Both compact/spread cases completed25
+  iterations with zero skipped/NaN iterations. All28 ranks have Nsight SQLite
+  and CUDA-event records including native parameter AG, gradient RS and NEP
+  redistribution, with completion-stream records. All4096 logical expert tensor
+  hashes, dense weights, actual bucket layouts and seeded routing maps match.
+  Native collective manifests match exactly, and all pairwise parameter splits
+  match at7,247,757,312 aggregate source/receiver bytes per measured iteration.
+- Owner ranks0-11, matched profiled steps15-20: compact90.868+/-1.702ms,
+  spread102.686+/-2.563ms. Firstforward23.697/32.321ms;
+  otherforward4.448/4.965; nonfinalbackward5.988/6.056;
+  finalbackward22.924/21.991; outsideF/B33.811/37.353.
+  These are validation observations, not a final placement ranking.
+- Separate post-profile native-log means86.975/92.825ms; profiled log means
+  90.650/102.417ms. Window shifts differ across policies and cannot be used
+  as causal profiler corrections. Counterbalanced matched-window companions
+  remain necessary before attributing the full training gap to placement.
+- Routing incidence example rank0:5291 compact/5296 spread token-peer pairs,
+  replacing the earlier cyclic-map1272/2096 disparity. Exact expert degrees
+  and GEMM capacity counts are preserved; unique-token/peer counts are measured
+  sampling differences, not asserted equal wire traffic.
+- Artifacts: Lustre slurm_runs/nep_cleanup_ab/3200350, including validator,
+  randomized-gate-analysis.json and archived analysis/launcher. No jobs remain
+  from this continuation. Routing blocker is resolved at EP8/6 and EP16/12;
+  full counterbalanced policy sweep is not represented as completed.
+
+## 2026-09-30 - Randomized controls and all-ready replay validated at EP8/6
+
+- Replay3200181 completed0:0 in12m14s. Six policies A/E/F/C/B/D each passed
+  eight profiled repetitions on all14 ranks. Exact parameter hashes are unchanged;
+  all4096 logical expert tensors, dense parameters and actual bucket layouts
+  match across policies. Every source/destination split matches, with
+  7,247,757,312 aggregate parameter bytes per repetition in every policy.
+- Mean maximum full-replica rank-local transfer elapsed times, including packing,
+  launch, participant waits and unpacking (not pure wire service): A10.021ms,
+  B9.250ms, C8.638ms, D8.610ms, E11.599ms, F9.919ms. These are component replay
+  timings, not training parity or globally aligned makespans. All eight repetitions
+  retained, including slightly slower first profiled samples. One policy order;
+  repeated/counterbalanced training remains necessary before final policy claims.
+- Nsight confirms real concurrent transfer kernels on follower ranks6/7:
+  C2.998/3.042ms, D3.129/2.209ms, F1.501/1.488ms per repetition; single-lane
+  A/B/E have zero cross-stream transfer concurrency. These kernel intervals
+  include participant waiting and do not establish useful simultaneous bandwidth.
+- Artifacts: Lustre slurm_runs/nep_cleanup_ab/3200181/all-ready-analysis.json
+  and all-ready-kernel-concurrency.json, all-rank Nsight and CUDA-event records.
+  Final CPU routing tests and git diff whitespace checks pass.
+- Submitted EP16/12 compact/spread randomized seed101 gate3200350, running
+  since10:50:48PDT on GB200 nodes0112/0113/0114/0117 and0261/0262/0264/0265,
+  segment4. Same four-layer H4608/latent1152/F3072/E512/top-k6 workload,
+  MBS2/GA2/S1024, TP2/CP1/ETP1, Flex/HybridEP, DistOpt and full MoE graphs.
+  Replica batches32/24; GBS56. NCCL_PXN_DISABLE=0 restores the larger-run
+  setting instead of carrying the EP8-only workaround. This is a within-EP16
+  placement comparison, not an EP8-to-EP16 scaling performance comparison.
+  All-rank profiling and fail-closed initialization/routing/bucket validation
+  remain enabled. No production runtime, dispatcher or optimizer edits.
+
+## 2026-09-30 - Randomized exact routing controls
+
+- User approved harness-only randomized exact routing, global-ID initialization,
+  parameter-only replay and staged EP8/6 -> EP16/12 validation. Highest-risk
+  comparisons first; stop and notify on any newly discovered confounder.
+- Added degree-preserving token/expert edge swaps, preserving exact per-expert
+  assignment counts and distinct top-k pertoken. Maps are seeded independently
+  of placement, generated before measurement and cached for graph replay. This
+  randomized construction is not claimed to sample regular graphs uniformly.
+- CPU preflight:3 tests pass (degrees, invalid dimensions, seeds, placement
+  counts, removal of adjacent-ID bias). Predetermined seeds101/202/303 give
+  compact/spread token-GPU pairs4516/4547,4493/4472,4516/4496 atEP8/6 and
+  5291/5296,5232/5238,5265/5265 atEP16/12 for1024 source tokens,E512,top-k6.
+  Unique-peer sampling differences are recorded, not mislabeled exact equality.
+- Added test-harness startup initialization using native FC1/FC2 initializers
+  with seeds keyed by logical parameter name/global expert ID, restoring RNG
+  state afterward. Hash physical parameters before/after existing native NEP
+  startup synchronization; record dense/expert bucket layouts. Not GPU-validated
+  yet. No production dispatcher, optimizer or NEP runtime source changes.
+- Submitted short profiled CUDA routing/STE-gradient/graph-replay job3199910;
+  allocated GB200 lyris0258 at10:11:49PDT. Results under Lustre
+  slurm_runs/nep_randomized_controls/3199910. Full-training jobs remain gated.
+- Job3199910 completed0:0 in1m09s. CPU tests and CUDA exact-count, straight-through
+  gradient and five-replay CUDA-graph checks passed. PyTorch trace retained at
+  slurm_runs/nep_randomized_controls/3199910/routing-cuda.json. Container isort
+  and Black ran on the five initial Python harness files.
+- Submitted job3199948: profiled EP8/6 compact/spread seed101 gate, ascending
+  parameter order, fixed ascending backward order, one transfer lane in both.
+  Allocated GB200 lyris0157/0158/0257/0258, segment2, at10:16:25PDT. All-rank
+  initialization/routing/bucket manifests and AG/RS/Nsight records required;
+  fail-closed paired validator runs before accepting results. No wider sweep
+  queued. Current changes are staged and captured by the launcher patch archive.
+- Job3199948 completed0:0 in8m58s. Both placements completed25 iterations with
+  zero skips/NaNs. Replica domains nvlblk09/nvlblk15. All4096 logical expert
+  tensors match exactly across full/reduced replicas and paired placements;
+  all-rank nonexpert weights, expert/dense buckets and seeded routing maps match.
+  Native collective manifests (including AG/RS) and exact parameter traffic
+  match:7,247,757,312 bytes perstep, with every pairwise split verified.
+- Measured owner-rank means oversteps15-20:compact153.944+/-0.418ms and
+  spread158.759+/-0.717ms. First-forward39.356/40.948ms, otherforward4.756/4.778,
+  nonfinalbackward8.024/8.057, finalbackward16.324/15.890, outsideF/B85.484/89.087.
+  One seed and one run order only: validation data, not a final policy ranking.
+  Post-profile log means147.725/153.825ms kept separate, not substituted.
+  Analysis and paired manifests saved in Lustre slurm_runs/nep_cleanup_ab/3199948.
+- Submitted all-ready replay3200181, allocated fourGB200 nodes0083/0090/0133/0141
+  at10:28:47PDT, segment2. Runs actual initialized owner parameter plans before
+  optimizer construction, with no AG, backward or token dispatch. Three warmups,
+  eight profiled repetitions, all-rank CUDA-event/Nsight records and exact final
+  parameter hash validation. OrderA/E/F/C/B/D prioritizes high-risk placement and
+  lane comparisons. This isolates transfer mechanics; it is not training parity
+  or a pure wire-service measurement. No EP16 job submitted yet.
+
+## 2026-09-30 - Placement routing preflight stopped on a confounder
+
+- User requested highest-confounder-risk experiments first and immediate stop
+  on discovery. Began compact/spread routing preflight; no GPU jobs submitted,
+  no implementation changes. Isolated branch remains clean at8cfd198d2.
+- Executed the actual placement/map functions via Python AST extraction (no
+  Torch dependency), then enumerated the exact-uniform router's expert IDs
+  `(token * 6 + k) % 512` for1024 source tokens. Both policies preserve every
+  expert's token count and every rank's expert-assignment total, but not the
+  number of distinct source tokens assigned to each destination GPU.
+- EP8/6: compact/spread total token-GPU pairs1144/1432; follower unique-token
+  counts152,168 versus304,304. Expert assignments remain768 perrank.
+- EP16/12: compact/spread total token-GPU pairs1272/2096; follower unique-token
+  counts92,104,100,96 versus304,304,304,304. Expert assignments remain384 perrank.
+- This establishes a failed routing-invariance control, NOT measured wire bytes
+  or a proven HybridEP runtime/bandwidth penalty. Backend behavior still needs
+  verification before making such a causal claim. Native token handling changes
+  as an input to the proposed full-training placement comparison; equal GEMM
+  shapes alone do not isolate NEP parameter redistribution.
+- Stopped and notified user. Recommend redistribution-only all-ready replay
+  first; full-training placement evidence requires an explicit decision about
+  controlling native routing or measuring its joint effect with placement.
+
+## 2026-09-29 - Controlled placement/scheduling ablation approved
+
+- User approved isolated two-file controls, balanced-routing study, limited
+  profiling-disabled companion timing and staged EP8/6 -> EP16/12 validation.
+  Show the small regression gate before any EP16 sweep. Plan and acceptance
+  criteria: NEP_CONTROLLED_PLACEMENT_20260929.md.
+- Created nep-placement-controlled-20260929 from e0113b468. Added opt-in
+  compact/spread placement, ascending/disjoint-first parameter order and one/two
+  lane execution with identical preallocated resources in both lane modes.
+  Existing AG readiness and consumer completion edges enclose both lanes.
+  Added opt-in fixed ascending gradient batches for later placement comparisons.
+- Runtime scope remains nonuniform_common.py/nonuniform_ep.py plus tests;
+  benchmark launcher gains explicit controlled cases and profiler-off entrypoint.
+  No native optimizer or dispatcher edits. Reference and one-lane regression
+  keep backward scheduling unchanged; spread execution checks are not placement
+  performance data until global initialization/routing/bucket manifests pass.
+- Job3190428 started on GB200 lyris0059 for98 unit tests and all six real-NCCL
+  policy cells plus native AG/RS prefetch with one/two lanes. Artifacts in Lustre
+  slurm_runs/nep_controlled_placement/3190428. No large sweep submitted.
+- Job3190428 completed0:0 in6m14s:98 tests and all six policy cells/native
+  one/two-lane prefetch probes passed. Actual trace pairwise splits match, and
+  every policy transfers663,552 bytes aggregate with no broadcast duplication.
+  Saved branch commit8cfd198d2. Native source files outside the two NEP modules
+  are untouched; scripts/nonuniform/run_nep_cleanup_ab.sh has opt-in test cases.
+- Submitted EP8/6 gate3190514 (four GB200 nodes, segment2,35min cap). Started
+  14:16PDT on lyris0217/0218/0258/0260. Profiled R/C/C/R measures one-lane
+  regression against e0113b468; compact/spread two-lane cells check execution;
+  approved profiling-off R/C/C/R measures instrumentation-independent timing.
+  Spread training cell is explicitly not accepted placement-performance evidence.
+  All artifacts under Lustre slurm_runs/nep_cleanup_ab/3190514. Monitor300seconds.
+- Job3190514 completed0:0 in23m33s. All ten25-iteration cases completed with
+  zero skipped/NaN iterations, no OOM/timeouts. Replica domains nvlblk13 and15.
+  Profiled R/C/C/R full-owner means151.743+/-0.627 versus151.735+/-0.626ms;
+  approved profiler-off rank0 logged means145.392+/-0.300 versus145.217+/-0.252ms.
+  Same steps15-20, not post-profile substitution. Total-time gate passes within
+  observed variation. First-forward increased0.284ms and final-backward0.149ms,
+  offset by0.438ms less outside F/B; do not claim every phase is unchanged.
+- Compact two-lane execution153.170ms (+0.95% vsone-lane). Kernel concurrency
+  verified on both followers,29.322/30.053ms perfirstforward; includes peer waits,
+  not pure transfer service time. Spread two-lane execution/payload checks pass,
+  but its performance is excluded until global initialization and backward
+  scheduling controls are matched. No EP16 sweep or paper policy claim yet.
+- Every profiled case sends/receives7,247,757,312 parameter bytes perstep with
+  exact pairwise split matching. Compact non-parameter collective manifests
+  identical, including native AG/RS and grad Gather. All-rank Nsight/event records
+  retained. Effective model options match across profiled/off modes. Log-based
+  profiling elevation4.21% reference and4.34% controlled, not subtractable costs.
+- Controlled resource cost measured: owner ranks0/1 allocated58,648.04MiB vs
+  reference51,682.04MiB (+6.803GiB), because both controlled lane modes retain
+  two preallocated pools. One/two/spread-two observations match. This is opt-in
+  experimental overhead, not a memory-neutral replacement for the reference.
+- Saved analyses and exact harness snapshot in job3190514 root; results and
+  remaining placement-study gates in NEP_CONTROLLED_PLACEMENT_20260929.md.
+  Branch remains clean at8cfd198d2. Trusted runtime and native files untouched.
+
+## 2026-09-29 - Destination-specific DistOpt parameter redistribution
+
+- User approved replacing broadcast-and-slice with exact destination payloads.
+  Created `nep-param-destination-scatter-20260929` from trusted `8f840ff72`;
+  the trusted worktree is untouched. Runtime edits are confined to the cached
+  parameter transfer plan and its redistribution method in nonuniform_ep.py.
+- Reuse gradient Scatter's expert/slot segment mapping; pack in communicator
+  destination order and use variable-split all_to_all_single. Only owners send,
+  only followers receive; owner-local parameters are copied directly. Existing
+  buffers, streams, events, owner ordering, native AG/RS and prefetch are retained.
+- Exact metadata check passed for E512 EP16/12 and EP8/6, E128 EP8/4 and EP6/6,
+  and E17 EP8/6, including unequal parameter slots and pairwise split matching.
+  This is not yet GPU correctness or performance evidence.
+- Submitted small all-rank-profiled correctness job3189220 on GB200 lyris0035.
+  Tests include exact payload checks under compact/spread placement, nondivisible
+  experts, fresh values, proxy rebinding, bounded buffer reuse and native AG/RS.
+  Completed 0:0 in4m36s:93 unit tests and all three real-NCCL smoke suites passed.
+  Four-rank traces validate225 parameter collectives: pairwise split counts match,
+  send-only owners/receive-only followers, and zero parameter broadcasts. Native
+  AG/RS and independent GPU progress assertions also passed. Artifacts: Lustre
+  slurm_runs/nep_destination_scatter/3189220. Runtime diff is52 additions/47 deletions.
+- Saved fix and tests as e0113b468. Submitted job3189318: existing small EP8/6
+  DistOpt/Flex workload, before/after and healthy, unchanged workload/profiling
+  and resource configuration. Four GB200/GB300 nodes, segment2,25 iterations,
+  profiled15-20, MBS2/GA2/S1024, H4608/latent1152/F3072/E512/top-k6, four MoE
+  layers, TP2/CP1. All-rank Nsight and CUDA-event AG/RS/reshard records enabled.
+  Initial state pending Priority, StartTime Unknown; monitor every300seconds.
+- Job3189318 completed0:0 in10m34s; before/after/healthy each completed25 iterations
+  with zero skipped/NaN iterations. GB200 lyris0032/0033 and0035/0036, each replica
+  contained in nvlblk02. Distinct software cliques1000/1001; cross-replica two-rank
+  communicator logs show cliqueSize1 and NCCL RDMA Plugin v11, not shared NVLink.
+- Matched profiled steps15-20, full-owner ranks0-5: healthy109.815+/-0.619ms,
+  before152.888+/-0.545ms, after152.829+/-0.621ms. SD is across six per-step
+  rank-cohort means. Owner parity71.827%->71.855%: neutral within variation,
+  NOT a parity recovery claim. First-forward40.022->39.174ms. Other forward
+  4.532->4.562ms; nonfinal backward7.811->7.829ms. Final backward and tail
+  boundaries shift; do not attribute those shifts to a changed backward algorithm.
+- Per-step parameter source bytes unchanged7,247,757,312; aggregate receiver bytes
+  8,436,842,496->7,247,757,312 (-14.094%). All actual pairwise A2A split counts
+  agree; owners send only, followers receive only, no parameter broadcasts.
+  2,346 other recorded collective calls (14ranks x6steps) have identical counts,
+  memberships and payloads before/after, including native AG/RS and grad Gather.
+- Profiling-window distinction retained: log measured/post-profile means are
+  before152.683/146.950ms, after152.583/147.325ms, healthy109.583/107.775ms.
+  Profile-window elevation is3.90%,3.57%,1.68%, respectively; these windows are
+  descriptive instrumentation-sensitivity evidence, not an overhead subtraction.
+  No claim of a statistically established speedup or universal no-regression.
+- Real NCCL value probes pass exact fresh-value comparisons. Training logs are
+  not bitwise equal across independent runs (small loss/gradient differences);
+  they are only a completion/finite-values check, not proof of exact trajectory
+  equivalence. No deterministic end-to-end trajectory test was run.
+- Full all-rank Nsight SQLite/reports and CUDA-event AG/RS/reshard records retained
+  in Lustre slurm_runs/nep_cleanup_ab/3189318. Reproducible analysis script and
+  destination_scatter_analysis.json saved there. Both runtime worktrees are clean.
+  Old broadcast data remains withdrawn for placement conclusions.
+
+## 2026-09-29 - Withdraw invalid broadcast-based ablation results
+
+- User identified that parameter redistribution sends each owner's entire remote
+  expert buffer to every follower instead of only the experts needed by that
+  GPU pair. This is an incorrect transfer policy, not an acceptable placement
+  tradeoff. It affects compact and spread placement alike.
+- Withdraw all paper-facing performance data and conclusions from jobs3181167,
+  3181303,3181315,3181288,3181404,3181439, including scheduling comparisons on that
+  implementation. Retract the compact-over-spread recommendation and the claim
+  that these data justify skipping a parallel-stream ablation.
+- Replace published charts/tables/downloads with withdrawal notices. Block their
+  regeneration by replacing the report generator with a withdrawal publisher.
+  Mark affected source roots invalid; keep raw records only for provenance/debugging.
+- New evidence requires destination-specific transfers, per-pair expert/payload
+  checks and fresh measurements. No runtime changes or new jobs in this request.
+- The following September28 entry is a historical log ONLY. Its measurements
+  and conclusions are withdrawn, regardless of earlier validation/pass wording.
+
+## 2026-09-28 - WITHDRAWN: placement and transfer-order ablations
+
+- User approved the placement/order/release-timing study. Created isolated branch
+  `nep-placement-ablation-20260928` from tested `8f840ff72`; trusted branch unchanged.
+- Added opt-in current/spread follower placement with unchanged local experts and
+  per-rank expert counts; ascending/waves controls for forward and gradient order.
+  Only two runtime files touched. Existing small launcher gains opt-in cases and
+  workload overrides; no default changes. Plan: NEP_PLACEMENT_ABLATIONS_20260928.md.
+- Submitted one-node correctness gate3181152; started on GB200 lyris0087. Tests
+  cover expert identity/locality/capacity and real NCCL fresh parameter values
+  across all four placement/forward-order combinations. No large run until passed.
+- All generated data remains on Lustre; all-rank profiling stays enabled.
+- Gate3181152 completed0:0 in5m26s:96unit tests and four real-NCCL parameter
+  tests passed. Container isort/Black completed; frozen commit `1f084d5dc`.
+- Submitted3181167, six-case EP8/6 matrix on four GB200 nodes/segment2. Running
+  across nvlblk09(full) and nvlblk10(second); native AG/RS/prefetch smoke passed.
+  Healthy case began training. Prepared optional hard-launcher cases, not yet
+  submitted. Offline analyzers gain configurable steps and kernel-union summaries;
+  these are analysis-only edits, not changes to running training/profiling.
+- Small sweep3181167 completed0:0 with all six profiles validated. Compact waves
+  iteration155.870ms (repeat155.135), compact ascending157.020, spread161.695-162.067;
+  healthy110.627. Order pairs preserve every collective call/payload. FirstF
+  exclusive redistribution3.894ms compact-waves versus5.276ascending/5.671spread.
+  Spread endpoint receiver payload increases72%, despite unchanged source payload.
+- Submitted hard matrix3181288 after small success; started on eight GB200 nodes,
+  segment4. Both replicas physically nvlblk13, isolated using cliques1000/1001;
+  rank0<->16 transport explicitly NET/RDMA, not NVLink. Baseline still starting.
+- Separate release branch3225f09a1 passes98unit and8NCCL parameter delivery tests
+  (job3181250). Native AG remains early; parameter redistribution can wait until
+  consumption; gradient launch can wait until final sync via existing scheduler.
+  Current production/placement branches untouched. Small profiled training gate
+ 3181303 submitted before any large release-control runs.
+- Submitted compute-rich EP8/6 sweep3181315 with only sequence1024->8192 changed
+  between suites. All variants within a suite have identical workload settings.
+- Hard matrix3181288 completed0:0: owner iteration compact566.765ms,
+  ascending585.001ms, spread688.028ms, compact repeat569.864ms; healthy515.631ms.
+  FirstF118.025/135.793/152.556/118.128ms respectively. Exact order-only collective
+  signatures match. Compact waves recover17.768ms firstF and18.236ms iteration.
+- Spread receiver broadcast payload grows33.974->108.716GB/step; source27.179GB
+  and Gather input54.358GB unchanged. Do not label this pure equal-traffic scheduling.
+  Spread profiling distortion is larger: measured/post687.725/607.000ms versus
+  compact566.425/555.057ms. Both windows show slower spread, but magnitude differs.
+- Release small3181303 passed: current155.631ms, late params155.332ms,
+  late gradients172.945ms, grad ascending156.348ms, repeat155.156ms.
+- Compute-rich3181315 passed: healthy153.003ms, compact193.362ms,
+  ascending197.088ms, spread202.986ms, repeat192.890ms; explicit0<->8 RDMA verified.
+- Real-routing3181404 passed all25iterations/all-rank captures and order signatures,
+  but timing variance/profiler sensitivity makes performance ranking inconclusive.
+  Router-only graphs/no forced routing/no token dropping, held fixed within suite.
+- Hard release3181439 completed0:0 in22m47s. Initial validated values current566.294ms,
+  late params570.950ms, late gradients699.850ms; full repeat/order analysis pending.
+  Native AG remains early in parameter-release control. Gradient-release control
+  delays the whole dependent Gather/staging/RS pipeline and changes ready-prefix
+  batching, not isolated transfer service. Signatures/payload counts unchanged.
+- Trusted runtime unchanged; isolated tested branches1f084d5dc and3225f09a1 clean.
+  Analysis-only interval-union optimization matches old results exactly on cached
+  real profiles and within2.7e-15ms on1000 randomized tests.
+- Final hard release values: grad ascending573.960ms, repeat568.392ms; full five-case
+  all-rank payload/count signatures pass. Current/late-param firstF117.754/122.074ms,
+  but post-profile iteration557.657/558.100ms gives no robust unprofiled benefit.
+- Current/late-gradient finalB+tail203.063/329.852ms; owner Gather exclusive
+ 0.044/21.888ms, RS exclusive2.851/96.944ms. These are rank-local exclusive unions,
+  not additive causal costs; all total residency includes participant waiting.
+- Eight allocations completed0:0,34profiled training cases, no NCCL hangs.
+  Recommendation remains compact placement + disjoint-owner waves + early release;
+  no conditional parallel-stream extension justified by the spread results.
+  Full account:NEP_PLACEMENT_ABLATIONS_20260928.md. Figures/report on Lustre under
+  plots/nep_placement_ablations_20260928, with measured/post windows kept separate.
+- Published the six phase figures, report and compact kernel diagnostics to
+  https://sc.talos.nvidia.com/view/home/scratch.darfeen_coreai/nep_placement_ablations_20260928/index.html.
+  Remote report/index/hard-figure checksums match the Lustre originals.
+
+## 2026-09-22 - Investigate disjoint-participant parameter-transfer ordering
+
+- No runtime edits or new jobs. Proposed cached parameter-plan order uses the same
+  participant-disjoint wave algorithm already present in the gradient dispatch path,
+  retaining one transfer stream and the same buffers/groups/payloads on every rank.
+  EP16/12 waves:0/3/6/9;1/4/7/10;2/8;5/11. This breaks the shared-follower chain without
+  the rejected parallel-owner variant's multiple concurrent transfer kernels per GPU.
+- Added offline estimate using job3131835 all28 rank event profiles, steps20-27.
+  Recorded-order replay reproduces first-forward endpoints; proposed grouping passes
+  640 arbitrary-membership disjointness/coverage checks. These are modeling checks,
+  not GPU correctness/performance validation. Runtime scope would be about20-30 lines
+  in nonuniform_ep.py plus tests; gradient path, dispatcher and DistOpt stay unchanged.
+- Conditional estimates: fixed subsequent AG/input readiness saves4.04ms firstF
+  (74.10% firstF /87.49% iteration parity); propagating earlier full-replica compute
+  while keeping reduced-peer readiness fixed saves12.63ms (79.44% /88.86%). A50% increase
+  in broadcast post-ready interval gives11.41ms savings in that coupled model. No
+  guarantee of positive gains: native-kernel/resource contention is not predicted.
+- Even removing all37.165ms firstF excess yields only93.03% iteration parity with
+  other phases unchanged. Full report NEP_PARAMETER_WAVE_PROPOSAL_20260922.md; replay
+  and assumptions in Lustre job3131835/ag_redistribution_analysis/parameter_wave_estimate.json.
+
+## 2026-09-22 - Explain the earlier-AG estimate error
+
+- Existing job3131835 traces show a cross-follower chain: follower12 receives owners
+  0/1/2, follower13 receives2/3/4/5, follower14 receives5/6/7/8, follower15 receives
+  8/9/10/11. Shared-owner broadcasts link serialized follower streams. In step20's
+  third bucket, owner0 AG advances1.536ms, owner11 AG advances7.656ms, but owner11
+  parameter readiness advances only1.755ms. Earlier late-owner readiness becomes
+  waiting for this chain. Detailed matched timings added to NEP_AG_RED_OVERLAP_20260922.md.
+- The prior26ms estimate used late-owner local opportunity, not a cross-rank critical
+  path. The same original trace had only2.296ms opportunity on owner0. This was not
+  an adequate basis for a first-forward speedup estimate. No new runs or runtime changes.
+
+## 2026-09-22 - Isolated next-AG / current-redistribution overlap experiment
+
+- User approved testing earlier next-bucket AG submission. Created branch/worktree
+  `nep-ag-red-overlap-20260922` from accepted cleanup commit `ee28f09ff`; trusted
+  graph-order and cleanup branches remain untouched. The only production change moves
+  next-group `start_param_sync()` before the current bucket's parameter-ready event wait
+  in `finish_param_sync`. Own-AG dependencies, native AG order, serialized redistribution,
+  shared staging reuse, skip-next, force-sync, and completion guards remain in place.
+- Added four unit cases covering prefetch-before-wait, skip-next, final bucket and
+  idempotence. Extended existing four-GPU AG/RS/follower smoke with deliberately delayed
+  redistribution to require the next native AG to finish before prior delivery completes.
+  Initial queued job3131770 was canceled before running to correct a test assertion:
+  only rank0, not the deliberately delayed rank2, can assert independent compute precedes
+  the first AG completion. Replacement job3131771 started on GB300 theia0288.
+- Added one optional case to the existing hard A/B launcher; all defaults unchanged.
+  Planned matched healthy / accepted cleanup / earlier-AG cases retain MBS1, GA2,
+  sequence8192, EP16/12, SM margin32 and all-rank Nsight plus AG/RS event records.
+  No large benchmark submission until focused tests pass. Artifacts remain on Lustre.
+- Offline pre-experiment opportunity estimate: rank11's seven next-AG launch transitions
+  have26.024 ms inside previous redistribution after preceding graph compute/AG readiness;
+  ranks0/5 have2.296/9.230 ms. This is not a counterfactual timing prediction: remote
+  readiness, changed waits, and resource contention can reduce any actual recovery.
+- Validation job3131771 completed successfully:83 unit cases and four-GPU profiled
+  AG/RS/follower smoke, including next-AG GPU completion before delayed prior delivery on
+  both owners. Production change committed as `ccb4b9726` in the isolated branch.
+  Submitted job3131835 for healthy_margin / cleanup_margin / ag_overlap_margin on either
+  GB200 or GB300,8nodes segment4,30minute limit and8minute per-case watchdog.
+- Job3131835 completed on GB300 in16minutes, domains18/20. All35iterations in all
+  three cases passed dedicated exact-uniform validation;88all-rank trace sets validated.
+  Matched owner measured means: healthy486.866ms / firstF94.792ms; acceptedNEP
+  562.702 /133.644; earlierAG560.519 /131.957. FirstF gain1.686ms; iteration gain2.183ms;
+  parity86.52 ->86.86%. Peak allocated memory unchanged116.394GiB. Other-phase shifts
+  are small relative to observed variability; no broad no-regression guarantee claimed.
+- Actual AG/redistribution kernel overlap0 ->13.546ms, but broadcast residency
+  23.681 ->33.091ms. Before-last-peer-kernel-start prefix21.236 ->30.673ms explains
+  almost all of that increase; post-last-peer2.445 ->2.418ms. Rank11 remains last ready
+  in64/64bucket/step pairs; final bucket readiness advances only1.677ms. Thus local
+  launch opportunity did not translate to a26ms critical-path gain. No proof of
+  bandwidth saturation or increased transfer service time. Branch remains isolated.
+- Offline analysis required per-iteration clock alignment and graph-launch-correlated
+  membership; prior schema2/3 parser attempts are superseded by schema4 and final
+  `ag_redistribution_analysis/overlap_results.json`. Production code was not changed
+  during/after the A/B. Full report: `NEP_AG_RED_OVERLAP_20260922.md`.
+
+## 2026-09-22 - First-forward attribution closes the37.609 ms difference
+
+- Offline analysis of accepted GB200 job3122515 healthy_margin/cleanup_margin only;
+  owner ranks0-11 and measured iterations20-27, with all-rank peer readiness matching.
+  No new GPU job or production-code change. Added two offline analysis scripts and an
+  optional iteration-range argument to the existing phase analyzer.
+- Disjoint NEP-minus-healthy first-forward accounting: model-EP inside layers20.259 ms;
+  directly exposed broadcast waiting8.457 ms; broadcast after all inputs ready1.344 ms;
+  directly exposed packing/unpacking2.721 ms; native compute/TP4.048 ms; AG-only gaps
+  -0.163 ms; remaining measured gap/memory/mixed categories0.944 ms. Sum37.609 ms.
+- Approximately19.8 ms of model-EP increase coincides with before-last-peer-kernel-start
+  prefixes, not longer post-last-start service. Rank11 finishes redistribution last in
+  all64 bucket/iteration cases; full-replica ready spread averages6.320 ms. Follower
+  serialized receives delay later owners; early owners then wait inside model-EP.
+- Host submission is early:768/768 redistribution calls finish CPU enqueue before AG
+  completes (minimum3.174 ms lead); AG-complete-to-redistribute positive gaps sum0.024 ms
+  per owner/iteration. All672 next-AG CPU submissions also precede previous redistribution
+  completion, but GPU readiness is gated by the previous parameter-ready wait. No claim
+  that all measured waiting is recoverable or a physical transfer minimum is established.
+- Canonical schema2 normalizes healthy/NEP TP process-group aliases. Full reproducible
+  accounting: NEP_FIRST_FORWARD_ATTRIBUTION_20260922.md and Lustre job3122515
+  first_forward_attribution/first_forward_findings.json. Earlier exploratory summaries
+  are superseded by this normalized result. No plots created.
+
+## 2026-09-22 - Combined-change phase parity from existing profiles
+
+- Recomputed job3122515 healthy_margin versus cleanup_margin, both native SM margin32,
+  owner ranks0-11 and matched measured iterations20-27. Combined accepted changes are
+  gradient-buffer cleanup plus backward SM reservation; rejected parallel transfers are
+  excluded. No new allocation or implementation edits.
+- Healthy/NEP ms and parity: firstF99.843/137.452 (72.64%), otherF82.622/82.965 (99.59%),
+  nonfinalB127.826/128.892 (99.17%), finalB142.762/163.472 (87.33%), outsideF/B60.276/71.624
+  (84.16%), iteration513.329/584.405 (87.84%). Source: existing cleanup_phase_analysis.json.
+- Checked accepted code: neither cleanup nor backward-only SM margin modifies first-
+  forward AG/pack/broadcast/unpack or parameter-ready waits. Early submission remains
+  enabled. First-forward excess37.609 ms is elapsed phase time, not pure transfer time.
+
+## 2026-09-21 - Cleanup plus native SM reservation validated independently
+
+- GB200 job3122515 completed all four35-iteration cases in19m32s, physical NVL domains
+  12/16, original hard EP16/12 proportional MBS1/GA2/8192-token workload. All120 rank
+  profile sets include required native AG/RS/NEP metadata; all35 iterations per case
+  finite/no skips. No parallel-owner transfer code used.
+- Matched owner means20-27: healthySM16 513.373, cleanupSM16 594.782, cleanupSM32
+  584.405, healthySM32 513.329 ms. Native NVTE_BWD_LAYERNORM_SM_MARGIN=32 saves10.377 ms;
+  final backward172.181 ->163.472 ms; outside tail72.669 ->71.624 ms. Healthy unchanged.
+  Owner parity86.31 ->87.84%; not full parity. Do not combine absolute GB200/GB300 times.
+- Sampled cooperative RMSNorm admission gap sum18.932 ->7.568 ms, healthy8.346/8.426 ms.
+  Grid408 ->360 CTAs. This agrees with isolated no-dependency NCCL/cooperative-launch
+  reproduction. Some gaps persist with several collectives active; not a universal fix.
+- Keep cleanup commitee28f09ff and tested SM32 launch setting. Reject parallel checkpoint
+  f57cc9a65 due to hard-case first-forward regression. Trusted branch remains unchanged;
+  all three implementation worktrees clean. No jobs remain from this experiment.
+- Updated full report NEP_BUFFER_AND_OWNER_TRANSFER_20260921.md includes phase tables,
+  profiling distortion, numerical-validation limits, failed attempts, and rollback paths.
+
+## 2026-09-21 - Hard validation: reject parallel owner transfers
+
+- GB300 job3122295 completed all six35-iteration cases with all-rank profiles. Owner
+  means20-27: healthy486.492, originalNEP582.952, cleanup569.738, parallel587.212 ms.
+  Cleanup saves13.214 ms; parallel regresses17.474 ms versus cleanup, primarily first
+  forward133.747 ->146.901 ms. Keep cleanup checkpointee28f09ff; do not promote parallel
+  checkpointf57cc9a65. Trusted branch/tag remains untouched.
+- Trace shows increased follower native scan and owner HybridEP device-sync residency
+  during parallel broadcasts. This establishes interference with native progress, not
+  specifically NVLink saturation. Shorter redistribution scopes were not an E2E win.
+- Native backward SM margin32 reduces cooperative-norm admission gaps and final backward
+  on the parallel branch, but that branch retains the forward regression. Healthy margin
+  16/32 iteration486.492/486.386 ms. Need independent cleanup+margin validation.
+- Extra appended case did not execute because the inherited postprocessor exits1 when
+  it expects random forced balancing instead of the actual exact-uniform routing. Outer
+  uniform validation correctly accepted the six completed cases. Removed appended case;
+  added cleanup_margin explicitly to outer case list. Job3122515 started18:56:48 PDT on
+  GB200, eight nodes/segment4, healthy16/cleanup16/cleanup32/healthy32. All-rank profiling
+  and original hard model/batch/transport remain unchanged. No production edits involved.
+- Detailed results, limitations and artifact paths: NEP_BUFFER_AND_OWNER_TRANSFER_20260921.md.
+
+## 2026-09-21 - Gradient-buffer cleanup and bounded owner-transfer experiment
+
+- Preserved trusted branch/tag `nep-graph-launch-order-20260921` unchanged. New cleanup
+  branch `nep-buffer-cleanup-20260921`, commit `ee28f09ff`, clears only logical-owner
+  gradient padding (valid gradients are overwritten by staging) and scales dense plus
+  logical-owner gradients instead of also scaling obsolete physical expert gradients.
+  Non-distributed optimizer behavior and native dense handling are unchanged.
+- GB200 job `3122017`: 79 unit tests passed; four-GPU native AG/RS and parameter
+  prefetch correctness smoke passed. This is not yet performance acceptance.
+- EP8/6 profiled cleanup/reference job `3122068` submitted, four nodes/segment two,
+  MBS1/GA2/8192 tokens, H4608/F3072/E512, four MoE layers in the original hybrid pattern.
+  All ranks collect native AG/RS plus NEP operations and graph-node Nsight timelines.
+- Isolated RMSNorm graph diagnostic reproduced a backward launch stall behind unrelated
+  NCCL traffic; max-CTA reduction alone did not remove it. Job `3122071` tests native
+  TE backward SM margins 0/8/32. No conclusion about the exact mechanism is accepted yet.
+- Separate experimental branch `nep-param-owner-parallel-20260921` starts from the cleanup
+  checkpoint. It uses per-owner parameter-transfer streams and per-owner bounded buffers,
+  joining at parameter readiness, preserving the per-layer dependency. Extra temporary
+  memory and correctness/performance must be validated before accepting this experiment.
+  All generated artifacts are under Lustre `slurm_runs/nep_buffer_cleanup` or `nep_cleanup_ab`.
+- Cancelled `3122068` before accepting any result: its rank wrapper reset `CODE_REPO`
+  to the candidate for both A/B cases. Fixed the wrapper to preserve the selected checkout;
+  replacement `3122093` submitted. This was a benchmark-launcher error, not a NEP failure.
+- `3122071` reproduced the independent-graph stall and removed it with TE's native
+  `NVTE_BWD_LAYERNORM_SM_MARGIN`: rank-0 median graph time with 32-CTA-limit Gather
+  was 14.632 ms at margin 0, 14.560 ms at margin 8, and 0.268 ms at margin 32.
+  With four-CTA-limit Gather, margin 8 was sufficient (0.244 ms versus 14.732 ms at
+  margin 0). These are isolated diagnostic results, not model-performance results.
+  The GPU trace shows RMSNorm forward and its preceding memset proceeding while
+  RMSNorm backward is delayed; the test has no Gather-to-graph dependency.
+- `3122082` tests the parallel-transfer branch on GB300: 80 unit tests passed; shared-
+  follower multi-owner correctness and the prior native AG/RS smoke are still in progress.
+- Both correctness smokes subsequently passed. On a shared follower, an independent
+  owner's broadcast completed at 10.057 ms while the delayed owner's broadcast remained
+  active until 14.490 ms (profile iteration 2). This validates removal of the cross-owner
+  dependency in the toy, not training performance. Experimental checkpoint: `f57cc9a65`.
+  Small EP8/6 cleanup/parallel/parallel-plus-SM-margin comparison submitted as `3122109`.
+- Stronger root-cause evidence: the diagnostic's Nsight API/kernel correlation identifies
+  `rmsnorm_bwd_general_kernel` as a `cudaLaunchCooperativeKernel` launch. At margin zero
+  its grid is 456 CTAs (three per SM on that GPU); the cooperative launch requires grid
+  residency that unrelated NCCL/spin kernels prevent. Shrinking the grid through TE's
+  existing backward SM margin removes the stall. Graph-node `launchType=0` alone had
+  obscured this; uncaptured warmup API/kernel correlation supplies the launch type.
+  The diagnostic does not add a Gather-to-compute event dependency. Actual training
+  impact will be evaluated separately, with the saved code unchanged.
+- The larger hybrid EP8/6 toy repeatedly failed native dense RS with RDMA registration
+  error 524 on both GB200 and GB300, including the untouched reference. Restoring the
+  trusted allocator and launch environment (`3122146`) did not fix it. It is not evidence
+  of a cleanup or parallel-transfer regression. No transport downgrade was applied.
+  `3122176` uses the prior four-MoE-only smoke configuration (MBS2/GA2/sequence1024),
+  with reference/cleanup/parallel/parallel-plus-margin cases. Original hard EP16/12
+  comparison remains unsubmitted pending small validation. The hard launcher already
+  uses backward SM margin16; its proposed margin32 test must override that explicit
+  harness assignment, not just an inherited environment variable.
+- `3122176` repeated the same reference dense-RS error. Re-reading the prior successful
+  smoke entry identified its required launch-time `NCCL_PXN_DISABLE=1` override (job
+  `3121169`); the new wrapper had omitted it. Restore this already-validated small-only
+  transport setting for all comparison cases. The EP16/12 hard benchmark retains its
+  original PXN behavior. The allocator hypothesis was not confirmed and did not fix it.
+- `3122197` completed the four EP8/6 small cases with the required PXN override.
+  Full-owner measured iteration means: reference167.012, cleanup162.080,
+  parallel159.430, parallel+SM32 157.220 ms. All100 iterations finite/no skips;
+  all56 rank profile sets complete and required AG/RS/NEP metadata validated.
+  Parallel reduces first-forward46.151 ->43.632 ms. SM reservation reduces final
+  backward55.588 ->17.327 ms but shifts36.052 ms into the tail, net gain2.210 ms
+  in this compute-light toy. Do not claim the whole backward reduction as an E2E gain.
+- Original hard EP16/12 comparison submitted as `3122295`, eight nodes/segment4,
+  healthy/reference/cleanup/parallel/parallel+SM32/healthy+SM32, original PXN setting,
+  original15-MoE-layer MBS1/GA2/8192-token workload. Estimated start18:34 PDT at submission.
+  Required all-rank profiles plus untimed all-rank memory peaks; no larger scale thanEP16.
+  Full details and numerical-equivalence caveat: `NEP_BUFFER_AND_OWNER_TRANSFER_20260921.md`.
+
 ## 2026-08-21 - EP16/EP12 H-only/F-only expert-GEMM isolation
 
 - Added a dedicated five-case same-allocation wrapper around the validated EP16/EP12 benchmark:
@@ -4991,3 +6677,4519 @@ Append a dated entry whenever we do something new: code changes, job submissions
   DistOpt transfer slot instead of two, saving one 400 MiB slot at the cost of removing adjacent
   parameter-bucket staging concurrency. This requires an explicit implementation decision before
   another full-scale retry.
+
+## 2026-08-28 - Ultra reduced-EP memory diagnosis and minimum-batch search
+
+- Added a default-preserving control for the number of persistent NEP DistOpt parameter-transfer
+  slots. The default remains two; Ultra retries explicitly use one. Focused distributed tests
+  passed on four ranks, and the EP8/EP4 DistOpt+Flex validation completed ten finite iterations
+  with the one-slot case at 239.400 ms versus 254.267 ms for two slots. The implementation
+  worktree contains only `nonuniform_ep.py` and its focused unit-test changes.
+- GB300 Ultra job `2813882` verified that one slot removes the prior 400 MiB transfer-buffer OOM.
+  Healthy completed at 3,344.333 ms over iterations 8-10. NEP completed iteration 1 but a
+  reduced-replica rank then OOMed on a 98 MiB grouped-GEMM output. EP56 distributes 512 experts
+  as ten experts on eight ranks and nine on forty-eight ranks, versus eight experts per rank for
+  healthy EP64; the ten-expert ranks therefore carry 25% more expert parameters and associated
+  optimizer state than healthy ranks.
+- Cache release was not a simple fix: `EMPTY_UNUSED_MEMORY_LEVEL=2` job `2815573` more than
+  doubled healthy iteration time and NEP still OOMed. Reducing only reduced-replica gradient
+  accumulation exhausted every legal sample-count setting without changing the MBS1 peak:
+  GA3/GBS53 job `2816130`, GA2/GBS46 job `2819322`, and GA1/GBS39 job `2819371` all OOMed.
+  A 68-bucket retry `2819784` still had a 400 MiB atomic parameter bucket and OOMed. A
+  `cudaMallocAsync` retry `2820836` moved the failure earlier into FusedAdam's lazy
+  `exp_avg`/`exp_avg_sq` allocation on reduced ranks, directly confirming live expert
+  optimizer-state pressure rather than a missing allocator or cache flag.
+- With reduced MBS already at its legal minimum of one, the remaining batch dimension that lowers
+  per-microbatch activation peak is the reduced replica's token batch. HybridEP requires the
+  global sequence length to be divisible by `TP(8) * token_chunk(64) = 512`: 8160 failed FP8
+  alignment in job `2821312`, 8128 failed NVFP4 alignment in `2821730`, and 8064 failed the
+  HybridEP chunk assertion in `2821875`. The first legal reductions, 7680 (`2823169`) and
+  7168 (`2823248`), both completed one finite iteration and OOMed in the second grouped expert
+  forward. Jobs `2823487` and `2823488` are queued on GB300 regular/backfill for the next
+  legal value, 6656, with full ranks unchanged, reduced MBS1/GA4, 64 buckets, one transfer slot,
+  forced balancing, and all-rank profiling.
+- The 6656 retry `2823487` completed one finite iteration and then OOMed, but rank mapping
+  showed the new limiting failures on full-replica owner ranks 0, 1, 2, 4, 5, and 7. The single
+  400 MiB DistOpt parameter-transfer slot was retained in a shared dictionary after the final
+  parameter redistribution and therefore remained live during the next forward. Owner grouped
+  expert allocations needed only 126-180 MiB, so further reduced-only token cuts could not
+  address this owner-side peak.
+- Changed only the DistOpt parameter-sync lifecycle to clear that shared staging reference after
+  the final parameter scatter. Intermediate buckets continue to retain and reuse the configured
+  slot, so collective ordering and adjacent-bucket behavior are unchanged. Isort, Black, Ruff,
+  Python compilation, and the four-rank focused DistOpt suite passed; all 12 focused tests passed
+  on every rank.
+- Current training-scripts GB300 job `2824377` validated the release on the
+  `scaling_ladder/a315m_1b_moe_88b` DistOpt+Flex/HybridEP workload. Healthy EP8/EP8 averaged
+  687.567 ms and NEP EP8/EP6 averaged 720.933 ms over iterations 8-10, for 95.372% owner-time
+  parity. Both cases completed ten finite updates with zero skipped/NaN iterations and emitted
+  exactly 16/14 all-rank traces. This is within the prior same-workload GB300 parity range of
+  95.039-96.114%, so no release-induced performance regression is measurable.
+- Original-batch, graph-free Ultra EP64/EP56 jobs `2824493` and `2824494` are queued with
+  reduced MBS1/GA4, sequence length 8192, 64 buckets, one transfer slot, forced balancing, and
+  all-rank profiling. This retry tests whether correcting staging lifetime removes the need for
+  any reduced token-batch reduction.
+- Original-batch Ultra job `2824493` confirmed the lifetime fix removed the full-owner failure:
+  it completed one finite iteration and no owner rank OOMed. Reduced rank 65, one of the EP56
+  ranks that owns ten experts, then failed on a 100 MiB grouped-expert output with 88.12 MiB
+  physically free. This leaves a genuine reduced-EP peak deficit of roughly 12 MiB after the
+  avoidable staging residency is removed. Jobs `2825011` and `2825012` therefore test the
+  smallest legal reduced token-batch cut, sequence 8192 to 7680 (6.25%), while full ranks remain
+  unchanged at sequence 8192 and MBS2/GA2.
+
+## 2026-08-28T11:34:00-07:00 - Asymmetric-sequence preflight before Ultra retry
+
+- Submitted matching four-node EP8/EP6 canaries on GB300 (`2825559`) and GB200 (`2825560`) to
+  exercise the exact rank-local sequence override before the 32-node Ultra allocation. Both
+  started together, so the GB200 duplicate was canceled and GB300 was retained.
+- Job `2825559` used the current one-slot/lifetime-release implementation with DistOpt,
+  overlap-grad-reduce, overlap-param-gather, Flex/HybridEP, forced load balancing, 64 requested
+  DDP buckets, and all-rank profiling. Full ranks used sequence 8192, MBS4, and three
+  microbatches; reduced ranks used sequence 7680, MBS1, and twelve microbatches. The true GBS
+  remained 168.
+- The canary completed all ten optimizer updates with zero skipped or NaN iterations, no OOM or
+  Python traceback, and all 14 expected profiler traces. This validates the heterogeneous
+  sequence/batch launcher and the complete NEP collective/optimizer path on a small allocation.
+  It cannot prove Ultra's model-scale memory headroom; that still requires the queued EP64/EP56
+  topology. Artifacts are under
+  `/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/training_scripts_nep_ab/seq_split_canary_gb300`.
+
+## 2026-08-28T12:36:00-07:00 - First full seq7680 allocation timed out, retries lengthened
+
+- Regular GB300 job `2825011` started on two 16-node segments and confirmed all 120 rank-local
+  settings: full ranks 0-63 used sequence 8192, MBS2, and two microbatches; reduced ranks 64-119
+  used sequence 7680, MBS1, and four microbatches; true GBS remained 60. The pending backfill
+  duplicate `2825012` was canceled immediately.
+- Cold container/model setup consumed 5:47 of the eight-minute allocation. Training then ran for
+  about 141.5 seconds before SLURM killed the step at its time limit, just before iteration 1 was
+  logged. There was no OOM or Python traceback. Prior equivalent Ultra first iterations take
+  133.5 seconds; termination-time stacks showed ranks actively distributed across forward,
+  backward, token dispatch, native grad sync, and NEP finalization rather than one common blocked
+  call. This is classified as an undersized allocation, not a completion or failure result.
+- Submitted exact 12-minute replacements `2826164` (GB300 regular) and `2826165` (GB300
+  backfill), with an 11-minute case timeout. No model, topology, batch, profiling, collective, or
+  implementation setting changed.
+
+## 2026-08-28T13:46:00-07:00 - Ultra model-scale memory preflight
+
+- Exact seq7680 retry `2826164` completed one finite update in 133.172 seconds, then reduced
+  rank 69 OOMed in the second grouped-expert forward while requesting 68 MiB with 48.19 MiB
+  physically free. This is a genuine reduced-rank peak deficit; the earlier eight-minute run did
+  not reach the failing second forward.
+- Exact seq7168 retry `2826493` completed one finite update in 132.020 seconds, then unchanged
+  full-owner ranks 0-6 OOMed in the second grouped-expert forward on 124-178 MiB allocations.
+  All full owners reported about 263,999.8 MiB allocated after update 1, matching the other
+  retries, with no cross-iteration allocation growth. The shared transfer dictionary is therefore
+  being cleared; this failure is a model-scale transient peak with negligible headroom, so a
+  further reduced-only sequence cut cannot make the full ranks reliable.
+- Prepared a smaller but memory-representative Ultra NEP preflight without changing production
+  code. It retains the full Ultra layer stack and H/F dimensions, changes 512 experts at
+  EP64/EP56 to 256 experts at EP32/EP24, and uses 16 allocated GB300 nodes (14 active). Full ranks
+  still own eight experts each; reduced ranks own 10-11 rather than the target's 9-10, so expert
+  parameters, owner proxy state, and transfer staging per GPU are at least as stressful. Both
+  replicas use MBS1/GA4; full sequence remains 8192 and reduced sequence is 7168. Jobs `2826597`
+  (regular) and `2826598` (backfill) run four updates with all-rank profiling; the first starter
+  will be retained. The shared benchmark harness was restored immediately after submission.
+
+## 2026-08-28T14:18:00-07:00 - Scaled-preflight limits and exact MBS1 gate
+
+- Both scaled candidates started together; retained regular `2826597` and canceled backfill
+  `2826598`. The 256-expert EP32/EP24 case reached the first optimizer step and OOMed while
+  FusedAdam lazily allocated 40 MiB `exp_avg`/`exp_avg_sq` tensors. EP24 assigns up to eleven
+  logical experts per owner, one above the target EP56 maximum of ten, so this was an intentional
+  over-stress rather than a target-geometry failure.
+- The attempted 240-expert correction `2826675` failed during setup on the source model's
+  requirement that the true expert count divide the full EP32 degree. This is expected: current
+  nondivisible support handles the reduced replica while the source/full degree remains valid.
+- Valid 224-expert EP32/EP24 job `2826732` constructed ten-expert owner buckets, then OOMed in
+  FusedAdam state creation. Its log proves the scaled topology has dense DP size 7, versus 15 in
+  exact EP64/EP56 jobs. The smaller allocation therefore stores more than twice each dense DistOpt
+  shard and cannot reproduce target model-scale memory, despite matching the reduced rank's
+  ten-expert physical/proxy maximum. It remains useful for topology/configuration validation only.
+- Exact 120-rank job `2826857` used the original 512 experts and DP size 15, full MBS1/GA4 at
+  sequence 8192, reduced MBS1/GA4 at sequence 7168, GBS60, 64 buckets, one transfer slot, and
+  all-rank profiling. It completed one finite update in 134.079 seconds. Persistent full-owner
+  allocation after the update was 263,607 MiB, about 392 MiB below the earlier MBS2 run, and no
+  full owner failed. The second forward OOMed only on ten-expert reduced ranks 65, 68, 69, and 71;
+  their 64-88 MiB grouped-expert allocations lacked 56-70 MiB at the transient peak.
+- Submitted exact follow-ups `2826896` (regular) and `2826899` (backfill) changing only reduced
+  sequence 7168 to the next legal value 6656. Full MBS1/GA4, reduced MBS1/GA4, GBS60, profiling,
+  model, topology, DistOpt/Flex configuration, bucket count, and implementation are unchanged.
+
+## 2026-08-28T14:53:00-07:00 - Ultra reduced-rank memory boundary
+
+- Exact seq6656 job `2826896` completed one finite update in 133.989 seconds, then OOMed only on
+  reduced-replica ten-expert ranks 65 and 68 during the second grouped-expert forward. The reported
+  failures requested 58-82 MiB with 48-50 MiB physically free. No full-owner rank failed, confirming
+  that full MBS1/GA4 resolved the separate full-replica transient peak.
+- The 512-token reduction from seq7168 to seq6656 increased worst-rank physical headroom by about
+  30 MiB. Submitted exact seq6144 completion gates `2827381` (GB300 regular) and `2827383` (GB300
+  backfill), the first legal point expected to clear the remaining measured deficit. All other model,
+  topology, optimizer, Flex/HybridEP, bucketing, profiling, and batch settings remain fixed.
+- Initial seq6144 submission `2827381` accidentally captured the unfiltered A/B harness and began
+  the healthy case rather than NEP; it was canceled before an optimizer update. Corrected NEP-only
+  job `2827488` completed one finite update in 134.808 seconds, then reduced rank 68 OOMed in the
+  second grouped-expert forward while requesting 100 MiB with 92.12 MiB physically free. It again
+  had no full-rank failure and narrowed the reduced-rank deficit to about 8 MiB.
+- Submitted exact seq5632 gates `2827559` (GB300 regular) and `2827561` (GB300 backfill). Based on
+  the measured seq6656-to-seq6144 headroom gain, this next legal point should add roughly 40 MiB
+  while changing no other workload or implementation variable.
+
+## 2026-08-28T15:22:00-07:00 - Launch-control canary before the next Ultra gate
+
+- Postmortem showed jobs `2827488` and `2827561` did not capture the temporary full-batch and
+  rank-launcher override controls used by earlier valid Ultra attempts. Their full ranks ran MBS2/GA2
+  and their reduced ranks remained at sequence 8192, so their nominal seq6144/seq5632 OOMs are invalid
+  for the intended memory sweep and must not be used as sequence-scaling evidence.
+- Four-node EP8/EP6 canary `2827714` captured all launch controls together. Logs prove full ranks used
+  MBS2/GA6, reduced ranks used MBS1/GA12, reduced ranks received sequence 7680, and the true GBS stayed
+  168. It completed two finite updates with zero skipped/NaN iterations and wrote all 14 expected
+  profiler traces. The batch job's nonzero terminal status came only from post-run pair analysis
+  looking for the intentionally omitted healthy case; training itself completed successfully.
+- Submitted first valid post-seq6656 Ultra gates `2827807` (GB300 regular) and `2827808` (GB300
+  backfill) at reduced sequence 6144. They captured NEP-only selection, full and reduced MBS1/GA4,
+  the rank-local sequence override, skipped pair analysis, 64 buckets, one transfer slot, and all-rank
+  profiling. The tracked shared harness was restored with no diff immediately after submission.
+- Valid seq6144 job `2827807` completed one finite update in 134.680 seconds, then reduced rank 65
+  OOMed in the second grouped-expert forward while requesting 76 MiB with 58.19 MiB physically free.
+- Exact two-update seq5632 job `2827873` used the correct batch and sequence controls but changed the
+  profiler schedule to start=1/end=2. Its second iteration was the active capture step rather than the
+  warmup step used by seq6144, and its failing reduced rank held about 0.79 GiB more PyTorch allocation
+  despite fewer tokens. That OOM is therefore profiler-schedule-confounded and is not used to infer the
+  sequence-memory trend.
+- Preserved the exact validated captured harness at `/tmp/ultra_validated_submission_harness.sh` and
+  submitted seq5632 jobs `2827932`/`2827934` for three updates with the original start=2/end=3 profiler
+  schedule. This both matches the prior memory condition and emits a one-step all-rank trace.
+- Profiler-matched seq5632 job `2827932` still OOMed in the second grouped-expert forward, on reduced
+  rank 71, requesting 70 MiB with 24.19 MiB physically free. Thus the changed profiler schedule was
+  not the root cause. Across failures PyTorch still reports 2-5 GiB reserved but unallocated, despite
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` already being enabled.
+- Megatron's native `--empty-unused-memory-level 2` calls `torch.cuda.empty_cache()` both before and
+  after the optimizer step; the latter is immediately before the failing second forward and releases
+  fragmentation produced by lazy optimizer-state initialization. Submitted exact jobs `2828890` and
+  `2828894` at reduced sequence 8192, so success would require no sequence reduction. Both retain
+  MBS1/GA4, three updates, matched start=2/end=3 all-rank profiling, and every other Ultra setting.
+- Full-sequence level-2 job `2828890` still OOMed in the second grouped-expert forward. Reduced ranks
+  reported only 4-30 MiB physically free on 70-100 MiB requests, with about 5 GiB reserved but
+  unusable. Native cache emptying therefore does not resolve these fragmented active segments.
+- Submitted conservative seq4096 gates `2829262`/`2829264` for three updates with the original
+  profiler schedule and all other controls fixed. If seq4096 completes, the next point will be seq5120;
+  this bounded search establishes a passing point first, then finds the largest passing sequence
+  without spending another full allocation on every 512-token decrement.
+- A two-update seq4096 run with profiler active on iteration 1 (`2829379`) failed in iteration 2 on
+  full-owner ranks, showing that continuing after trace capture leaves insufficient allocator headroom.
+  Active-last seq4096 job `2829495` then failed during its profiled second update only on full ranks
+  0-7; no reduced rank failed. The worst full-rank deficit was 48 MiB. This establishes reduced
+  sequence 4096 as sufficient and isolates the remaining profiled peak to full sequence 8192.
+- Added optional `FULL_SEQ_LENGTH` handling only to the untracked rank-launch wrapper. Four-node
+  EP8/EP6 canaries `2829663` and `2829665` used full sequence 7680 and reduced sequence 4096; both
+  completed two finite updates, exited 0, and wrote all 14 all-rank traces. Submitted exact EP64/EP56
+  gates `2829702`/`2829704` with the same dual-sequence active-last profile design, MBS1/GA4, GBS60,
+  64 buckets, and one transfer slot.
+
+## 2026-08-28T17:45:00-07:00 - Exact Ultra dual-sequence completion gates
+
+- Exact full-sequence 7680/reduced-sequence 4096 gate `2829702` completed one finite update in
+  136.797 seconds, then OOMed during the profiled second forward only on full-replica ranks. All 120
+  profiler traces were emitted and no reduced-replica rank failed, so the independent rank-local
+  sequence controls are working and full sequence 7680 remains above the reliable profiled peak.
+- Exact midpoint gate `2829799` used full sequence 6144 and reduced sequence 4096. It completed one
+  finite update in 136.761 seconds, then reduced rank 68 OOMed during the profiled second forward on
+  a 36 MiB allocation with 18.19 MiB physically free. Reduced sequence 4096 has therefore passed on
+  one allocation (`2829495`) but failed on another and is not a reliable completion point.
+- Submitted exact gate `2829898` changing only reduced sequence 4096 to 3584. It retains EP64/EP56,
+  512 experts, Flex/HybridEP, distributed optimizer with overlap, MBS1/GA4 on both replicas, GBS60,
+  64 buckets, one transfer slot, forced balancing, graph-off execution, two updates, and an all-rank
+  active-last profiler step. This exact-geometry gate is required because smaller allocations change
+  the dense distributed-optimizer DP shard; the successful EP8/EP6 canaries prove control flow but
+  cannot prove Ultra's model-scale memory headroom.
+- Four-node EP8/EP6 control-path canary `2829982` reproduced the full-sequence 6144/reduced-sequence
+  3584 launcher pair with Flex/HybridEP, distributed optimizer, and all-rank active-last profiling on
+  GB200. It completed both updates with finite loss, zero skipped/NaN iterations, exit code 0, and all
+  14 traces. The queued GB300 duplicate `2829979` was canceled once GB200 started. This rules out a
+  rank-launch/configuration failure but does not replace exact gate `2829898` for Ultra memory proof.
+
+## 2026-08-28T19:45:00-07:00 - Ultra exact-gate continuation
+
+- Exact full-sequence 6144/reduced-sequence 3584 job `2829898` completed one finite update in
+  137.504 seconds and emitted all 120 traces, but full rank 5 OOMed during the profiled second
+  forward on a 50 MiB grouped-expert allocation with 10.19 MiB physically free.
+- Four-node full-sequence 5632/reduced-sequence 3584 canary `2831273` completed both finite profiled
+  updates with exit 0. Exact job `2831270` then completed one finite update in 138.186 seconds but
+  OOMed during the profiled second forward on full ranks 0/4/7 and reduced heavy-owner ranks 64-71.
+  The reduced-side requests were 32-114 MiB with only 4-94 MiB physically free. All 120 traces were
+  emitted. Duplicate exact job `2831272` was canceled during container setup.
+- Exact full-sequence 4096/reduced-sequence 3072 job `2831343` completed one finite update in
+  136.709 seconds. Full ranks were clean, but every reduced ten-expert rank 64-71 OOMed during the
+  profiled second forward on 94-100 MiB grouped-expert allocations; the worst rank had 4.19 MiB
+  physically free. All 120 traces were emitted. This isolates the remaining peak to reduced ranks.
+- Existing same-allocation 64-bucket graph-free A/B `2810439` is the healthy control: healthy used
+  the heavier original MBS2 and sequence 8192, held about 146-147 GiB after optimizer initialization,
+  and completed ten finite updates. Its NEP case held about 264 GiB after one update and failed.
+  Current one-slot NEP gates still report roughly 269.5 GiB live at the failing forward. Thus this is
+  NEP reduced-owner/proxy/optimizer-state headroom, not a generic two-replica Ultra or launcher bug.
+- Submitted exact job `2831719` at full sequence 4096 and reduced sequence 2048. This changes only
+  reduced token load from the latest gate, retaining MBS1/GA4, GBS60, EP64/EP56, 512 experts,
+  Flex/HybridEP, DistOpt overlap, 64 buckets, one transfer slot, forced balancing, graph-off execution,
+  and an all-rank active-last profiler step. Its much-later backfill duplicate `2831726` was canceled.
+- Exact reduced-sequence 2048 job `2831719` completed one finite update in 135.835 seconds and made
+  it through the profiled second forward/backward, past the grouped-expert failures seen at sequence
+  3072. It then OOMed in native `finalize_model_grads._allreduce_non_tensor_model_parallel_grads`
+  while `_flatten_dense_tensors` attempted one 6.89 GiB TP-gradient coalescing allocation. Full ranks
+  had 6.7-6.9 GiB physically free and reduced heavy-owner ranks had about 4.4 GiB; all 120 traces were
+  emitted. This fixed-size native finalize buffer is independent of reduced token count, so further
+  token cuts cannot provide a reliable completion guarantee.
+- The least invasive semantic-preserving candidate is an NEP-gated, deterministic chunking of that
+  native TP-gradient list (for example, at 2 GiB whole-tensor boundaries), reducing peak temporary
+  storage while preserving elementwise all-reduce results and rank order. It would require touching
+  native finalize behavior and add several TP collective launches, so it has not been implemented
+  without explicit approval and a small correctness/performance gate. No experiment jobs remain.
+
+## 2026-08-31 - Training-scripts matrix closed with Ultra failed
+
+- Marked `nemotron3/ultra` failed for the current all-workload NEP sweep. Exact EP64/EP56 retries
+  repeatedly completed one finite update but could not complete a timed steady-state window on
+  GB300. The latest reduced-sequence retry passed the prior grouped-expert peaks, then OOMed in
+  native non-tensor-model-parallel gradient finalization on a 6.89 GiB coalescing allocation.
+- No slowdown is reported for Ultra because there is no valid completed NEP timing window. The
+  other twelve workloads retain their finalized iterations 8-10 healthy/NEP owner-time A/B
+  comparisons; failed Ultra attempts are not extrapolated into a performance result.
+
+## 2026-08-31 - Scaling-ladder slowdown interpretation
+
+- Compared the finalized iterations 8-10 owner-time results from jobs `2786858`, `2786860`,
+  and `2788799`. NEP slowdown is `NEP owner mean / healthy mean - 1`.
+
+| Workload | MBS x GA | EP change | Healthy (ms) | Added NEP time (ms) | Slowdown |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `a315m_1b_moe_88b` | 4 x 3 | 8 to 6 | 684.4 | 27.7 | 4.0% |
+| `a500m_2b_moe_140b` | 1 x 3 | 8 to 6 | 310.8 | 75.1 | 24.2% |
+| `a770m_4b_moe_215b` | 1 x 3 | 8 to 6 | 409.2 | 76.0 | 18.6% |
+| `a1b_7b_moe_310b` | 1 x 3 | 8 to 6 | 457.8 | 82.8 | 18.1% |
+| `a2b_14b_moe_560b` | 1 x 3 | 16 to 12 | 631.8 | 75.4 | 11.9% |
+| `a3b_30b_moe_1t` | 1 x 6 | 32 to 28, TP2 | 1,531.3 | 10.3 | 0.7% |
+
+- This is not a one-variable model-size sweep. The ladder changes MBS, gradient accumulation,
+  EP degree and reduction ratio, TP degree, hidden/FFN dimensions, and hybrid-layer depth. Those
+  settings independently change reshard bytes per rank and the amount of compute available to
+  hide them.
+- The controlled MBS1/GA3/EP8-to-EP6 subset (`a500m`, `a770m`, and `a1b`) does show the
+  expected local trend: absolute NEP critical-path cost stays approximately flat at 75-83 ms,
+  while relative slowdown falls from 24.2% to about 18% as healthy iteration time grows.
+- The `a315m` point is not comparable to that subset because MBS4 supplies roughly four times
+  the per-microbatch token compute without increasing parameter-gradient reshard volume, giving
+  much more overlap opportunity. The `a3b` point additionally uses GA6, TP2, and only a 12.5%
+  EP reduction instead of 25%, so its longer backward window and smaller relative redistribution
+  hide almost all NEP work.
+- Therefore total model size alone does not predict NEP slowdown. The relevant quantity is exposed
+  NEP communication divided by owner critical-path compute. A causal model-size experiment must
+  hold MBS, GA, TP/EP topology and reduction ratio, bucket policy, and routing policy fixed.
+
+## 2026-08-31 - a3b/a8b and Nemotron workload analysis
+
+- Analyzed the finalized A/B artifacts and rank-0/paired-participant traces for jobs `2788305`,
+  `2788799`, `2807728`, and `2801792`. All measured cases used mock data, forced expert
+  balancing, Flex/HybridEP, distributed optimizer, overlap-grad-reduce, and overlap-param-gather.
+  Reported iteration results use iterations 8-10; profiler traces cover steps 5-6 and are used for
+  structural evidence, not substituted for the later end-to-end timing window.
+
+| Workload | Main architecture | MBS x GA | EP change | Healthy (ms) | Added NEP time (ms) | Slowdown |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `a3b_30b_moe_1t` | H2688/F1856, 128 experts, top-k 6, 23 MoE + 23 Mamba + 6 attention | 1 x 2 | 32 to 28, TP2 | 422.9 | 57.4 | 13.6% |
+| `a3b_30b_transformer_moe_1t` | H2688/F1856, 128 experts, top-k 6, 28 MoE + 28 attention | 1 x 2 | 32 to 28, TP2 | 518.2 | 70.7 | 13.6% |
+| `nemotron3/nano` | Same core H/F, MoE, and layer pattern as hybrid a3b; graph-free source recipe | 1 x 2 | 32 to 28, TP2 | 1,067.3 | 58.1 | 5.4% |
+| `a3b_30b_gdp_latentmoe_muon_3t` | H2688/F3712, 256 experts, top-k 11, latent MoE/GDP/MTP, Muon | 1 x 4 | 64 to 56, TP1 | 2,701.5 | 147.9 | 5.5% |
+| `a8b_120b_latentmoe_1t` | H4608/F3072, 512 experts, top-k 6, latent MoE/MTP, 30 MoE layers | 1 x 8 | 16 to 12, TP2 | 5,621.1 | 682.1 | 12.1% |
+| `nemotron3/super` | H4096/F2688, 512 experts, top-k 22, 42 MoE layers, NVFP4 | 1 x 2 | 64 to 56, TP2 | 1,652.2 | -60.8 | parity/noise |
+| `nemotron3/ultra` | H8192/F5120, 512 experts, top-k 22, 50 MoE layers, NVFP4, TP8 | 2 x 2 source | 64 to 56 | N/A | N/A | failed/OOM |
+
+- The hybrid and transformer a3b pair is the cleanest architecture comparison. Transformer has
+  about 22.5% longer healthy time and 23.2% more absolute NEP penalty, leaving the same 13.6%
+  slowdown. Its participant wait is mostly concurrent with other GPU work: owner EDP exposure is
+  8.2 ms versus 0.5 ms healthy, Gather exposure is 0.3 ms, and Scatter exposure is 6.2 ms. The
+  short iteration therefore remains sensitive to fixed staging/scheduling, idle, and tail costs;
+  replacing Mamba with attention does not independently improve parity.
+- Nano shares the hybrid a3b model dimensions, MoE settings, and layer pattern, but its source
+  recipe does not enable local CUDA graphs and adds TP communication overlap/DDP bucket padding.
+  Its absolute NEP penalty is essentially identical to hybrid a3b (58.1 versus 57.4 ms), while its
+  healthy iteration is 2.5 times longer. The lower 5.4% slowdown is therefore amortization, not a
+  lower-volume NEP path. Nano's large EDP participant-wait residency is mostly overlapped; profiler
+  timing is materially perturbed and must not be read as its steady-state slowdown.
+- a8b is the clear difficult case. EP16 assigns 32 experts per rank; reduced EP12 assigns 42 or 43.
+  On the paired heavy reduced rank, the trace shows 82,560 expert GEMM kernels versus 61,440 on the
+  full owner (+34.4%), about 20% more summed expert GEMM time, and about 28% more grouped-backward
+  CPU time. Owner EDP payload rises from 13.59B to 18.26B elements (+34.4%). Matched collective
+  service rises from 242.2 to 328.7 ms, but accumulated owner participant waiting rises from 4.4
+  to 723.0 ms. Rank-0 EDP exposure rises from 95.1 to 595.8 ms, while Gather and Scatter expose
+  only 10.5 and 27.8 ms. Thus a8b's 682 ms slowdown is primarily reduced-replica readiness plus
+  the larger heavy-owner EDP payload, not Gather/Scatter transfer time.
+- The Muon a3b workload is not comparable to the ordinary a3b model despite its name: it doubles
+  F, doubles experts, raises top-k from 6 to 11, uses latent MoE/GDP/MTP and Muon, switches to TP1,
+  and doubles GA. It incurs 148 ms absolute overhead but amortizes it over a 2.7 s iteration.
+  Its 329 ms owner participant wait is mostly hidden: 322.5 of 352.0 ms EDP residency overlaps
+  other GPU work, leaving 29.5 ms exposed; Gather is effectively hidden and Scatter exposes 6.2 ms.
+- Nemotron Super establishes parity, not a speedup. The standard three-iteration window reports
+  -3.7% slowdown, but healthy standard deviation is 74.5 ms, larger than the 60.8 ms mean gap;
+  iterations 9-10 give only a 1.1% apparent NEP speedup. Structurally, 547.5 of 585.5 ms owner
+  EDP residency overlaps other GPU work, Gather is fully hidden, and Scatter exposes about 8 ms.
+  Its deep FP4 workload supplies enough work to absorb the reduced-rank readiness delay.
+- Ultra has no performance result. Repeated exact EP64/EP56 attempts exhausted memory after at
+  least one finite update; the latest attempt reached native gradient finalization and failed on a
+  6.89 GiB coalescing allocation. This is currently a capacity/compatibility failure and cannot be
+  placed on a model-size slowdown trend.
+- Across this set, slowdown tracks heavy reduced-rank expert ownership, expert-gradient payload,
+  and available overlap work more closely than nominal active or total parameter count. Raw
+  milliseconds should also not be compared between the GB300 a3b/a8b/Nano runs and the GB200
+  Muon/Super runs; only each workload's colocated healthy-versus-NEP ratio is valid.
+
+## 2026-08-31 - MBS/GA interpretation and a8b work-balancing options
+
+- Both ordinary a3b workloads use MBS1 and GA2 on every replica. The benchmark-scaled GBS is
+  64 for healthy EP32/EP32 and 60 for NEP EP32/EP28. Increasing total work per synchronization
+  should reduce their roughly 13.6% percentage slowdown because Gather/EDP/Scatter occur once per
+  accumulated update. MBS1/GA4 would imply GBS128/120 and MBS1/GA6 GBS192/180. The nearby
+  scaling-ladder a3b point uses MBS1/GA6 and reaches 0.7% slowdown, but also has two MTP layers,
+  so this is directional evidence rather than an isolated GA result.
+- Merely repartitioning the same local sample count is not predictably beneficial. For example,
+  MBS2/GA1 retains GBS64/60: larger expert GEMMs may be more efficient, but it removes one
+  accumulation window and increases activation memory. Increasing GA at MBS1 is the lower-risk
+  controlled test; increasing MBS while also increasing GBS may help further if memory permits.
+- a8b uses MBS1/GA8 on both full and reduced replicas. Healthy GBS128 gives 64 samples to each
+  full EP16 replica; NEP GBS112 gives 64 to full EP16 and 48 to reduced EP12. This is already a
+  GPU-count-proportional 4:3 assignment. It equalizes nominal routed tokens per GPU but not
+  execution time because reduced ranks own 42-43 experts instead of 32 and execute more, smaller
+  expert operations.
+- Lowering reduced-replica MBS is impossible because it is already one. Lowering its total local
+  batch means fewer reduced microbatches/GA rounds (or fewer tokens), with sample-aware gradient
+  normalization. That should improve owner parity but discards reduced-replica throughput; reducing
+  MBS or sequence length would also make each expert GEMM smaller.
+- Alternatives are: increase only full-replica GA so the reduced replica becomes below proportional
+  without discarding its current work; use a closer reduced degree such as EP14, reducing the heavy
+  ownership ratio from 43/32 to at most 37/32; increase MBS on both sides if memory allows so
+  per-expert kernels become larger; or improve grouped-expert scheduling/fusion. EP14 and full-only
+  GA are the simplest current levers. Bucket/launch tuning can reduce secondary overhead but cannot
+  eliminate a true reduced-replica readiness gap.
+
+## 2026-08-31 - Workload disposition by required tuning
+
+- Filed `a3b_30b_moe_1t` and `a3b_30b_transformer_moe_1t` in the same category as the
+  MBS1 scaling-ladder workloads whose mostly fixed NEP cost is too large relative to a short
+  optimizer update. Their required follow-up is larger work per iteration/update, initially by
+  increasing GA and scaling GBS consistently while retaining MBS1, topology, routing, bucket
+  policy, precision, and model math.
+- Filed `a8b_120b_latentmoe_1t` separately as requiring below-GPU-proportional reduced-replica
+  work. Its reduced EP12 ranks are measurably less efficient than full EP16 ranks because they
+  own 42-43 experts rather than 32 and execute more fragmented expert work. The preferred tuning
+  is fewer reduced GA rounds or more full-replica GA, preserving MBS1 kernel shapes and
+  sample-count-aware gradient normalization. A closer EP16/EP14 topology is an alternative.
+
+| Disposition | Workloads | Required action |
+| --- | --- | --- |
+| Increase work per update to hide/amortize NEP | `scaling_ladder/a500m_2b_moe_140b`, `scaling_ladder/a770m_4b_moe_215b`, `scaling_ladder/a1b_7b_moe_310b`, `scaling_ladder/a2b_14b_moe_560b`, `a3b_30b_moe_1t`, `a3b_30b_transformer_moe_1t` | Increase GA/GBS first; test MBS only if memory allows |
+| Reduced replica needs below-proportional work due to MoE efficiency | `a8b_120b_latentmoe_1t` | Shift work from reduced to full replica, or use a closer reduced EP degree |
+| Current measured overhead already low/parity | `scaling_ladder/a315m_1b_moe_88b`, `scaling_ladder/a3b_30b_moe_1t`, `nemotron3/nano`, `a3b_30b_gdp_latentmoe_muon_3t`, `nemotron3/super` | No immediate work-allocation change |
+| Failed capacity gate | `nemotron3/ultra` | No performance classification until a complete NEP timing window exists |
+
+## 2026-08-31 - Targeted work-allocation tuning setup
+
+- Selected `scaling_ladder/a500m_2b_moe_140b` as the representative fixed-overhead
+  workload because it has the largest measured slowdown in that category (+24.2%) and requires
+  only four nodes. This gives a faster, lower-cost causal test than the 16-node ordinary a3b jobs.
+- Added default-preserving benchmark-harness controls for replica-local MBS and accumulation
+  counts. The wrapper now derives and records the true GBS from topology, MBS, and accumulation;
+  no production NEP implementation file was changed.
+- The a500 experiment keeps MBS1 and increases GA from 3 to 12 on both replicas. Healthy
+  EP8/EP8 therefore uses GBS192 and NEP EP8/EP6 uses GBS168. This isolates whether a longer
+  compute window amortizes and hides the previously measured roughly 75 ms fixed NEP cost.
+- The a8b experiment keeps healthy and full EP16 at MBS1/GA8, while reduced EP12 uses
+  MBS1/GA6. Healthy GBS remains 128 and NEP true GBS becomes 100. This preserves kernel shapes
+  while reducing reduced-replica work below the original GPU-proportional allocation.
+- Validation passed for shell syntax, Python compilation, matrix invariants, whitespace, and
+  shellcheck. Direct-rank dry runs confirmed a500 GBS192/168 and a8b true GBS100, with a8b
+  rank-local accumulation counts of 8 on full owners and 6 on reduced owners.
+- Submitted identical GB200/GB300 candidates for each workload. GB300 a500 job `2861627`
+  and GB300 a8b job `2861632` allocated immediately; pending GB200 duplicates `2861624`
+  and `2861630` were canceled. Both live jobs use segment-4 placement, named Enroot cache
+  reuse, colocated healthy-to-NEP ordering, ten iterations, and all-rank profiles on steps 5-6.
+
+## 2026-08-31 - First tuning results and bounded follow-up
+
+- a500 GA12/12 job `2861627` completed with finite updates and every expected trace.
+  Healthy was `1222.133 +/- 6.099 ms`; NEP was `1366.267 +/- 8.925 ms`, a
+  `144.133 ms` / `11.794%` gap and `89.451%` owner parity. This improves the original
+  `80.544%` parity materially, but does not meet the target.
+- The a500 profile rejects a pure once-per-update fixed-cost explanation. Full owner rank 0
+  executes 13,824 expert GEMMs per profiled iteration while reduced rank 8 executes 19,008
+  (+37.5%). EDP matched service is only about 2.694 ms, but owner participant wait is about
+  525.236 ms in the profiled window because rank 8 is later. Increasing GA therefore adds
+  useful overlap work and also repeats the reduced-replica imbalance.
+- a8b GA8/6 job `2861632` completed with finite updates and every expected trace.
+  Healthy was `5587.800 +/- 33.800 ms`; NEP was `5985.267 +/- 4.278 ms`, a
+  `397.467 ms` / `7.113%` gap and `93.359%` owner parity. This improves the original
+  `89.179%` parity but remains below 95%.
+- Submitted one bounded correction for each workload while retaining the same healthy case:
+  a500 full/reduced GA12/9 (true NEP GBS150) and a8b GA8/5 (true NEP GBS94).
+  GB200 jobs `2861773` and `2861823` allocated first; pending GB300 duplicates
+  `2861779` and `2861827` were canceled.
+- a500 GA12/9 job `2861773` completed with all finite iterations and all 30 expected
+  healthy/NEP traces. Healthy was `1168.167 +/- 8.225 ms`; NEP was
+  `1220.467 +/- 3.650 ms`, a `52.300 ms` / `4.477%` gap and `95.715%` owner
+  parity. This meets the 95% target and improves both relative and absolute overhead.
+- Participant alignment confirms the intended mechanism: rank-0 EDP participant wait fell
+  from about 525.236 ms in the GA12/12 profile to 15.531 ms in GA12/9, while matched
+  EDP service stayed essentially unchanged at 2.687 ms.
+- a8b GA8/5 GB200 job `2861823` completed its healthy leg but failed during NEP setup
+  before iteration 1: the 184.31 GiB GPU had only about 0.5-1.4 GiB free when ranks requested
+  another 1.45-3.40 GiB. This is a hardware-capacity gate, not a performance data point.
+- Resubmitted the unchanged GA8/5 case as GB300 job `2862013`, because GA8/6 already
+  demonstrated that this workload and profiler fit on GB300. The backfill estimate is currently
+  unknown; a regular-partition test-only request estimated 20:22 PDT, so backfill remains active.
+
+## 2026-08-31 - a8b residual-overhead diagnosis
+
+- a8b GA8/5 GB300 job `2862013` completed with all finite iterations and all 60 expected
+  traces. Healthy was `5509.767 +/- 12.426 ms`; NEP was `5887.067 +/- 60.120 ms`,
+  a `377.300 ms` / `6.848%` gap and `93.591%` owner parity.
+- One-node analysis job `2862130` parsed the large profiles without login-node OOM.
+  At GA8/5, full owner rank 0 waits only 2.583 ms for its paired EDP participant, while
+  reduced rank 16 waits 159.508 ms for rank 0. The reduced replica is therefore early.
+  Gather+EDP+Scatter exposure is about 143.525 ms versus 162.014 ms healthy EDP exposure.
+- Therefore another reduced-GA cut is not justified. The remaining profile delta is owner-side:
+  `+291.766 ms` non-NCCL union and `+660.925 ms` idle, partly offset by `-464.310 ms`
+  NCCL union and `+50.033 ms` more overlap. Submitted GB300 job `2862162` with
+  healthy/full GA12 and reduced GA7 to amortize this residual while keeping reduced work low.
+
+## 2026-08-31 - a8b work-allocation tuning result
+
+- a8b GA12/7 GB300 job `2862162` completed successfully with finite updates and all
+  60 expected all-rank profiles. Healthy EP16/EP16 used MBS1/GA12 (true GBS192), while
+  NEP EP16/EP12 used MBS1 with GA12/7 (true GBS138).
+- Healthy was `8627.467 +/- 12.067 ms`; NEP was `8713.100 +/- 54.016 ms`, a
+  `85.633 ms` / `0.993%` gap and `99.017%` owner parity. Increasing the full/healthy
+  work window therefore amortized the residual owner-side overhead without making the
+  reduced replica critical again.
+- Together with a500 GA12/9 at `95.715%` parity, this closes both targeted workload
+  tuning experiments without changing production NEP implementation files. These are
+  owner-iteration-parity configurations; because the reduced replicas deliberately receive
+  below-proportional work, healthy and NEP true GBS differ and aggregate sample throughput
+  must not be inferred from the parity percentages.
+
+## 2026-08-31 - Proportional larger-dispatch experiments
+
+- Defined constant-local-batch experiments that increase tokens per expert dispatch without
+  changing aggregate samples per lane. Both healthy replicas and both NEP replicas use identical
+  MBS and GA, so reduced-replica work remains exactly proportional to its active rank count.
+- a500 changes MBS1/GA3 to MBS3/GA1 at unchanged true GBS48 healthy and GBS42 NEP.
+  a8b changes MBS1/GA8 to MBS2/GA4 at unchanged GBS128/112. The ordinary a3b hybrid,
+  transformer, and Nano workloads change MBS1/GA2 to MBS2/GA1 at unchanged GBS64/60.
+- Representative full/reduced-rank dry runs, wrapper syntax, and ShellCheck passed. Every run
+  retains ten iterations and all-rank PyTorch profiles on steps 5-7; iterations 8-10 are the
+  timing window. No production implementation file was changed.
+- Submitted paired GB300/GB200 backfill candidates and will retain the first starter per scale:
+  a500 jobs `2862743`/`2862744`, a8b jobs `2862745`/`2862746`, and EP32 jobs
+  `2862747`/`2862748`. All six initially wait with unknown start times.
+
+### a8b capacity retry
+
+- GB200 a8b job `2862746` completed the MBS2/GA4 healthy leg, then reduced NEP ranks
+  OOMed before iteration 1 at roughly 178 GiB allocated while requesting another 4 GiB for
+  vocabulary-parallel cross entropy. This is a GB200 capacity failure, not performance data.
+- Canceled pending GB300 sibling `2862745` when GB200 started, then submitted the unchanged
+  capacity-sufficient GB300 retry as job `2862835`. All batch and profiling settings are identical.
+
+### a500 MBS3/GA1 result
+
+- GB200 job `2862744` completed exit 0 with all finite iterations and all 30 expected profiles;
+  its pending GB300 sibling `2862743` was canceled after the GB200 allocation started.
+- Healthy was `245.333 +/- 2.281 ms`; proportional NEP was `265.633 +/- 2.779 ms`, a
+  `20.300 ms` / `8.274%` gap and `92.358%` owner parity. True GBS remained 48/42,
+  exactly matching the original MBS1/GA3 comparison.
+- Relative to the original `80.544%` proportional parity and `75.067 ms` absolute gap, larger
+  expert dispatches materially improve both metrics but do not reach the 95% gate. This supports
+  per-dispatch expert efficiency as a major a500 limiter without claiming it is the only limiter.
+
+### a8b GB300 hardware retry
+
+- GB300 job `2862835` completed three healthy iterations, then every rank in its second
+  four-node segment reported `cudaErrorNvlinkUncorrectable` from HybridEP dispatch. This is a
+  physical NVLink-domain failure and invalidates the run before any timing comparison.
+- Canceled the allocation before it could attempt NEP and submitted unchanged GB300 retry
+  `2863174`, explicitly excluding the failed nodes `theia[0242,0244,0246-0247]`.
+
+### a500 same-hardware control correction
+
+- The initial comparison of MBS3/GA1 job `2862744` against the previously highlighted
+  MBS1/GA3 result from job `2786858` mixed GB200 and GB300 allocations. A same-commit,
+  same-topology, same-GBS GB200 control exists in job `2786652`: MBS1/GA3 measured
+  `309.533 ms` healthy and `342.433 ms` NEP, or `90.392%` owner parity.
+- Against that cleaner hardware-matched control, MBS3/GA1 at `245.333/265.633 ms` improves
+  owner parity by `1.966` percentage points to `92.358%` and reduces the absolute NEP gap by
+  `12.600 ms` (`32.900 -> 20.300 ms`). This is directional evidence that larger dispatches
+  help a500, but it is not parity and the cross-allocation comparison does not isolate node-level
+  variance as tightly as a same-allocation shape A/B would.
+
+### a8b MBS2/GA4 result
+
+- Clean GB300 retry `2863174` completed both legs with finite updates and all requested
+  `32/28` rank traces. Healthy and NEP used MBS2/GA4 at unchanged true GBS128/112, so the
+  reduced EP12 replica remained exactly GPU-count proportional to the full EP16 replica.
+- Healthy measured `4010.133 +/- 27.992 ms`; NEP measured `4778.033 +/- 9.169 ms`, a
+  `767.900 ms` / `19.149%` gap and `83.929%` owner parity. This is worse than the clean
+  MBS1/GA8 proportional result (`89.179%` parity) despite substantially faster healthy runtime.
+- Larger per-dispatch token batches therefore do not recover proportional a8b parity. They
+  improve the healthy shape more than the reduced-EP critical path and widen the relative owner
+  gap; a8b still requires below-proportional reduced work, a closer reduced EP degree, or a
+  deeper owner compute window rather than this constant-work MBS/GA repartition alone.
+
+### EP32 queue split
+
+- Historical job `2788799` showed that each healthy+NEP pair required only about four to seven
+  minutes, while the combined EP32 request reserved 45 minutes and slipped to a late-afternoon
+  estimate. A 15-minute test-only request produced a materially earlier backfill estimate.
+- Replaced combined jobs `2862747`/`2862748` with short per-workload candidates: hybrid a3b
+  `2863510` GB300 and `2863514` GB200, transformer a3b `2863517` GB300 and `2863525`
+  GB200, and Nano `2863528` GB300 and `2863536` GB200. Every valid job retains MBS2/GA1,
+  GBS64/60, ten iterations, and all-rank profiling on steps 5-6.
+- Initial GB200 hybrid submission `2863511` had a misspelled environment key and was canceled
+  while pending; corrected job `2863514` supersedes it. It produced no allocation or result.
+- The two 45-minute jobs were canceled only after all six valid split candidates were queued.
+  For each workload, the pending architecture sibling will be canceled after the first starts.
+### Final proportional larger-dispatch results
+
+- All five valid jobs completed exit 0 with finite timing iterations and every requested all-rank
+  profile: a500 `2862744` (GB200), a8b `2863174` (GB300), hybrid a3b `2863510`
+  (GB300), transformer a3b `2863517` (GB300), and Nano `2863528` (GB300). The
+  unused architecture siblings were canceled without running, and the queue was empty afterward.
+- The constant-work shape changes and owner-rank results were:
+
+  | Workload | Old -> new MBS x GA | Prior parity | New healthy / NEP | New parity | Change |
+  | --- | --- | ---: | ---: | ---: | ---: |
+  | a500 | `1x3 -> 3x1` | 90.392% | 245.333 / 265.633 ms | 92.358% | +1.966 pp |
+  | a8b | `1x8 -> 2x4` | 89.179% | 4010.133 / 4778.033 ms | 83.929% | -5.250 pp |
+  | hybrid a3b | `1x2 -> 2x1` | 88.054% | 359.900 / 401.333 ms | 89.676% | +1.622 pp |
+  | transformer a3b | `1x2 -> 2x1` | 88.000% | 467.900 / 513.233 ms | 91.167% | +3.167 pp |
+  | Nano | `1x2 -> 2x1` | 94.835% | 575.167 / 625.900 ms | 91.894% | -2.940 pp |
+
+- The a500 prior is the hardware-matched GB200 control `2786652`; this corrects the earlier
+  cross-architecture comparison. Its absolute owner gap fell from `32.900` to `20.300 ms`.
+  Hybrid and transformer gaps fell by 27.8% and 35.8%, respectively. None reached the 95%
+  parity target.
+- Constant-work MBS/GA repartitioning is therefore not a general route to parity. It increases
+  tokens per expert per dispatch, but it also removes repeated-microbatch overhead and shortens
+  the healthy iteration without adding compute slack per update. That trade helped a500 and the
+  two ordinary a3b variants, while healthy improved more than NEP for a8b and Nano. For the
+  latter workloads, retain the prior MBS/GA shape when owner parity is the objective; a8b still
+  needs below-proportional reduced work or a closer reduced EP degree.
+- Short 10-minute test-only candidates `2864810`, `2864811`, and `2864813` did not reproduce
+  the earlier favorable estimate and were canceled pending. They consumed no GPU allocation.
+## 2026-09-01 - Proportional higher-work sweep
+
+- Started a bounded follow-up that adds real compute slack instead of keeping per-update work
+  fixed. The first point keeps the larger-dispatch MBS from the previous sweep and restores the
+  source GA on every full and reduced rank: a500 MBS3/GA3 (GBS144 healthy, 126 NEP),
+  a8b MBS2/GA8 (GBS256/224), and hybrid a3b, transformer a3b, and Nano MBS2/GA2
+  (GBS128/120). Full and reduced replicas remain exactly proportional.
+- Every comparison remains a same-allocation healthy/NEP A/B with ten iterations, timing on
+  iterations 8-10, all-rank PyTorch profiles on steps 5-6, forced balanced routing, Flex/HybridEP,
+  distributed optimizer, overlap-grad-reduce, and overlap-param-gather. Production NEP files
+  are frozen.
+- Submitted a500 jobs `2873999` GB200 and `2874001` GB300, a8b job `2874002`
+  GB300, hybrid jobs `2874005`/`2874007`, transformer jobs `2874012`/`2874014`,
+  and Nano jobs `2874015`/`2874017` (GB200/GB300). a500 GB200 started first;
+  canceled later-starting duplicate `2874001`.
+- Initial estimates are 09:28-09:51 PDT for the GB200 EP32 jobs, 11:01 for a8b GB300,
+  and 18:17-19:54 for the GB300 EP32 siblings. Jobs will be polled every five minutes,
+  with duplicate architecture siblings retained only until the first viable starter is confirmed.
+### a500 MBS3/GA3 result
+
+- GB200 job `2873999` completed exit 0 in 8:54 with finite iterations and all 16 healthy plus
+  14 NEP rank traces. Healthy measured `703.833 +/- 15.249 ms`; proportional NEP measured
+  `731.033 +/- 3.062 ms`, a `27.200 ms` / `3.865%` gap and `96.279%` owner parity.
+- Increasing GA from 1 to 3 at the already-improved MBS3 shape raises parity by 3.921 points
+  from 92.358% and clears the 95% target. This supplies actual compute slack while retaining
+  exact proportional work; no second a500 point is needed.
+### a8b MBS2/GA8 result and second point
+
+- GB300 job `2874002` completed exit 0 in 12:01 with finite iterations and all 32 healthy plus
+  28 NEP rank traces. Healthy measured `7996.167 +/- 35.253 ms`; proportional NEP measured
+  `8811.133 +/- 139.177 ms`, an `814.967 ms` / `10.192%` gap and `90.751%`
+  owner parity.
+- Adding real work improves parity by 6.822 points over MBS2/GA4 and by 1.572 points over
+  the original MBS1/GA8 proportional point, but does not clear 95%. Submitted the second
+  bounded point as GB300 job `2874187`: proportional MBS2/GA12, true GBS384 healthy and
+  GBS336 NEP, with unchanged model, topology, profiling, and implementation.
+### a8b MBS2/GA12 result
+
+- GB300 job `2874187` completed exit 0 in 13:45 with finite iterations and all 60 traces.
+  Healthy measured `11892.033 +/- 22.295 ms`; proportional NEP measured
+  `12766.000 +/- 38.462 ms`, an `873.967 ms` / `7.349%` gap and `93.154%`
+  owner parity. This is another 2.403-point gain over GA8, but remains below 95%.
+- Reserve the third bounded point until the EP32 MBS2/GA2 results determine where it has the
+  highest value. No production implementation file changed.
+### Third bounded point
+
+- Submitted GB300 job `2877252` for proportional a8b MBS2/GA20 (true GBS640 healthy,
+  GBS560 NEP). This is the third and final added configuration in the bounded sweep. It keeps
+  activation shape, model, topology, implementation, and all-rank profiling unchanged while
+  increasing only the repeated compute window.
+### GA20 infrastructure retry
+
+- Job `2877252` ended `NODE_FAIL` after 7:26 during healthy initialization because SLURM
+  reported a node failure on `theia0219`; it produced no timing comparison and does not count
+  as a configuration failure. Submitted identical retry `2877884`, excluding `theia0219`
+  plus the previously identified bad nodes. No benchmark setting changed.
+
+### a8b MBS2/GA20 result
+
+- GB300 retry `2877884` completed exit 0 in 17:39 with finite timing iterations and all 32
+  healthy plus 28 NEP rank profiles. Healthy measured `20306.300 +/- 28.171 ms`; proportional
+  NEP measured `21125.600 +/- 79.119 ms`, an `819.300 ms` / `4.035%` gap and `96.122%`
+  owner parity.
+- The absolute owner penalty remains approximately constant across GA8, GA12, and GA20
+  (`814.967`, `873.967`, and `819.300 ms`), while iteration work grows. Raising GA therefore
+  amortizes the fixed NEP critical-path cost: parity improves from `83.929%` at MBS2/GA4 to
+  `90.751%`, `93.154%`, and `96.122%` at GA8, GA12, and GA20. GA20 clears the 95% target
+  while retaining exact proportional work.
+
+### EP32 MBS2/GA2 results
+
+- Both hardware candidates ran during the interrupted session, so neither result was discarded.
+  Every completed comparison has finite iterations 8-10 and all 64 healthy plus 60 NEP profiles:
+
+  | Workload / hardware | Job | Healthy / NEP | Gap | Parity |
+  | --- | ---: | ---: | ---: | ---: |
+  | hybrid a3b / GB300 | `2874007` | `697.533 / 759.267 ms` | `61.733 ms` | `91.869%` |
+  | hybrid a3b / GB200 | `2874005` | `733.733 / 782.500 ms` | `48.767 ms` | `93.768%` |
+  | transformer a3b / GB300 | `2874014` | `908.900 / 961.667 ms` | `52.767 ms` | `94.513%` |
+  | transformer a3b / GB200 | `2874012` | `931.167 / 994.167 ms` | `63.000 ms` | `93.663%` |
+  | Nano / GB200 | `2874015` | `1083.967 / 1225.600 ms` | `141.633 ms` | `88.444%` |
+
+- Against the hardware-matched GB300 MBS2/GA1 controls, MBS2/GA2 improves hybrid a3b by
+  `2.193` parity points (`89.676%` to `91.869%`) and transformer a3b by `3.346` points
+  (`91.167%` to `94.513%`). The latter is close to, but does not clear, the 95% target.
+- Nano GB300 job `2874017` completed the healthy leg and all 64 healthy profiles, then reached
+  NEP process-group initialization before its 12-minute allocation expired. This is an
+  allocation-time failure, not a model or implementation failure, and yields no A/B result.
+
+## 2026-09-02 - Nano GB300 wall-time-only retry
+
+- Submitted job `2885951` with the same EP32/EP28 topology, MBS2/GA2, true GBS128/120,
+  segment 16, ten iterations, profiling window, implementation commit, and container as
+  `2874017`. Only the allocation limit changed from 12 to 20 minutes (`CASE_TIMEOUT=18m`),
+  and artifacts use a new `nano_gb300_r2` directory. Its initial scheduled start is 10:15 PDT.
+
+### Nano first-retry anomaly
+
+- Job `2885951` started early and completed exit 0 in 8:12 with every requested profile. Its raw
+  comparison reported healthy `1135.700 +/- 30.018 ms` and NEP `932.600 +/- 0.173 ms`, or
+  `121.778%` owner parity.
+- This apparent speedup was not accepted as a tuning result. During the profiled iterations,
+  healthy and NEP all-rank step spans were `1292.6` and `1312.5 ms`; the four healthy-only
+  ranks were not outliers; and rank 0 executed exactly 1,104 expert GEMM kernels in both cases.
+  The reversal was confined to the first three post-profiler timing samples and contradicted
+  both the profiles and the prior GB300/GB200 runs.
+
+### Nano extended replication
+
+- Identical-config GB300 job `2886755` completed exit 0 in 10:01 on a different segment. It ran
+  through 20 iterations and averaged iterations 10-20, retaining all-rank profiling on steps 5-6
+  and complete 64 healthy plus 60 NEP traces.
+- Healthy measured `1108.809 +/- 12.114 ms`; NEP measured `1204.727 +/- 12.312 ms`, a
+  `95.918 ms` / `8.651%` slowdown and `92.038%` owner parity.
+- This is only `+0.144` parity points over the hardware-matched MBS2/GA1 GB300 control
+  (`91.894%`), so doubling GA at MBS2 does not materially improve Nano. The first retry is
+  retained as a documented non-reproducible post-profiler artifact, not performance evidence.
+- All three bounded higher-work configurations are now complete. No sequence-length point was
+  needed to establish the main result, and no production implementation file changed.
+
+## 2026-09-02 - Complete training-script workload result ledger
+
+### Audit scope and notation
+
+- Audited every `comparison_*.json` under
+  `/lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/training_scripts_nep_ab`: 45 successful
+  comparison artifacts were found, and all report source commit
+  `8643ab867049f71fb751121366c078ac58f17326`.
+- The three tables below account for all 45 successful artifacts exactly once: 12 accepted/current
+  workload results, 22 valid tuning or hardware-control results, and 11 superseded or diagnostic
+  results. Jobs `2786571` and `2786661` had not previously appeared in the journal and are now
+  explicitly recorded.
+- `EP H -> N` is the pair of expert-parallel replica degrees in the healthy and NEP cases. For
+  example, `8+8 -> 8+6` means two healthy EP8 replicas versus one EP8 and one EP6 replica.
+- Batch notation is `MBS x GA(full/reduced), GBS`; a single GA value means both replicas used it.
+  Times are post-warmup owner-rank iteration means from the comparison artifact. Parity is
+  `healthy mean / NEP owner mean * 100`; values above 100% are retained as measured but are not
+  treated as evidence that NEP is intrinsically faster.
+- Every artifact can be retrieved unambiguously by searching the artifact root above for
+  `comparison_JOB.json`, replacing `JOB` with the listed job ID. `Profiles H/N` records the
+  healthy and NEP trace counts retained by that artifact.
+
+### Accepted/current workload results (12 artifacts)
+
+| Workload | Job / hardware | EP H -> N | Batch H -> N | Healthy ms | NEP ms | Parity | Profiles H/N |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: |
+| `scaling_ladder/a1b_7b_moe_310b` | `2786858` / GB300 | 8+8 -> 8+6 | 1x3,48 -> 1x3,42 | 457.833 | 540.667 | 84.679% | 16/14 |
+| `scaling_ladder/a315m_1b_moe_88b` | `2786858` / GB300 | 8+8 -> 8+6 | 4x3,192 -> 4x3,168 | 684.367 | 712.033 | 96.114% | 16/14 |
+| `scaling_ladder/a500m_2b_moe_140b` | `2786858` / GB300 | 8+8 -> 8+6 | 1x3,48 -> 1x3,42 | 310.767 | 385.833 | 80.544% | 16/14 |
+| `scaling_ladder/a770m_4b_moe_215b` | `2786858` / GB300 | 8+8 -> 8+6 | 1x3,48 -> 1x3,42 | 409.233 | 485.267 | 84.332% | 16/14 |
+| `scaling_ladder/a2b_14b_moe_560b` | `2786860` / GB300 | 16+16 -> 16+12 | 1x3,96 -> 1x3,84 | 631.767 | 707.200 | 89.334% | 32/28 |
+| `a8b_120b_latentmoe_1t` | `2788305` / GB300 | 8+8 -> 8+6 | 1x8,128 -> 1x8,112 | 5621.067 | 6303.133 | 89.179% | 32/28 |
+| `a3b_30b_moe_1t` | `2788799` / GB300 | 16+16 -> 16+14 | 1x2,64 -> 1x2,60 | 422.867 | 480.233 | 88.054% | 64/60 |
+| `a3b_30b_transformer_moe_1t` | `2788799` / GB300 | 16+16 -> 16+14 | 1x2,64 -> 1x2,60 | 518.233 | 588.900 | 88.000% | 64/60 |
+| `nemotron3/nano` | `2788799` / GB300 | 16+16 -> 16+14 | 1x2,64 -> 1x2,60 | 1067.333 | 1125.467 | 94.835% | 64/60 |
+| `scaling_ladder/a3b_30b_moe_1t` | `2788799` / GB300 | 16+16 -> 16+14 | 1x6,192 -> 1x6,180 | 1531.300 | 1541.633 | 99.330% | 64/60 |
+| `a3b_30b_gdp_latentmoe_muon_3t` | `2807728` / GB200 | 64+64 -> 64+56 | 1x4,512 -> 1x4,480 | 2701.500 | 2849.400 | 94.809% | 128/120 |
+| `nemotron3/super` | `2801792` / GB200 | 32+32 -> 32+28 | 1x2,128 -> 1x2,120 | 1652.167 | 1591.367 | 103.821% | 128/120 |
+
+- The Super result is classified as parity/noise, not an NEP speedup claim.
+- `nemotron3/ultra` has no valid completed NEP timing window and remains failed/OOM for this
+  sweep; the exact attempts and memory diagnosis are recorded in the 2026-08-28 entries and the
+  matrix-closure entry. Dense `8b_1t` and `8b_hybrid_1t` are not NEP workloads and remain N/A.
+  These three rows complete the source workload-set disposition beyond the 12 timed rows.
+
+### Valid tuning and hardware-control comparisons (22 artifacts)
+
+| Workload / purpose | Job / hardware | EP H -> N | Batch H -> N | Healthy / NEP ms | Parity | Profiles H/N |
+| --- | --- | --- | --- | ---: | ---: | ---: |
+| `a500m`, matched GB200 control | `2786652` / GB200 | 8+8 -> 8+6 | 1x3,48 -> 1x3,42 | 309.533 / 342.433 | 90.392% | 16/14 |
+| `a500m`, GA12 proportional | `2861627` / GB300 | 8+8 -> 8+6 | 1x12,192 -> 1x12,168 | 1222.133 / 1366.267 | 89.451% | 16/14 |
+| `a500m`, below-proportional reduced GA | `2861773` / GB300 | 8+8 -> 8+6 | 1x12,192 -> 1x(12/9),150 | 1168.167 / 1220.467 | 95.715% | 16/14 |
+| `a500m`, larger dispatch | `2862744` / GB200 | 8+8 -> 8+6 | 3x1,48 -> 3x1,42 | 245.333 / 265.633 | 92.358% | 16/14 |
+| `a500m`, larger dispatch plus GA3 | `2873999` / GB200 | 8+8 -> 8+6 | 3x3,144 -> 3x3,126 | 703.833 / 731.033 | 96.279% | 16/14 |
+| `a8b`, below-proportional GA6 | `2861632` / GB300 | 8+8 -> 8+6 | 1x8,128 -> 1x(8/6),100 | 5587.800 / 5985.267 | 93.359% | 32/28 |
+| `a8b`, below-proportional GA5 | `2862013` / GB300 | 8+8 -> 8+6 | 1x8,128 -> 1x(8/5),94 | 5509.767 / 5887.067 | 93.591% | 32/28 |
+| `a8b`, GA12 with reduced GA7 | `2862162` / GB300 | 8+8 -> 8+6 | 1x12,192 -> 1x(12/7),138 | 8627.467 / 8713.100 | 99.017% | 32/28 |
+| `a8b`, MBS2 GA4 proportional | `2863174` / GB300 | 8+8 -> 8+6 | 2x4,128 -> 2x4,112 | 4010.133 / 4778.033 | 83.929% | 32/28 |
+| `a8b`, MBS2 GA8 proportional | `2874002` / GB300 | 8+8 -> 8+6 | 2x8,256 -> 2x8,224 | 7996.167 / 8811.133 | 90.751% | 32/28 |
+| `a8b`, MBS2 GA12 proportional | `2874187` / GB300 | 8+8 -> 8+6 | 2x12,384 -> 2x12,336 | 11892.033 / 12766.000 | 93.154% | 32/28 |
+| `a8b`, MBS2 GA20 proportional | `2877884` / GB300 | 8+8 -> 8+6 | 2x20,640 -> 2x20,560 | 20306.300 / 21125.600 | 96.122% | 32/28 |
+| `a3b_30b_moe_1t`, MBS2 GA1 | `2863510` / GB300 | 16+16 -> 16+14 | 2x1,64 -> 2x1,60 | 359.900 / 401.333 | 89.676% | 64/60 |
+| `a3b_30b_transformer_moe_1t`, MBS2 GA1 | `2863517` / GB300 | 16+16 -> 16+14 | 2x1,64 -> 2x1,60 | 467.900 / 513.233 | 91.167% | 64/60 |
+| `nemotron3/nano`, MBS2 GA1 | `2863528` / GB300 | 16+16 -> 16+14 | 2x1,64 -> 2x1,60 | 575.167 / 625.900 | 91.894% | 64/60 |
+| `a3b_30b_moe_1t`, MBS2 GA2 hardware sibling | `2874005` / GB200 | 16+16 -> 16+14 | 2x2,128 -> 2x2,120 | 733.733 / 782.500 | 93.768% | 64/60 |
+| `a3b_30b_moe_1t`, MBS2 GA2 | `2874007` / GB300 | 16+16 -> 16+14 | 2x2,128 -> 2x2,120 | 697.533 / 759.267 | 91.869% | 64/60 |
+| `a3b_30b_transformer_moe_1t`, MBS2 GA2 hardware sibling | `2874012` / GB200 | 16+16 -> 16+14 | 2x2,128 -> 2x2,120 | 931.167 / 994.167 | 93.663% | 64/60 |
+| `a3b_30b_transformer_moe_1t`, MBS2 GA2 | `2874014` / GB300 | 16+16 -> 16+14 | 2x2,128 -> 2x2,120 | 908.900 / 961.667 | 94.513% | 64/60 |
+| `nemotron3/nano`, MBS2 GA2 hardware sibling | `2874015` / GB200 | 16+16 -> 16+14 | 2x2,128 -> 2x2,120 | 1083.967 / 1225.600 | 88.444% | 64/60 |
+| `nemotron3/nano`, first GB300 MBS2 GA2 sample | `2885951` / GB300 | 16+16 -> 16+14 | 2x2,128 -> 2x2,120 | 1135.700 / 932.600 | 121.778% | 64/60 |
+| `nemotron3/nano`, extended GB300 MBS2 GA2 replication | `2886755` / GB300 | 16+16 -> 16+14 | 2x2,128 -> 2x2,120 | 1108.809 / 1204.727 | 92.038% | 64/60 |
+
+- Job `2885951` is a mechanically valid successful artifact but its apparent NEP speedup did not
+  reproduce. It is retained for auditability and rejected as performance evidence; `2886755` is
+  the accepted extended replication of that exact configuration.
+
+### Superseded or diagnostic successful comparisons (11 artifacts)
+
+| Workload | Job / run | EP H -> N | Batch H -> N | Healthy / NEP ms | Parity | Profiles H/N | Disposition |
+| --- | --- | --- | --- | --- | ---: | ---: | --- |
+| `a315m_1b_moe_88b` | `2786571` / `gate3_gb200` | 8+8 -> 8+6 | 4x3,192 -> 4x3,168 | 689.533 / 715.233 | 96.407% | 16/14 | Historical pre-final gate; superseded by source-fidelity job `2786858` |
+| `a2b_14b_moe_560b` | `2786661` / `matrix_ep16_gb300` | 16+16 -> 16+12 | 1x3,96 -> 1x3,84 | 625.800 / 694.067 | 90.164% | 32/28 | Historical pre-final matrix point; superseded by `2786860` |
+| `a1b_7b_moe_310b` | `2786752` / `final_ep8_gb300` | 8+8 -> 8+6 | 1x3,48 -> 1x3,42 | 458.200 / 532.800 | 85.998% | 16/14 | Non-source TE op-fuser option remained; superseded by `2786858` |
+| `a315m_1b_moe_88b` | `2786752` / `final_ep8_gb300` | 8+8 -> 8+6 | 4x3,192 -> 4x3,168 | 665.400 / 700.133 | 95.039% | 16/14 | Non-source TE op-fuser option remained; superseded by `2786858` |
+| `a2b_14b_moe_560b` | `2786759` / `final_ep16_gb300` | 16+16 -> 16+12 | 1x3,96 -> 1x3,84 | 626.200 / 714.767 | 87.609% | 32/28 | Non-source TE op-fuser option remained; superseded by `2786860` |
+| `a8b_120b_latentmoe_1t` | `2787055` / `a8b_domainfix_gb300` | 8+8 -> 8+6 | 1x8,128 -> 1x8,112 | 6035.833 / 8035.333 | 75.116% | 32/28 | Source ETP1 was stripped and defaulted to ETP2; superseded by `2788305` |
+| `a3b_30b_moe_1t` | `2787177` / `ep32_gb200bf` | 16+16 -> 16+14 | 1x2,64 -> 1x2,60 | 505.433 / 568.633 | 88.886% | 64/60 | Source ETP1 was stripped/defaulted to ETP2; superseded by `2788799` |
+| `a3b_30b_transformer_moe_1t` | `2787177` / `ep32_gb200bf` | 16+16 -> 16+14 | 1x2,64 -> 1x2,60 | 634.800 / 709.533 | 89.467% | 64/60 | Source ETP1 was stripped/defaulted to ETP2; superseded by `2788799` |
+| `nemotron3/nano` | `2787177` / `ep32_gb200bf` | 16+16 -> 16+14 | 1x2,64 -> 1x2,60 | 1129.800 / 1252.200 | 90.225% | 64/60 | Source ETP1 was stripped/defaulted to ETP2; superseded by `2788799` |
+| `scaling_ladder/a3b_30b_moe_1t` | `2787177` / `ep32_gb200bf` | 16+16 -> 16+14 | 1x6,192 -> 1x6,180 | 1794.933 / 1899.767 | 94.482% | 64/60 | Source ETP1 was stripped/defaulted to ETP2; superseded by `2788799` |
+| `a1b_7b_moe_310b` | `2788215` / `etp_fix_smoke_gb300` | 8+8 -> 8+6 | 1x3,48 -> 1x3,42 | 467.933 / 558.000 | 83.859% | 16/14 | Valid ETP parser smoke/repeat; canonical source-fidelity baseline remains `2786858` |
+
+This ledger is the authoritative result index for the workload-set sweep as of 2026-09-02. Failed
+launches, OOMs, scheduler events, profiler diagnoses, and the reasoning behind each accepted or
+rejected result remain in their dated entries above; they are not silently converted into timing
+results here.
+
+## 2026-09-02: Same-workload parity-gap decomposition (a500m GA1 versus GA3)
+
+### Selection and controls
+
+- Chose two `scaling_ladder/a500m_2b_moe_140b` A/B jobs with materially different parity:
+  job `2862744` at MBS3/GA1 (92.358%) and job `2873999` at MBS3/GA3 (96.279%).
+- Both jobs used GB200, four nodes, segment size four, source commit
+  `8643ab867049f71fb751121366c078ac58f17326`, and the same healthy EP8+8 versus NEP EP8+6
+  topology. The model is identical: 27 layers, hidden size 1024, MoE FFN size 640, 128 experts,
+  top-k 6, sequence length 8192, TP1/CP1/PP1, Flex/HybridEP, distributed optimizer, eight DDP
+  buckets, and forced balanced routing.
+- A full parsed Megatron-argument diff found only the expected global/evaluation batch-size change
+  (healthy/NEP GBS 48/42 to 144/126) and the output path. This isolates the comparison to three
+  versus one gradient-accumulation steps. A tempting 90.392% comparison from job `2786652` was
+  rejected because its Transformer Engine op-fuser setting differed.
+- An a8b GA4/GA20 pair was also screened and had matching arguments apart from batch size, but its
+  76-79 MB compressed rank-zero traces exceeded the bounded login-node analysis attempt. No result
+  was inferred from that incomplete analysis.
+
+### Measured result and trace attribution
+
+The stacked chart is anchored to the unprofiled post-warmup timing gap. Trace-derived categories are
+mutually exclusive exposed intervals on the NEP owner rank, with the healthy exposed residency
+subtracted for collectives present in both modes. The residual is kept explicit because profiler
+host perturbation makes the traced iteration spans unsuitable as substitutes for the measured
+iteration means.
+
+| Configuration | Healthy | NEP owner | Gap | Slowdown | Parity |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| MBS3, GA1 | 245.333 ms | 265.633 ms | 20.300 ms | 8.274% | 92.358% |
+| MBS3, GA3 | 703.833 ms | 731.033 ms | 27.200 ms | 3.865% | 96.279% |
+
+| Exposed contribution | GA1 ms (% healthy) | GA3 ms (% healthy) |
+| --- | ---: | ---: |
+| Incremental expert EDP | 4.847 (1.976%) | 15.171 (2.156%) |
+| Default/other synchronization delta | 0.858 (0.350%) | 7.397 (1.051%) |
+| Scatter | 1.946 (0.793%) | 1.817 (0.258%) |
+| NEP staging | 2.327 (0.948%) | 1.987 (0.282%) |
+| Gather | 0.196 (0.080%) | 0.000 (0.000%) |
+| Unattributed measured residual | 10.127 (4.128%) | 0.828 (0.118%) |
+| **Total measured gap** | **20.300 (8.274%)** | **27.200 (3.865%)** |
+
+### Why parity differs
+
+- Healthy useful iteration time grows 2.869x from GA1 to GA3, while the absolute NEP gap grows only
+  1.340x. The higher parity is therefore overhead amortization and additional overlap opportunity,
+  not removal of the NEP communication.
+- Scatter plus NEP staging stays nearly fixed in absolute time (4.272 ms at GA1 versus 3.804 ms at
+  GA3), so its relative cost falls from 1.741% to 0.540% of healthy time. Gather changes from
+  0.196 ms exposed to fully hidden.
+- Expert EDP executes the same operation counts and payloads in both configurations: healthy has
+  eight operations totaling 503,316,480 elements and NEP has 16 totaling 692,060,160 elements.
+  Matched collective service remains approximately 1.99 ms healthy and 2.88-2.95 ms NEP. The large
+  GA3 EDP residency is participant-arrival waiting, not transfer growth; 112.393 of 129.035 ms is
+  concurrent with other GPU work. Incremental exposed EDP remains approximately 2% of healthy time
+  in both runs, so it does not explain the parity improvement.
+- The GA1 residual is not assigned to a specific kernel without evidence. It can contain fixed
+  host/runtime/launch costs and cross-allocation measurement effects. Each parity remains a valid
+  same-allocation healthy/NEP A/B, but the trace data do not justify a finer causal label for that
+  residual.
+
+### Artifacts
+
+- Analysis utility: `scripts/nonuniform/analyze_workload_parity_pair.py` (analysis only; no NEP or
+  training implementation files changed).
+- Primary measured-gap chart:
+  `/lustre/fsw/coreai_comparch_sysarch/darfeen/analysis/nep_workload_parity/a500_ga1_ga3_2862744_2873999/overhead_breakdown.png`.
+- Detailed profile timeline chart:
+  `/lustre/fsw/coreai_comparch_sysarch/darfeen/analysis/nep_workload_parity/a500_ga1_ga3_2862744_2873999/profile_timeline_breakdown.png`.
+- Machine-readable metrics:
+  `/lustre/fsw/coreai_comparch_sysarch/darfeen/analysis/nep_workload_parity/a500_ga1_ga3_2862744_2873999/overhead_breakdown.json`.
+
+## 2026-09-02: Exact-closure alternative and amortization qualification
+
+- Screened two additional pairs with the rank-zero named-operation attribution. The a3b MBS2
+  GA1/GA2 pair left 8.20%/7.32% of healthy time unattributed. The same-allocation scaling-ladder
+  a1b/a315m pair left 14.31%/1.94% unattributed. Neither is suitable for a causal stacked chart.
+- Selected the historical Scatter N=4 versus N=1 experiment because it holds the workload fixed and
+  has exact trace closure. Both use GB200, the same 14-stage model (six Mamba, two attention, and six
+  MoE layers), H=2688, MoE F=1856, 144 experts, top-k 6, sequence length 18,432, TP2/CP1/ETP1,
+  healthy EP16+16 versus NEP EP16+12, full/reduced MBS4/1, GA1, and exact-uniform routing. Logged
+  settings differ in Scatter chunks only: four for jobs 2484783/2484810 and one for
+  jobs 2484849/2484884.
+- Unprofiled post-warmup timing improves from 549.070 -> 590.190 ms (41.120 ms gap, 93.033%
+  parity) at N=4 to 552.480 -> 579.840 ms (27.360 ms gap, 95.281% parity) at N=1.
+- Each profiled backward gap is the exact identity
+  NCCL union delta - NCCL/non-NCCL overlap delta + non-NCCL union delta + GPU-idle delta.
+  Folding overlap into NCCL gives strictly stacked components:
+
+| Scatter chunks | NCCL delta net of overlap | Non-NCCL delta | GPU-idle delta | Profile gap | Residual |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 17.722 ms | 3.964 ms | 22.365 ms | 44.051 ms | 0.000 ms |
+| 1 | 19.232 ms | 5.253 ms | 8.624 ms | 33.109 ms | <0.000000000001 ms |
+
+- The causal difference is scheduler drain idle, not reduced collective service. Final-drain idle
+  falls from 23.32 to 10.63 ms (-12.69 ms), closely matching the unprofiled NEP-gap reduction from
+  41.12 to 27.36 ms (-13.76 ms). This is a historical scheduler A/B, not the current production
+  implementation.
+- Replacement chart:
+  /lustre/fsw/coreai_comparch_sysarch/darfeen/analysis/nep_exact_closure/scatter_n4_n1_2484810_2484884/exact_backward_overhead_stacked.png
+  Machine-readable values:
+  /lustre/fsw/coreai_comparch_sysarch/darfeen/analysis/nep_exact_closure/scatter_n4_n1_2484810_2484884/exact_backward_closure.json
+
+### What the a500 GA1/GA3 result establishes
+
+- It supports a **fixed or sublinear per-optimizer-update cost**, not the universal statement that
+  all NEP overhead is fixed. With unchanged expert buckets, Gather/EDP/Scatter operation counts and
+  payloads are identical at GA1 and GA3. Scatter plus staging is approximately constant
+  (4.272/3.804 ms), while healthy owner work grows 2.869x and the measured absolute gap only
+  1.340x. Its percentage cost is therefore amortized.
+- Increasing GA does not give the reshard three backward passes to hide under: Megatron suppresses
+  gradient synchronization on accumulation microbatches and launches it on the final microbatch.
+  Larger MBS or more compute after an early bucket-ready point can increase the actual overlap
+  window; larger GA primarily dilutes the once-per-update communication and launch cost.
+- Participant readiness, reduced-replica work imbalance, NCCL interference, and exposed fractions
+  remain workload-dependent and can grow nonlinearly. The practical conclusion is conditional:
+  NEP is tolerable when per-update useful work is large relative to its exposed once-per-update
+  critical path, not merely whenever the nominal model or batch is large.
+
+## 2026-09-08: Failure-category before/after plots
+
+Created one stacked before/after plot for each performance failure category identified in the
+original workload sweep. The stacks use mutually exclusive owner-rank timeline states and close
+exactly to the profiled NEP-minus-healthy iteration-span delta. Positive values are added NEP time;
+negative values are NEP credits. These are exact timeline identities, not independent causal costs,
+so the measured unprofiled parity is shown separately.
+
+### Category 1: insufficient work to amortize NEP
+
+- Used the same `a8b_120b_latentmoe_1t` workload, topology, and proportional reduced-replica work.
+  Only gradient accumulation/global batch changes: job `2863174` is MBS2/GA4 and job `2877884` is
+  MBS2/GA20.
+- Measured post-warmup timing changes from 4010.133 -> 4778.033 ms (83.929% parity) to
+  20306.300 -> 21125.600 ms (96.122% parity).
+- Healthy work grows 5.064x, while the measured absolute NEP gap remains approximately fixed
+  (767.900 versus 819.300 ms). The profiled signed delta similarly remains approximately fixed
+  (1101.717 versus 1081.091 ms), dropping from 24.294% to 4.631% of the healthy profiled span.
+  This is the clean amortization signature.
+
+### Category 2: reduced-replica readiness imbalance
+
+- Used `scaling_ladder/a500m_2b_moe_140b`, MBS1, healthy EP8+8 versus NEP EP8+6, and full-replica
+  GA12. Job `2861627` uses proportional reduced GA12; job `2861773` reduces it to GA9.
+- Measured timing changes from 1222.133 -> 1366.267 ms (89.451% parity) to
+  1168.167 -> 1220.467 ms (95.715% parity).
+- The all-rank EDP participant-wait signal falls from 525.236 to 15.531 ms, while matched transfer
+  service is unchanged (2.694 versus 2.687 ms). The profiled signed span delta falls from
+  471.551 ms (28.230%) to 21.665 ms (1.357%).
+- The before case ran on GB300 and the after case on GB200. Each parity is a valid allocation-local
+  healthy/NEP A/B, and the unchanged collective service plus participant-wait collapse supports the
+  readiness diagnosis. Cross-case absolute milliseconds should not be treated as a hardware A/B.
+
+### Category 3: Nemotron Ultra capacity/compatibility
+
+- Ultra did not produce a valid post-warmup timing pair, so no before/after latency stack or parity
+  is claimed.
+- Job `2801307` had approximately 216.5 GiB occupied at graph capture and later exhausted memory.
+  After retained-staging lifetime fixes and token cuts, job `2831719` reached native gradient
+  finalization with approximately 4.4 GiB free, where a 6.89 GiB native coalescing allocation was
+  requested: approximately 2.49 GiB short.
+- The fixes removed avoidable retained-transfer memory and moved the failure later, but did not
+  resolve the workload. The third plot is therefore an explicit unresolved-capacity chart.
+
+### Artifacts and validation
+
+- Plot utility: `scripts/nonuniform/plot_nep_failure_categories.py`.
+- The large a8b traces are parsed through a bounded-memory streaming path added to
+  `scripts/nonuniform/analyze_workload_parity_pair.py`; its output was verified exactly equal to the
+  existing in-memory parser on a representative trace.
+- Final plots:
+  `/lustre/fsw/coreai_comparch_sysarch/darfeen/analysis/nep_failure_categories/final/category1_amortization_a8b.png`,
+  `/lustre/fsw/coreai_comparch_sysarch/darfeen/analysis/nep_failure_categories/final/category2_readiness_a500.png`,
+  and
+  `/lustre/fsw/coreai_comparch_sysarch/darfeen/analysis/nep_failure_categories/final/category3_ultra_capacity_unresolved.png`.
+- Machine-readable inputs and plotted values:
+  `/lustre/fsw/coreai_comparch_sysarch/darfeen/analysis/nep_failure_categories/final/failure_category_plot_data.json`.
+- No training or NEP implementation files were changed for this analysis.
+
+## 2026-09-08: Category-1 native-state attribution correction
+
+- The increase in the signed `native_comm_only` delta from 241.103 ms at GA4 to 514.394 ms at
+  GA20 is not caused by a classifier change. Healthy and NEP launch identical owner-rank model-EP
+  kernel counts within each case: 4,800 kernels at GA4 and 24,000 at GA20.
+- HybridEP `device_sync_kernel<16>` accounts for 225.880 of the 230.389 ms GA4 model-EP
+  residency delta and 610.811 of the 619.277 ms GA20 delta. Other dispatch/combine kernel
+  residencies are nearly unchanged between healthy and NEP. The plotted native category therefore
+  primarily represents accumulated model-EP participant polling/waiting, not extra operations or
+  payload transfer.
+- At GA20, 89.394 ms of the larger model-EP residency delta is classified as overlap, leaving
+  529.883 ms as model-EP-only. Classification thus reduces the blue segment; it does not explain
+  its increase. Dense-DP and other-native deltas then bring the complete native-only value to
+  514.394 ms.
+- GA20 has five times as many HybridEP synchronization kernels. The per-kernel NEP-minus-healthy
+  `device_sync_kernel` penalty falls from approximately 156.9 us at GA4 to 84.8 us at GA20, but
+  its accumulated absolute difference still grows. Both jobs use GB300 but are separate
+  allocations, so cross-job absolute polling durations are not a controlled node-level A/B.
+
+## 2026-09-08: Category-1 state redistribution at GA20
+
+- The exact stack is occupancy accounting, not a migration of causal cost between named
+  operations. From GA4 to GA20, the NEP-minus-healthy components change by +273.291 ms native-only,
+  -287.457 ms expert-EDP-only, +92.004 ms overlap, -104.360 ms idle, and +5.896 ms across the
+  remaining states. These changes sum to the -20.626 ms change in profiled span delta.
+- Expert EDP did not disappear. On the NEP owner its total residency changes only
+  383.164 -> 321.907 ms, while residency overlapping another activity changes
+  40.118 -> 272.506 ms. Its exposed residency therefore falls 343.046 -> 49.401 ms. Healthy
+  exposed EDP remains similar at 85.643 -> 79.454 ms. Most of the pink-bar reduction is EDP moving
+  into an overlap state, plus a 61.257 ms reduction in NEP EDP residency.
+- Almost all incremental overlap is comm/comm: the signed compute/comm delta changes
+  6.486 -> 4.454 ms, while comm/comm changes 1.910 -> 95.946 ms. The EDP any-overlap delta net of
+  compute changes by 90.206 ms, and model-EP overlap changes by 89.133 ms, identifying EDP plus
+  native model-EP co-residency as the dominant green segment. This is not evidence of useful
+  compute hiding EDP.
+- Idle does not literally fall in either raw timeline. Healthy idle grows
+  1096.967 -> 3882.461 ms and NEP idle grows 1553.308 -> 4234.442 ms as the iteration becomes
+  longer; only the signed NEP-minus-healthy excess falls 456.341 -> 351.981 ms. In the two GA20
+  steps, native-only delta varies approximately 704.863 -> 323.925 ms while idle delta varies
+  181.545 -> 522.416 ms, despite stable total profile gaps of 1087.992 and 1074.190 ms. This
+  demonstrates that polling-kernel residency versus device-idle classification is phase-sensitive.
+- The robust conclusion remains amortization of a similar end-to-end penalty. The two-step,
+  separate-allocation state composition does not establish that a causal overhead source changed.
+
+## 2026-09-08: Category-1 HybridEP participant-wait decomposition
+
+- The GA20 owner trace contains 7,200 HybridEP `device_sync_kernel<16>` events per iteration:
+  30 MoE layers times 12 internal synchronization points per layer times 20 microbatches. The
+  610.811 ms mean NEP-minus-healthy increase in these kernels is therefore approximately 84.8 us
+  per synchronization point when averaged across all launches; individually small readiness
+  skews accumulate into a large summed residency.
+- All-rank ordinal matching across the full-replica TP-rank-0 model-EP group
+  `[0, 2, 4, 6, 8, 10, 12, 14]` separates rank-0 participant-arrival wait from the tail after the
+  latest participant arrives. In profile step 5, NEP adds 1,111.423 ms of arrival wait while the
+  matched post-arrival tail is 313.691 ms shorter. In step 6, NEP adds 1,037.021 ms of arrival wait
+  while the post-arrival tail is 625.690 ms shorter. Thus the large model-EP delta is participant
+  polling, not increased dispatch/combine payload-transfer service.
+- The penalty is not a uniform per-call tax. The first microbatch alone contributes 295.404 ms in
+  step 5 and 252.490 ms in step 6. Across the full step, rank 8 is the latest participant for
+  3,336/7,200 and 4,304/7,200 synchronization points; rank 10 causes the largest repeated
+  first-microbatch waits, approximately 20--30 ms each at recurring synchronization ordinals.
+- Expert GEMM work does not explain the dominant skew in these traces. Ranks 0, 8, and 10 each
+  launch exactly 7,680 expert GEMMs in the first microbatch and 153,600 per profiled step. Rank 10
+  has only approximately 3--4 ms more first-microbatch expert-GEMM residency than rank 0, far below
+  the 252--295 ms first-microbatch wait delta, while rank 8 has less total expert-GEMM residency
+  than rank 0 despite most often arriving latest.
+- On both the early and late ranks, every inspected long synchronization kernel immediately follows
+  its approximately 1--2 us `update_expected_value_kernel` on the same stream, with a sub-2-us
+  gap. No long same-stream GPU kernel is queued directly ahead of the rendezvous. The readiness
+  skew is already present before that HybridEP synchronization sequence is reached. Its exact
+  upstream source remains to be attributed across host launch timing and dependencies on other
+  streams; it is not yet justified to assign it to expert imbalance, model-EP bandwidth, or a
+  specific NEP collective.
+- These are summed residency results, not additive critical-path costs. A polling kernel can replace
+  timeline time otherwise classified as GPU idle or overlap another collective, so the 610.811 ms
+  synchronization-residency increase must not be added directly to the measured iteration gap.
+
+## 2026-09-09: Controlled failure-mechanism figures
+
+- Added `scripts/nonuniform/plot_nep_failure_mechanism_details.py` to keep three measurements
+  distinct: exact rank-local profiler-step phase accounting, non-additive operation
+  residency/overlap, and clock-independent cross-rank participant-duration comparisons.
+- Category 1 uses the existing a8b MBS2 GA4/GA20 traces. The post-profiler timing gap remains
+  nearly fixed at 767.9 versus 819.3 ms while owner-time parity rises from 83.93% to 96.12%.
+  In the traces, rank-0 exposed expert-EDP residency falls from 343.0 to 49.4 ms because the
+  longer iteration supplies more overlap opportunity. This supports amortization; summed native
+  polling residency is not interpreted as additive causal cost.
+- The previous category-2 profiles were invalid for a precise before/after attribution because
+  GA12/12 job 2861627 used GB300 and GA12/9 job 2861773 used GB200 on separate allocations.
+  Controlled job 2977274 ran healthy/NEP GA12/12 and healthy/NEP GA12/9 sequentially on the same
+  four GB300 nodes and segment, with all-rank profiling in steps 5--6.
+- In controlled job 2977274, proportional GA12/12 measured 1205.7 ms healthy versus 1471.7 ms
+  NEP: a 266.0 ms gap and 81.93% owner-time parity. GA12/9 measured 1206.7 ms healthy versus
+  1238.3 ms NEP: a 31.6 ms gap and 97.45% mean parity. The latter mean is inflated by one healthy
+  timing outlier (1158.5, 1169.7, 1291.9 ms); median parity is 94.41%, and the profiled rank-0
+  phase-span ratio is 93.60%. Only the reduced replica accumulation count changed between the NEP
+  cases, so the mechanism comparison remains controlled even though the three-sample timing mean
+  is not a precise parity estimate.
+- Rank-0 expert-EDP residency changes from 673.9 ms at GA12/12 to 20.9 ms at GA12/9, while the
+  minimum participant-duration service proxy is stable at 2.53 ms. Rank-0 excess participant
+  residency therefore falls from 671.4 to 18.4 ms. This directly identifies reduced-replica
+  readiness, rather than EDP transfer service, as the mechanism removed by below-proportional
+  work. Residency is still non-additive and is not summed with the iteration gap.
+- Corrected an earlier exploratory category-1 accounting error: ranks
+  `[0, 2, 4, 6, 8, 10, 12, 14]` were not the complete full replica for topology EP16/EP12 with
+  TP2. The final analysis scans all full-replica ranks 0--15 and avoids cross-rank timestamp
+  subtraction. Earlier per-rank ordinal conclusions based on the incomplete even-rank set should
+  not be used.
+- Final six-figure source directory:
+  `/lustre/fsw/coreai_comparch_sysarch/darfeen/analysis/nep_failure_mechanisms_controlled_20260909`.
+  `mechanism_details.json` contains the plotted values.
+
+## 2026-09-09: Audit retracts completion of the overhead explanation
+
+- Full findings: `NEP_FAILURE_MECHANISM_AUDIT.md`. The six plots establish useful
+  observations but do not complete the promised causal explanation. The previous
+  completion claim is withdrawn.
+- EDP's 673.9 -> 20.9 ms combines gradient reduce-scatter and parameter all-gather.
+  In controlled NEP these are 604.879 -> 1.690 ms and 69.016 -> 19.218 ms on rank 0.
+  Healthy has four calls per operation type; NEP has eight. Raw traces confirm this.
+- Rank 8's grad RS changes 1.682 -> 281.960 ms while rank 0's falls. This supports
+  reversal of readiness skew, not removal of job-wide waiting. Minimum participant
+  duration is not proven transfer service; earlier exact-service claims are withdrawn.
+- The profiled gap falls 511.6 -> 117.1 ms, mainly through a 460.5 ms reduction in
+  the post-optimizer CPU phase delta, offset partly by 77.2 ms more forward/inter-MB
+  delta. The dependency explanation is still missing. These profile gaps differ
+  from logged gaps of 266.0 -> 31.6 ms and cannot be used interchangeably.
+- GA12/9 mean parity of 97.45% depends on a slow healthy sample; median parity is
+  94.41%. These three samples do not establish reliable >=95% parity.
+- Category-1 amortization remains supported. Whole-step minimum polling subtraction
+  does not identify the responsible peer or per-operation waiting.
+- Published overlap labels visibly collide; figures are not final explanatory
+  deliverables. This audit made no implementation changes or benchmark submissions.
+
+## 2026-09-09: GPU-progress attribution and longer readiness confirmation
+
+- Implementing the approved follow-up without changing training implementation.
+  New analysis correlates model-backward kernels with CPU autograd scopes, excludes
+  NEP/AccumulateGrad staging, and uses GPU Adam annotations rather than CPU Adam
+  submission to define optimizer execution. Interval masks count overlap once.
+- The old controlled a500 rank-0 GPU gradient drain changes from 514.74 ms at
+  GA12/12 to 12.27 ms at GA12/9. The apparent post-optimizer tail was largely
+  outstanding GPU gradient reductions: CPU Adam submission had finished, but GPU
+  Adam had not run. Reduced peers show the complementary readiness change.
+  This does not establish why every upstream model-EP delay occurs.
+- DistOpt owner-transfer broadcasts redistribute parameters, not gradients.
+  New results distinguish these from gradient Gather, gradient reduce-scatter,
+  and parameter all-gather; old generic Scatter/EDP labels were ambiguous.
+- Initial all-event analysis exhausted host memory (exit 137). Replaced it with
+  bounded-memory streaming; generated output remains under Lustre.
+- Confirmation job 2977756 was canceled after healthy trained but failed during
+  profiler teardown: train-iters=32 ended before profile-step-end=33. No training
+  implementation change was made. Its timing window also touched profiler warmup;
+  these results are excluded from the confirmation.
+- Corrected job 2977799 uses four GB200 nodes lyris[0038-0039,0042,0046], segment=4,
+  selected from gb200-backfill,gb300-backfill. Two rounds reverse workload and
+  healthy/NEP order. Each case has 35 iterations, timing 11--30, profiling 32--33
+  with stop at 34. Both GA12/12 and GA12/9 retain all-rank PyTorch traces.
+  The first proportional pair reports 96.073% parity, unlike the old 81.926%;
+  longer warmup, different allocation, and GB200 versus GB300 prevent attributing
+  that discrepancy to a single cause. Awaiting both reversed-order rounds.
+- Only timing-window/order support in the benchmark harness and analysis tools
+  changed. Training checkout remains at 99ae923603b295c72372af85bc1bffe5c39bf8b2
+  plus its preexisting edits; nonuniform_ep.py SHA256 is
+  4676f164a95255bdcc7e2531a06ca92c41a2583bf6f9a7a85b3b74b64f26f2d1.
+
+### Confirmation preemption and recovery
+
+- Job 2977799 was PREEMPTED after 30:05, not an NEP failure. Seven cases
+  completed, including three valid A/B pairs; the final healthy launch was killed
+  before producing timing samples. Complete pair parities: round1 proportional
+  96.073%, round1 GA12/9 95.226%, round2 GA12/9 101.449%. The incomplete fourth
+  pair is excluded. These do not reproduce the historical 81.93 -> 97.45% trend.
+- Submitted recovery 2978113 with CONFIRM_ROUNDS=2 and a 25-minute limit. It
+  started immediately on GB200 lyris[0080,0083,0085-0086], segment=4. It reruns
+  only the two reverse-order A/B pairs. Comparisons remain same-allocation within
+  each pair, but this recovery is a different allocation from round1; do not
+  describe the resulting combined dataset as one-allocation eight-case ABBA.
+- Added a round selector to the wrapper only; no model, batch, profiler, optimizer,
+  or NEP settings changed. Training implementation hash remains identical.
+- New a8b scope analysis records 4500 DtoD copies per iteration in parameter
+  redistribution and 2580 in gradient staging. For GA4/GA20, respectively, those
+  scopes contain 152.82/136.70 and 104.57/89.36 ms with no recorded GPU activity.
+  Correlated next-operation host submission is later than the preceding GPU work
+  for 92.04/84.06 and 60.52/51.96 ms of those idle intervals. This is direct
+  evidence of a material fixed host-submission component, not a claim that the
+  entire ~1.1 s profiled gap has been explained.
+- Added four CPU-only analysis regression tests, all passing. Isolated analysis
+  dependencies live on Lustre; Black was pinned to compatible 24.10.0 after its
+  version check rejected 26.5.1. No training dependencies were changed.
+
+### Completed recovery and interpretation limits
+
+- Recovery 2978113 COMPLETED with exit 0 in 16:30. GA12/9: healthy
+  1259.385 +/- 2.286 ms, NEP 1319.525 +/- 6.050 ms, parity 95.442%.
+  GA12/12: healthy 1208.800 +/- 3.409 ms, NEP 1282.050 +/- 10.345 ms,
+  parity 94.286%. Each distribution has 20 samples; both cases retain all 16/14
+  healthy/NEP rank traces. Before/after training implementation hashes match.
+- Five valid comparisons across the original and recovery allocations now exist.
+  Proportional parity is 94.29--96.07%; GA9 is 95.23--101.45%. The historical
+  81.93 -> 97.45% improvement is not reproduced as a stable general effect.
+  Within-run drift is retained: original GA9 NEP rises from ~1234 to ~1310 ms
+  during the timing window. Do not treat all samples as stationary independent noise.
+- Runtime arguments confirm random-logit force-load-balancing, not exact uniform
+  routing. This was preserved and is documented as a possible confound, not a
+  proven cause of drift. a8b expert latent input is 1152, distinct from model H4608;
+  its 28 main plus two MTP MoE layers explain the 2580/4500 copy counts.
+- Corrected another analysis-label ambiguity: native dense-DP activity includes
+  scalar all-reduces as well as three gradient RS calls. Relabeled the broad
+  category dense_dp_sync without altering timings; exact op/payload fields remain
+  available. Gradient RS and parameter AG remain separate for expert EDP.
+- Results and limitations are recorded in NEP_OWNER_PROGRESS_RESULTS.md. Profile
+  phases close exactly, but they must not be presented as an exact decomposition
+  of clean timing: e.g. 49.48 ms logged versus 151.26 ms profiled gap in first-round
+  proportional. Remaining model-EP upstream causes are explicitly unresolved.
+
+- Further trace/code cross-check: a8b and a500 use dynamic HybridEP receive sizing
+  (moe_expert_rank_capacity_factor=None), with CPU synchronization, not the
+  available static-budget mode. In a8b's final-microbatch window, NEP HybridEP
+  host-sync union is 839.74 -> 644.08 ms (GA4 -> GA20), versus healthy 575.11 ->
+  614.30 ms. Expert gradient RS overlaps those host waits for 329.68 -> 112.72 ms;
+  its GPU-only exposed time is 331.02 -> 27.65 ms. These are overlapping views,
+  not additive costs or proven savings from removing synchronization. Native DDP
+  overlap remains enabled and gradient validation disabled. No dispatcher-mode
+  or training implementation changes were made in response to this finding.
+
+### 2026-09-09: Owner-progress analysis validation and publication
+
+- Completed all historical and confirmation trace processing. Five analysis unit
+  tests pass; 264 owner/peer-step checks pass (96 a8b, 48 historical a500, 120
+  confirmation), covering phase closure and ordered expert collective signatures.
+  These checks do not substitute for numerical gradient validation.
+- Published 12 PNG figures, with remote SHA256 checksums verified against local
+  files: https://sc.talos.nvidia.com/view/home/scratch.darfeen_coreai/nep_owner_progress_20260909/
+- Final report: NEP_OWNER_PROGRESS_RESULTS.md. No training implementation changes
+  were made. All experiment and analysis processes have finished. The historical
+  a500 improvement remains non-reproduced as a stable effect; unresolved upstream
+  model-EP causes are retained as limitations rather than assigned guessed costs.
+
+### 2026-09-09: Bounded failure-category closeout
+
+- Reanalyzed all 60 historical a500 rank traces over an equal seven-microbatch
+  window (MB2--8), plus host-launch diagnostics on ranks 0,8,11,12,13. No GPU job
+  was submitted and no training implementation or runtime setting was changed.
+- Reduced rank8 takes 1173.03 ms at GA12 and 1173.12 ms at GA9 for the same work
+  count. Rank11 similarly takes 1173.10/1172.68 ms. GA9 removed three slow
+  microbatches; it did not repair per-microbatch service time.
+- NEP GA12 rank11 has 465.5 ms GPU idle in that window; 379.1 ms precedes the next
+  GPU launch, with 174.8 ms of that subset inside grouped-linear CPU calls.
+  Rank8 has 189.6/150.4/85.3 ms respectively and more model-EP polling. Rank11's
+  launch-idle grows to 424.4 ms at GA9. This narrows the explanation to recurring
+  host submission/readiness behavior, but does not prove which CPU scheduling,
+  library, or signaling mechanism caused each delay or which peer was last.
+- a8b retained as observed fixed-cost amortization. a500 withdrawn as a proven
+  general failure/fix example: the old clean-timing improvement is not reliably
+  reproduced. The >=90% causal-attribution gate is NOT met, and temporal closure
+  is explicitly not used to claim it is. Closed the bounded evidence review with
+  these limitations instead of launching another uninformative sweep.
+- Added analyze_nep_closeout.py and render_nep_closeout.py; six analysis tests,
+  120 exact-window checks, 40 host-subset checks, Black/isort checks, and diff
+  whitespace checks pass. Existing unrelated worktree changes remain untouched.
+- Published two final PNGs and verified both remote SHA256 hashes:
+  https://sc.talos.nvidia.com/view/home/scratch.darfeen_coreai/nep_closeout_20260909/
+  Report and acceptance decisions: NEP_OWNER_PROGRESS_RESULTS.md, final closeout
+  section. Generated data live under the Lustre analysis/nep_closeout_20260909
+  directory. Logged timing and profiled breakdowns remain separate measurements.
+
+### 2026-09-09: Reopened original causal-attribution task
+
+- User requires the original questions answered, not just a bounded evidence
+  closeout. Added an opt-in benchmark entrypoint for per-call grouped-linear
+  wall/thread CPU time, voluntary/involuntary context switches, native thread ID,
+  available m_splits, and process CPU affinity. Measurements stay in memory until
+  exit; no CUDA synchronization, gradient, or model changes are added.
+- The shared A/B runner accepts PRETRAIN_DIAGNOSTIC_ENTRYPOINT, defaulting to the
+  unchanged entrypoint. This harness-only change was disclosed before editing.
+- Submitted 2978755 to GB200/GB300 backfill, four nodes, segment4, 20-minute cap:
+  healthy EP8/8 then NEP EP8/6, MBS1 GA12/12, 24 iterations, all-rank torch profiler
+  steps16--21. CPU diagnostics cover zero-based iterations10--22. Initial start
+  estimate: 12:29 PDT. Monitor every five minutes.
+- CPU-only checks cover off-CPU sleep, exception propagation, and disabled-path
+  return behavior; shell syntax passes. Output root is Lustre
+  slurm_runs/a500_cpu_diagnostic/2978755/. Trusted NEP training code is unchanged.
+
+- 2978755 COMPLETED exit0 in 10:32 on GB300 theia[0037,0041,0043,0045]. Both cases
+  trained and collected six all-rank profiler steps. Instrumentation was discarded
+  by the existing NEP shim's os.execv, so CPU diagnostic directories are empty.
+  Retain the run as an uninstrumented control, not as successful CPU measurement.
+  Matched logged profiled-window parity: 89.075%, gap208.2 ms (iterations17--21).
+  Before/after training SHA256 remains 4676f164a95255bdcc7e2531a06ca92c41a2583bf6f9a7a85b3b74b64f26f2d1.
+- Corrected the diagnostic wrapper to set the existing NEP-entrypoint environment
+  flag and run pretrain_hybrid.py in-process, preserving hooks. Added current CPU
+  IDs and an explicit post-measurement save before the last iteration. Submitted
+  corrected job2978877, identical workload/profiler configuration, both backfills.
+  Initial scheduler estimate unknown; five-minute polling continues.
+- Historical same-host comparison (ranks8/11 on the same Slurm node) matches144
+  dispatches per recorded step. Rank8's dispatch CUDA synchronization overlaps
+  time BEFORE rank11 enters that same dispatch for416.697/504.174 ms in steps5/6.
+  This directly bounds an arrival-wait component without cross-node clock
+  subtraction. Results saved in analysis/nep_causal_completion_20260909/
+  a500_same_host_dispatch.json. Root cause of rank11 CPU lateness remains under
+  investigation; no claim that it is the unique last participant.
+
+- Corrected CPU diagnostic job2978877 COMPLETED exit0 in9:47 on GB300
+  theia[0023-0026]. All30 rank CPU files and torch profiles exist. Profile-window
+  parity97.498%, gap43.18 ms; this is not an isolated improvement over2978755
+  because allocation changed. Grouped-linear calls are almost entirely ON CPU:
+  summed per-iteration off-CPU time is generally below1 ms versus450--620 ms wall.
+  Small CPU>wall discrepancies are timer-bracketing overhead (~1--2 ms total).
+- Healthy ranks2/3 have forward CPUs120/121 but backward CPUs48/62. Healthy rank2
+  grouped CPU604.9 ms versus NEP rank2's487.6 ms with forward120/backward121 and
+  identical full-replica expert count. This motivates a CPU-placement intervention;
+  it is not yet proof of a NUMA effect. All processes originally allow CPUs0--143
+  with SLURM_CPU_BIND=quiet,none. OMP_NUM_THREADS=1.
+- Added opt-in BENCH_CPUS_PER_TASK to the benchmark runner: native Slurm core
+  binding/block distribution, with the default launch unchanged. Submitted2979045
+  (four nodes,28-minute cap) for same-allocation unbound proportional, bound
+  proportional, and bound below-proportional healthy/NEP comparisons. Bound cases
+  request36 CPUs per GPU rank. All keep profiling and CPU diagnostics enabled.
+  Job started12:32:18 PDT on GB200 lyris[0042,0044,0046,0048]. Per-node lscpu JSON
+  confirms CPUs0--71 NUMA0/socket0 and72--143 NUMA1/socket1. Monitor every5 minutes.
+  Artifacts: Lustre slurm_runs/a500_cpu_placement/2979045/. No training changes.
+
+- User requested exact placement verification before accepting changed parity.
+  Slurm confirms2979045 SegmentSize=4 and all nodes in nvlblk03; no cross-NVLink
+  domain placement was found. This allocation is GB200, unlike the historical
+  GB300 reference. Unbound proportional profile-window parity88.680%, gap226.64ms.
+- Found a new harness-only CPU-binding bug: on the partially occupied final node,
+  Slurm places rank13/GPU1 on CPUs72--107, but nvidia-smi topo shows GPU1 local to
+  CPUs0--71. Canceled2979045 rather than interpreting confounded bound cases.
+  No training implementation changed; SHA256 remains4676f164a95255bdcc7e2531a06ca92c41a2583bf6f9a7a85b3b74b64f26f2d1.
+- Next reproduction pins the original GB300 nodes theia[0028-0031], segment4,
+  contiguous allocation, original ten iterations/profiler5--6/timing8--10,
+  GA12/12 and12/9. New CPU instrumentation and binding are not enabled. This
+  separates exact reproduction from the later instrumented diagnostic experiments.
+
+- Exact-node reproduction job2979126 is queued; scheduler estimate15:35 PDT.
+  Inspection of actual CPU diagnostic host metadata reveals unbound NEP maps
+  14 ranks as4/4/3/3, not the previously assumed4/4/4/2. Ranks8 and11 are on
+  different hosts in2978877 and2979045. Therefore the earlier historical
+  rank8/rank11 "same-host" timing bound is WITHDRAWN pending actual historical
+  mapping/clock verification. Raw data are retained, but those416/504ms values
+  must not be used as clock-independent causal proof. Per-rank interval and CPU
+  duration analyses do not depend on that cross-host timestamp assumption.
+
+- Audit found an original a8b placement confound:2863174 (GA4) used
+  theia[0091-0092,0094,0100-0102,0106-0107], all nvlblk22;2877884 (GA20) used
+  theia[0176-0178,0180] in nvlblk26 and[0187,0189,0196-0197] in nvlblk27.
+  Replica-local domains were intact, but EDP was intra-domain versus inter-domain.
+  This invalidates treating the original pair as an isolated GA intervention.
+- Submitted2979170 with a standalone wrapper, exactly2877884's eight GB300 nodes,
+  segment4, original MBS2/GA20 followed by MBS2/GA4, ten iterations, profiler5--6,
+  timing8--10. Both healthy/NEP pairs share the allocation. No CPU diagnostic or
+  CPU-binding changes enabled; no training code changes. Forty-minute allocation
+  cap,12-minute per-case hang timeout. Logs/data under Lustre a8b_fixed_placement.
+
+- Exact-node a5002979126 COMPLETED exit0 in14:32. All60 traces collected across
+  two A/B pairs. Verified Slurm SegmentSize4, actual default14-rank mapping4/4/3/3,
+  and all16 GPUs share fabric ClusterUUID d77ac26e-5760-46ef-9d51-077ed9baf943,
+  CliqueId32766, StateCompleted/StatusSuccess. NVML/chrony snapshot13:15:57 was
+  during first healthy profiler export, outside profile5--6 and timing8--10.
+- Proportional H1200.833/N1343.767ms, mean parity89.363% versus original81.926%.
+  Below-proportional H1195.533/N1267.800ms, mean parity94.300% versus original97.448%.
+  Below-proportional median parity94.249% matches original94.407%; original mean
+  was raised by a1291.9ms healthy sample versus1158.5/1169.7ms other healthy samples.
+  Do not claim the original97.45% mean has been reproduced.
+- Original versus new proportional rank11 grouped CPU scopes fall from821.398 to
+  710.430ms/profiled iteration, while physically corresponding healthy rank12
+  changes592.814 to602.222ms. This locates part of run-to-run timing variability;
+  it does not establish the CPU-placement cause. No cross-host timestamp arithmetic.
+- Submitted2979338 for corrected explicit per-local-GPU CPU masks, same original
+  GB300 nodes, three instrumented pairs,28-minute cap. Started13:30:16 PDT.
+  Native SLURM_CPU_BIND mask_cpu uses masks0--35,36--71,72--107,108--143; no shared
+  runner edits. Preflight asserts actual14-rank4/4/3/3 layout and exact affinities.
+  The new CPU instrumentation/profiling schedule is held fixed across this test;
+  it is not mixed with the ten-iteration original reproduction's timing window.
+
+- Explicit mask preflight passed all14 ranks before the first recorded profile;
+  actual container diagnostic metadata also confirms all masks and CPU IDs.
+  2979338 COMPLETED exit0 in22:51. Profile-window H/N/parity: unbound proportional
+  1750.82/2019.40ms/86.700%; bound proportional1393.86/2108.82ms/66.097%; bound
+  below1388.02/1704.06ms/81.454%. CPU binding is NOT adopted as a parity fix.
+  All90 profiles and CPU files exist. Training implementation remains untouched.
+- Binding reduces many ranks' grouped CPU times, but NEP rank13 remains slow:
+  same21 experts as rank11, yet grouped forward/backward CPU287.48/508.47ms
+  versus211.30/360.11ms. Off-CPU time is negligible; NUMA binding alone does not
+  explain the remaining variation. These are instrumented profiled windows,
+  not substitutes for original ten-iteration timing results.
+- Added offline analyze_nep_grouped_host.py; synthetic nested-runtime union and
+  closure test passed. It partitions grouped host scopes into runtime API union
+  versus outside-runtime time; individual API rows are inclusive/non-additive.
+  Backward cuLaunchKernelEx counts: healthy rank14=9216, NEP ranks11/13=12096.
+  CPU launch residency rank11=60.176ms, rank13=113.929ms despite identical counts.
+  Outside-runtime backward scopes290.899/382.879ms also differ. Increased launch
+  count is real, but does not alone explain the rank-specific cost difference.
+
+- Bound proportional rank13's extra grouped CPU time is present throughout all12
+  microbatches: forward roughly23--25ms/MB and backward41--44ms/MB versus rank11's
+  17--18ms/30ms. Actual trace records show first EDP submission after268 of288
+  grouped backward calls, i.e. in the final microbatch (24calls/MB). The earlier
+  eleven microbatches' CPU cost inflation cannot be caused by same-iteration
+  gradient EDP submission. Reduced rank13 has no gradient Gather operation.
+- Submitted2980905, same four original GB300 nodes/segment4, to compare existing
+  random-logit balancing against native exact-uniform routing, then uniform with
+  GA12/9. CPU binding disabled, all-rank torch profiling and CPU instrumentation
+  held fixed. Initial statePriority/estimateUnknown. Benchmark entrypoint swaps
+  only the existing router flags for uniform cases; training code is unchanged.
+  Optional diagnostic m_splits capture copies only CPU tensors after the original
+  call in one selected iteration, never reads a CUDA tensor or adds a GPU sync.
+  Shell syntax and Python compilation passed. This diagnostic intervention is
+  not represented as reproduction of the original workload's parity.
+
+- 2980905's first four training legs COMPLETED exit0; wrapper FAILED after uniform
+  healthy because the existing analyzer required random-logit balancing=True.
+  No training/collective failure. Added explicit analyzer --routing-mode with
+  unchanged random default; uniform mode requires uniform=True and random=False.
+  All13 workload-pair validation checks pass. Uniform split snapshots confirm
+  every captured expert has3072 tokens on EP8 and2304 on EP6 (288 snapshots/rank).
+- Reanalyzed existing completed uniform data without rerunning: random proportional
+  parity84.588%, gap321.00ms; uniform proportional parity86.722%, gap239.78ms.
+  Thus exact-uniform splits do not eliminate the proportional regression.
+  This remains a diagnostic routing intervention, not a replacement original baseline.
+- The below-proportional uniform pair was not reached. Since the allocation was
+  released, the next short job repeats uniform proportional as a matched control
+  alongside uniform GA12/9, rather than comparing across allocations. Only the
+  benchmark analyzer/explicit diagnostic routing support changed; no training code.
+
+### 2026-09-09 14:45 PDT: Original-parity placement re-audit
+
+- Rechecked historical `sacct` submit lines, current Slurm topology, submitted
+  wrappers, and the shared runner's node subset/rank launch. Both original a8b
+  runs used segment4, but only GA20 crossed NVLink blocks26/27. Job2979170 pins
+  exactly those original GA20 nodes for both GAs. Healthy uses four nodes per
+  replica; NEP uses the first four plus the next three. No replica crosses a
+  block. Slurm confirms SegmentSize4 and exclusive allocation.
+- a500's original/reproduction nodes28--31 are all in block18. The14-rank launch
+  is4/4/3/3, preserving the full8-rank and reduced6-rank replica boundaries.
+  No experimental CPU binding is adopted. Exact node selection makes a separate
+  contiguous constraint immaterial to the selected node set.
+- Job2981040 is the uniform-proportional/uniform-below diagnostic control, not
+  a substitute for original random-routing parity. It requests the same four
+  original GB300 nodes, segment4, exclusive allocation, and a20-minute limit.
+  Both jobs remain queued. At14:40, a8b's tentative start was00:18 PDT Sep10;
+  the uniform job had no estimate. All requested nodes are allocated, not idle.
+- Rebuilt the completed2980905 uniform CPU summary with all30 ranks. All four
+  random/uniform healthy/NEP analyzer positive/negative routing-mode checks pass;
+  six existing offline overlap/boundary regression tests pass. No training code
+  or queued training settings changed during this audit.
+
+- Completed offline2980905 owner-progress extraction for ranks0,8,11,12,13 in
+  both modes/routing cases. Restricted summaries to ProfilerStep17--21 (step16
+  was recorded but is outside the logged timing window). All phase and exclusive
+  state sums close. Owner0 random H1762.16/N2083.12ms: through-backward delta
+  +279.78ms, gradient-drain +40.95ms; uniform H1566.36/N1806.22ms: +233.62ms,
+  +5.68ms respectively. These disjoint phase locations are not independent causal
+  collective costs. Exact-uniform routing does not restore proportional parity.
+  Results: analysis/nep_causal_completion_20260909/routing_profile_matched_window.json.
+- Original a8b2877884 and exact-node a5002979126 logs print the same PyTorch build,
+  2.12.0a0+0291f960b6.nv26.04.48445190. This checks the visible torch version only,
+  not an immutable digest of the entire cached container. Trusted NEP checksum
+  remains unchanged. At15:00, both reproduction jobs still pending; tentative
+  estimates were19:40 for2981040 and00:11 Sep10 for2979170. Five-minute monitoring
+  continues; neither result is being declared reproduced while pending.
+
+### 2026-09-09: Accepted existing-data scope completed
+
+- User accepted finishing with existing profiles: faithfully show observed
+  before/after parity, exact temporal/activity accounting, collective exposure,
+  and supporting mechanisms, while disclosing placement and reproducibility
+  limits. No claim of a unique root cause for every delayed participant.
+- Canceled pending2979170 and2981040 before allocation (sacct: CANCELLED,
+  elapsed00:00:00, Start=None). No new jobs or training implementation changes.
+  The five-minute monitor exited after the canceled jobs left the queue.
+- Added NEP_EXISTING_PROFILE_CLOSEOUT.md and offline renderer
+  scripts/nonuniform/render_nep_existing_evidence.py. Updated the older results
+  document's header to point to the final accepted-scope report; historical
+  analyses and withdrawn claims remain available rather than being overwritten.
+- Rendered five figures: a8b/a500 overview and communication panels, plus a500
+  reproducibility. Original logged samples8--10 remain separate from profile
+  steps5--6. Phase stacks and exclusive GPU state deltas close to the complete
+  profiled gap; overlapped category residency is never summed as additive cost.
+  DistOpt parameter redistribution is explicitly distinguished from gradient
+  Scatter. Healthy/NEP observed expert gradient bucket counts remain disclosed.
+- a8b is observed amortization with a known inter-domain placement confound.
+  a500's profile gap falls511.63 ->117.07ms, mainly a444.16ms improvement in the
+  owner gradient-drain delta, offset by51.71ms more through-backward delay.
+  The original97.45% mean is preserved, not claimed reproduced; the exact-node
+  repeat is94.30% mean, with94.25% median versus original94.41% median.
+- Validation: six existing CPU accounting tests pass; renderer positive and
+  three negative tests verify rejection of invalid exposure, nonclosing phases,
+  and mismatched profile windows. All five plots visually inspected; corrected
+  a legend that obscured data. Black/isort run with the installed Lustre tools
+  because login-host uv is unavailable; no commit was requested or made.
+- Artifacts and evidence.json live in
+  /lustre/fsw/coreai_comparch_sysarch/darfeen/analysis/nep_existing_evidence_20260909.
+  Only five PNGs copied to computelab-sc-01:/home/scratch.darfeen_coreai/nep_existing_evidence_20260909;
+  Talos: https://sc.talos.nvidia.com/view/home/scratch.darfeen_coreai/nep_existing_evidence_20260909/.
+
+### 2026-09-09: All-workload confounder audit and corrected-domain rerun started
+
+- User requested auditing all workload results and rerunning confounded workloads,
+  with each replica wholly in one NVLink domain and distinct replicas in distinct
+  domains. Audit covers45 successful comparison artifacts/35 jobs/12 timed MoE
+  workloads;36 artifacts violate this placement policy. Nine have plausible
+  inferred layout but lack per-rank fabric manifests. Ultra remains failed/OOM;
+  dense8b scripts are NEP N/A. See NEP_WORKLOAD_CONFOUNDER_AUDIT.md for scope,
+  per-workload counts, diagnostic annex, and unresolved provenance limitations.
+- Confirmed other issues: superseded ETP2 instead of source ETP1 runs; non-source
+  TE op-fuser in early runs; mixed GB200/GB300 comparisons across tuning points;
+  a8b same-leaf versus cross-leaf placements; short/noisy samples and distinct
+  profiler/timing windows. Correction: job2861773 is GB200, not the earlier
+  ledger's GB300 label. Source Super/Ultra quantization config is unavailable;
+  built-in NVFP4 substitution remains disclosed, not exact-source equivalence.
+- Full runtime JSON and per-run audit in
+  /lustre/fsw/coreai_comparch_sysarch/darfeen/analysis/nep_workload_audit_20260909.
+  Additional H/N argument checks found no precision/graph/optimizer/capacity/
+  recomputation/overlap mismatch in the checked fields. Unknown clock, thermal,
+  package provenance and background network conditions are not certified absent.
+- Harness-only changes: opt-in replica-sized segment requirement; per-rank
+  startup fabric/GPU/package manifests and fail-closed placement validation;
+  pair-level corresponding-domain/package consistency check. Added offline
+  audit and five passing placement tests. No training implementation changes.
+  Trusted NEP SHA256 remains4676f164a95255bdcc7e2531a06ca92c41a2583bf6f9a7a85b3b74b64f26f2d1.
+- Counted-feature test-only submissions predicted nodes outside the requested
+  NVL blocks; site Lua does not obviously remove those features. Cause unresolved.
+  Explicit node-list tests preserved correct placement. GB200 estimated earlier
+  than GB300, so selected GB200 for the first gate, without mixing H/N hardware.
+- Submitted2988230: original ladder a500 EP8/8 healthy versus EP8/6 NEP,
+  MBS1/GA3, nodeslyris[0001-0002,0021-0022], blocks01/02, same IB leaf, segment2,
+  exclusive4-node allocation.24 iterations; all-rank profile10-13; logged15-24.
+  Original then conditional MBS3/GA3, then MBS3 fullGA4/reducedGA3; source model
+  dimensions/sequence/top-k/dispatcher unchanged. Case timeout7m, allocation25m.
+  Initial pending Resources estimate2026-09-10 02:16 PDT; estimate may change.
+- A submission attempt was denied by the tool reviewer citing /home log paths.
+  Inspected both scripts: effective outputs and ROOT_DIR already point to Lustre.
+  Resubmitted with explicit command-line Lustre stdout/stderr paths, accepted.
+  scontrol confirms both output paths and exact node list/SegmentSize2.
+- Low-cost monitoring agent Hooke, full-context fork
+  01a08a03-8855-7de2-a620-58e500569037, assigned five-minute polling until terminal,
+  immediate parent notification on start/failure/completion, no edits/submissions.
+  Corrected reruns are not complete; proceed through EP8, EP16, EP32 validation
+  before the largest originals. Artifacts:
+  /lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/workload_nvl_audit/2988230.
+
+### 2026-09-10: Cross-replica bandwidth evidence and smallest soft-clique baseline
+
+- Inspected original healthy rank0 expert-DP traces. Two-rank reduce-scatter
+  wire bytes are input_bytes/2; all-gather wire bytes are output_bytes/2.
+  Divide by full GPU kernel duration, including participant waiting.
+  Large-payload healthy gradient RS median/max GB/s: a315m365.16/403.41,
+  a500400.27/418.42, a770415.91/457.43, a1b458.24/512.22,
+  a2b395.18/444.68, a3b hybrid362.72/446.51, transformer431.30/459.48,
+  Nano497.51/508.23, ladder a3b436.34/454.09. These are same-domain jobs
+  2786858/2786860/2788799. Separate-domain a8b2788305 gives84.46/85.50.
+- NEP cross-replica owner collectives likewise reach429.30GB/s(a500),
+  470.39(a3b hybrid),475.31(Nano),563.99(a8b same-domain2863174).
+  This supports actual cross-replica NVLink use in sampled old runs, not merely
+  physical co-location. Not a claim about every collective on every rank.
+  No NCCL connection records found in90 driver/70 batch logs. Current cluster
+  IMEX prolog uses physical block intersected with job nodes, not replicas.
+- User approved trying NCCL_MNNVL_CLIQUE_ID per replica, then explicitly
+  requested smallest baseline only and cancellation of all outstanding jobs.
+  Canceled2988230 before allocation; sacct confirms elapsed0. Old monitoring
+  agent no longer exists (send_input returned agent not found).
+- Added run_lyris_smallest_soft_clique.sh and run_lyris_soft_clique_rank.sh.
+  Existing benchmark harness now accepts healthy-only and a rank-launcher
+  override, with existing defaults unchanged. No training implementation edits.
+  Shell syntax passes. Startup asserts one physical block, rank-to-host/GPU
+  mapping, world16 and topology8/8. Clique1000 on ranks0-7,1001 on ranks8-15,
+  set before Python/NCCL; no global MNNVL/P2P disable. NCCL INIT/GRAPH/NET/P2P/ENV
+  logs and per-rank GPU snapshots on Lustre; all-rank profiler remains enabled.
+- Submitted2993664, a315m/1b healthy-only EP8/8, source MBS4 GA3 sequence8192,
+  scaled GBS192, Flex/HybridEP and DistOpt.24iters, profiler10-13, timing15-24.
+  Fifteen-minute allocation cap and seven-minute training timeout. Selected
+  GB200 automatically from gb200/gb300 backfill. Allocated2026-09-10 10:20:32 PDT
+  on lyris[0136,0138-0140], block08, segment4. At initial check still in prolog;
+  no training result or transport validation claimed yet.
+  Artifacts: /lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/soft_clique_baseline/2993664.
+
+### 2026-09-10: Smallest soft-clique baseline completed and transport validated
+
+- Job2993664 COMPLETED exit0 in5m18s (cache warmup1m38s; training step3m17s).
+  All24 iterations and16 rank traces present. Logged iterations15-24:
+  697.6,697.5,694.4,697.1,696.7,698.5,698.0,696.3,695.9,695.9ms.
+  Mean696.79ms; sample std1.21056ms (CV0.174%). No NEP run in this job.
+- NCCL confirms clique1000/1001, each size8, same physical fabric UUID.
+  Rank0 log nccl.lyris0136.2115597.log explicitly shows0->8 send and8->0 receive
+  via NET/NCCL RDMA Plugin v11/1/GDRDMA(PCI). Intra-replica connections use
+  P2P/MNNVL. NIC logs report800000Mb/s on this GB200 allocation; do not assume
+  this cluster's GB200 NIC speed from generic400Gb/s reference specifications.
+- Rank0 profiled expert-DP large-payload all-gather:12 samples, effective
+  GB/s min/median/max35.124/69.644/77.002. Reduce-scatter:12 samples,
+  13.167/21.263/78.038GB/s. These include participant wait, not pure wire rates.
+  Fastest RS exchanges99.090432MB/rank in1.269764ms. Thus the software clique
+  boundary successfully forces network transport while retaining intra-replica
+  NVLink. Old GB300 same-domain a315m bandwidth is not a same-hardware timing
+  comparator, and no isolated end-to-end cost is claimed from that comparison.
+- squeue is empty after completion. All other outstanding jobs were canceled;
+  no follow-on cases submitted without user instruction.
+
+### 2026-09-10: Matched soft-clique healthy/NEP comparison submitted
+
+- User requested NEP comparison and parity. Submitted2993769, same a315m model,
+  healthyEP8/8 then NEPEP8/6 within one four-node allocation. MBS4 GA3 seq8192
+  unchanged on both replicas: healthyGBS192, NEPGBS168 (proportional local work).
+  DistOpt/Flex/HybridEP, source graph settings, all-rank profiler10-13,
+  logged iterations15-24 and24 total iterations unchanged. Twenty-minute cap.
+- Only launcher changes: allow CASE_ORDER override; assert NEP rank distribution
+  4/4/3/3 and assign clique1000 to0-7,1001 to8-13; retain healthy4/4/4/4.
+  Placement files separated by mode to avoid H/N overwrites. All30 rank dry-run
+  mappings and shell syntax pass. Training implementation untouched.
+- Initial status pending Priority, no start estimate. Will poll every5min until
+  terminal and compare healthy and NEP from this allocation, not the prior
+  allocation's696.79ms baseline. Root:
+  /lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/soft_clique_baseline/2993769.
+
+### 2026-09-10: Soft-clique NEP comparison reaches97.25% owner parity
+
+- Job2993769 completed exit0 in9m38s on GB200 lyris[0138-0140,0144], one
+  physical block. Healthy and NEP ran sequentially in the same allocation.
+  Healthy iterations15-24 mean708.32ms, std2.30690ms, median708.05ms.
+  NEP mean728.34ms, std4.19317ms, median728.15ms. Owner time parity97.2513%,
+  slowdown2.8264%, absolute gap20.02ms. Compare these matched legs, not the
+  earlier allocation's healthy696.79ms. No isolated causal attribution claimed.
+- MBS4 GA3 seq8192 both replicas; healthyGBS192, NEPGBS168. Reduced replica
+  receives proportional work. All24 training iterations completed;16healthy
+  and14NEP rank traces collected. No separate optimizer numerical test in this
+  benchmark. End-of-process TCPStore/heartbeat broken-pipe warnings appeared
+  during NEP teardown; both training steps and batch exit0, timing/profile
+  completeness checks passed. Do not mislabel teardown warnings as training hangs.
+- NEP rank0 log nccl.lyris0138.2907969.log confirms clique1000,size8 and
+  cross-replica0->8 via NET/NCCL RDMA Plugin v11/1/GDRDMA(PCI), intra-replica
+  0->1 via P2P/MNNVL. Thus NEP comparison retains the intended transport split.
+- Machine-readable comparison:
+  /lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/soft_clique_baseline/2993769/ep8/scaling_ladder__a315m_1b_moe_88b/comparison_2993769.json.
+
+### 2026-09-10: Original a500 soft-clique comparison submitted
+
+- User selected a500 as next workload. Submitted2994105: healthyEP8/8 then
+  NEPEP8/6, four nodes, one physical block, per-replica software clique IDs.
+  Original MBS1 GA3 seq8192, healthyGBS48 and NEPGBS42 (proportional work).
+  DistOpt/Flex and original graph settings;24iters, profiler10-13 all ranks,
+  timing15-24, seven-minute case timeout, twenty-minute allocation cap.
+- Only change: existing launcher accepts WORKLOAD_FILTER override; shell syntax
+  passes. No NEP/training changes or batch tuning. Both GB200/GB300 backfill
+  eligible; H/N necessarily share one allocation and GPU generation.
+  Artifacts: /lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/soft_clique_baseline/2994105.
+
+### 2026-09-10: Original a500 soft-clique result is82.28% parity
+
+- Job2994105 completed exit0 in8m39s on GB200 lyris[0110,0120-0121,0124],
+  physical block07. Healthy then NEP, same allocation. All24 iterations and
+  all16healthy/14NEP traces validated. Original MBS1 GA3 seq8192 unchanged;
+  healthyGBS48, NEPGBS42, proportional reduced-replica work.
+- Iterations15-24: healthy mean299.12ms, std3.23172ms, median298.3ms;
+  NEP mean363.55ms, std12.80089ms, median362.15ms. Owner parity82.2775%,
+  slowdown21.5399%, gap64.43ms. Healthy samples298.8,298.3,297.0,297.3,298.3,
+  298.4,299.4,308.1,297.9,297.7; NEP353.4,348.1,350.8,350.0,359.4,364.9,
+  373.6,379.1,379.0,377.2. NEP shows upward timing drift, CV3.52%; this is a
+  completed observation, not a stable replicated estimate or causal diagnosis.
+- Rank0 transport logs1994318(healthy)/2003738(NEP) both confirm0->8 via
+  NET/NCCL RDMA Plugin v11 and intra-replica0->1 via P2P/MNNVL. Thus poor parity
+  persists with controlled cross-replica transport. Do not attribute the gap
+  to a specific mechanism without analyzing these new profiles.
+- No tuning or additional job submitted. Result JSON under the above root:
+  ep8/scaling_ladder__a500m_2b_moe_140b/comparison_2994105.json.
+
+### 2026-09-10: a500 MBS3 proportional-work experiment submitted
+
+- User approved increasing both replicas to MBS3 while retaining sourceGA3.
+  Submitted2994279, healthyEP8/8 then NEPEP8/6 in one four-node allocation,
+  seq8192, healthyGBS144/NEPGBS126. Proportional reduced-replica work retained.
+  Soft clique IDs, source graphs, Flex/DistOpt,24iters, all-rank profile10-13,
+  timing15-24 unchanged. Seven-minute case timeout, twenty-minute allocation.
+- Added only optional SOFT_CLIQUE_MBS to launcher, applied equally to healthy,
+  full and reduced replicas; accumulation overrides remain unset. Syntax passes.
+  No training implementation changes. Previous original MBS1 result82.28%
+  remains separately recorded; new H/N pair will use the same allocation.
+  Artifacts: /lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/soft_clique_baseline/2994279.
+
+### 2026-09-10: a500 MBS3 reaches94.75% soft-clique owner parity
+
+- Job2994279 completed exit0 in8m20s on GB200 lyris[0208-0210,0212].
+  Both cases use MBS3 GA3 seq8192, proportional work, healthyGBS144/NEPGBS126.
+  All24 iterations and16healthy/14NEP profiles validated. Logged15-24:
+  healthy mean699.66ms,std4.15858ms,median698.35ms; NEP mean738.43ms,
+  std4.53922ms,median737.05ms. Parity94.7497%, slowdown5.5413%, gap38.77ms.
+  CV about0.59%/0.61%; no upward drift resembling the earlier MBS1 NEP window.
+- Healthy samples698.2,697.7,696.9,699.6,699.6,698.5,710.8,701.2,696.5,697.6.
+  NEP742.3,738.8,736.9,749.8,735.1,735.9,737.6,735.2,737.2,735.5.
+- Compared with earlier GB200 MBS1 job2994105, observed parity rises82.28%
+  to94.75%, gap64.43 to38.77ms. Each H/N pair is same-allocation, but the two
+  batch settings used different nodes/physical blocks; this is not a fully
+  fixed-node causal estimate of MBS alone. Do not claim95% achieved or intrinsic
+  cause without further evidence. No reduced-batch adjustment was made.
+- Rank0 transport logs170104(healthy)/179551(NEP) verify cross-replica0->8 via
+  NET/NCCL RDMA Plugin v11 and intra-replica0->1 via P2P/MNNVL in both legs.
+  No training implementation changes, no further jobs submitted.
+  Result: ep8/scaling_ladder__a500m_2b_moe_140b/comparison_2994279.json under root above.
+
+### 2026-09-10: Accepted a500 result interpretation and proposed next workload
+
+- Recorded interpretation: results support increasing a500 MBS1->3 at GA3
+  improving owner parity82.28%->94.75% with proportional work and verified
+  cross-replica RDMA. Different nodes between the two matched A/B allocations
+  are a residual uncertainty, not a demonstrated confounder or grounds to
+  invalidate the improvement. MBS1's observed timing drift is the concrete
+  caveat; MBS3 variability is low. No unique overlap mechanism claimed yet.
+- Recommend ladder a2b/14b next: original MBS1 GA3, healthyEP16/16 versus
+  NEPEP16/12, eight-node allocation (32healthy/28NEP GPUs), TP1/CP1,
+  healthyGBS96/NEPGBS84. Historical parity89.33% used shared-domain transport.
+  This adds intermediate EP16 validation within the same model family before
+  EP32 and tests whether the old low parity persists with software-separated
+  replica cliques. Healthy/NEP same allocation, all-rank profiling, original
+  configuration first; batch tuning only after seeing that result.
+- Proposal only. No new jobs submitted; awaiting user selection/approval.
+
+### 2026-09-10: Broader coverage selected; original a8b latent-MoE submitted
+
+- User prioritized architectural coverage over another ladder model. Selected
+  a8b/120b:512experts,latent width1152,hidden4608,TP2; physicalEP16/12.
+  Submitted2994416, healthy32GPU/8nodes then NEP28GPU/7nodes within one
+  eight-node allocation. Original MBS1 GA8 seq8192, healthyGBS128/NEPGBS112,
+  proportional work.24iters, profile10-13 all ranks, timing15-24. Both
+  GB200/GB300 backfill eligible, thirty-minute cap, twelve-minute case timeout.
+- Launcher-only generalization derives replica boundary from topology*TP*CP
+  and verifies native contiguous rank placement for partially occupied nodes.
+  Ninety dry-run rank mappings pass across previous EP8 and new TP2 EP16
+  healthy/NEP cases. Physical single-block guard now allows4or8nodes. Existing
+  default workload/group/timeout preserved. Training implementation unchanged.
+- Soft clique IDs1000/1001 now assigned at rank16 boundary for a8b, retaining
+  intra-replica NVLink and forcing cross-replica network transport. Runtime
+  verification required before accepting results; no parity claimed yet.
+  Artifacts: /lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/soft_clique_baseline/2994416.
+
+### 2026-09-10: Corrected a8b per-replica placement guard
+
+- Job2994416 failed before training in21seconds: the launcher incorrectly
+  required the entire eight-node allocation to occupy one physical NVL block.
+  No performance result. Replacement2994485 requested segment8; canceled while
+  pending after user clarified that separate replica domains are acceptable.
+- Submitted2994514 with8nodes,segment4. Guard now checks that each contiguous
+  four-node replica stays within one block; it permits different blocks across
+  replicas. NEP uses only the first three nodes of the second replica.
+  Same-block placement remains permitted with distinct software clique IDs;
+  NCCL transport logs must verify cross-replica RDMA in either layout.
+- Shell syntax checks pass. Only launcher placement checks changed; original
+  a8b MBS1 GA8 seq8192, healthyEP16/16 and NEPEP16/12, profiling and trusted
+  training implementation remain unchanged. Results pending.
+
+### 2026-09-10: a8b healthy completed; NEP OOM on GB200
+
+- Job2994514 ran12m18s. Healthy step completed24iterations, all32rank
+  profiles collected. NEP failed during gradient finalization before producing
+  a completed iteration; no parity result. No timeout or placement rejection.
+- Replica0 occupied lyris0092,0094,0104,0108 in nvlblk06; replica1 occupied
+  lyris0127,0128,0131,0132 in nvlblk08 (NEP uses first3). Both NCCL rank0
+  logs2292431/2302053 confirm0<->16 NET/RDMA/GDRDMA; intra-replica P2P/MNNVL.
+- Healthy rank0 expert-EDP trace:24 allgathers median70.54,max88.38GB/s;
+  24 reduce-scatters median66.17,max82.22GB/s. Two-rank transferred bytes are
+  output bytes/2 for AG and input bytes/2 for RS, divided by GPU duration.
+  Includes participant waits; these are effective rates, not isolated link
+  ceilings. Confirms network-scale bandwidth, not prior NVLink-scale rates.
+  NEP failed before its profile window, so no NEP trace bandwidth measurement.
+- Healthy logged iterations15-24: mean5793.61ms,population std27.96ms,n10.
+  NEP reduced rank16 requested3.40GiB in cached owner-task tensor preparation
+  with1.02GiB free of184.31GiB; PyTorch allocated175.82GiB. Full rank0 also
+  OOM in native TP gradient flattening requesting1.45GiB with0.79GiB free.
+  This affects both replicas, not merely the reduced replica's activations.
+- No batch, profiling, or implementation changes made in response. Candidate
+  next step: same matched A/B on larger-memory GB300, before changing model
+  work or training code. No follow-up job submitted yet.
+
+### 2026-09-10: Approved unchanged a8b comparison on GB300
+
+- Submitted2994648 to gb300-backfill only,8nodes,segment4,time30m,
+  healthy32ranks then NEP28ranks,12m timeout per case. Initially pending
+  Resources,StartTime Unknown. User approved larger-memory hardware retry.
+- Only GPU partition changed from2994514. MBS1 GA8 seq8192,TP2 CP1,
+  physicalEP16/16 versus16/12,GBS128/112,24iterations,all-rank profiles10-13,
+  logged timing15-24. No training implementation or batch changes.
+- Per-replica domain guard and distinct NCCL clique IDs retained; verify
+  RDMA transport and effective trace bandwidth before accepting comparison.
+  Artifacts under Lustre slurm_runs/soft_clique_baseline/2994648.
+
+### 2026-09-10: All-rank GEMM extraction for topology-controlled a500
+
+- Analyzed all60traces (four steps each) from2994105 and2994279. Exact
+  GroupedLinear CPU-scope attribution, kernel count checks on every rank,
+  GPU interval union (not summed multi-stream residency) for effective rates.
+- MBS1->3: full/reduced NEP effective TFLOP/s594.1/549.9->958.6/895.5;
+  reduced/full ratio92.55%->93.42%. Both improve strongly, relative recovery
+  only0.87points. Reduced-minus-full active GEMM time1.885->3.068ms grows
+  absolutely; normalized per MBS it falls1.885->1.023ms.
+- Does not explain the entire82.28%->94.75% owner parity gain as selective
+  GEMM recovery. Profile and logged windows differ materially, so no causal
+  percentage of the25.66ms logged-gap reduction is assigned to GEMMs.
+  Launch spacing and overlap effects are not measured by kernel-active time.
+- Details in NEP_A500_CLIQUE_GEMM.md; all generated metrics stored under
+  Lustre analysis/a500_clique_gemm_20260910. Training code unchanged.
+
+### 2026-09-10: GB300 a8b proportional comparison completed
+
+- Job2994648 completed0:0 in16m17s. Healthy and NEP each completed24iters,
+  with32/28rank profiles. GB300 resolves the prior GB200 capacity failure
+  without changing batch settings or implementation.
+- Logged iterations15-24: healthy5651.31ms,std28.49ms; NEP6018.77ms,
+  std19.31ms,n10 each. Owner parity93.8948%,slowdown6.5022%,gap367.46ms.
+  Original MBS1 GA8 seq8192,TP2 CP1,EP16/16 versus16/12,GBS128/112.
+- Allocated theia0145,0146,0147,0149 for replica0 and
+  theia0154,0156,0157,0161 for replica1, all in physical nvlblk25. NEP uses
+  only the first3nodes of replica1. Software cliques1000/1001 separate them.
+  NCCL logs1468588/1479625 confirm intra-replica P2P/MNNVL.
+- Rank0 cross-replica pair[0,16] trace bandwidth validates RDMA-scale service:
+  healthy expert AG median86.716,max88.654GB/s; RS85.900,max87.562 (24each).
+  NEP ep_dp AG87.308,max88.558; RS86.031,max87.201GB/s (32each).
+  Bytes=output bytes/2 for AG,input bytes/2 for RS; GPU duration includes
+  participant waits. Both cases remain far below NVLink-scale bandwidth.
+- Comparison JSON and all profiles under Lustre
+  slurm_runs/soft_clique_baseline/2994648/ep16/a8b_120b_latentmoe_1t/.
+  No GEMM disadvantage or slowdown attribution claimed from timing alone;
+  the new profiles support a subsequent same-definition GEMM analysis.
+
+### 2026-09-10: Original a770 submitted for GEMM-efficiency coverage
+
+- User selected an unmodified workload after a8b reached93.89% parity.
+  Submitted2995392: scaling_ladder/a770m_4b_moe_215b,healthyEP8/8 versus
+  NEPEP8/6,originalMBS1 GA3 seq8192,TP1 CP1,H1280 F768,128experts,top-k6.
+  HealthyGBS48/NEPGBS42,proportional work; no batch or training-code changes.
+- Four nodes,segment4,GB200/GB300 backfill eligible,20minute allocation,
+  seven-minute per-case timeout.24iters,profile10-13 all ranks,timing15-24.
+  Separate software cliques preserve intra-replica NVLink and force network
+  cross-replica transport; verify logs and trace bandwidth before acceptance.
+- Initially pending with no estimate. Poll every5minutes. Planned analysis:
+  owner parity and the same CPU-scope-attributed GEMM-active union efficiency
+  used for a500. Large relative GEMM loss is a hypothesis, not guaranteed by
+  the historical84% parity. All artifacts under Lustre soft_clique_baseline/2995392.
+
+### 2026-09-10: Original a770 result and all-rank GEMM efficiency
+
+- Job2995392 completed0:0 in8m03s on GB200 lyris0199-0202,nvlblk12.
+  Both24iteration cases completed,all30rank traces collected. Logged15-24
+  healthy422.30ms,std3.26;NEP492.24ms,std6.28,n10 each. Owner parity85.7915%,
+  slowdown16.5617%,gap69.94ms. Original MBS1 GA3 retained.
+- Separate software replica cliques: rank0 NCCL logs4182042/4191482 confirm
+  0->8 via NET/RDMA/GDRDMA. Trace healthy AG/RS median80.27/80.82GB/s,
+  maxima82.57/83.46;NEP AG median73.97,max80.06;RS median12.85,max82.84.
+  GPU durations include waiting, so low NEP RS effective rate is not an
+  isolated transport bandwidth measurement. No NVLink cross-replica rates.
+- Reused a500 offline analyzer with optional MoE layer-count parameter
+  (a500 default unchanged). a770 has15MoE layers,H1280,F768; useful routed
+  expert work26.0919TF/GPU/iteration. All rank/step exact kernel counts pass.
+  Full forward/backward counts1440/2880;reduced role average1920/3840.
+- All30traces,4steps each: healthy/full NEP/reduced NEP active GEMM union
+  33.417/33.135/37.201ms; effective TFLOP/s780.8/787.4/701.4.
+  Reduced/full efficiency89.07%,versus92.55% for a500MBS1. Extra reduced
+  active GEMM time4.065ms. Moderate loss, not a large collapse in efficiency.
+- Profile host steps557.39ms healthy versus702.74ms NEP differ from logged
+  timing windows. Do not assign the69.94ms logged gap to the4.065ms active
+  GEMM difference or infer a causal percentage from those separate windows.
+  All extracted metrics under Lustre analysis/a770_clique_gemm_2995392/.
+  No training implementation changes or follow-up jobs submitted.
+
+### 2026-09-10: Minimal a770 MBS increase submitted
+
+- User requested the minimal change to improve reduced expert GEMM efficiency.
+  Submitted2995524,MBS1->2 only,GA3 unchanged;healthyGBS96/NEPGBS84.
+  Same MBS on healthy/full/reduced replicas retains proportional allocation.
+  H1280,F768,15MoE layers,128experts,top-k6,seq8192,TP1,EP8/8 vs8/6.
+- Existing SOFT_CLIQUE_MBS override; no launcher or training code changes.
+  Four nodes,segment4,GB200/GB300 eligible,20m cap,7m per case,24iters,
+  all-rank profiles10-13,timing15-24. Initially pending Priority,no estimate.
+- Larger microbatches may improve both GEMM efficiency and overhead amortization;
+  verify the former from traces instead of attributing any parity gain solely
+  to it. Monitor every5minutes and retain RDMA bandwidth validation.
+
+### 2026-09-10: a770 MBS2 improves parity and reduced expert efficiency
+
+- Job2995524 completed0:0 in7m41s on GB200 lyris0200-0203;healthy and
+  NEP each24iterations,all30traces. MBS2 GA3,GBS96/84,other settings unchanged.
+  Logged15-24 healthy678.50ms,std6.53;NEP725.69ms,std10.49,n10 each.
+  Owner parity93.4972%,slowdown6.9550%,gap47.19ms. Compared with MBS1
+  job2995392:parity85.7915%,gap69.94ms. Improvement7.71parity points.
+- All-rank expert CPU-scope attribution and exact per-step kernel-count
+  checks pass. MBS2 full/reduced GEMM-active union52.315/54.290ms;
+  effective997.49/961.21TFLOP/s,reduced/full96.36%. MBS1 full/reduced
+  33.135/37.201ms,787.43/701.38TFLOP/s,89.07%. Extra reduced active time
+  falls4.065->1.974ms despite twice the useful FLOPs. This directly supports
+  reduced-replica GEMM-efficiency recovery with larger microbatches.
+- Not all parity gain is attributed to that recovery: total work doubles,
+  communication amortization changes, and profile windows differ from logged
+  timing. Same hardware generation and nvlblk12 but one node differs across
+  MBS settings; each healthy/NEP pair shares its allocation.
+- NCCL rank0 logs2333331/2342771 confirm cross-replica0->8 RDMA/GDRDMA.
+  Trace pair bandwidth remains below NVLink: healthyAG median64.15,max81.56;
+  RS43.74,max57.70GB/s;NEPAG9.31,max60.53;RS10.73,max31.04GB/s.
+  Effective durations include waits/contention and are not isolated link rates.
+- All metric rows and bandwidth summaries under Lustre
+  analysis/a770_clique_gemm_2995524/. No follow-up jobs submitted.
+
+### 2026-09-10: a770 causal audit does not confirm GEMMs caused parity recovery
+
+- User asked to confirm causality, not merely correlation. Additional all60rank
+  traces,4steps each,CPU scope audit confirms90forward and90backward grouped
+  linear calls per step. No new GPU jobs or training changes.
+- MBS1 full/reduced grouped-forward CPU totals66.987/74.433ms;backward
+  101.555/119.243ms. MBS2 forward64.514/76.718ms;backward100.679/130.117ms.
+  Reduced-minus-full CPU scope difference grows25.135->41.643ms. These are
+  instrumented scope durations, including possible waits, not exclusive host
+  overhead and not additive with GPU or collective durations.
+- Profile healthy/full NEP step means557.394/702.736ms atMBS1 and
+  723.676/868.502ms atMBS2: absolute profile gap145.342->144.827ms is nearly
+  unchanged. Logged post-profile gap69.94->47.19ms behaves differently.
+- Confirmed: GPU expert efficiency recovers89.07%->96.36%,extra reduced
+  GEMM-active union falls4.065->1.974ms. Not confirmed: that this caused the
+  7.71point logged parity improvement or most of the22.75ms logged-gap drop.
+  MBS also doubles useful work/changes overlap, and profiling materially
+  perturbs runtime. Do not infer a causal share from these different windows.
+- CPU per-rank/step evidence at Lustre analysis/a770_cpu_gemm_check/summary.json
+  and sibling rank files. Existing result is a batch-size performance win
+  accompanied by improved GPU expert efficiency, not isolated causal proof.
+
+### 2026-09-10: Expanded a770 causal audit and missing timing evidence
+
+- Decomposed rank0 and rank8 traces for both jobs and modes using existing
+  bounded-memory exclusive interval accounting; stacks exactly reconstruct
+  every profile span. Results: Lustre analysis/a770_critical_path_audit/.
+- Owner rank0 NEP expert-EDP compute overlap increases28.39->98.58ms atMBS2,
+  but exposed EDP also increases16.31->48.75ms. Healthy exposed EDP changes
+  1.58->3.47ms. Rank0 NEP idle decreases169.48->99.70ms while healthy idle
+  decreases98.81->75.64ms. Thus some scheduling/overlap improves in profiles
+  but other costs increase; no net absolute overhead reduction is observed.
+- Explicitly checked logged timing INSIDE the profiler window10-13:
+  MBS1 healthy557.175/NEP702.525ms,gap145.350ms;MBS2 healthy723.500/NEP868.325ms,
+  gap144.825ms. Agrees with profile spans; mismatch is not merely comparing
+  ProfilerStep boundaries with a differently defined interval timer.
+- Driver configuration has timing_log_level=0 and log_timers_to_tensorboard=False.
+  Therefore iterations15-24 have total elapsed times but no phase or GPU-op
+  timing from which to attribute their69.94->47.19ms gap. Exact causal
+  attribution of that22.75ms change is not identifiable from current artifacts.
+- Additional other-comm audit: each profiled step has two default_pg barriers
+  and one scalar optimizer-group allreduce. Timer.elapsed(barrier=True) in
+  training.py:3506 invokes Timer.stop/start, each performing a barrier and
+  cuda synchronize. These are measured operations, not assumed disabled.
+  They do not establish the unprofiled gap cause; no flag/code change made.
+- No new jobs submitted. To resolve the unprofiled gap requires operation/phase
+  evidence during a timing window that reproduces it; do not claim absent
+  operation timestamps can be recovered from aggregate scalar logs.
+
+### 2026-09-10: Corrected parity on profiler-active iterations for all new workloads
+
+- User requires measured/profiled iterations consistently. Recomputed logged
+  means from iterations10,11,12,13 ONLY for each successful topology-controlled
+  A/B. These are the iterations recorded in the traces, not15-24.
+- Job2993769 a315m MBS4 GA3:healthy758.000,NEP836.425ms,parity90.6238%.
+- Job2994105 a500 MBS1 GA3:healthy395.625,NEP535.925ms,parity73.8210%.
+- Job2994279 a500 MBS3 GA3:healthy738.400,NEP810.300ms,parity91.1267%.
+- Job2994648 a8b MBS1 GA8 GB300:healthy6904.325,NEP7412.800ms,parity93.1406%.
+- Job2995392 a770 MBS1 GA3:healthy557.175,NEP702.525ms,parity79.3103%.
+- Job2995524 a770 MBS2 GA3:healthy723.500,NEP868.325ms,parity83.3213%.
+- Source samples and batch settings saved in Lustre
+  analysis/profile_window_parity_20260910.json. GB200 a8b failed before
+  NEP timing;healthy-only a315m has no paired parity. Earlier post-profile
+  percentages must NOT accompany explanations from these trace windows.
+
+### 2026-09-10: Differential profiler burden and post-analysis limitations
+
+- Inspected training.py profiler setup: default CPU+CUDA activities; shape and
+  callstack collection disabled,Chakra disabled. Trace export happens after
+  active window in iteration14,already excluded. Those optional features or
+  export stalls cannot explain active-window10-13 inflation.
+- All60a770traces event census,4steps each. MBS2 per-rank healthy/full NEP/
+  reduced NEP CPU-op counts23393.9/31664.5/39030.7;CUDA driver calls4437/4467/5885;
+  GPU kernels14594.7/14902.8/16288;GPU memcpy events224/2189/2829.
+  Graph launch counts identical288. NEP has substantially greater instrumented
+  operation burden,especially reduced ranks; not more graph replay calls.
+- PyTorch profiler registers per-op RecordFunction enter/exit callbacks and
+  CUPTI GPU collection. Larger event counts support differential overhead, but
+  they do not separately identify CPU callback versus CUPTI cost in milliseconds.
+  Collective dependencies can propagate delayed launches to other ranks.
+- Explicit trace overhead activities (buffer requests/flushes/lazy loading)
+  sum only0.385ms healthy rank0,0.465ms NEP rank0,0.630ms NEP rank8 per step.
+  Removing these labels cannot remove the roughly99ms differential observed
+  profile-vs-post-profile inflation in a770MBS2.
+- Cannot reconstruct exact uninstrumented execution by subtracting host spans:
+  instrumentation changes enqueue/readiness times,overlap and contention. GPU
+  timestamps accurately describe profiled execution,not a counterfactual run.
+  Need a validated lighter capture mode to obtain representative same-window
+  iteration times and GPU traces,not a synthetic corrected timeline.
+- Next candidate experiment (not submitted): compare normal capture to CUDA-only
+  activity capture,all ranks,same allocation,healthy andNEP;retain profiler,
+  acknowledge reduced CPU-op attribution. CPU/CUDA overhead not yet isolated.
+  Evidence under Lustre analysis/a770_profiler_burden/;no training code changes.
+
+### 2026-09-10: a770 profiler activity isolation
+
+- Submitted 2996710: four nodes, segment4, GB200/GB300 backfill, 35-minute limit.
+- a770 MBS2 GA3, healthy EP8/EP8 and NEP EP8/EP6, CPU+CUDA then CUDA-only
+  captures in the same allocation. All ranks profiled, iterations10-13 recorded;
+  iterations15-24 reported separately. No changes to training implementation.
+- Opt-in launcher sweep and diagnostic entrypoint only; stub tests verified both
+  activity selections preserve other profiler kwargs and the trusted entrypoint.
+- Initial state pending Priority, StartTime unknown. Artifacts: Lustre
+  slurm_runs/soft_clique_baseline/2996710/{cpu_cuda,cuda}.
+- Completed exit0 in 15m22s on GB200 lyris[0205-0206,0213-0214], nvlblk12;
+  both replica placement guards passed, separate software cliques retained.
+  All four cases completed24 iterations, with16 healthy/14 NEP traces per mode.
+- CPU+CUDA: recorded10-13 H759.250/N880.275ms (86.25% parity);
+  post15-24 H691.960/N738.960ms (93.64%). Requested CUDA-only:
+  recorded H760.525/N870.850ms (87.33%); post H696.380/N737.100ms (94.48%).
+- IMPORTANT: requested CUDA-only did NOT remove CPU activity from traces.
+  Streaming census on ranks0/8 found identical CPU-op and kernel counts across
+  modes: H rank0 CPU94100/kernel58432; NEP rank0 CPU137972/kernel60300;
+  NEP rank8 CPU159988/kernel65924 over four iterations. NCCL metadata retained.
+  Therefore this is not a successful CPU instrumentation ablation and cannot
+  attribute differential overhead to CPU versus CUPTI. Do not interpret the
+  small timing difference as a demonstrated improvement or debias the traces.
+  Effective profiler configuration needs verification before another capture.
+
+### 2026-09-10: fix profiler patch lifetime; validated CUDA-only capture
+
+- Root cause of2996710: the trusted NEP entrypoint calls os.execv to restart
+  pretrain_hybrid.py, losing the Python profiler patch. The printed requested
+  mode was from the old process, not the training profiler instance.
+- Diagnostic wrapper now sets the same MEGATRON_NONUNIFORM_EP_ENTRYPOINT=1 flag
+  and runs final pretrain_hybrid.py directly. ActivityProfile checks actual
+  activities and underlying use_cpu during prepare_trace (outside active steps).
+  No changes to Megatron/NEP training source or workload settings.
+- GPU smoke2997460 completed0:0 in2m33s on lyris0230. Production NeMo26.06:
+  CPU+CUDA recorded10 CPU ops/10 GPU kernels; CUDA-only0 CPU ops/10 GPU kernels.
+  Effective use_cpu=True/False assertions passed. Artifacts in Lustre
+  analysis/profile_activity_smoke_2997460.
+- Submitted2997621: same a770MBS2/GA3, four nodes segment4, two healthy/NEP
+  pairs (CPU+CUDA then CUDA-only), all ranks profiled10-13, post15-24 separate.
+  Initial pending Priority, Slurm estimated15:40 cluster time. Artifacts:
+  slurm_runs/soft_clique_baseline/2997621 on Lustre.30-minute allocation cap.
+- Cap shortened to20min while queued. Completed0:0 in15m08s on GB300
+  theia[0217,0222-0224], nvlblk29; per-replica placement guards passed.
+- CPU+CUDA recorded10-13 H699.400/N810.725ms, parity86.268%; post15-24
+  H653.310/N696.150ms, parity93.846%. CUDA-only recorded H692.850/N748.500ms,
+  parity92.565%; post H651.650/N701.400ms, parity92.907%.
+- All60 traces audited with analyze_profile_activity_probe.py. CUDA-only has
+  zero CPU ops on all30 ranks, with GPU kernels retained. Rank0 counts match
+  across modes exactly: healthy58432/NEP60300 over4 iterations. GPU-only loses
+  CPU scopes, ProfilerStep markers and per-kernel process-group metadata.
+- Recording-minus-post inflation: full H46.090/N114.575ms; GPU-only
+  H41.200/N47.100ms. Lower differential distortion, not zero instrumentation
+  overhead. No post-hoc subtraction is justified. Analysis JSON stored under
+  slurm_runs/soft_clique_baseline/2997621/profile_activity_analysis.json.
+- User requested MBS mechanism comparison, then explicitly limited new runs
+  to MBS1 only; reuse MBS2 above. No extra MBS2 run submitted. Launcher now
+  accepts PROFILE_ACTIVITY_MODES=cuda to avoid another full-profile pair.
+
+### 2026-09-10: GPU-only MBS1 comparison completed
+
+- Only MBS1 submitted:2998515, GB300 four nodes segment4, cap15min shortened
+  to10min. Completed0:0 in8m38s on theia[0001,0007-0009], nvlblk17.
+  Placement guards passed, replicas use separate software cliques; RDMA
+  between replicas. Same a770/GA3/seq8192,DistOpt/Flex,EP8/8 vsEP8/6.
+- Recorded10-13: MBS1 H428.600/N521.900ms,82.123% parity,gap93.300ms;
+  existing MBS2 H692.850/N748.500ms,92.565%,gap55.650ms. Reduction37.650ms.
+  Post15-24 separately: MBS1 H415.660/N443.930ms,93.632%; MBS2
+  H651.650/N701.400ms,92.907%. MBS1 healthy post stdev31.05ms vsNEP3.09ms.
+- All60 GPU-only traces validated by analyze_gpu_only_mbs_pair.py: zero CPU
+  ops; NCCL stream sequences match full-profile reference (labels only,
+  no transferred times); dedicated expert streams match expected GEMM counts.
+- Full/reduced expert GEMM union MBS1 32.129/35.443ms; MBS2 49.895/52.823ms.
+  Relative effective efficiency90.65% ->94.46%, but absolute disadvantage
+  only shrinks3.313 ->2.928ms. Not enough to explain37.650ms iteration gain.
+- Rank0 EDP H/N union28.182/78.171 ->35.574/30.928ms; exposed with nothing
+  else5.410/18.279 ->3.096/5.416ms. Rank0 GPU-busy delta58.286 ->19.609ms;
+  logged-time-minus-busy remainder35.014 ->36.041ms (includes boundaries).
+- Matched rank0/8 ReduceScatter summed duration: MBS1 owner54.507/reduced
+  37.574ms; MBS2 owner16.618/reduced63.839ms. Sum of shorter per-op endpoint
+  durations16.298 ->16.618ms; owner excess38.209 ->0ms. Supports reduced
+  owner-side participant waiting, not faster transfers. Not an additive
+  critical-path cost. Parameter AG owner excess15.211 ->5.892ms as well.
+- Finer expert-group host-span mapping failed kernel-orientation validation
+  across MBS. Prototype removed; no host-spacing conclusion used.
+- Measured parity gain and owner EDP waiting change established; exact CPU
+  cause of readiness change remains unproven. Different allocations and
+  differential MBS1 capture inflation limit instrumentation-free conclusions.
+- Lustre analysis/a770_gpu_only_mbs_pair/{summary.json,edp_pair_durations.json};
+  raw traces soft_clique_baseline/2998515/cuda and2997621/cuda.
+  No further jobs submitted, no training implementation changes.
+
+### 2026-09-10: Nsight Systems feasibility for MBS1 capture overhead
+
+- User redirected investigation toward Nsight. NVIDIA documents Blackwell
+  Hardware Event System (HES) timestamps as lower-launch-overhead than software
+  tracing, especially for CUDA graph nodes. Systems, not Compute, is the
+  timeline tool for this experiment. Benefit to MBS1 remains to be measured.
+- Capability smoke3000903: one node, six-minute cap, completed0:0 in2m30s
+  on GB200 lyris0233 using existing NeMo26.06 container. No training changes.
+  Nsight Systems2026.2.1.210, bundled CUPTI13.2, --trace=cuda selects HES.
+  SQLite diagnostic explicitly says 'Hardware tracing used for CUDA tracing.'
+- --cuda-graph-trace=node --sample=none --cpuctxsw=none
+  --cuda-event-trace=false --capture-range=cudaProfilerApi.
+  No torch.profiler or autograd NVTX instrumentation in this smoke.
+  All30 expected kernels collected:10 ordinary plus20 graph nodes; launch
+  API correlations also present. No explicit cuda-hw flag in installed CLI;
+  cuda-sw requests software tracing, default cuda automatically used hardware.
+- Report also warns 'Not all CUDA events might have been collected.' Known
+  workload kernel count is complete, but do not silently ignore warning or
+  assume complete API/boundary records. Must validate production trace counts
+  and diagnose warning before making detailed timing claims.
+- Native Megatron Nsight path unconditionally enters autograd emit_nvtx;
+  bypass that per-op annotation for low-overhead experiments, retaining
+  explicit capture control only. Do not run PyTorch and Nsight collectors
+  simultaneously. No full MBS1 Nsight benchmark submitted yet.
+- Code: scripts/nonuniform/nsys_capability_smoke.py. Lustre artifacts:
+  analysis/nsys_smoke_3000903/{version.txt,help.txt,cuda.log,cuda.nsys-rep,
+  cuda.sqlite}. Source: docs.nvidia.com/nsight-systems/UserGuide/index.html
+  and docs.nvidia.com/cupti/main/main.html#hardware-event-system-hes.
+
+### 2026-09-10: MBS1 Nsight hardware-trace A/B submitted
+
+- Job3001023, four nodes segment4, GB200/GB300 backfill, 15-minute cap,
+  healthy EP8/8 then NEP EP8/6. Same a770, seq8192, GA3, MBS1, true GBS48/42,
+  DistOpt/Flex, graph capture, replica software cliques and trusted code unchanged.
+- New diagnostic-only NsightCapture adapter replaces torch.profiler.profile
+  with capture start/stop and one NVTX range per recorded iteration. No Kineto
+  collector or autograd emit_nvtx. Existing training step calls drive capture.
+- Nsight flags: cuda,nvtx; only nep_capture NVTX domain; no sampling/context
+  switches; graph node tracing; CUDA event tracing disabled; CUDA profiler API
+  capture. Reports, SQLite exports and temporary capture files all on Lustre.
+- Host stub verified start10, iteration ranges10-13, stop14 and idempotent stop;
+  Python compile and shell syntax checks passed. All-rank Nsight report count
+  validated separately from torch traces; simultaneous collectors rejected.
+- Initially pending Priority, no start estimate. Monitor every300s. MBS2 is
+  conditional on reduced differential capture distortion and complete traces.
+- First launch3001023 allocated GB200 lyris[0093-0096], but Python data-loader
+  Unix sockets failed before iteration1 because inherited Lustre TMPDIR exceeded
+  AF_UNIX path length. Canceled immediately on first five-minute inspection.
+  Corrected diagnostic launcher to use documented NSYS_TMPDIR for profiler
+  artifacts on Lustre while preserving application TMPDIR=/tmp for sockets.
+  No model/NEP code changes; no timings from failed attempt accepted.
+- Retry3001067: GB300 theia[0166,0174-0176], healthy completed with16 complete
+  expert-kernel traces and hardware tracing confirmed. Capture activation took
+  about1.9s in loggediteration10. Steady captured11-13 H517.77ms vs post437.04ms.
+  NEP completed1-9, then HybridEP ALLGATHER TIMEOUT at first captured iteration;
+  case killed by7min timeout. No NEP captured timings; no parity claim accepted.
+- Next bounded diagnostic retry drains GPU work and uses a Gloo barrier before
+  and after capture activation, at existing profiler WARMUP step9. No additional
+  barriers in measured10-13. Goal: prevent profiler activation skew/in-flight
+  transport interaction; timeout's exact mechanism not yet proven. No changes
+  to trusted training code. NSYS_TMPDIR alone appeared ignored by installed
+  tool; also set profiler-process TMPDIR to Lustre, child app TMPDIR=/tmp.
+- Aligned retry3001228: GB200 lyris[0032-0033,0035-0036], segment4, same clique
+  topology controls. Healthy completed all24 iterations; all16 Nsight reports
+  confirm hardware tracing, ranges10-13 and4320 expert kernels/rank/iteration.
+  H recorded10-13 mean501.70ms; post15-24 mean448.06ms. These are distinct
+  windows, not an exact causal estimate of profiler overhead.
+- NEP completed1-8 then timed out in first captured warmup iteration9:
+  HYBRID-EP ALLGATHER TIMEOUT expecting3096 got3095. Previous retry failed at
+  iteration10 expecting3456 got3455. All14 ranks logged capture activation.
+  Capture-boundary Gloo alignment + prior GPU drain did not resolve failure.
+  Canceled immediately at inspection, allocation released after10m44s.
+- No valid NEP recorded window, so no measured Nsight parity or differential
+  overhead can be reported. User's conditional MBS2 Nsight run NOT submitted.
+  Exact Nsight/HybridEP failure mechanism remains unknown; evidence rules out
+  unaligned capture activation as a sufficient explanation, not all possible
+  profiler-induced dependencies. No changes to NEP/training implementation.
+- Diagnostic code: nsys_capture_adapter.py, run_nsys_rank.sh,
+  analyze_nsys_activity_probe.py. Raw artifacts under Lustre
+  slurm_runs/soft_clique_baseline/{3001067,3001228}/nsys. All jobs terminal.
+
+### 2026-09-10: Isolate Nsight graph-origin tracing before MBS comparison
+
+- User requests fixing capture failure, then MBS1/2 healthy/NEP comparison and
+  same-recorded-iteration mechanism analysis. Existing model/NEP untouched.
+- Installed Nsight node granularity defaults to host-and-device on HES with
+  driver13+. Megatron graphs are launched by Python graph.replay(). Test explicit
+  node:host-only, retaining kernel-level graph data and HES, changing only the
+  graph-launch origin flag from previous aligned retry. Not yet a proven cause.
+- Retain all-rank capture, replica clique/RDMA placement, Gloo activation
+  alignment at warmup9, measured10-13, separately reported post15-24.
+- Host-only retry3001420, GB300 theia[0025,0033-0035], NEP still times out at
+  capture9 (3096 vs3095). Canceled redundant healthy phase at next inspection.
+  Graph-origin flag alone does not fix capture failure.
+- Next diagnostic isolates HES vs software by --trace=cuda-sw,nvtx; retains
+  host-only node granularity. Add45s delayed Python traceback during capture,
+  canceled on normal capture completion; abort Nsight A/B job on first failed
+  case. No training/NEP implementation changes.
+- Software-node tracing3001646 completed both24-iteration cases on GB200
+  lyris[0150-0153]. Switching HES -> software avoids reproduced capture failure;
+  internal HES failure cause remains unproven. No traceback/watchdog triggered.
+  Recorded10-13 H487.50/N636.45ms; post15-24 H422.77/N523.76ms. Differential
+  recording-minus-post distortion47.96ms, still unacceptable for mechanism claim.
+- Ancillary source-inspection container step failed during concurrent cache
+  initialization; primary training and both profile exports completed normally.
+  Avoid starting extra named-container steps until cache initialization ends.
+- Only mamba/attn/moe_router are graph captured. All expert GEMMs, HybridEP,
+  and NCCL kernels remain outside graphs. Next test: software graph:host-only
+  granularity, retaining those individual kernels but treating graph spans as
+  coarse spans (not pure compute). MBS1/2 four-case sweep in one allocation;
+  separate mbs1/mbs2 roots avoid overwriting any artifacts. No model changes.
+- Software whole-graph sweep3001725 completed0:0 in18m11s on GB300
+  theia[0063,0069-0071], segment4. MBS1 NEP->healthy, MBS2 healthy->NEP.
+  All60 traces validated: expert GEMM counts correct; NCCL per-stream sequences
+  match reference metadata after symbol normalization. Only labels transferred,
+  never timings. Graph spans are coarse bounds, not pure compute measurements.
+- MBS1 recorded10-13 H509.175/N575.725ms,88.4407%; pre6-8 87.7432%; post15-24
+  H455.910/N502.020ms,90.8151%. Recorded-minus-post distortion20.440ms
+  differential; pre-to-recorded latency gap changes only0.817ms. Timing drift
+  prevents claiming exact profiler overhead from either neighboring window.
+- MBS2 recorded H708.700/N749.675ms,94.5343%; pre94.1684%; post H681.500/
+  N717.860ms,94.9349%. Differential recorded-minus-post4.615ms (0.40pp parity).
+- Analysis: scripts/nonuniform/analyze_nsys_mbs_pair.py; results under Lustre
+  soft_clique_baseline/3001725/nsys_mbs_analysis. Distinct graph-span vs known
+  kernel coverage gives bounds on exposure rather than falsely labeling graph
+  internal gaps as compute overlap.
+- Next job3001940: identical four-case sweep, only NSYS_CUDA_TRACE=cuda switches
+  software -> HES with graph:host-only granularity. This combination has not
+  yet been tested. Need low-overhead MBS1 calibration before closing task.
+- Job3001940 failed NEP before capture at iteration2, HybridEP expected576,
+  got575; six-minute fail-fast timeout prevented redundant cases. HES is not
+  usable for this workload; exact profiler-internal failure remains unknown.
+- Inspection3001984 found CUDA13.2/CUPTI2026.1.1, Nsight2026.2.1. Software
+  Nsight records2325 extra cudaMemcpyAsync calls/owner/iteration in NEP versus
+  healthy. This motivates native concurrent GPU-only activity collection,
+  avoiding CUDA API instrumentation; does not yet prove a causal bottleneck.
+- Collector smoke3002054 failed CUPTI_ERROR_NOT_INITIALIZED: unnecessary
+  cuptiActivityEnableHWTrace(0) requires initialized CUDA driver. Removed it
+  (software tracing is default). Added core-dump disable to smoke script.
+- Smoke3002164 passed on GB200:30 kernels, including20 CUDA graph-node kernels,
+  zero dropped/invalid records. Host stub verified capture9, measured10-13,
+  stop14 and idempotent stop. No production training changes.
+- Submitted3002215: four sequential cases MBS1 NEP/healthy then MBS2
+  healthy/NEP, GB200 lyris[0208,0210,0212,0214], segment4. All-rank native
+  GPU activity plus three coarse CPU staging-method scopes, no CUDA API or
+  autograd-op trace. Library analysis/cupti_gpu_3002164/libgpu_trace.so.
+- 3002215 completed all cases12m28s,60 all-rank traces zero dropped/invalid
+  records, expert counts and NCCL sequences validated. Recorded10-13 parity
+  MBS1 H443.275/N494.975ms=89.555%; MBS2 H712.300/N742.725=95.904%.
+  MBS1 pre89.128%/post91.180%, MBS2 pre95.114%/post95.430%. MBS1 drift
+  means this is not yet a clean low-overhead final result. Staging scopes:
+  parameter redistribution CPU26.022->24.826ms, GPU idle within scope
+  13.964->2.132ms (full owners0-5), supporting better hiding with MBS2.
+- Direct CUPTI HES smoke3002411 passed30 kernels including graph nodes,
+  zero drops/invalids. Explicit cuInit before cuptiActivityEnableHWTrace(1).
+  No Nsight injection, API callbacks or CPU-op instrumentation.
+- 3002441 direct-HES four-case test failed first NEP case at capture39;
+  pre29-38 averaged507.64ms; no recorded iterations. Six-minute case timeout
+  stopped remaining cases, job elapsed8m05. HES failure reproduces without
+  Nsight, so removing Nsight API instrumentation does not resolve it.
+- Submitted3002525 using working software GPU-only collector, capture40-49
+  of60 iterations with pre29-38/post51-60 controls. Diagnostic-only window
+  overrides added; original defaults10-13 retained. No model/NEP changes.
+  Production nonuniform_ep.py SHA256 remains
+  4676f164a95255bdcc7e2531a06ca92c41a2583bf6f9a7a85b3b74b64f26f2d1.
+
+### 2026-09-11: Reduce remaining native collector distortion
+
+- 3002525 completed all four cases14m45s, all60 traces validated. Later
+  capture40-49 did not solve MBS1 distortion: H428.20/N513.24ms recorded,
+  pre H410.61/N467.18, post H407.94/N480.50. MBS2 recorded parity95.432%,
+  pre95.884%, post95.078%. No final low-overhead MBS1 claim accepted.
+- Deferred native CUPTI buffer parsing until capture stops; preallocated and
+  zeroed32x8MiB host buffers/rank before timing. Smoke3002648 compilation failed
+  due size_t value instead of pointer for cuptiActivitySetAttribute; fixed.
+  Smoke3002689 passed30 kernels including20 graph nodes, zero drops/invalids.
+- Buffered collector four-case3002727 completed14m21s on GB200
+  lyris[0099-0102], all60 traces validated. MBS1 H404.85/N482.39ms recorded,
+  pre H391.95/N439.87, post H401.95/N448.69. Buffer preallocation did not
+  remove differential distortion. MBS2 recorded parity93.137%, post93.127%.
+- Tested GIL-preserving PyDLL bindings for tiny timestamp/range calls in
+  3002848, GB200 lyris[0225-0226,0228-0229], completed15m35s. MBS1 H433.92/
+  N515.15ms recorded, pre H413.24/N454.24, post H410.67/N477.32. This
+  does not resolve distortion; do NOT claim GIL handoff was its main cause.
+- Whole-graph smoke3002905 produced eager kernels but no graph spans. NVIDIA
+  CUPTI documentation explicitly forbids late enable of whole-graph tracing
+  after graph instantiation. Enable GRAPH_TRACE at collector initialization;
+  skip pre-window graph records on export, count them separately from invalid
+  records. Fixed smoke3002956 passed10 eager kernels +2 graph spans, zero
+  dropped/invalid records. https://docs.nvidia.com/cupti/main/main.html
+- Submitted3003037: GB300 theia[0083-0085,0087], same four-case MBS comparison,
+  whole-graph GPU-only capture40-49. Expert GEMMs and all communications remain
+  individually traced; only mamba/attn/moe_router use coarse graph spans.
+  Pre29-38 is now graph-only tracing, post51-60 disabled, explicitly distinct
+  controls. Sparse CPU markers use time.time_ns after checking that CUPTI's
+  timestamp lies within enclosing Python CLOCK_REALTIME reads. No changes to
+  model/NEP implementation. No accepted final result yet.
+- analyze_cupti_mbs_pair.py checks all-rank drops, expert kernel counts and
+  per-stream NCCL ordering against reference semantic labels (not timings).
+  For graph mode it reports both lower/upper exposure and GPU-idle bounds;
+  graph spans must not be described as uninterrupted GPU compute.
+
+### 2026-09-11: Isolated CUPTI13.4 hardware trace validation
+
+- 3003037 completed15m59s; all60 traces validated. MBS1 recorded H413.75/
+  N461.65ms=89.624% versus post H402.47/N434.66=92.594%; MBS2 recorded
+  H663.81/N717.18=92.558% versus post650.03/696.60=93.315%. Whole-graph
+  software tracing still distorts MBS1; these are not accepted final results.
+- Downloaded SHA256-verified NVIDIA CUDA13.4.1 standalone CUPTI13.4.58 and
+  cudart13.4.49 headers under Lustre tools/cupti_13_4. Only diagnostic CUPTI
+  is replaced; production CUDA runtime, NCCL, PyTorch and NEP remain unchanged.
+  Release notes document an HES heap-corruption fix, but do not prove the
+  exact cause of our previous failures.
+- HES smoke3003254 emitted only10 eager kernels, missing20 graph kernels.
+  Raw-kind diagnostic3003306 confirmed missing records, not parser filtering.
+  Added GPU-drained forced flush BEFORE disabling activity; graph-trace
+  preparation now follows HES selection and precedes graph instantiation.
+- Smoke3003376 passed both modes:30 kernels including20 graph nodes in node
+  mode;10 eager kernels plus2 graph spans in whole-graph mode. Zero dropped
+  or invalid records. CUPTI runtime/header version130400 verified with ldd.
+- Submitted3003475 using node-level HES, all-rank capture40-49 of60 iterations,
+  same MBS1 NEP/healthy then MBS2 healthy/NEP allocation; GB200 lyris[0235-0238],
+  segment4. Library analysis/cupti_gpu_3003376/libgpu_trace.so. No production
+  implementation changes. A successful smoke does not yet establish that
+  HybridEP workload capture works or that its distortion is acceptable.
+- 3003475 completed all four cases; all60 traces validated. HES no longer
+  fails this workload with13.4, but overhead remains unacceptable. MBS1
+  H/N pre430.41/468.83, recorded496.42/587.73, post419.75/486.95ms;
+  MBS2 pre705.58/757.89, recorded727.41/800.99, post697.67/745.94ms.
+- Added diagnostic CUPTI_MEMORY_ACTIVITY=0 option (default remains enabled)
+  to isolate memory-copy activity overhead. Kernel-only smoke3003525 passed
+  30 kernels including20 graph nodes, zero drops/invalids. Workload3003550
+  completed14m30s on GB200 lyris[0037-0040], all four cases. MBS1 H/N
+  pre407.56/506.15, recorded461.49/620.63, post414.91/501.43ms; MBS2
+  pre690.99/752.95, recorded706.04/806.33, post697.35/741.89ms. This did
+  NOT fix profiling distortion; memory-copy timestamps are not its sole cause.
+- Live training-process affinity check showed CPUs0-143 available, not a
+  one-core restriction. No CPU-binding or training changes were made.
+- Whole-graph software/kernel-only smoke3003633 passed10 eager kernels and
+  2 graph spans, zero drops/invalids. Submitted3003670 for the same four-case
+  comparison, CUPTI13.4, HES0, whole_graph1, memory_activity0. Profiling omits
+  memory-copy intervals, so apparent GPU idle/exposed time is not exact;
+  analyzer now preserves that metadata. Expert and collective kernels remain
+  individually traced. No accepted low-distortion MBS1 result yet.
+- 3003550 all60 kernel-only HES traces validated. 3003670 completed14m39s
+  on GB200 lyris[0147,0151,0154,0157], all60 traces validated. H/N MBS1
+  pre414.98/485.57, recorded419.09/498.39, post400.42/455.55ms. MBS2
+  pre688.88/737.10, recorded693.22/743.91, post671.52/718.20ms. MBS1
+  still distorted; MBS2 parity93.186% versus93.500% post. Do not present
+  their measured parity difference as an undistorted workload effect.
+- Tested CUPTI13.4 V2 graph filtering:3003806 compile error from wrong
+  attribute name;3003823 crashed using read-only subscriber-state attribute
+  as a setter. Corrected subscription through allowMultipleSubscribers=1.
+  3003844 reported NOT_COMPATIBLE from remaining V1 timestamp call; replaced
+  with cuptiGetTimestamp_v2. 3003905 captured all30 kernels despite graph
+  filter, so it failed the intended eager-only completeness check.
+- Persistent one-node debug allocation3003937 allowed immediate API tests.
+  Setting graph filter before subscription with null handle crashed; setting
+  after subscription and disabling GRAPH_TRACE at capture still emitted all
+  graph nodes. Keeping GRAPH_TRACE enabled with a user-defined kind-only
+  record finally suppressed body-node records. Eager records retain only
+  kind/start/end/stream/device/name; safe decoding uses CUPTI layout metadata.
+- Sparse graph CUDA-event envelopes are preallocated before capture; no GPU
+  synchronization/elapsed-time reads inside measured iterations. Read/export
+  after GPU drain. Five CPU/GPU clock anchor trials bound alignment error;
+  smoke bound6800ns. These envelopes include internal graph/launch gaps and
+  must NOT be treated as uninterrupted compute. Memory copies remain untraced.
+- 3003937 final smoke passed10 eager kernels+2 manual graph envelopes, zero
+  dropped/invalid records. Library SHA256
+  8c77cdb120925c53edf7f11e847104b0fcba81fa958651c83f15ddeeaa18986c.
+  Released allocation immediately after testing. Submitted3003972 for four
+  cases, same windows40-49 and bracketing controls; eager_only1, graph_events1,
+  memory_activity0, HES0. All changes remain in diagnostic scripts only.
+- 3003972 completed15m45s on GB200 lyris[0157,0159-0160,0162]. MBS1
+  H/N pre429.26/492.31, recorded432.42/497.13, post412.57/470.77ms.
+  Recorded parity86.984% versus pre87.193% and post87.637%. MBS2 H/N
+  pre707.94/743.65, recorded704.09/741.02, post684.50/728.50ms;
+  recorded95.016%, pre95.198%, post93.960%. The gain persists in controls,
+  but residual differential distortion is not zero (up to about1.1pp).
+- All MBS1 traces and MBS2 healthy ranks0-14 validated. MBS2 healthy rank15
+  has an invalid record, so the all-rank audit is NOT complete. Do not silently
+  waive the validator. MBS2 NEP rank0 independently validates. Its owner tail
+  after the last expert GEMM is19.412ms versus MBS1 owner mean30.153ms;
+  staging CPU duration remains about38-39ms. Memory-copy intervals are absent,
+  and graph envelopes bound rather than measure continuous compute; these
+  observations alone are not a complete precise gap decomposition.
+- Added optional CUPTI_MINIMAL_FULL=1: minimal selected fields for native
+  graph envelopes, memory copies, memsets, and eager kernels. Removed manual
+  CUDA-event graph timing from this experiment (GRAPH_EVENTS=0). New parser
+  uses per-kind CUPTI layouts and logs invalid record category/timestamps.
+  Smoke3004176 passed kernel/graph checks, zero dropped/invalid records.
+- Added explicit D2D copy and cudaMemsetAsync smoke operations with payload
+  assertions. Submitted smoke3004214 and success-gated four-case3004215.
+  Same60 iterations/capture40-49; minimal_full1, eager_only1, memory_activity1,
+  graph_events0,HES0. The4-node job cannot start unless the memory smoke passes.
+
+### 2026-09-11: Fresh-process profiler calibration
+
+- Smoke3004214 passed explicit copy/memset checks. All60 traces from3004215
+  validated, but MBS1 recorded parity85.93% versus post89.10% failed the
+  low differential overhead objective. MBS2 recorded94.04%, post93.88%.
+  These are not accepted unbiased mechanism measurements.
+- Whole-graph HES3004283 completed but was also rejected: MBS1 recorded
+  healthy515.54/NEP616.40ms versus post433.96/515.39ms. Working capture
+  does not establish low overhead. No production changes were made.
+- Sparse eager-only collector now exports absolute clock origin and explicit
+  zero-duration graph-envelope counts. Zero-duration graph envelopes carry no
+  occupancy; invalid kernel or negative duration records still fail validation.
+  This does not establish the cause of the earlier discarded invalid record.
+- Smoke3004433 passed. Calibration3004434 completed both fresh MBS1 controls
+  (healthy427.59/NEP477.87ms, parity89.48%, iterations40-49) then failed in
+  analysis because the wrapper demanded traces from deliberately unprofiled
+  controls. Training itself completed. Corrected only this analysis guard:
+  explicit control marker permits zero traces and rejects CUPTI activation.
+  Reanalysis of those existing controls passed.
+- Submitted3004599, allocated GB200lyris[0201-0204], segment4. Eight cases:
+  MBS1 control N/H, profiled N/H; MBS2 profiled H/N, control H/N. All60
+  iterations, measured40-49; fresh controls never load CUPTI or graph timers.
+  Profiled cases use sparse eager kernels plus CUDA-event graph envelopes,
+  no memory activity. Graph envelopes are NOT continuous compute, and missing
+  memory activity forbids claiming exact total GPU idle/exposure. All-rank
+  trace validation remains mandatory. Model, optimizer and NEP unchanged.
+
+- 3004599 completed all eight cases, all60 rank traces validated. MBS1
+  recorded412.92/492.70ms (H/N), parity83.81%, fresh control87.52%:
+  rejected differential bias3.71pp. MBS2 recorded684.73/730.54ms,
+  parity93.73%, fresh94.03%. Note earlier progress message rounded the
+  MBS1 bias to3.73pp; the precise stored summary gives3.7078pp.
+- 3004764 removed per-graph CUDA-event timers, keeping eager kernels and
+  sparse NEP host ranges. Completed28m01s, all60 traces validated.
+  MBS1 recorded444.42/508.79ms, parity87.348%, fresh87.455%.
+  Absolute overhead7.91%H/8.04%N, with substantial recorded variance:
+  H std10.18ms/N14.57ms. Matching means alone is not decisive evidence
+  that instrumentation no longer distorts scheduling. MBS2 recorded
+  705.03/755.51ms, parity93.318%, fresh94.380% (1.062pp bias).
+- Tested sparse V2 collector with hardware event timestamps. Smoke3005216
+  failed because the legacy enable-HES API cannot be mixed with V2.
+  Changed only diagnostic collector to use ENABLE_HES attribute through
+  SetAttribute_v2. Smoke3005259 passed10 eager kernels, no drops/invalid.
+  Workload3005297 MBS1 recorded500.76/562.08ms versus controls420.23/
+  453.25ms: rejected large overhead. Cancelled rather than spending the
+  remaining allocation on this rejected variant.
+- Added CUPTI_LATE_GRAPH_ACTIVITY diagnostic option: graph activity enabled
+  only at capture start, not before graph instantiation. Smoke3005467 passed
+  10 eager kernels, no graph records, no drops/invalid. Workload3005518
+  completed27m09s and all60 traces validated, but MBS1 parity91.48% versus
+  control88.82% remained distorted; MBS2 recorded94.77%, control93.79%.
+- Added CUPTI_LATE_INIT diagnostic option: preload library for version
+  compatibility but defer subscriber initialization until after graph capture
+  and warmup. No production changes. Smoke3005726 passed10 eager kernels,
+  zero drops/invalid. Submitted3005780 on GB200lyris[0038-0039,0046,0048],
+  segment4, same eight-case controls/captures. Results pending. All these
+  sparse modes omit graph internals and memory activity: do NOT interpret
+  missing events as GPU idle or exact exposed communication.
+
+### 2026-09-11: Complete profiler calibration and MBS mechanism comparison
+
+- Late-init CUPTI3005780 completed26m52s; all60 rank traces validated.
+  MBS1 recorded441.05/520.05ms H/N, parity84.81%, fresh-control86.45%.
+  MBS2 recorded711.90/750.30ms, parity94.88%, fresh94.41%.
+  MBS1 retained differential distortion and was not accepted as unbiased.
+- Added analysis-only `audit_cupti_mbs_tail.py`. It identified late default-PG
+  timing barriers in3005780, not EDP/Scatter. In MBS1 iteration40, owner2
+  finished Adam/copies later than peers, which then waited at the barrier.
+  This located the delay but did not identify why owner2 progressed slowly.
+  Sparse graph/memory omissions still forbid calling absent activity GPU idle.
+- Tested device-buffer preallocation to avoid CUPTI pool growth: smoke3006143
+  passed; eight-case3006226 completed26m51s, all60 traces validated. MBS1
+  controls425.24/468.63ms versus recorded445.89/517.45ms: still+4.86%H/
+  +10.42%N, rejected. No evidence pool growth was the main cause.
+- Live environment inspection confirmed OMP_NUM_THREADS=1, not an oversized
+  OpenMP pool. Many NCCL watchdog/heartbeat threads were present; their
+  presence alone does not establish CPU contention or a slowdown cause.
+- HES plus late graph activity smoke3006507 produced30 valid eager+graph-body
+  kernels, not the10 eager-only expectation. Made the smoke expectation
+  explicit for that full-graph mode;3006660 passed. Workload3006778 MBS1 NEP
+  was566.32ms versus467.99ms control (~21% overhead). Cancelled at13m57s
+  instead of completing the remaining rejected profiling cases.
+- Implemented diagnostic-only `cuda_event_capture_adapter.py`: preallocated
+  CUDA-event ranges plus CPU wall/thread time around TE grouped forward/
+  backward, NEP gradient staging/parameter redistribution and optimizer/copies.
+  No CUPTI subscriber, event synchronization, parsing or export in the measured
+  window. This deliberately trades a complete kernel/NCCL timeline for low
+  overhead; operation elapsed ranges are not kernel busy time.
+- Smoke3006965 passed bitwise output/input-gradient/parameter-gradient
+  equivalence with and without wrappers. No training implementation changes.
+- Job3007029 completed27m55s, exit0, on GB200lyris[0266,0268-0270], segment4,
+  same software-clique cross-replica RDMA isolation. Eight cases,60 iterations
+  each; all four profiled cases recorded every rank in iterations40-49.
+  MBS1 H425.61+/-0.95ms / N481.69+/-4.13ms, parity88.36%.
+  MBS2 H702.83+/-5.46ms / N733.95+/-3.72ms, parity95.76%.
+  Fresh-control parity89.78%/95.54%; surrounding-window parity88.29%/95.72%.
+  MBS1 recording is about+1.1% for both H/N versus surrounding windows;
+  MBS2 recording adds no discernible time. MBS1 fresh-control mismatch1.42pp
+  remains disclosed; no claim of zero bias or exact per-collective exposure.
+- `analyze_cuda_event_mbs_pair.py` validated all60 files: ten measured
+  iterations,90 grouped forwards/backwards each, matching CPU/GPU counts,
+  expected NEP operation counts, clock error<200us. Added disjoint temporal
+  partitions which telescope exactly to each rank's iteration range.
+- Full-owner extra time falls56.085 to31.089ms in the operation traces.
+  First-forward region penalty28.426->19.788ms; post-expert tail penalty
+  16.278->2.552ms; intervening region11.381->8.748ms. Final microbatch
+  expert-backward-span penalty remains4.316/4.545ms, while the first two
+  microbatch backward spans match healthy. More host submission completes
+  before GPU execution at MBS2: redistribution1.7%->54.6% and optimizer
+  71.7%->100% on full owners. Reduced redistribution CPU time is almost
+  unchanged19.735->19.081ms but its GPU operation range falls14.059->5.243ms.
+  This supports improved parameter delivery/launch headroom plus amortization,
+  not a large pure-GEMM efficiency recovery. The post-expert relative gain
+  includes NEP tail shrinking6.13ms AND healthy tail growing7.59ms; do not
+  label the entire13.72ms as NEP becoming faster or as Scatter savings.
+- Detailed result and limitations: `NEP_A770_LOW_OVERHEAD_MBS_RESULTS.md`.
+  Artifacts: Lustre `slurm_runs/soft_clique_baseline/3007029`, primary
+  `cuda_event_analysis/summary.json`. Older per-case comparison JSONs select
+  post-window51-60 and are NOT used as measured-window results.
+- Trusted training NEP SHA256 still
+  4676f164a95255bdcc7e2531a06ca92c41a2583bf6f9a7a85b3b74b64f26f2d1.
+  Production model/NEP/optimizer unchanged throughout profiler investigation.
+
+### 2026-09-11: Static audit of parameter redistribution host work
+
+- User requested code-level starvation candidates, with generalization across
+  supported EP degrees and features. No production edits or new jobs.
+- Audited trusted NEP parameter Scatter, native DistOpt param-sync, forward
+  readiness callbacks and ownership helpers. NEP packs/unpacks one expert
+  tensor per copy_ call; even its existing _foreach_copy_ helper is a scalar
+  loop, not a batched implementation. Owner-entry filtering and tensor-view
+  construction recur inside the forward-readiness callback.
+- Found redundant staging for singleton owner-transfer groups: code packs
+  proxy -> temporary, skips broadcast, then copies temporary -> model. A direct
+  proxy -> model copy can remove the intermediate pass without aliasing model
+  parameters or changing communicator order. This condition is runtime-derived,
+  not tied to any EP degree. Pure ownership-helper checks confirmed singleton
+  reduced-owner groups for128 experts at8/6,16/12,32/28 and8/4, and some full
+  owners at32/28. Multi-rank transfer groups must retain their general path.
+- For15 MoE layers with two expert weight tensors each, rank8's22 experts
+  imply660 parameter tensors and1320 pack/unpack copy_ calls per iteration;
+  singleton direct copying would reduce that to660, not eliminate the needed
+  update. These are static call counts, not measured GPU kernel counts or time.
+- NEP finish_param_sync launches the next native parameter all-gather only
+  after current redistribution submission. Native DDP starts its next gather
+  before its post-processing. This delays prefetch and may also inherit current
+  stream dependencies, but moving it earlier requires an explicit NCCL-order
+  audit; it is not bundled into the lower-risk copy cleanup recommendation.
+- Shared bounded staging slots are cleared at chain end and lazily allocated
+  again next iteration. This creates allocator/view churn but does not prove
+  cudaMalloc, device synchronization or GPU starvation. Retaining slots changes
+  memory lifetime and must be evaluated separately against prior memory goals.
+- Low-overhead traces establish submission timing, NOT individual kernel
+  starvation. In particular an end event enqueued after a CPU method returns
+  can include host delay of the event itself. No claim that these static
+  candidates account for a measured number of GPU-idle milliseconds.
+- Any implementation must preserve actual tensor dtype/device/shape, logical
+  expert-ID mappings including padded slots, physical/proxy storage identities,
+  native DistOpt lifecycle, dispatcher and graph compatibility, optimizer modes
+  and collective ordering. Initial candidates: cached static descriptors and
+  singleton direct copies; batching requires a verified compatible library
+  primitive, not simply invoking the existing scalar _foreach_copy_ helper.
+
+### 2026-09-11: Delegated copy cleanup and reconciled workload parity
+
+- User approved a separate-branch implementation and requested existing parity,
+  tuning outcomes, hypotheses and the strength of MoE-efficiency evidence.
+  Spawned full-context agent Mill01a09141-a62e-7ac1-b6d6-45dc8ee1aedb with
+  explicit generalization, correctness, storage and no-regression requirements.
+  Branch nep/param-redistribution-cpu-20260911 in separate worktree
+  /home/darfeen/Megatron-LM-nep-param-cpu-20260911. Original trusted checkout
+  must remain untouched. No prefetch reorder or memory-lifetime expansion is
+  included; agent must report implementation and performance validation separately.
+- Rechecked raw profile-window JSON and comparison files. Topology-controlled
+  profile/post parity: a31590.62/97.25%; a500 MBS1->3 profile73.82->91.13%,
+  post82.28->94.75%; a8b93.14/93.89%. Latest low-overhead a770 MBS1->2
+  profile88.36->95.76%,post88.71->95.27%,fresh89.78->95.54%.
+  Profiler types/windows are not interchangeable. a500 MBS points use different
+  allocations; latest a770 points share one allocation.
+- New summary NEP_WORKLOAD_PARITY_STATUS_20260911.md includes all original
+  workload dispositions and historical tuning, clearly quarantining old
+  placement/profiler/hardware confounds rather than calling them current results.
+- Reduced GEMM efficiency is real (e.g. a77089.07->96.36%, controlled shape
+  diagnostic79.30->88.96%, persistent wgrad around78%). No audited full
+  workload establishes it as the primary cause of low iteration parity.
+  a500 extra active GEMM time grows despite improved parity. CPU copy cleanup
+  is a plausible improvement, not a measured fix or proof of GPU starvation;
+  it does not directly fix intrinsic expert GEMM shape/output inefficiency.
+
+### 2026-09-11: Topology-controlled small-model parity plots
+
+- Added scripts/nonuniform/plot_nep_small_model_parity.py. Reads original
+  measured-window JSON, post-window comparisons, and job3007029 event summary;
+  asserts the expected plotted measured values rather than hardcoding heights.
+- Primary chart: profiled a50073.82->91.13% with MBS1->3 and a77088.36->95.76%
+  with MBS1->2. GA3 unchanged; both H/N batches scale proportionally. a31590.62%
+  shown as original-only MBS4 reference, not an invented before/after pair.
+- Separate post-profile chart: a50082.28->94.75%,a77088.71->95.27%,a31597.25%.
+  Titles/labels disclose architecture,EP8/8 vs8/6,TP1/CP1,GB200,seq8192,
+  GA3,GBS changes,DistOpt/Flex,software-clique RDMA transport,profiler methods
+  and distinct windows. a500 allocation difference and profiling caveats remain
+  visible. No pending CPU-cleanup result is implied by these workload changes.
+- Generated PNG/PDF pairs and data.json under Lustre analysis/
+  nep_small_model_parity_20260911. Visually inspected charts, corrected label
+  overlap, and copied all five artifacts to computelab-sc-01. Remote SHA256
+  matches verified. Talos:
+  https://sc.talos.nvidia.com/view/home/scratch.darfeen_coreai/nep_small_model_parity_20260911/
+
+### 2026-09-11: Final-GA kernel-sum companion chart; remove a315
+
+- Removed a315 from both parity charts because it has no before/after pair.
+- Added analyze_nep_final_ga_sums.py and a matching-profile companion figure.
+  Final GA is backward microbatch 3. Validated 24/30 grouped-linear backward
+  calls per microbatch for a500/a770, respectively, and no uncorrelated compute
+  kernels in all 96 owner/iteration samples (6 owners x 4 steps x 4 runs).
+- Sum individual GPU kernel durations, then average owners 0-5 and steps10-13.
+  Not a union, elapsed span, or measurement of achieved overlap. NCCL sums
+  include participant waits. Compute includes backward gradient accumulation
+  but excludes NEP staging and communication. Final-GA communication includes
+  gradient Gather and expert EDP reduce-scatter including trailing completion;
+  DistOpt parameter AG/redistribution is in forward and excluded.
+- a500 MBS1->3: comm130.154->13.913ms, backward43.695->97.543ms;
+  matching measured parity73.82->91.13%. Older a770 MBS1->2:
+  comm101.960->127.947ms, backward59.854->113.280ms;
+  matching measured parity79.31->83.32% (jobs2995392/2995524).
+- New a770 job3007029 lacks individual comm/full backward kernel capture.
+  Keep its88.36->95.76% parity in the original chart, separate from the older
+  full-profile companion; never attach older kernel sums to newer parity.
+  Full-profile distortion and allocation confounders remain explicitly labeled.
+- Generated plots/data under Lustre analysis/nep_small_model_parity_20260911;
+  no training changes or new GPU jobs. Companion visually checked.
+
+### 2026-09-11: Correct interpretation of final-GA residency changes
+
+- Per user request, companion a770 parity now uses post-profile steps15-24,
+  85.79->93.50%, of the SAME old jobs2995392/2995524. Kernel sums still use
+  steps10-13; this mismatch is explicitly labeled and cannot decompose the
+  post-profile latency. a500 remains profiled parity, MBS1->3 (not MBS2).
+- Audited all eight EDP RS kernels, four steps, on rank0 and its rank8 peer
+  using record_param_comms external-ID attribution. Input payload per step
+  unchanged across MBS: a5001.2890625GiB, a7702.4169921875GiB (FP32).
+  Gradient synchronization payload does not grow with token batch size.
+- a500 rank0 summed EDP127.794->13.010ms, rank8 8.934->63.009ms.
+  Signed cumulative peer start skew118.946->-49.984ms per iteration, while
+  matching completion timestamps differ by at most0.042ms. The waiting side
+  reverses; this is not a tenfold bandwidth or payload improvement.
+- a770 rank0 EDP95.467->124.945ms, rank8 52.567->16.676ms;
+  signed cumulative start skew42.876->108.233ms, matching completion differences
+  <=0.021ms. The increased rank0 residency is consistent with more participant
+  waiting, not expected growth in gradient bytes with MBS.
+- Six-owner plot means: a500 Gather0.884->1.221ms,EDP129.270->12.692ms;
+  a770 Gather7.469->4.507ms,EDP94.491->123.440ms. These are kernel-duration
+  sums with waits, NOT intrinsic transfer cost or exposed critical-path time.
+  Peer audit identifies readiness skew but not its upstream CPU/compute cause.
+- Audit code scripts/nonuniform/audit_final_ga_edp.py; detailed JSON remains
+  on Lustre. No GPU jobs or production edits. Updated plots republished.
+
+### 2026-09-11: a770 all-owner EDP arrival audit
+
+- Matched EDP by process-group ID, participant set, step, and per-group ordinal
+  across all14 rank traces per job, validating all12 EDP participants. Matching
+  EDP peer kernel completion spread <=0.086ms. Four profiled steps10-13.
+- Full-owner average MBS1->2: Gather7.469->4.507ms; EDP94.491->123.440ms.
+  EDP residency before the peer kernel starts78.306->107.124ms; remaining
+  EDP16.185->16.317ms. Identified pre-peer residency is76.80->83.72% of the
+  plotted Gather+EDP total. Remaining EDP is NOT proven pure transfer time.
+- Summing all12 EDP ranks (ms-rank per iteration): residency872.511->838.316;
+  pre-peer residency678.818->642.743; remaining193.693->195.573. Thus aggregate
+  waiting drops only5.3%, unlike a500 rank0/8's51.5% arrival-gap reduction.
+  Owner-only EDP grows because more waiting falls on the full owners.
+- Gather peer kernels can finish independently; trace metadata also omits
+  participant lists for some multi-rank Gather groups. Do not apply the EDP
+  last-participant-start decomposition to Gather. Its waiting fraction remains
+  unquantified; no claim that the remaining23.65/20.82ms is all useful transfer.
+- The upstream reason MBS changes replica arrival skew differently between
+  a500/a770 remains unproven; profiler distortion/allocation confounders remain.
+  Code:audit_a770_collective_arrivals.py, data:a770_collective_arrivals.json
+  in the existing Lustre plot-analysis directory. No new GPU jobs/plot changes.
+
+### 2026-09-11: Replace incorrect communication series definition
+
+- User clarified blue series must be NEP Gather + Scatter excluding participant
+  waiting, NOT Gather + EDP. Removed the old numeric blue bars and changed the
+  legend accordingly. EDP excluded entirely; DistOpt Scatter is forward parameter
+  redistribution, so reshard total spans an iteration while compute is final GA.
+- Wait-subtracted Gather/Scatter values are not established. Explicit N/A values
+  replace the incorrect bars, not zeros or relabeled EDP numbers. This corrects
+  the figure but does not complete numerical measurement of the requested series.
+  Parity and compute data unchanged. Rendered and visually checked PNG/PDF;
+  publishing updated plots only to the existing Talos directory.
+
+### 2026-09-11: Numerical reshard estimates, EDP-delta stack, iteration-gap bars
+
+- Used existing traces only, no new GPU jobs. Added analysis-only
+  analyze_nep_reshard_estimate.py and analyze_nep_edp_delta.py. Compact per-rank
+  caches and detailed JSON live in the existing Lustre plot-analysis directory.
+- Recovered actual process-group participants from distributedInfo.pg_config
+  (event metadata omits some 3-rank groups). Matched PG ID, host call ordinal,
+  and ProfilerStep; checked full participant sets, payload agreement, common
+  trace time origins. All four cases contain192 full-owner Gather kernels and
+  192 Scatter kernels across6 owners x4 steps (8 calls/step/category).
+- Reshard estimator: subtract prefix before latest peer GPU start only if all
+  peer kernel intervals intersect. Preserve nonintersecting/buffered calls,
+  because send completion can precede receiver launch. This is an explicitly
+  labeled arrival-adjusted ESTIMATE, not exact removal of all internal waiting.
+  Multi-peer useful progress before last arrival can be removed; internal waits
+  after arrival and waits on buffered/nonintersecting calls can remain. No pure
+  bandwidth or counterfactual critical-path claim. Raw sums retained in JSON.
+- Full-owner means (ms), original->largerMBS:
+  a500 Gather0.790->1.009,Scatter1.258->1.933,total2.048->2.942;
+  a770 Gather5.003->2.595,Scatter0.997->1.067,total5.999->3.662.
+  Raw totals:a5002.184->3.171,a77016.326->14.673. DistOpt Scatter is forward
+  parameter broadcast/redistribution, not gradient EDP reduce-scatter.
+- Matched native healthy EXPERT_DATA_PARALLEL_GROUP and NEP ep_dp gradient
+  reduce-scatter for owners0-5 and their peers8-13. EDP estimate is per-owner
+  kernel end minus later peer start, averaged over4 steps. Peer kernel endpoints
+  within0.089ms; all kernels overlap their matching peer. Results:
+  a500 healthy6.384/6.465,NEP8.881/9.072,delta2.498/2.607ms;
+  a770 healthy11.632/11.824,NEP16.185/16.317,delta4.553/4.493ms.
+  Healthy has4 EDP kernels/step versus NEP8 in ALL four cases. This is disclosed;
+  deltas compare recorded configurations, NOT iso-bucket theoretical costs.
+- User requested stacked blue bars: dark=Gather+Scatter estimate,light=EDP delta.
+  Totals4.546,5.549,10.552,8.155ms. Brown final-GA compute remains unchanged.
+  Added red iteration gaps140.30,71.90,69.94,47.19ms, using a500 profiled10-13
+  and a770 post-profile15-24, consistent with parity bars. Mixed windows are
+  explicit; blue stack is NOT a decomposition of the red end-to-end gap.
+- Four-case checks: original raw Gather sums reconcile; raw=adjusted+removed;
+  all192 owner calls/category/case present; EDP96healthy/192NEP calls; no empty
+  categories accepted. Figure rendered and visually checked, numeric source
+  data in stacked_plot_values.json. Publish only PNG/PDF to the existing Talos
+  directory. Supersedes the prior N/A figure; exact wait-free times remain
+  unidentifiable from kernel timestamps alone.
+
+### 2026-09-11: Host-idle/staging and replica compute plot
+
+- Existing data only; no new jobs. Added analyze_nep_compute_and_host.py and
+  optional host/staging extraction to analyze_nep_final_ga_sums.py. Checked120
+  traces/480 rank-steps. Results/cache: compute_replica_host_staging.json and
+  per-rank JSON under existing Lustre plot-analysis directory.
+- New blue segment = GPU-idle union inside recorded NEP CPU scopes + exposed
+  NEP-correlated staging/copy GPU intervals. These intervals are disjoint; CPU
+  wall time is NOT blindly added. Observed coincidence, not proof of incremental
+  overhead or CPU causality. Unannotated work and starvation masked by active
+  NCCL are omitted. NEP wrappers can include native work also present in healthy.
+- Owner means (0-5), a500MBS1/3,a770MBS1/2: host-idle30.073/14.986/43.203/15.396ms;
+  exposed staging1.876/1.940/3.075/2.381ms; new segment31.949/16.927/46.277/17.776ms.
+  Combined blue stacks36.494/22.476/56.830/25.932ms.
+- Final-GA compute sums healthy16 / NEPfull8 / NEPreduced6:
+  a500MBS1:38.141/43.247/39.016ms; a500MBS3:96.582/96.998/103.329ms;
+  a770MBS1:60.106/59.062/58.326ms; a770MBS2:100.521/111.383/100.456ms.
+  Reduced is lower in3/4 cases, except a500MBS3. Kernel sums exclude launch gaps
+  and NEP staging, include gradient accumulation; not backward elapsed latency.
+- Added3 compute bars alongside3-segment blue stack and red iteration gap.
+  GPU measurements use profiled10-13; a770 parity/red remain post15-24 by request.
+  EDP4-vs8, mixed windows, profiler and estimator/noncausal-accounting caveats
+  remain explicit. All old owner compute sums reproduced;480 steps pass bounds
+  and disjoint host/staging arithmetic. Figure visually checked; updated PNG/PDF
+  copied to existing Talos directory. Analysis JSON remains on Lustre. No training
+  or production implementation changes.
+
+### 2026-09-11: Use post-profile a500 red iteration-gap bars
+
+- Per user request, red bars now use post-profile steps15-24 for BOTH models.
+  a500MBS1/MBS3 changes140.30/71.90ms to64.43/38.77ms. a770 stays69.94/47.19ms.
+  Values read from original comparison JSONs; a500 values asserted. Blue/compute
+  data and upper parity bars unchanged. Separate iteration_window/parity_window
+  metadata and visible subtitle/footer distinguish the windows. No new jobs.
+
+### 2026-09-11: Align a500 parity bars with post-profile iteration gaps
+
+- Per user request, companion-chart a500 parity now uses post-profile15-24:
+  MBS1 82.28%, MBS3 94.75%, read from original comparison JSONs and asserted.
+  All companion parity/red bars now share post-profile windows. Updated title
+  and parity_window metadata. GPU/CPU estimates and red values unchanged.
+  Rendered PNG/PDF and republished to existing Talos directory; no new jobs.
+
+### 2026-09-11: Explain dark-blue shrink with larger MBS
+
+- Added analyze_nep_host_scope_overlap.py;24 existing owner traces,96 steps.
+  Partitioned GPU states inside union of NEP CPU scopes; no new jobs. Data:
+  host_scope_overlap_summary.json and per-rank caches under existing Lustre dir.
+  State sums exactly reproduce previous host-scope union and plotted GPU idle.
+- a500MBS1->3: host union68.590->68.640ms; concurrent non-NEP compute union
+  12.144->33.711ms; idle30.073->14.986ms; exposed staging1.876->1.940ms.
+  Thus dark31.949->16.927ms despite essentially unchanged host-scope duration.
+- a770MBS1->2: host union89.327->83.719ms; concurrent compute17.394->41.216ms;
+  idle43.203->15.396ms; exposed staging3.075->2.381ms; dark46.277->17.776ms.
+- Dominant idle source is forward-side nep_distopt_param_scatter host scope:
+  a500 duration40.497->40.363ms,idle28.944->13.998ms (14.946ms reduction);
+  a770 duration52.968->48.464ms,idle35.754->14.417ms (21.337ms reduction).
+  a770 nep_distopt_stage_owner_grads idle also falls5.837->0.153ms (5.684ms).
+  Per-name scopes can nest: retain individually, do not blindly sum them.
+- Supported mechanism for the plotted metric: more GPU compute runs concurrently
+  with similar-duration NEP host work, so less of those host windows is GPU-idle.
+  Not primarily fewer/faster parameter copies; exposed staging is nearly flat
+  on a500. Compute concurrence is measured across whole iteration, not only
+  final GA. This is not an isolated causal MBS experiment or proof of equivalent
+  post-profile savings; profiling/allocation effects and scope attribution remain.
+
+### 2026-09-11: Forward parameter AG/Scatter GPU overlap and dark-blue location
+
+- Extended host-scope audit to separately match native expert parameter all-gather
+  and NEP parameter broadcast GPU kernels.24 existing owner traces,96 steps;
+  eight calls of each type per step. No new jobs; same profiled10-13 window.
+- Native parameter AG summed residency / overlap with non-NEP,non-communication
+  GPU work (ms): a500MBS1 29.463/10.106 (34.3%),MBS3 21.913/10.925 (49.9%);
+  a770MBS1 18.579/8.667 (46.6%),MBS2 65.806/25.579 (38.9%). Raw NCCL
+  residency includes participant wait; not net overhead or wire-transfer time.
+- NEP parameter Scatter raw1.301/1.950/8.857/10.167ms respectively, with ZERO
+  model-compute overlap in all four owner averages. May overlap other comm or
+  staging; do not call this fully exposed relative to all GPU work.
+- GPU idle inside forward parameter host scopes vs backward grad host scopes:
+  a500MBS1 30.071/0.002ms;MBS3 14.736/0.250ms;
+  a770MBS1 36.988/6.215ms;MBS2 15.229/0.167ms.
+  Sums reconcile to total host idle. Forward idle alone accounts for80-94% of
+  the entire dark-blue bar (which also includes exposed GPU staging).
+- Main dark-blue source is forward host parameter redistribution, not backward
+  gradient reshard. Host-side work can overlap earlier GPU compute even while
+  the eventual Scatter kernels themselves have no compute overlap.
+- Accounting caveat: plotted light-blue EDP delta currently includes gradient
+  reduce-scatter ONLY, not native parameter-all-gather healthy-vs-NEP delta.
+  No chart changes here; results retained in host_scope_overlap_summary.json
+  and v2 per-rank caches on Lustre.
+
+### 2026-09-11: Include parameter all-gather delta; distinguish Scatter from idle
+
+- Existing profiles only, no new jobs or production changes. Added a separately
+  cached parameter-AG mode to the peer-matched EDP analyzer and added its signed
+  NEP-minus-healthy estimate to the plot's light-blue gradient-RS delta.
+- Parameter AG healthy/NEP arrival-adjusted owner means (ms): a500 MBS1
+  3.255/4.694, MBS3 3.217/4.771; a770 MBS1 5.965/8.362, MBS2 5.864/8.292.
+  Added deltas: 1.439, 1.553, 2.397, 2.428 ms. Matched all actual two-rank
+  groups, payload sizes and trace origins; 4 healthy vs 8 NEP calls/step.
+  All peer kernels intersected; maximum end spread below 0.065 ms. Last-peer
+  start trimming remains an estimate, not exact internal-wait removal.
+- New Scatter audit excludes ALL other GPU activity, including other comm and
+  staging: exposed raw Scatter is 1.243, 1.881, 8.857, 8.908 ms respectively.
+  Raw Scatter residency is 1.301, 1.950, 8.857, 10.167 ms; model-compute overlap
+  remains zero. Actual exposed residency includes participant waiting and is
+  distinct from the arrival-adjusted Scatter estimates in the plotted stack.
+- Dark blue remains unchanged: no recorded GPU kernels/memcopies/memsets during
+  NEP CPU scopes, plus separately exposed GPU staging/copies. It does NOT count
+  NCCL Scatter kernels. Forward parameter redistribution dominates this idle.
+  Code loops over packing copies, broadcast submission, and unpacking copies;
+  scope-level evidence alone cannot uniquely separate Python/launch overhead,
+  host scheduling, profiler overhead, or blocking synchronization in idle gaps.
+- Validated all four previous idle means unchanged and Scatter exposure plus
+  overlap equals raw residency; all edited scripts parse. Rendered and visually
+  checked the plot. GPU figures still use profiled 10-13; parity/red gaps use
+  post-profile 15-24. The stack is NOT an exact decomposition of those gaps.
+- Artifacts: analysis/nep_small_model_parity_20260911 on Lustre, including
+  param_ag_arrival_adjusted_delta.json and host_scope_states_v3 caches.
+
+### 2026-09-11: Add topology-controlled original a8b result to current figure
+
+- Added job2994648 to small_model_parity_final_ga PNG/PDF, with post-profile
+  iterations15-24 parity93.8948%, healthy5651.31ms, NEP6018.77ms, gap367.46ms.
+  Values loaded directly from the job comparison JSON, not older a8b runs.
+- Separate right-hand panel identifies original MBS1/GA8/seq8192, proportional
+  reduced work, GB300, TP2/CP1, EP16+16 versus16+12, GBS128/112. No additional
+  batch tuning; hardware changed from GB200 after OOM. Cross-replica RDMA
+  bandwidth was verified; full PyTorch profiles, not low-overhead protocol.
+- Parity shares the existing percentage scale; healthy/NEP iteration bars use
+  an explicitly separate seconds axis. No unextracted a8b communication or
+  host/staging breakdown attached. Existing small-model bars unchanged.
+- Rendered and visually checked; existing data only, no new jobs. Plot set
+  published under the existing nep_small_model_parity_20260911 Talos directory.
+
+### 2026-09-11: Complete a8b stacked components and replica compute bars
+
+- Extracted all32 healthy and28 NEP rank traces from job2994648, four profiled
+  steps10-13 each. Reused small-model measurement logic with GA8 rather than
+  GA3, validating60 grouped backward calls in each of8 microbatches (30 MoE
+  layers), zero uncorrelated compute kernels, actual PG participants, common
+  trace origins, matched per-step collective order and peer payload sizes.
+- Final-GA active compute sums, mean per GPU: healthy247.802ms (32 ranks),
+  NEP full253.644ms (16 ranks), NEP reduced268.980ms (12 ranks).
+- Blue means over full owners0-11: Gather16.715ms + parameter Scatter25.596ms
+  arrival-adjusted estimates; raw residency29.952/177.240ms respectively.
+  Nonintersecting Gather calls retain raw duration, as in small-model charts.
+- Expert gradient RS after arrival: healthy158.518 vs NEP217.521ms, delta59.004.
+  Parameter AG: healthy81.478 vs NEP105.524ms, delta24.046. Light blue83.049ms
+  combined; native healthy6 vs NEP8 kernels/step in each phase. No initial
+  peer-wait removal is claimed to be an exact internal-wait measurement.
+- Dark blue215.682ms =181.727ms GPU idle in NEP CPU scopes +33.955ms exposed
+  staging. Full blue stack341.043ms. GPU metrics remain profiled10-13; the
+  red367.460ms gap and93.895% parity remain post-profile15-24. These distinct
+  windows and summed residency measures are NOT an exact causal decomposition.
+- Added the same five sub-bars on the a8b panel, with a separate ms scale.
+  Existing small-model data unchanged. GA3 rank-0 regression reproduced every
+  cached measurement exactly; optional faster streaming parser agreed exactly
+  on376556 reference events. All scripts parse; rendered plot visually checked.
+- Offline analysis only, no new GPU jobs or production changes. Initial four
+  workers hit SIGKILL; reduced to two with compact event storage. Interrupted
+  sessions resumed rank caches rather than reprocessing completed traces.
+  Data and caches: Lustre analysis/nep_small_model_parity_20260911, including
+  a8b_plot_components.json. PNG/PDF published to the existing Talos directory.
+
+## 2026-09-11: Contribution pseudocode and architecture figures
+
+- Added NEP_CONTRIBUTIONS.md with placement, virtual dispatch, gradient sync,
+  and optimizer lifecycle pseudocode. Explicitly attributed common-owner
+  resharding to NTP; separated NEP additions from inherited mechanisms.
+- Added reproducible systems and native-Megatron integration diagrams in
+  scripts/nonuniform/plot_nep_contributions.py. These are architecture diagrams,
+  not benchmark timelines or claims of complete overlap.
+- Verified the illustrative E10 EP4/EP3 mapping directly against placement
+  functions from Megatron-LM-nep-main-20260817. Checked expert coverage and
+  balanced counts for E128 EP16/12, EP32/28, EP8/4 and E512 EP16/12.
+- Visually inspected both figures; text-box bounds assertions passed.
+  PNG/PDF artifacts reside on Lustre under analysis/nep_contributions_20260911
+  and were copied to computelab-sc-01 in the same dedicated directory name.
+- Documentation and plotting only; no runtime edits or GPU jobs.
+
+### 2026-09-11: Clarify expert ownership and fused-dispatch contributions
+
+- Added nep_expert_contributions PNG/PDF after feedback that the original
+  systems figure made only the DistOpt integration clear. The new figure
+  follows expert E3 across physical and canonical layouts, explains why local
+  bucket-offset pairing is insufficient, and shows the 10-real/12-virtual
+  dispatch transformation, masked slots, and an E9 token-routing example.
+- Re-ran placement checks and visually checked the new diagram. Kept the
+  existing DistOpt and implementation diagrams as complementary views.
+
+## 2026-09-14: First-forward and final-backward microbatch comparison
+
+- Added a companion to small_model_parity_final_ga covering the same a500
+  MBS1/3, a770 MBS1/2, and a8b MBS1 jobs. Existing full PyTorch profile
+  iterations 10-13 only; no new jobs or runtime modifications.
+- Extracted healthy rank0, NEP full-owner rank0, and reduced-owner rank8/16.
+  Shows first forward versus mean later forwards, final backward versus mean
+  earlier backwards, and a separate gradient-finalization tail. GPU elapsed
+  envelopes are not summed kernel time or a causal CPU-overhead estimate.
+- All 60 sampled rank-iterations passed correlation and microbatch-boundary
+  checks. Final-GA compute sums reproduce the existing analysis within 0.002ms.
+  No parameter-redistribution calls were observed in later forward windows.
+- Added scripts/nonuniform/analyze_nep_microbatch_phases.py and matching plot
+  script, with methodology in NEP_MICROBATCH_PHASES_20260914.md. Full-profiler
+  overhead and representative-rank sampling are disclosed on the figure.
+- Data and PNG/PDF on Lustre: analysis/nep_microbatch_phases_20260914; published
+  to the same dedicated directory under the authorized Talos plot location.
+
+## 2026-09-14: Audit ordinary-microbatch reduced-replica differences
+
+- Audited later forward and earlier backward differences from the new figure.
+  Consistent reduced-minus-full differences: a500 MBS1 F/B, a770 MBS1 B,
+  a770 MBS2 F. Neighboring healthy/full/reduced ranks reproduce the means.
+  Tiny a770 MBS2 and a8b earlier-backward differences remain within variation.
+- Exclusive GPU-state accounting identifies a500/a770 MBS1 backward gaps as
+  predominantly HybridEP polling, not extra GEMM service. Matched all six
+  reduced ranks; inspected late-peer grouped-backward host scopes and launch
+  timestamps. a770 has <=4.83us nonintersection discrepancies, explicitly
+  retained rather than inventing an exact arrival-wait decomposition.
+- a770 MBS2 later-forward gap is chiefly idle while ordinary grouped-expert
+  CPU work submits kernels; 6.17ms of its 8.53ms additional idle versus full
+  overlaps _GroupedLinear. No repeat parameter redistribution is implicated.
+- NEP_ORDINARY_MICROBATCH_AUDIT_20260914.md records tables, specific trace
+  examples and limitations. Distinguishes repeated observed differences from
+  population significance; host/profile/OS contributions are not separable.
+  Analysis and per-rank caches on Lustre; no runtime edits or new GPU jobs.
+
+## 2026-09-14: Delegate controlled single-knob parity sensitivity study
+
+- Spawned Ampere (01a0a142-0f6a-7ef3-aee6-dfbad17f096d) with full context
+  and high reasoning effort for the user's single-knob sensitivity experiment.
+- Recommended anchor: a770 EP8/8 healthy versus EP8/6 NEP, MBS2 GA3,
+  seq8192, H1280, expert F768, E128, top-k6, DistOpt and Flex/HybridEP.
+  Prior low-overhead measured owner parity was 95.76% in job 3007029;
+  require reproduction before relying on it as the new comparator.
+- Independently test shorter sequence, lower top-k, and possibly smaller
+  expert F, resetting to the anchor each time. Hold other independent knobs
+  fixed in healthy and NEP; record derived payload/bucket effects explicitly.
+  Target a reproducible >=5 percentage-point drop, preferably below 90%.
+- Require same-allocation comparisons, controlled cross-replica IB topology,
+  all-rank profiling with the accepted low-overhead protocol, matched measured
+  iterations, and repeated anchor checks. Poll queues every five minutes.
+- No runtime edits. Keep trusted runtime and the unaccepted CPU-optimization
+  branch separate. Agent owns NEP_SINGLE_KNOB_SENSITIVITY_20260914.md and
+  dedicated experiment artifacts on Lustre. No new results yet.
+
+## 2026-09-14: Classify final-backward and first-forward overheads
+
+- Analyzed trusted DistOpt code, accepted low-overhead job3007029, existing
+  full-profile microbatch summaries, and isolated CPU-copy A/B job3007909.
+- Recorded NEP_SYNC_MICROBATCH_OVERHEADS_20260914.md. These costs combine
+  necessary data movement with implementation-specific work; exposure depends
+  on workload, and fixed payload per update does not mean fixed latency.
+- First-forward parameter delivery has direct redundant singleton-copy and
+  metadata work plus workload-dependent launch headroom. Final-backward staging
+  already has98.3% CPU calls finished before GPU range start at MBS1; do not
+  claim identical starvation or attribute its4.3-4.5ms penalty without evidence.
+- DistOpt skips backward gradient Scatter and redistributes updated parameters
+  in first forward. Larger GA amortizes these once-update costs, not the ordinary
+  per-microbatch expert path. Full-profiler and targeted timings remain separate.
+- No runtime edits, plots or new jobs for this analysis; CPU-cleanup branch
+  remains unaccepted pending broader correctness validation.
+
+## 2026-09-14: Begin incremental sync CPU cleanup and live correctness gates
+
+- User prioritizes removing implementation overhead before further workload
+  sensitivity tests. Sensitivity agent paused new cases; its completed anchor
+  reproduced95.79% owner parity. Do not mix that run with implementation A/B.
+- Created nep/sync-cpu-20260914 under .worktrees/nep-sync-cpu-20260914,
+  inheriting the isolated metadata-cache/singleton-copy changes. Trusted source
+  remains untouched; original snapshot0fd1e023e and prior candidate df70344f5
+  remain available. Validation harness checkpoint7060ca275.
+- Added a correctness-only adapter replaying trusted gradient staging and
+  parameter transfer on identical live inputs; compares exact values and
+  destination storage identity. It is separate from profiled timing cases.
+- Job3054627 failed before training: a second Pyxis mount flag replaced earlier
+  mounts. Fixed the test launcher to use one combined mount list. No runtime
+  code executed in that failed attempt.
+- Retry3054658 running on GB200 lyris[0095-0096,0099-0100], segment4;
+  checks replica containment and uses cross-replica software cliques/RDMA.
+  Shadow smoke then original/cached NEP MBS1/2, GA3, a770, all-rank targeted
+  profiling40-49 after warmup,60 iterations. Monitor every five minutes.
+- Planned subsequent gate: batched parameter copies, then gradient staging
+  separately, preserving streams, NCCL ordering, prefetch and buffer lifetime.
+  Historical foreach contention regression requires end-to-end checks, not
+  acceptance based solely on shorter CPU scopes.
+
+### 2026-09-14: Sync-copy gates 1/2 passed; stage 3 running
+
+- Gate1 job3054658 passed224 live parameter and192 gradient copy comparisons.
+  Cached/singleton MBS1 improved458.69->451.29ms; MBS2 initially regressed
+  724.01->732.02ms, so acceptance was held for reversed-order repeat3054733.
+  Same-node original/cached/cached/original MBS2:733.37/728.64/723.41/739.72ms.
+  Original regression did not reproduce. Both jobs completed successfully.
+- Gate2 job3054823 passed FP32/BF16 CPU/CUDA placement/rebinding tests for
+  EP8/4,8/6,16/12,32/28 and the same live distributed checks. Parameter batching
+  improved MBS1 450.10->441.84ms and MBS2 724.34->716.86ms versus cached.
+  Full-owner redistribution CPU17.528->8.364ms at MBS1. Commit2fe05a928.
+- Gate3 job3054926 running: cached integer gradient-copy plan plus foreach
+  staging, compared against gate2, with unchanged streams and EDP launch order.
+- Detailed report in candidate worktree NEP_SYNC_CPU_RESULTS.md. No changes
+  to trusted runtime; all results/profiles on Lustre. Sensitivity study paused.
+
+### 2026-09-14: Reject gradient foreach staging after repeat; test metadata only
+
+- Gate3 job3054926 passed400 standalone gradient comparisons and224 parameter/
+  192 gradient live replay checks. MBS1 improved445.41->438.74ms, but MBS2
+  regressed718.48->723.34ms against accepted parameter-only batching.
+- Repeat3055060 completed on GB200 lyris[0113,0117,0123,0126], segment4,
+  replica-contained/cross-replica RDMA. Combined/parameter-only/combined MBS2:
+  741.48/735.63/737.30ms. Small repeated incremental regression (+0.51% mean)
+  means gradient foreach is rejected, despite improved copy-scope timings.
+- Same-job original/combined MBS1 measured485.26/482.42ms; post479.28/461.47ms.
+  Healthy measured424.54ms. MBS2 healthy711.81, trusted749.07ms. These windows
+  remain separate. Combined is diagnostic, not the accepted final runtime.
+- Job3055348 now tests metadata-only gradient caching with original scalar
+  copies against parameter-batched checkpoint2fe05a928. Standalone + live
+  shadow checks, MBS1 A/B, repeated MBS2 A/B; all-rank profiling enabled.
+- No collective/stream/prefetch changes. Runtime edits remain confined to
+  nonuniform_ep.py on isolated nep/sync-cpu-20260914. Rejected dc7bb0389 kept
+  for rollback/audit; trusted branch unchanged. No claim that all remaining
+  implementation overhead is removed or unavoidable.
+
+### 2026-09-14: Close incremental copy cleanup with parameter-only runtime
+
+- Job3055348 completed26m53s, all standalone/live checks and six profiled
+  timing cases passed. GB200 lyris[0075,0083,0087,0089], segment4, contained
+  replicas/cross-replica RDMA. No hangs or numerical copy mismatches.
+- Metadata-only gradient trial: MBS1 baseline462.84 versus485.87ms, MBS2
+  repeated baseline mean726.19 versus726.825ms. No end-to-end benefit shown;
+  discarded. Do not claim the metadata cache caused all observed runtime skew.
+- Saved rejected metadata-only candidate30e51b754, then restored runtime
+  exactly to accepted parameter-batching checkpoint2fe05a928. Retain static
+  parameter metadata caching, singleton direct copy and parameter foreach
+  batching; no gradient-staging changes. Trusted branch stays untouched.
+- All runtime changes relative to0fd1e023e confined to nonuniform_ep.py.
+  No native DDP/optimizer/dispatcher changes, no stream/group/prefetch changes,
+  no buffer-lifetime increase. Tests exercise EP8/4,8/6,16/12,32/28 mappings,
+  FP32/BF16 CPU/CUDA plus live EP8/6 DistOpt/Flex with128 nondivisible experts.
+- Parameter batching isolated gate: MBS1 450.10->441.84ms; MBS2
+  724.34->716.86ms. Full-owner parameter CPU17.528->8.364ms; reduced-owner
+  8.666->2.779ms. These compare against cached, not original/healthy.
+- Job3055060 original-to-final MBS2:749.07->735.63ms, healthy711.81ms,
+  parity95.03%->96.76%. Rejected combined MBS1 must not stand in for final.
+- Candidate report NEP_SYNC_CPU_RESULTS.md includes all negative gates and
+  remaining implementation/measurement limits. Cannot honestly classify all
+  remaining overhead as unavoidable. All submitted validation jobs terminal;
+  no further GPU jobs or plots launched. Sensitivity study remains paused.
+
+### 2026-09-14: Resume workload sensitivity on the accepted runtime
+
+- User fixes GA3 and asks for later-forward/earlier-backward agent status plus
+  first-forward/final-backward ablations. Agent had no new jobs submitted after
+  an editing-tool failure; supplied working apply_patch-through-PTY method and
+  resumed its bounded MBS/sequence/top-k matrices, no runtime edits.
+- Parent prepares independent expert-F1536 and shared-F3072 comparisons to
+  anchor F768/shared1536. This contrasts expert payload growth against added
+  shared-expert work; shared/dense traffic also changes and must be recorded.
+  Same EP8/8 versus8/6, MBS2 GA3, all-rank profiles and accepted93d313df4.
+- Job3057186 failed pre-training due to parent Black24/container Black26
+  mismatch. Fixed launcher preflight only; retry3057217 running on GB200
+  lyris[0042-0045], segment4, replica-contained and cross-replica RDMA.
+- New analyze_nep_sync_workload.py uses an exact additive temporal partition
+  and first/later-forward, final/earlier-backward comparisons. It explicitly
+  does not label event envelopes as GPU busy time, pure comm or causal cost.
+  Historical3054530 anchor reproduces95.7924% as analyzer self-test only.
+- Plan/control details: NEP_SYNC_WORKLOAD_SENSITIVITY_20260914.md. No new
+  measured ablation results yet; polling every five minutes, data on Lustre.
+
+### 2026-09-14: Complete first/final microbatch ablations and audit drift
+
+- Agent completed A3057161/B3057162 on accepted93d313df4, fixedGA3, all14
+  cases/210 rank profiles valid. Parent C3057217 completed29m50s, all8
+  cases/120 rank profiles valid. All jobs terminal, no duplicates submitted.
+- Sequence4096 parity92.17% versus B anchors95.76/96.80%; topk2 retains97.26%.
+  MBS1 measured98.14% is nonstationary versus pre94.17/post92.12%; explicitly
+  inconclusive. Earlier-backward large reduced-replica lag was not reproduced.
+- ExpertF doubled: parity90.54%, parameter-delivery GPU envelope17.71ms
+  versus anchors9.74/10.04ms, CPU~8.9ms unchanged. First-minus-later-forward
+  NEP gap23.81ms versus anchor12.63-15.01ms; supports payload-sensitive GPU
+  delivery cost, not more host operations. Native healthy expert buckets4->5
+  also change; not a pure payload-only or iso-bucket comparison.
+- SharedF doubled:94.94% is between C anchors93.41/96.59%; no established
+  gain. Parameter envelope10.15ms and first-minus-later gap15.05ms unchanged
+  within anchor spread. Dense buckets3->4; do not hide this derived effect.
+- C anchor drift driven chiefly by healthy682.48->703.13ms while NEP
+  730.61->727.92ms. Earlier optimistic shared-width interpretation rejected.
+- Short sequence's extra late intervals: finalB4.25ms, lastB->optimizer16.40ms,
+  afteroptimizer9.73ms. All gradient staging already CPU-submitted ahead;
+  optimizer CPU done21.32ms before GPU starts. Do not attribute whole tail to
+  host submission or a specific NCCL operation without kernel detail.
+- NEP_SYNC_WORKLOAD_SENSITIVITY_20260914.md contains complete tables, bucket
+  thresholds, controls, confidence limits and scope. Five knobs tested; no H,
+  expert-count, depth, routing-imbalance or EP-ratio sweep yet.
+- Three phase plots under Lustre plots/nep_sync_workload_20260914, copied to
+  computelab scratch with matching Talos directory. All rows use measured
+  iteration40-49, with SD over iteration rank-means; no mixed/post correction.
+
+### 2026-09-15: Stronger workload-only stress tests for both microbatch phases
+
+- User requests a substantial owner-parity reduction toward85%, not another
+  mild sweep around95%. Keep separate first-forward/final-backward and
+  later-forward/earlier-backward investigations. Low E2E parity alone does
+  not establish the proposed phase mechanism; require phase-local evidence.
+- Parent submitted3063815 at09:00PDT:4nodes,segment4,40min,GB200/GB300
+  backfill. InitiallyPriority,StartTimeUnknown. Cases:anchor_start,
+  expertF3072,expertF3072+sequence2048,anchor_end; each has healthy/NEP pair,
+  alternating order. F768->3072 changes one independent variable; adding
+  sequence8192->2048 changes two. All other independent settings stay fixed.
+- Accepted93d313df4 runtime SHA653a7efd remains unchanged. MBS2/GA3,
+  EP8/8 versus8/6 with proportional replica batches48/48 versus48/36,
+  FlexHybridEP/DistOpt, unchanged graph scopes, requestedDDP8. Derived native
+  buckets may change with width; record them rather than claim iso-bucketing.
+- New experiment-only pretrain_nep_sync_stress.py and
+  run_nep_sync_stress_20260915.sh reuse existing profile/launch/analysis code.
+  Three variant argument checks, invalid-anchor rejection and bash-n passed.
+  No NEP/runtime/optimizer/dispatcher implementation changes.
+- AgentAmpere owns stronger ordinary-phase sweep, initiallysequence2048/1024.
+  Same topology checks, all-rank event profiles40-49 of60steps,pre/post
+  diagnostics,anchor repeats. Never accept unstableMBS1's98% as improvement.
+  Cross-replica software-cliqueRDMA and domain-contained replicas required.
+  Poll queued/running jobs every300s, six-minute per-case timeout. Artifacts
+  go to Lustre slurm_runs/soft_clique_baseline/JOB; no data underhome.
+
+### 2026-09-15: Strong synchronization ablation reaches below85% parity
+
+- Job3063815 completed0:0 in29m13s onGB200lyris[0014-0017]. Both replicas
+  fitnvlblk01; all fourtags show28two-rankcliqueSize1logs and1344RDMAchannels.
+  All8cases/120rankprofiles/1200recordedrank-iterations validate,60finite-loss
+  steps/case,no skipped/NaNsteps. RuntimeSHA unchanged.
+- Owner parity:initialanchor95.60%,F3072 89.73%,F3072+seq2048 80.73%,
+  finalanchor95.71%. Shortsequence pre/post79.55/78.29%, so substantial
+  degradation is not confined to recording. Do not hide residual windowdrift.
+- Shortsequence NEP-minus-healthy:firstF44.16ms,finalB24.47ms,lastB-to-
+  optimizer22.78ms; ordinarylaterFtotal-4.81ms,earlierBtotal-5.98ms.
+  Intended synchronization-adjacent phases account for positive slowdown.
+- Fquadrupling parameter-deliveryGPUenvelopes9.83->33.95ms whileCPU9.25->
+  8.90ms. Shortsequence retains34.15msdelivery and reducescomputeheadroom.
+  FixedF absolutegap88.80->88.36ms whilehealthy776.22->370.09ms explains
+  relativeparitydrop;GA3unchanged. Not exactNCCL causal attribution.
+- Native physicalbucketschange3dense/4expert->2dense/6expertwithF;NEP8logical
+  groupsunchanged. SequenceatfixedFpreservesbucketlayout. Fullreport:
+  NEP_SYNC_STRONG_SENSITIVITY_20260915.md.
+- Agentsequence-only3063804completed;seq2048 reaches86.88%butprimarily
+  finalB/tail,soNOTordinaryphase-success. Follow-up3064000nowrunningE512
+  andE512+seq2048 to stressnativeper-expertCPUsubmission,stillmax2knobs,
+  unchangedruntime/MBS/GA/EP. ParentwillnotrelabelfinalBcostasordinarycost.
+
+### 2026-09-15: Complete stronger ordinary-work sweeps and correct attribution
+
+- Agent jobs3063804/3064000/3064218 allCOMPLETED0:0 in27m04/29m14/28m25.
+  All24cases/360rankprofiles/3600recordedrank-iterations validate,60finite-loss
+  steps/case,no skips/NaNs. Runtime/helper/frozenharness hashes unchanged.
+  Every case passed replica domain containment and cross-replicaRDMA checks.
+  GB200allocations,segment4,requestedGB200/GB300. No furtherjobsqueued.
+- GA3,MBS2,EP8/8 versus8/6,proportionalGBS96/84,FlexHybridEP/DistOpt unchanged.
+  Eachrow uses matchedhealthy/NEP,owners0-5,recorded40-49. Paritiesbelow:
+  3063804:anchors95.95/96.29%;seq2048 86.88%;seq1024 92.01%.
+  3064000:anchors95.45/95.01%;E512 85.75%;E512+seq2048 81.64%.
+  3064218:anchors96.62/96.28%;H320 97.01%;H320+E512 85.84%.
+  E512 pre/post87.53/86.23;E512seq2048 78.61/81.32;
+  H320E512 82.94/87.77. Windowvariationretained,notprofiler-subtracted.
+- CAUSAL CORRECTION: flat full-owner ordinary spans do NOT exclude ordinary
+  reduced-replica overhead. Replicas synchronizegrads only on finalmicrobatch;
+  reduced ordinarydelay can appear as full-ownerfinalB/tailwaiting. Earlier
+  negative ordinary-attribution language basedonlyonownerpartition superseded.
+- E512 reduced loses24.17ms afterfirstF throughfinalBstart:laterF18.45ms,
+  earlierB5.04ms,transitions0.68ms. Initial18.52mslead becomes5.64mslag;
+  finalBend25.33mslater. E512seq2048 loses29.79ms,initial14.44mslead becomes
+  15.36mslagbeforefinalB. This supports ordinaryworkdelayingreadiness,NOT
+  assigningall154-169msiterationgap tothismechanism. Fixedclockoffsetscancel
+  in localelapsedprogress; absoluteinterhostclockalignmentnotindependentlytested.
+- H320E512 reaches85.84%butreducedstill1.10msaheadbeforefinalB,6.30msahead
+  afterit onaverage. ItisNOT acleanordinary-driven85%case. Expertweightbytes
+  matchoriginal(Hquarter*Equadruple),buttensors/hostworkincrease:NEPgradstage
+  CPU10.18->39.60ms,paramredistribution8.78->24.27ms;extraownerfinalB73.42ms.
+  Exactcausalshareunresolved.EventenvelopesarenotpureGEMM/NCCLservice/idle.
+- Nativebucketsderivedfromshapes:anchor3dense/4expert;E512andH320E512
+  2dense/7expert;H3203dense/4expert.NEP8logicalgroupsallcases. Noisobucketclaim.
+  H320keepsMamba40heads*64=2560SSMinnerwidth;NOT aquarterofSSMscanwork.
+- Fullresults,hostmetrics,limits:NEP_ORDINARY_STRONG_SENSITIVITY_20260915.md.
+  Lustre JOB/{ordinary_strong,ordinary_experts,ordinary_hidden}_analysis and
+  ordinary_progress_analysis include allsamples,manifests,validation.
+  No runtimeedits,remote pushes,ornewplots. Allstudyjobsandagentworkcomplete.
+
+### 2026-09-15: Plot literal first/last forward/backward microbatches
+
+- User requests healthy,NEPfull,andNEPreduced comparison for strongerablation
+  results. New plotting-only scriptplot_nep_strong_microbatch_phases.py reads
+  existing3063815/3064000/3064218/3063804 profiles; no GPU jobs or runtime edits.
+- Literal MB1/MB3 forward andbackward,not earlier/later microbatch averages.
+  Same recorded40-49 windows; average ranks0-5 healthy/full and8-13 reduced
+  within iteration,then mean/sampleSD across10iterations. All16case owner
+  parities match original summaries; native and NEPsync bucket counts checked.
+- Expert-boundedGPUelapsed envelopes include interveningwork/waits,notpure
+  GEMMtime; post-backward optimizer/tail excluded and explicit in captions.
+  Common scales withinforward/backwardrows,per-case actualH/F/E/sequence,
+  MBS/GA/GBS/replicaBS/topology/dispatcher/optimizer/buckets recordedonfigures.
+- Overviewof5reportedlowparitypoints plusseparatesweeps withoriginalbefore/
+  afteranchors:expert_width,expert_count,hidden_width,sequence_length.
+  PNG/PDFplusplotted_values.json/csv inLustreplots/nep_strong_microbatch_phases_20260915.
+  Visuallyinspectedoverviewandsweep,labelspacingchecked.Noplotsmixedwindows.
+- Copiedplotsetto designatedcomputelab-sc-01scratchdirectory;Talos:
+  https://sc.talos.nvidia.com/view/home/scratch.darfeen_coreai/nep_strong_microbatch_phases_20260915/
+
+### 2026-09-15: Accumulation-aware slowdown stacks from existing profiles
+
+- User requests first forward, all other forwards, all earlier backwards,
+  and the remaining slowdown without counting accumulated replica delay twice.
+  Added plotting-only `scripts/nonuniform/plot_nep_accumulated_slowdown.py`.
+  No jobs, runtime changes, or profiler-window substitutions.
+- At each expert-bounded phase endpoint, take the maximum local elapsed time
+  of cohort means (ranks 0-5 and 8-13), identically for healthy and NEP.
+  Differences of these progress-envelope advances give the first three colors.
+  This is temporal accounting, not a proven causal or per-participant critical
+  path. Constant host-clock offsets cancel; iteration-start skew is excluded.
+- The fourth color is explicitly remaining last backward PLUS optimizer/sync
+  tail and intervening gaps, not pure last-backward or communication cost.
+  All four signed components reconcile exactly to measured full-owner iteration
+  slowdown, normalized by the same healthy mean. Negative values are retained.
+  Detailed residual breakdown, endpoints and per-iteration samples are exported.
+- All 16 cases reproduce original measured parity and pass additive checks.
+  Synthetic test verifies that 6 ms ordinary delay consumes a 5 ms initial lead,
+  leaving only 1 ms additional progress time, without double-counting the wait.
+  Overview visually inspected. Four sweep figures retain original anchors.
+- Large outputs: Lustre `plots/nep_accumulated_slowdown_20260915`.
+  Talos publication: https://sc.talos.nvidia.com/view/home/scratch.darfeen_coreai/nep_accumulated_slowdown_20260915/
+
+### 2026-09-15: Group slowdown stacks and include initial unchanged workloads
+
+- Added `overview_grouped.png/pdf`: expert-width, expert-count, hidden-width /
+  expert-count, and sequence-length groups, each with its own initial unchanged
+  anchor and both variants. Twelve bars with shared scale and group separators.
+- Rendered directly from the saved numerical data; no analysis or timing
+  changes, runtime edits, or new jobs. Visually checked labels and grouping.
+- Published in the same Talos plot directory as the accumulation-aware figures.
+
+### 2026-09-15: Audit width scaling, parameter-delivery timing and layer locality
+
+- User asks whether compute/transfer scale equally, delivery is early enough,
+  and overhead is concentrated in particular layers. Analyzed existing job3063815
+  (all120 rank profiles,40-49); no new jobs or runtime edits. Runtime hash matches.
+- Ordinary grouped-forward GPU ranges14.005->18.424ms (1.316x), backward
+  12.163->29.589ms (2.433x), NEP redistribution9.832->33.951ms (3.453x)
+  when F768->3072. These are ranges, not pure GEMM/transfer service times.
+- Executed code prefetches only native owner all-gather. NEP redistribution
+  runs at finish_param_sync, on the expert compute stream, then next native
+  all-gather is started. All420 noninitial F3072/full-owner submissions begin
+  after preceding expert GPU completion; no recorded expert/redistribution overlap.
+- Repeated boundary effect, not layer0:51.004/53.396ms first-forward excess
+  resides at MoE layer boundaries1,3,5,7,9,11,13. Initial pre-expert startup
+  adds3.578ms separately. Native parameter all-gather and non-expert kernels
+  are not individually instrumented, so full gap causal attribution is unresolved.
+- Report: `NEP_EXPERT_WIDTH_DELIVERY_20260915.md`; reproducible analyzer
+  `scripts/nonuniform/analyze_nep_width_delivery.py`; large summary/CSV on
+  Lustre under job3063815/width_delivery_analysis. No changes to prior plots.
+
+### 2026-09-15: Audit native parameter all-gather visibility and overlap window
+
+- The targeted six-wrapper CUDA-event recorder does not capture native
+  all-gather or NCCL kernels. Exact all-gather lead time and remaining overlap
+  slack cannot be measured from these profiles; this is an instrumentation gap.
+- Native all-gather is scheduled one logical bucket ahead, normally two MoE
+  layers here. The previous1.4ms single-expert comparison understates the gross
+  potential window. Ordinary-pass adjacent bucket FC1 markers are10.8-12.6ms
+  apart atF3072/S8192,6.6-6.9ms atS2048. These include other work/model-EP.
+- With4.5ms redistribution, conditional all-gather/scheduling budgets are
+  6.3-8.1ms or2.1-2.4ms, not measured free bandwidth or remaining slack.
+  Report updated; no new jobs or runtime/instrumentation changes.
+
+### 2026-09-15: Expert-count effect on the possible parameter prefetch window
+
+- Existing job3064000, full owners0-5, iterations40-49; ordinary MB1/MB2.
+  Checked all8 parameter-call consumer mappings stay MoE0,1,3,5,7,9,11,13.
+- E128->512 atF768/S8192: six ordinary two-layer bucket-consumer intervals
+  grow10.765-12.781ms to16.427-19.900ms. Matching noninitial redistribution
+  stages grow about1.27-1.30ms to4.42-4.92ms. Conditional window minus that
+  stage grows9.469-11.487ms to11.629-15.475ms (first single-layer interval
+  instead leaves4.909->4.468ms). Final unchanged anchor reproduces low-E range.
+- Thus gross absolute window grows; redistribution grows faster proportionally.
+  Native owner all-gather payload grows too and its time remains unmeasured,
+  so true spare overlap budget cannot be inferred. Longer ordinary windows
+  include host pacing/model-EP, not just useful compute. No new jobs or edits
+  to runtime/profiler. Raw source: job3064000/<case>/cupti/ep8/
+  scaling_ladder__a770m_4b_moe_215b/nep/3064000/cupti_profile/rank-*.json.
+
+### 2026-09-15: Require native AG/RS profiling and replay the strongest signal
+
+- User requires native parameter AllGather and gradient ReduceScatter data in
+  all future runs. Added mandatory capture/validation policy to AGENTS.md.
+- Extended the targeted CUDA-event profiler, not the training implementation:
+  instrument native coalesced AG/RS plus standalone NEP gradient A2A Gather
+  and parameter broadcast. Record PG membership, payload, host submission,
+  input-ready event, and completion on per-PG observer streams using existing
+  Work handles. No observer-to-compute dependency or new collective is added.
+  These intervals include launch/queue/participant waiting, NOT kernel-only
+  NCCL residency; do not label them pure transfer time or fully exposed time.
+- Two-rank delayed-peer smoke3065843 COMPLETED0:0. Verified tensor values,
+  all four collective types, and independent compute continuing while AG
+  remained pending: rank0 AG~48.4ms versus independent compute~0.5ms.
+- Selected a770-family E512/S2048/F768/H1280/topk6, MBS2/GA3. This had the
+  strongest prior final-backward penalty (~68.6ms) and ~81.6% owner parity.
+  Healthy EP8/8 and NEP EP8/6, proportional replica BS48/48 versus48/36,
+  native DistOpt plus Flex/HybridEP; unchanged runtime93d313df4d55.
+- Initial benchmark3065880 allocated GB300 but failed before training:
+  probe replaced base.CHANGES and accidentally deleted the anchor validator
+  entry. Fixed ONLY the probe to update that mapping; local argument test PASS.
+- Resubmitted3065919, RUNNING on GB200 lyris[0039,0047,0049-0050], segment4.
+  Same-allocation healthy then NEP; software cliques1000/1001 restrict NVLink
+  to each replica and force cross-replica RDMA. 60iterations per case,
+  all-rank profile40-49; pre29-38/post51-60 are distortion diagnostics only.
+- Scripts: run_nep_agrs_profile_20260915.sh, pretrain_nep_collective_probe.py,
+  cuda_collective_capture.py, analyze_nep_collective_probe.py. Large output:
+  /lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/soft_clique_baseline/3065919.
+  Completion and measurements were pending at submission.
+
+### 2026-09-15: AG/RS rerun3065919 completed and audited
+
+- COMPLETED0:0, elapsed8:53; healthy/NEP each60 iterations, no skips or NaNs.
+  All30 rank traces validated, including collective membership/order and
+  AG/RS payload equality on participants. Cross-replica transport logs show
+  RDMA/GDRDMA. No training-runtime changes.
+- Same-window40-49 owner mean671.969ms healthy versus894.533ms NEP:
+  75.12% parity,222.564ms difference. First-forward envelope+54.006ms,
+  final-backward envelope+79.553ms, last-expert-to-optimizer+76.417ms.
+- Full-owner input-ready-to-completion unions: healthy/NEP AG22.707/30.619ms,
+  RS45.196/239.128ms; NEP Gather141.179ms, parameter broadcasts28.164ms,
+  complete redistribution44.136ms. NEP reduced-owner RS61.793ms. These are
+  overlapping pending-operation intervals including waiting, NOT additive
+  exposed transfer costs. Do not infer239ms RS bandwidth cost from that total.
+- Pre/recorded/post rank0 parity74.12/75.11/75.66%; recorded-minus-post
+  differential9.78ms is a distortion/drift diagnostic, not a correction.
+  New75.12% does not reproduce old81.64%; different allocation, healthy
+  accelerated more. Never substitute old or post-profile timing for this run.
+- Report NEP_AGRS_PROFILE_20260915.md; machine-readable results under
+  job3065919/collective_analysis/summary.json. AG/RS payload growth is exactly
+  4/3 averaged over six NEP owner lanes. Parent staging ranges overlap child
+  collective ranges; no claim of pure wire time, full kernel coverage or
+  definitive Gather-versus-RS causal attribution from these totals alone.
+
+### 2026-09-15: Interpret distorted AG/RS trace without additive-wait attribution
+
+- Corrected prior inference: differential profiling overhead was already
+  established. New wrappers remain installed outside recording, so pre/post
+  windows cannot rule out instrumentation as the cause of changed parity.
+- Reanalyzed existing3065919, full owners0-5, iterations40-49; no jobs/code
+  changes. AG union inside first-forward16.022->25.760ms (+9.738ms versus
+  +54.006ms phase gap); redistribution41.912ms inside phase. Magnitudes18.0%
+  and77.6% of the gap, NOT causal percentages because AG overlaps other work.
+- RS inside final-backward37.254->164.012ms, delta126.757ms greater than
+  phase gap79.553ms. Pending durations are not additive overhead. After final
+  expert, Gather/staging finishes38.521ms later; final RS75.116ms later,
+  including36.595ms pending after all local Gather/staging has finished.
+- Middle parameter buckets2-7: AG~4ms, finishes9.612-10.921ms before
+  redistribution; redistribution5.908-6.001ms. Recorded expert operations
+  cover3.471-4.318ms in that interval, not pure compute. All360 middle-bucket
+  samples finish AG before previous expert completion. Current redistribution
+  still submitted~2ms after previous expert finishes, no expert overlap.
+- Owner0 post-AG interval12.679ms vs redistribution3.460ms; owner5 interval
+  7.920ms vs redistribution8.223ms. Opportunity exists but not uniform full
+  hiding. Initial bucket has no prior work, next bucket only2.979ms interval.
+  Detail and rank0/iteration44 example in NEP_AGRS_PROFILE_20260915.md.
+
+### 2026-09-15: Resolve the36.595ms final-RS tail against its reduced peers
+
+- Existing3065919 only, full owners0-5 and matched reduced peers8-13,
+  iterations40-49. Aligned origin_ns plus GPU timestamps; paired RS completion
+  skew-0.097..+0.021ms, much smaller than the observed readiness difference.
+- Relative to full-owner final local Gather/staging ready: local final RS
+  ready+0.002ms, peer last expert backward end+28.762ms, peer final staging
+  start/end+30.442/+32.100ms, peer RS ready+32.165ms, local RS done+36.595ms.
+  Hence32.165ms precedes peer readiness,4.430ms remains after readiness.
+- Peer final staging itself1.657ms; most readiness delay occurs while peer
+  backward has not finished. No claim that this proves GEMM-only slowdown.
+- Rank0/8 iteration44 example: peer CPU RS submitted+20.083ms but GPU ready
+  only+37.956ms, after last expert end+36.573ms; local RS done+42.095ms.
+  This is a device-input dependency, not failure to asynchronously enqueue RS.
+  Detailed milestones in NEP_AGRS_PROFILE_20260915.md. No new jobs/code changes.
+
+### 2026-09-15: Prefetch post-AG redistribution; isolated candidate and tests
+
+- User authorized moving parameter redistribution to earliest eligibility and
+  rerunning E512/S2048 to compare first-forward slowdown and owner parity.
+- Preserved trusted nep/sync-cpu-20260914 at93d313df4d55 unchanged. New branch
+  nep/param-prefetch-20260915 in .worktrees/nep-param-prefetch-20260915.
+- Candidate51fdbbb11 changes only runtime nonuniform_ep.py: at asynchronous
+  start_param_sync, queue native finish_param_sync(skip_next=True) and existing
+  redistribution on a shared stream; consumer finish_param_sync waits one
+  bucket event. Same native AG and same foreach/broadcast/unpack code, same
+  two-slot buffer bound. No gradient synchronization, dispatcher, optimizer
+  algorithm, topology, workload, or profiler changes. No host polling/thread.
+- Four-GPU smoke3066319 on GB200lyris0061 COMPLETED0:0. Real native AG/RS,
+  owner/follower broadcasts, native model-EP A2A, fresh exact parameter values
+  across five iterations, repeated finish, force_sync and bounded buffer reuse
+  all PASS. Independent compute finishes while delayed-peer AG is pending.
+  All four ranks have AG/RS/redistribution event profiles. Four focused pytest
+  lifecycle/transfer tests PASS. isort/Black and diff check passed.
+- Submitted3066391: four nodes segment4, GB200/GB300backfill,24min watchdog.
+  First8-iteration candidate shadow validation; then60 iterations each of
+  healthy, old delayed NEP, and new prefetch NEP on the same allocation,
+  measured/profiled40-49 on all ranks using unchanged AG/RS instrumentation.
+  E512/S2048/H1280/F768/MBS2/GA3, healthyEP8/8 vsNEPEP8/6, replica-local
+  batch48/48 vs48/36; cliques1000/1001 preserve cross-replica RDMA.
+- Queue PENDING/Priority at15:38PDT, start unknown; monitoring every5min.
+  Scripts run_nep_param_prefetch_smoke.sh,run_nep_param_prefetch_ab.sh and
+  pretrain_nep_param_prefetch_probe.py. Artifacts under Lustre job3066391;
+  no performance conclusion pending completion.
+
+### 2026-09-15: Early parameter redistribution full-workload result
+
+- Job3066391 started15:39:40PDT on GB200lyris[0019-0022], COMPLETED0:0
+  at15:57:17,17:37 allocation. Candidate validation8iters passes all14ranks;
+  healthy/oldNEP/newNEP60iters each complete without skips/NaNs. Cross-replica
+  RDMA retained; options differ only output paths.
+- Same profiled iterations40-49, matched full owners0-5: healthy660.702ms,
+  delayedNEP900.149ms, prefetchNEP894.085ms; parity73.40% ->73.90%.
+  Iteration SD3.821/9.251/8.163ms;6.064ms overall gain is not strong
+  evidence of robust end-to-end speedup or absence of regressions.
+- First-forward expert envelope86.083/140.394/116.415ms:23.979ms gain,
+  44.2% less excess over healthy. Startup grows2.605ms, leaving21.374ms gain
+  through last first-forward expert. Middle AG->redistribution gap9.897ms
+  ->approximately0; redistribution/expert-range overlap0 ->9.050ms. This
+  does not establish kernel concurrency from elapsed operation ranges.
+- Full owners enter final backward23.778ms earlier, finish13.444ms earlier;
+  reduced owners finish6.338ms earlier. Owner final-B/tail durations grow
+  10.334/8.307ms. No redistribution extends into backward on any measured rank.
+  Gradient-staging owner CPU range38.703 ->48.736ms, cause not established.
+  Candidate isolated, trusted branch unchanged; no blanket no-regression claim.
+- All14ranks/all10iterations have identical old/new operation counts,
+  collective payloads/dtypes/memberships. Report NEP_PARAM_PREFETCH_20260915.md;
+  artifact prefetch_analysis/summary.json under Lustre job3066391.
+
+### 2026-09-16: Distinguish late reduced peers from Gather/RS transfer in tail
+
+- Existing3066391, no jobs or runtime edits. Matched all6 full-owner/EP6-peer
+  pairs across measured40-49, payload/PG/ordinal validated. Paired RS completion
+  skew -0.021..+0.093ms. Full details in NEP_PARAM_PREFETCH_20260915.md.
+- New NEP relative owner last expert B: local Gather/staging ready+71.547ms,
+  peer last B+101.133, peer final RS ready+104.333, final RS done+108.693,
+  optimizer+131.007. After local ready,32.784ms waits peer; only4.359ms remains
+  after both final RS inputs ready. These are completion ranges, not wire time.
+- Relative healthy,95.283ms additional tail decomposes into84.422ms extra
+  peer-last-B lateness,2.528ms peer final preparation,-3.427ms post-ready RS,
+  5.809ms to dense RS completion,5.950ms to optimizer. No double-counting Gather.
+- Reduced replica enters final B77.673ms late versus14.205ms healthy.
+  Final dense RS latest-ready rank12(9iters)/rank11(1iter),103.660ms owner
+  wait before all ready then3.169ms to completion.
+- Owner Gather sums185.912ms include queueing. Rank0/iteration44 Gather2
+  both peers ready~50ms before completion; host already submitted, completion
+  follows old RS0 by0.366ms. Cannot claim50ms NVLink transfer or infer exact
+  device dependency from operation ranges. Final-B envelope+75.6ms remains
+  incompletely causally split; late-peer readiness clearly dominates final sync.
+
+### 2026-09-16: Test tail diagnosis without broad profiling
+
+- User explicitly authorized disabling NEP-penalizing profiling to validate
+  whether reduced-peer lateness remains. No runtime implementation changes.
+- Added isolated benchmark entrypoint pretrain_nep_tail_control.py: none mode
+  removes --profile and never installs either event/collective capture module;
+  sparse mode adds only last-backward/start/end, last NEP staging, final expert
+  and dense RS ready/done, optimizer-start CUDA events (separate observer streams,
+  no timing queries or host synchronization inside measured iterations).
+- Sparse counters assert workload90 grouped backward calls,7/8 native expert
+  buckets (0 on followers),2 dense buckets. Warmup event materialization and
+  clock calibration outside timing; uninstrumented controls quantify any cost.
+- Planned same-allocation sparse/none/full healthy+prefetchNEP,60iterations,
+  measured40-49. Same E512/S2048/MBS2/GA3,EP8/8 vsEP8/6,cliques/RDMA.
+  run_nep_tail_control.sh uses GB200/GB300backfill4nodes,segment4,28min limit,
+  6min per-case watchdog; large outputs remain on Lustre.
+
+- Attempt3073579 allocated GB200lyris[0037,0042,0044-0045],10:06:35PDT.
+  Sparse healthy completed60iterations with70markers/rank, all counters passed.
+  Batch then failed post-run analysis because it expected full profiler files.
+  Fixed only the diagnostic entrypoint to emit the existing control_no_cupti
+  marker, explicitly also labeling sparse versus none. No fake profiler files,
+  no runtime edits. Resubmit the entire same-allocation comparison.
+
+### 2026-09-16: Late-peer diagnosis survives removal of broad profiling
+
+- Job3073618 ran10:14:47-10:38:26PDT on GB200lyris[0037,0042,0044-0045],
+  COMPLETED0:0,23:39. All6cases60iterations, no skips/NaNs. Same workload,
+  candidate/ref hashes, segment4, cliques1000/1001, RDMA across replicas.
+- Measured40-49 healthy/NEP: none661.22/908.94ms,72.75% parity;
+  sparse645.80/897.54ms,71.95%; full654.11/893.42ms,73.21%.
+  None truly removes all profiler wrappers, not just collection. Sparse has
+  7/9 markers per owner/iteration, no in-window sync or extra collective.
+  Sparse cases are slightly faster than none; this cannot estimate exact
+  instrumentation cost independently of sequential run variation.
+- Sparse NEP after full owner last expert B: local Gather/staging+54.090ms,
+  peer last B+83.127, peer RS ready+86.653, final RS done+90.855, optimizer
+  +111.890. Final RS peer wait32.562ms(range21.993-40.211), then4.202ms
+  after both ready. Full profiler gives31.889ms wait and4.382ms post-ready.
+  Dominant late-reduced-peer final-sync bottleneck is confirmed without broad
+  profiling; pure RS wire time and complete final-B causal split remain unproven.
+- Report NEP_TAIL_PROFILE_CONTROL_20260916.md. All-rank markers/profiles and
+  tail_control_analysis/summary.json are under Lustre job3073618. No runtime
+  changes; previous failed wrapper attempt retained/documented, no jobs left
+  from this experiment.
+
+### 2026-09-16: Existing-trace reduced-replica arrival audit
+
+- No new jobs/runtime edits. Re-read all owner traces from3066391/prefetch
+  and3073618/full_nep, iterations40-49. Reduced finishes first forward6.386ms
+  earlier in3066391, then accumulates77.673ms lateness by final-B start.
+- Second microbatch full/reduced: forward80.641/95.403ms, expert active CPU
+  32.301/41.555ms; backward92.127/118.625ms, active CPU59.937/78.981ms.
+  CPU growth28.6%/31.8% is consistent with33.3% more real experts/GPU.
+  Forward GPU operation-range growth9.248ms tracks CPU growth9.254ms.
+-3073618 reproduces ordinary-phase differences and80.725ms final-B entry
+  skew. Sparse run confirms lateness persists but has different magnitudes.
+- Evidence supports increased native grouped-expert host work and ordinary
+  microbatch delay, not a proven GEMM FLOP/s regression. Backward GPU ranges
+  include submission gaps/dependencies; absent HybridEP/kernel details leave
+  their precise attribution unresolved. Full report:
+  NEP_REDUCED_ARRIVAL_AUDIT_20260916.md.
+
+### 2026-09-16: Increase compute per expert-host operation with sequence length
+
+- User requested more compute per CPU work and another overhead/cause check.
+  Prepare same-allocation S2048/S8192 healthy+NEP comparison,60iterations,
+  matching measured/profiled40-49. Only sequence length changes across points;
+  E512,H1280,F768,top-k6,MBS2,GA3 and pinned reference/candidate unchanged.
+- HealthyEP8/8 GBS96 versus NEPEP8/6 GBS84, proportional replica batches.
+  Four nodes,segment4, GB200 or GB300backfill, software cliques1000/1001,
+  existing named container. All-rank CPU/CUDA-event AG/RS/expert profiles stay
+  enabled; no training code edits. New sequence-control entrypoint validates
+  argument mutations and pinned implementation hashes. All artifacts Lustre.
+- Submitted3073889; started11:16:33PDT on GB200lyris[0253-0256],segment4.
+  Shell syntax and sequence-only argument mutation tests passed before submit.
+  Analyzer also checks identical bucket layouts and expert sync payloads/counts
+  across sequence points, separating ordinary CPU work from elapsed spans.
+-3073889 COMPLETED0:0 at11:34:56PDT,18:23; all4cases60iterations and all-rank
+  traces passed. Owner parity S2048:703.084/861.614ms=81.601%; S8192:
+  865.972/1025.773ms=84.421%. Extra time158.530/159.801ms, not parity yet.
+- Second-microbatch backward reduced-minus-full18.753 ->2.094ms, despite
+  extra expert active CPU15.741 ->16.307ms. All backward expert calls submit
+  before GPU start at8k versus69.7%full/43.4%reduced at2k. Forward remains
+  host-paced; its reduced-minus-full gap7.086 ->6.456ms.
+- Final-B entry lag41.458 ->5.881ms; exit54.616 ->22.719ms. Final RS peer
+  wait30.400 ->22.216ms, then4.475 ->4.276ms after both ready. Local final
+  Gather/staging tail28.321 ->3.958ms. Final backward still has unresolved
+  reduced duration penalty16.838ms. No kernel-only efficiency claim.
+- At8k owner post-opt30.503ms is28.834ms until slowest reduced optimizer
+  finishes plus1.669ms afterward. Larger remaining first-forward and optimizer
+  deltas offset the backward/tail gains; healthy skew also changes acrossseq.
+  Report NEP_SEQUENCE_CONTROL_20260916.md; JSON under job3073889
+  sequence_control_analysis/summary.json. Both runtime worktrees remain clean.
+
+### 2026-09-16: Full-owner versus healthy S8192 systematic overhead audit
+
+- Existing3073889 traces only. Distinguish within-NEP replica skew from the
+  159.801ms end-to-end healthy comparison. Added non-overlapping timeline and
+  mechanism evidence to NEP_SEQUENCE_CONTROL_20260916.md.
+- FinalB expert GPU operation sums20.183 ->20.539ms, only+0.356ms, versus
+  +34.681ms elapsed. CPU submission envelope102.068 ->168.920ms;35.072ms
+  of that NEP envelope is traced owner-grad staging. CPU final-expert return
+  lead over GPU completion shrinks44.909 ->12.668ms. Code has per-expert,
+  per-slot copies in _copy_nep_nccl_contexts_to_distopt_grads. Remaining gaps
+  are not fully attributable without missing native/host operation scopes.
+- Tail excess34.731ms partitions+3.991local readiness,+21.945peer waiting,
+  -3.831post-ready completion,+6.661expert-to-denseRS,+5.964tooptimizer.
+  First-forward redistribution host total24.285ms;18.988ms inside expert
+  envelope. Ordinary forward excess14.068ms has no redistribution calls and
+  is mostly between recorded expert operations; cause unresolved.
+- No runtime edits/jobs. No claim that inclusive CPU/comm sums are additive
+  critical-path costs or that event-range gaps prove kernel-level GPU idle.
+
+### 2026-09-16: S8192 profiler-free parity validation
+
+- User explicitly authorized removing all profiling atS8192. Prepare one
+  same-allocation none/full healthy+NEP comparison to avoid mistaking a node
+  allocation change for profiling distortion. No runtime modifications.
+- Reuse validated raw_main none path: remove --profile, no hooks/events,
+  assert CUDA event/collective capture modules were never imported. Full
+  controls retain previous AG/RS/expert profiling40-49. All cases60iterations;
+  report exactly40-49 for both modes, with pre/post windows separately.
+- S8192,E512,H1280,F768,top-k6,MBS2,GA3; EP8/8 versusEP8/6,GBS96/84.
+  Four nodes/segment4, cliques1000/1001, GB200/GB300backfill, pinned reference
+  and candidate hashes, named NeMo container, large artifacts on Lustre.
+
+### 2026-09-16: Original a8b latent workload on the current implementation
+
+- User requested parity on original a8b latent. Submitted3074709, eight
+  GB300 nodes,segment4,30minute limit,13minute case timeouts. Started13:50:50
+  PDT on theia0091,0094,0101,0102,0104,0106,0107,0108. Both replica node
+  sets pass single-domain checks(nvlblk22); software cliques1000/1001 force
+  cross-replica RDMA. Transport logs must still confirm actual routing.
+- Original H4608,latent expert input1152,F3072,E512,top-k6,seq8192,MBS1,
+  GA8,TP2,CP1,ETP1. HealthyEP16/16 versusNEPEP16/12; local replica batches
+  64/64 versus64/48;GBS128/112. DistOpt,Flex/HybridEP,source local graph
+  settings, selective recompute and eight requested DDP buckets retained.
+- Healthy runtime93d313df4d5588795ea628592668b188ed352a66; NEP candidate
+  51fdbbb11da3f9aa1a07f1bd52b7e3625151c7a9,with immediate post-AG
+  redistribution. SHA256 checks before each launch. No training code edits.
+- Forty-five iterations per case; all-rank CUDA-event operation profiles
+  25-34,post-profile timings36-45 reported separately. Diagnostic event-pool
+  capacity is now env-configurable(default4096 unchanged),set65536 here
+  because the original GA8 and deeper model exceed the small-workload pool.
+  These are elapsed operation ranges, not kernel-only busy time.
+- GB300 selected because original a8b NEP previously OOMed on GB200.
+  Launcher scripts/nonuniform/run_nep_a8b_latent_current.sh; all artifacts
+  under Lustre slurm_runs/soft_clique_baseline/3074709/current. Results pending.
+
+### 2026-09-16: Current a8b latent parity measured at 87.7-88.4 percent
+
+- Job3074709 completed0:0 in19m07s. Both healthy and NEP completed45/45
+  iterations with no skipped/NaN steps or capacity-overflow reruns; all32/28
+  rank operation profiles collected. No training implementation edits.
+- Matched profiled iterations25-34: healthy5759.78ms,population std18.286ms;
+  NEP6568.07ms,std19.060ms. Owner iteration parity87.6936%,slowdown14.0333%,
+  delta808.29ms. Rank0 event iteration means5760.018/6568.371ms agree with
+  logged durations within0.31ms; all-rank means agree within0.03ms per case.
+- Matched post-profile iterations36-45: healthy5707.58ms,std98.586ms;
+  NEP6453.98ms,std16.690ms. Parity88.4350%,slowdown13.0773%,delta746.40ms.
+  Healthy varies from5581.2to5842.3ms; do not conceal this by selecting a
+  narrower window. These are post-capture timings, not an entirely unpatched
+  profiler-free launch; the generic inactive wrappers remain installed.
+- Both cases' rank0 transport logs confirm0<->16 NET/NCCL RDMA Plugin
+  v11/GDRDMA(PCI),with intra-replica P2P/MNNVL. Rank0 log PIDs2389999
+  (healthy)and2402122(NEP). Replica domain checks passed in nvlblk22.
+- This original-workload result is below the older2994648 post-profile
+  93.89% result, but allocation/runtime/profiler differ between those jobs;
+  no causal attribution to GEMM efficiency or a specific code change yet.
+- Structured timings and all-rank iteration means:
+  /lustre/fsw/coreai_comparch_sysarch/darfeen/slurm_runs/soft_clique_baseline/3074709/current/cupti/ep16/a8b_120b_latentmoe_1t/current_parity_summary.json.
+
+### 2026-09-16: a8b MBS2 with same-allocation MBS1 controls submitted
+
+- User approved testing increased MBS. Submitted3078207 at15:05:07PDT,
+  gb300-backfill,eight nodes,segment4,45minute allocation. Initially pending
+  Resources,StartTime Unknown; monitor every five minutes.
+- Four cases in one allocation: MBS2 NEP then healthy, MBS1 healthy then
+  NEP. NEP MBS2 first to catch memory limits early. GA8,seq8192,all model
+  dimensions,TP2/CP1/ETP1,EP16/16 versusEP16/12,DistOpt/Flex unchanged.
+  MBS2 gives healthyGBS256,NEPGBS224,replica batches128/128 versus128/96;
+  MBS1 remains128/112 and64/64 versus64/48. Both retain proportional work.
+- Forty-five iterations per case,all-rank CUDA-event operation profiles25-34,
+  post-profile36-45. Same runtime hashes as3074709. Compare parity and token
+  throughput, keeping profile/post windows separate. Same-allocation MBS1
+  controls prevent allocating different nodes from masquerading as improvement.
+- Launcher-only changes parameterize MBS,tag,case order and timeout while
+  preserving original defaults. No runtime implementation changes. MBS2
+  cases capped18minutes,MBS1 cases13minutes. Launcher
+  scripts/nonuniform/run_nep_a8b_mbs_control.sh. Artifacts on Lustre under
+  slurm_runs/soft_clique_baseline/3078207/{mbs2,mbs1}. Results pending.
+
+### 2026-09-16: a8b MBS2 completes at 92 percent parity; overhead audit
+
+- Job 3078207 was preempted after 30m28s, after both MBS2 cases and MBS1
+  healthy completed 45 iterations. MBS1 NEP did not enter training. The MBS2
+  comparison is complete: 32 healthy and 28 NEP rank profiles, iterations
+  25-34, with post-profile timings 36-45. No replacement job submitted.
+- User clarified that matching allocation resources/topology is sufficient;
+  same-allocation controls are not required. Preserve that distinction in
+  future comparisons instead of allocating solely for same-node controls.
+- GB300, segment 4, full replica in nvlblk21 and second in nvlblk26;
+  transport logs confirm cross-replica RDMA/GDRDMA. TP2/CP1/ETP1,
+  EP16/16 healthy versus EP16/12 NEP, MBS2/GA8/sequence8192,
+  GBS256/224, proportional replica batches 128/128 versus 128/96.
+- Profiled healthy 8444.05 +/- 79.13 ms, NEP 9181.22 +/- 31.14 ms:
+  91.9709% parity and 737.17 ms extra. Post-profile healthy
+  8358.31 +/- 55.33 ms, NEP 9082.03 +/- 94.30 ms: 92.0313% parity
+  and 723.72 ms extra. Standard deviations are population values.
+- Additive full-owner elapsed-time partition of profiled gap: startup/first
+  forward +386.119 ms, ordinary forwards +83.823 ms, ordinary backwards
+  +114.588 ms, final backward +111.938 ms, backward-to-optimizer +15.325 ms,
+  optimizer +16.180 ms, post-optimizer +0.582 ms, transitions +8.624 ms.
+  These are operation-anchor intervals, not pure compute or kernel busy time.
+- Largest identified mechanism: whole 43-expert owner-buffer broadcasts,
+  followed by subset copies, send each full follower 68.479 GB despite only
+  13.590 GB of useful parameters. Shared transfer-stream dependencies through
+  overlapping owner/follower groups serialize delivery. Example iteration25:
+  bucket AGs finish near 123 ms, first owner's redistribution ends 130 ms,
+  last owner's 171 ms, next expert layer begins 172 ms. CPU submission was
+  already done before AG completion. This is not the previous late-host fix.
+- Final RS waits only 1.83 ms for the reduced participant on average. NEP
+  owners have 33.3% larger expert AG/RS payload; Gather, staging and native
+  RS contribute to final-backward cost, but their overlapping residencies
+  must not be added as an exclusive critical-path decomposition.
+- The ordinary-microbatch +198.411 ms remains mechanistically unresolved:
+  no NEP reshards run there and full-owner expert ranges do not grow.
+  Current CUDA-event profiles omit individual HybridEP, attention/Mamba
+  replay and some hooks. Do not attribute this remainder to CPU starvation
+  or reduced GEMM efficiency without additional evidence.
+- Existing MBS1 first-forward overhead is 382.382 ms, essentially unchanged
+  at MBS2. Higher parity mainly amortizes this dominant overhead, not removes
+  it. Profile/post windows remain separate throughout the analysis.
+- Added analysis scripts analyze_a8b_current_overheads.py and
+  analyze_a8b_delivery_chain.py under scripts/nonuniform; report:
+  NEP_A8B_MBS2_OVERHEADS_20260916.md. Artifacts under Lustre
+  slurm_runs/soft_clique_baseline/3078207/mbs2_overhead_analysis.
+  No training implementation changes. Candidate compact offloaded-only
+  broadcast optimization is documented but not implemented.
+
+### 2026-09-17: Compact first-forward parameter broadcasts implemented and tested
+
+- Created separate branch/worktree nep-param-compact-20260917 from trusted
+  prefetch commit 51fdbbb11. Previous runtime remains untouched for rollback.
+  Commit d638286d7 changes only parameter-transfer packing/unpacking plus tests.
+- Owner-local experts are copied directly from live native DistOpt proxies;
+  broadcasts contain only offloaded experts. Participants, group order, shared
+  transfer stream, buffer allocation/reuse, AG prefetch and gradient sync are
+  unchanged. Static compact offsets are cached, with no per-step mapping rebuild.
+- Four-GPU GB200 correctness job 3088005 completed 0:0 in 2m39s. Real NCCL
+  tests passed for E16 EP4/2, E23 EP4/3, E13 EP4/2 and E4 EP4/3, including
+  singleton transfers, changed proxy storage and repeated shared-buffer reuse.
+  Existing native AG/RS/prefetch smoke passed with fresh parameter values,
+  force-sync, model-EP traffic and independent GPU progress. Four focused
+  pytest tests passed. All-rank CUDA-event profiles saved under Lustre
+  analysis/compact_smoke_3088005; isort/Black run in the container.
+- Submitted GB300 benchmark 3088020, eight nodes, segment4, 30min limit:
+  a8b MBS2/GA8/seq8192, proportional EP16/12 NEP followed by EP16/16 healthy.
+  Same model, topology checks, RDMA software cliques, container, profile
+  iterations25-34 and post-profile36-45 as job3078207. No batch/graph/bucket
+  changes. SHA256 pinned to 677332c72a1242ccd61334901c60b37c34500f021ecc96a527ffeec09b28966d.
+  Initial StartTime Unknown; monitor every five minutes. Artifacts:
+  slurm_runs/soft_clique_baseline/3088020/mbs2 under the Lustre storage root.
+
+### 2026-09-17: a8b compact benchmark blocked by GB300 maintenance
+
+- Five-minute polling through approximately10:00PDT: 3088020 still pending,
+  StartTime Unknown. Inspected reservations: active admin-only `maint` covers
+  all theia0001-0288; `gb300_checkout` covers245nodes. The year-long end dates
+  are not a trustworthy return-to-service ETA. Do not bypass reservations.
+- Job remains queued with unchanged workload/resources. No after-performance
+  result yet; expected payload reduction is not a measured speedup.
+- Delegated continued five-minute start polling to context-inheriting low-cost
+  monitor Euclid, 01a0b04f-9355-72b2-8658-1d54398d75a4. Instructed to remain
+  active until RUNNING/terminal and notify immediately when allocated.
+- Implementation/validation and exact analysis-resume instructions recorded
+  in NEP_A8B_COMPACT_PARAMS_20260917.md. Performance validation is incomplete.
+
+### 2026-09-17: GB200 before/after profiles with memory-required depth reduction
+
+- User permits reducing depth only as needed to avoid OOM, requires explicit
+  before-fix and after-fix profiles on GB200. Existing original a8b MBS2 peak
+  allocated memory is 239202 MiB (233.6 GiB), MBS1 peak226197MiB (220.9GiB),
+  both exceeding GB200's184.31GiB. Earlier GB200 original-depth runs OOMed.
+- Reduced two complete repeated 5-MoE blocks: 30 to20MoE layers including
+  unchanged two MTP layers. Removing only one projects roughly195GiB; two
+  projects156GiB before accounting for fixed memory. This is an estimate,
+  not proof of the exact maximum depth. Preserve pattern order and remaining
+  repeats, H4608/latent1152/F3072/E512/topk6, MBS2/GA8/seq8192, EP16/12,
+  DistOpt/Flex, graphs and requested DDP buckets8. Only layer-pattern argument
+  changes; startup manifest checks all other workload dimensions/batch settings.
+- Submitted3088787 on gb200-backfill,8nodes,segment4,30min; started10:27:40PDT
+  on lyris0001,0008-0009,0011,0146-0148,0150. Before NEP51fdbbb11, after
+  NEPd638286d7, healthy93d313df4, each45iterations with profiles25-34 and
+  post-profile timings36-45. Runtime SHA256 pinned per case. Fail-fast on OOM.
+- New diagnostic entrypoint pretrain_a8b_gb200_depth.py and launcher
+  run_nep_a8b_gb200_before_after.sh under scripts/nonuniform. Existing phase
+  analyzer accepts --moe-layers20 and a separate healthy tag; default30-layer
+  behavior unchanged. Compile, shell syntax, and actual-matrix argument dry
+  run passed. No training implementation changes. Artifacts under Lustre
+  slurm_runs/soft_clique_baseline/3088787/{gb200_before,gb200_after,gb200_healthy}.
+- Original-depth GB300 job3088020 remains queued and monitored separately.
+
+### 2026-09-17: GB200 20-MoE attempt OOM; retry one repeat shorter
+
+- Job3088787 failed after5m21s during the before-fix case, before iteration1
+  completed. Real CUDA OOM at vocabulary cross entropy: 4.00GiB requested,
+  2.80GiB free of184.31GiB,174.06GiB PyTorch allocated and181.48GiB total
+  process use. Other ranks reported similar failures. Not an NCCL hang.
+- Memory prediction underestimated fixed/peak costs; the depth reduction is
+  still necessary. Removed one further complete repeated5-MoE block: new
+  total15MoE including the unchanged2MTP layers. All before/after/healthy
+  cases receive the same pattern; no other arguments/runtime changes.
+- Retry job3088971 submitted10:36:13PDT, initial estimated start12:51PDT;
+  monitor Euclid now watches this job as well as maintenance-blocked3088020.
+  Each case remains45iterations, all-rank profiles25-34, post-profile36-45.
+  Tags gb200_before/gb200_after/gb200_healthy under its Lustre job root.
+  Analyzer accepts --moe-layers15 --healthy-tag gb200_healthy; comparison
+  tags are gb200_before and gb200_after. Existing30-layer phase extraction
+  reproduced ten cached original rank0 iterations exactly after generalization.
+
+### 2026-09-17: GB200 before profile collected; after startup helper failure
+
+- 3088971 started10:42:59PDT. Before-fix NEP completed45/45iterations with
+  all28rank profiles; profile25-34 mean5018.22ms, post36-45 mean4972.24ms.
+  Rank0 peak PyTorch allocation129551MiB (~126.5GiB). Replicas in nvlblk01
+  and nvlblk12, same segment4 allocation; transport still to audit.
+- After-fix case failed before training in dataset setup with
+  ModuleNotFoundError: megatron.core.datasets.helpers_cpp on multiple ranks.
+  The new worktree's compiled helper was produced during startup and is now
+  present. Source is identical to before; add explicit make/import preflight
+  on all nodes before distributed training rather than depend on first-use
+  compilation. No change to runtime implementation or workload.
+- Reuse completed before profile and rerun only after+healthy on matched
+  GB200 resources, avoiding a redundant before case. Full-depth GB300 job
+  remains queued; same-allocation controls are not required by user.
+- Retry3089211 submitted10:59:23PDT,22minlimit, only after+healthy. Initial
+  Priority/StartTimeUnknown. Monitor watches it alongsideGB3003088020.
+  Added explicit dataset-helper make and all-node import preflight in the
+  launcher. No runtime code changes; model remains15MoE for both cases.
+
+### 2026-09-17: Compact parameter results and backward-skew investigation
+
+- Job3089211 completed after-NEP and healthy,45iterations each,28/32all-rank
+  operation profiles. Before3088971 profile/post means5018.22/4972.24ms;
+  after3089211 4980.52/4944.34ms; healthy4569.42/4556.27ms. Profile25-34,
+  post36-45. CUDA-event operation ranges are not individual kernel traces.
+- Full-owner startup+first-forward338.89->224.84ms, but final-backward
+  416.96->592.91ms. Reduced-minus-full final-backward start11.82->204.93ms.
+  Reduced ordinary backward346ms->352ms; full336ms->323ms. Do not call
+  this a compact-transfer regression until causality is established: before
+  and after were different allocations, with unchanged resources/workload.
+- Matched RS participants: owner summed waiting45.42->489.65ms, while
+  summed post-last-ready elapsed112.40->111.91ms. These sums overlap in
+  time and must not be added to iteration duration. Longer RS ranges reflect
+  arrival skew, not a measured increase in RS transfer service.
+- Expert backward CPU critical-rank identity changes: full rank5 before,
+  rank6 after; reduced rank21 before, rank27 after. Reduced arrival loses
+  about9-11ms per ordinary backward before versus28-30ms after. Investigating
+  native submission/compute pace; late arrival itself is not a root cause.
+- Submitted3089470,22minutes,8GB200nodes,segment4,back-to-back before/after
+  with identical15MoE/MBS2/GA8/seq8192 configuration and profiles. No runtime
+  or profiling edits. Initial scheduled start12:06PDT. Euclid monitors every
+  300seconds alongside pending full-depthGB300 job3088020. User requests
+  cause established and, where feasible, fixed before returning.
+
+### 2026-09-17: Same-node repeat validates compact transfer; no backward regression reproduced
+
+- 3089470 ran11:39:06-11:55:32PDT,COMPLETED0:0. Before and after both
+  completed45iterations/28profiles on the same7GB200nodes. The allocation
+  used8nodes,segment4; replicas both in nvlblk01 with distinct MNNVL cliques.
+  NCCL logs confirm0<->16 NET/NCCLRDMAPlugin/GDRDMA in both cases.
+- Profile25-34:5024.51->4913.90ms(-110.61ms,2.20%); post36-45:
+  5004.24->4873.58ms(-130.66ms,2.61%). Full-owner startup+firstF:
+  337.87->226.83ms. FinalB475.82->430.17ms, totalB2778.09->2785.08ms.
+  Earlier large finalB increase did not reproduce; no backward code changed.
+- Replica arrival skew at finalB83.24->28.51ms. Native ordinaryB full:
+  328.47->336.11ms, reduced344.99->345.74ms; changing native CPU/launch pace
+  shifts accumulated waits between phases. Exact CPU clock/NUMA/OS cause
+  is not observable in existing profiles; no such physical cause is claimed.
+- Owner summed RS post-last-ready109.76->109.88ms, unchanged; waiting
+  210.09->79.44ms. Source-counted parameter broadcast109.566->27.179GB.
+  All28ranks/10steps identical op counts/non-param collective payloads.
+- Benchmark losses diverge after early roundoff, including repeats of the
+  unchanged implementation. No skipped/NaN steps. Correctness evidence is
+  exact-value compact-transfer smokes, not benchmark loss equality.
+- Added analysis-only analyze_a8b_backward_skew.py and full results/caveats
+  to NEP_A8B_COMPACT_PARAMS_20260917.md. Runtime worktree unchanged and clean.
+- Monitor failed to send job transition notifications. Parent discovered
+  completed run directly. Reset Euclid to ONE pending job3088020,300s polls,
+  persistent Lustre status log, final answer immediately on RUNNING/terminal
+  rather than continuing a multi-job loop whose commentary is not delivered.
+
+### 2026-09-17: Remaining-overhead diagnostics and NICC MCP discovery
+
+- Submitted GB200 job3090523 at14:27PDT: healthy then compact NEP, 8nodes,
+  segment4, 22min. Identical15MoE/MBS2/GA8/seq8192/EP16-12 configuration;
+  45iterations, all-rank operation profiles25-34, post36-45 only for estimating
+  instrumentation distortion. No runtime implementation changes.
+- Diagnostic entrypoint pretrain_a8b_remaining_overheads.py adds HybridEP,
+  Flex metadata/preparation, grouped-expert parent, and CUDA graph replay
+  ranges to existing native AG/RS and NEP Gather/redistribution records.
+  These are elapsed operation ranges, not individual kernel service times.
+  Validate process groups, payloads, host submission and GPU completion on
+  every rank before accepting the comparison. Nested ranges are non-additive.
+- Recreated the dedicated300s start monitor after the earlier agent IDs were
+  unavailable on resumption. Pending Priority, no scheduled start at14:37PDT.
+- Queried NICC MCP catalog without changing MCP configuration. Nsight CUDA
+  connected successfully and provides CUDA documentation search, not trace
+  processing. Used it to check event/stream timing and dependency semantics.
+  Glean connected for internal performance-document searches. Scheduling Tools
+  requires user reauthentication; Nvperformance lacks a Codex AuthService
+  registration. Local Slurm and profile analysis remain the execution tools.
+- Glean retrieved Megatron's CPU-overhead troubleshooting and a grouped-GEMM
+  performance-model document. Neither establishes the cause of this run's gap;
+  use measured operation/rank comparisons before making that attribution.
+
+### 2026-09-17: Remaining-overhead attribution, pending expanded profiles
+
+- Added analysis-only analyze_a8b_operation_partition.py; four synthetic
+  nested/clipped/empty/adjacent interval tests pass, and all60rank caches for
+  3089211 partition exactly. Runtime and queued diagnostic entry untouched.
+- Recorded the existing measured-window411.14ms owner gap in
+  NEP_A8B_REMAINING_ATTRIBUTION_20260917.md: startup/firstF84.22,
+  otherF41.73, earlierB74.05, finalB155.86, drain24.27, optimizer/tail9.01,
+  transitions22.01ms. These are disjoint phases, not causal transfer costs.
+- Including every healthy second-replica rank, finalB extra155.86ms equals
+  extra reduced finalB70.14 + extra accumulated arrival skew95.14 - extra
+  end skew9.42ms. Native expert CPU thread time rises74.48->92.40ms per
+  ordinary backward on second/reduced ranks; exposed contribution unresolved.
+- Verified dynamic HybridEP sizing is intentional in this matrix, not a new
+  regression: static factor removed after2786484overflow; forbidden by the
+  matrix validator. Actual expert AG/RS counts5healthy/8NEP, dense3both.
+  Expanded3090523profiles will label native graphs/HybridEP/metadata before
+  claiming root causes for the remaining unscoped intervals.
+
+### 2026-09-17: Completed a8b remaining-overhead attribution, job3090523
+
+- COMPLETED0:0,15:25:51-15:45:24PDT. Healthy/compact NEP each45iterations,
+  all32/28rank profiles25-34. Same8node GB200 allocation,segment4; replicas
+  fit separate MNNVL cliques, and NCCL transport logs confirm cross-replica
+  RDMA/GDRDMA. Model15MoE, H4608/latent1152/F3072/E512/topk6, MBS2/GA8,
+  seq8192, TP2, EP16/16 versus16/12. Runtime compact worktree stays clean.
+- Profile means4942.33/5345.87ms, gap403.54ms,92.45% parity. Disjoint owner
+  phase attribution: startup/firstF+78.522, finalB+287.061, drain+33.893,
+  everything else+4.079ms net. Earlier7backwards are14.822ms faster on NEP
+  owners; do not reuse the ordinary-B regression from a different allocation.
+- All healthy second-replica ranks included: ordinaryB357.499->387.105ms,
+  expert backward/recompute CPU thread time82.630->102.997ms per microbatch.
+  FinalB start skew151.011->374.030ms; end skew12.138->30.592ms.
+  Owner finalB increase287.061 = reduced/second local increase82.495
+  + additional start skew223.019 - additional end skew18.454ms. This is an
+  elapsed identity, not a claim that287ms is RS service or removable waiting.
+- Owner RS sum275.728->993.141ms, but post-last-ready82.036->109.427ms.
+  The large difference is mostly arrival waiting; overlapping sums cannot
+  be added to iteration time. Actual expert buckets remain5healthy/8NEP.
+- FirstF gaps track parameter delivery: post-latest-AG to latest intra-replica
+  transfer completion3.4-10.3ms per bucket. FirstF inter-expert gap penalties
+  versus next microbatch8.3-12.3ms at delivery boundaries, healthy<=1.12ms.
+- Confirmed NEP-only blocking CUDA->CPU conversion of immutable active-slot
+  indices in Flex dispatch_postprocess,240calls/iteration. Metadata confirms
+  CPU token counts/CUDA slot indices on NEP. Owner CPU scope0.934->79.795ms;
+  GPU event range0.575->11.515ms. Expert CPU submission goes from0.121ms
+  BEFORE dispatch completion to0.239ms AFTER. These are overlapping ranges,
+  not79ms additive overhead. CPU index caching is a candidate, not yet changed.
+- Iter25 owner0 backward graph is CPU-submitted at101.120ms (0.122ms call),
+  GPU range104.700-444.044ms; reduced16 first-RS ready427.662ms, owner0 RS
+  completes441.933ms. Graph stall is not late CPU submission; internal device
+  dependency versus NCCL resource contention is unresolved without kernels.
+- Post36-45 means4821.71/5284.33ms,91.24% parity. Profile-versus-post favors
+  NEP by59.08ms; drift means this is not an exact profiler correction. Preserve
+  measured windows. No individual-GEMM efficiency claim from elapsed ranges.
+- Updated NEP_A8B_REMAINING_ATTRIBUTION_20260917.md. Analysis-only interval
+  script passes4synthetic cases and all60rank partitions. All collective peer
+  sets match. Artifacts remain on Lustre under3090523/gb200_after_overhead_analysis.
+  No new runtime fix or additional benchmark submitted. Monitor continues
+  pending full-depth GB300 job3088020 at300s intervals.
+
+### 2026-09-17: Cache immutable CPU expert slots; queued matched validation
+
+- User authorized fixing the NEP-added dispatch copy, followed by matched
+  slowdown attribution and, if native per-expert host work remains dominant,
+  increasing GPU work per expert in a separate experiment.
+- Created rollback-isolated branch nep/slot-cache-20260917 in
+  .worktrees/nep-slot-cache-20260917 from compact baseline d638286d7.
+  Commit e105bd46c adds6runtime lines only in token_dispatcher.py: cache CPU
+  slot indices at initialization and choose that cache for CPU token counts.
+  CUDA count selection retains the previous path. No collectives, bucket
+  ordering, expert placement, optimizer or training-math changes.
+- Added10parameterized selection tests covering CPU/CUDA counts, ordinary
+  dispatch, identity maps, padding/noncontiguous slots and empty selection.
+  CPU tests fail if device-slot conversion is attempted. Tests run before
+  distributed training in the benchmark allocation. Host lacks PyTorch.
+  Syntax/diff checks pass; focused test formatting used available Black24.10
+  with explicit version override (repo requires26), without unrelated edits.
+- Submitted3091300 at16:23PDT,8GB200nodes,segment4,30min. Healthy then old
+  compact NEP then cached-slot NEP,45iterations each; identical15MoE depth,
+  MBS2/GA8/seq8192/EP16-12, all-rank expanded operation profiles25-34.
+  Source dispatcher SHA and runtime commit logged for each variant.
+  Initially pending Priority, no ETA. Dedicated monitor polls300s and reports
+  immediately on allocation. Pending3088020 remains untouched.
+- Launcher scripts/nonuniform/run_nep_a8b_slot_cache_ab.sh. All generated
+  outputs under Lustre soft_clique_baseline/3091300/slot_{healthy,before,after}.
+
+### 2026-09-17: Slot cache validated; small speedup, remaining reduced-rank lag
+
+- Expanded3091300eligibility to GB200/GB300 using scontrol with explicit
+  TimeLimit=00:30:00 (omitting TimeLimit failed site validation). Allocated
+  GB20017:17:07,completed0:0 at17:43:44,26:37. Replica0nvlblk04,
+  replica1nvlblk08. All3cases45iterations and all88rank profiles completed.
+- Standalone1node3091500passed11CPU/CUDA selection tests,completed0:0 in1:41.
+  Same11tests also passed inside3091300preflight. Runtime remains6addedlines,
+  no other implementation changes; e105bd46c worktreeclean.
+- Measured25-34 healthy4878.83ms, before5228.27ms, fixed5201.53ms; parity
+  93.32->93.80%, saving26.74ms. Post36-45 healthy4748.98, before5138.93,
+  fixed5053.03ms;93.98%fixed parity is a separate distortion check, not used
+  for the measured breakdown. Saving varies16.24pre/26.74profile/85.90post.
+- Owner postprocess CPU78.605->4.194ms, GPU range11.279->0.574ms;
+  early expert CPU submission0->66.8% (healthy85.6%). Reduced CPU scope
+  74.758->5.348ms. The unnecessarycopy is removed, but not all its CPU
+  waiting was exposed. Allcollectiveparticipantsets validated.
+- Fixed owner extra versushealthy: startup/firstF77.564, otherF5.746,
+  earlierB15.764, finalB183.103, drain26.248, optimizer/tail8.059,
+  transitions6.144ms. FinalB grows59.050ms versusprefixed NEP because
+  owners reach finalB61.584ms earlier relative to reduced ranks, not because
+  RSservice grew (post-last-ready110.362->110.491ms).
+- Native expert CPUwork remains higher on reduced ranks (~101vs82ms per
+  ordinaryB), while full-owner ordinaryBnow318.97vshealthy316.86ms.
+  This motivates moreGPUworkperexpert, not a claim allCPUtime is exposed.
+- Submitted3091845seq12288healthy/fixedNEP,8nodes,segment4,25min,GB200/GB300.
+  Onlyseq8192->12288 and max-positionlimit change; MBS2/GA8andallothermodel/
+  topology/profiling settingsfixed.4manifest transformationtests passed.
+  InitialETA18:09PDT. Report NEP_A8B_SLOT_CACHE_20260917.md records results.
+- Replaced stale monitoringagent afteritmissed3091500/3091300starts. New
+  Rawls monitor successfully reported3088020RUNNING onGB30017:38:40 and
+  3091300COMPLETED. Nowmonitoring3091845/3088020with300s cadence, final
+  notification onstart/terminal; heartbeatmonitor_slot_cache_active.log.
+
+### 2026-09-17: GB300 sequence controls; 12K improvement not robust across windows
+
+- 3091845allocatedGB30017:52:24before anattemptto pinGB200; scontrol correctly
+  refusedchangeafterstart. AddedGB3008Kcontrol3091888,started17:54:30,so
+  sequence comparisons do not mixGB200/GB300. Bothcompleted0:0,21:10/19:14,
+  all45iterations and60profilespercomparison. Firstreplicaandsecondreplica
+  eachcontainedinonephysicalNVLdomain,anddifferentdomainswithineachjob.
+- Measured8K healthy4830.50/NEP5099.21ms,94.73%;12K6179.55/6472.81ms,
+  95.47%. Post8K4730.55/4996.05ms,94.69%;12K6068.98/6403.91ms,94.77%.
+  Absolutegap268.71->293.26ms measured and265.50->334.93ms post. Do not
+  claim12Ksignificantlyimprovedhiding: measuredgain mostlynotreproducedpost.
+- Reduced nativeexpertCPU perordinaryB97.928->98.804ms. All16healthysecond
+  ranks78.404->84.029ms. ReducedordinaryBpenalty15.917->19.373ms. Expert
+  GPU-eventrangesum80.962->80.718ms isnotpurekernelservice. Countsunchanged.
+- OwnerfinalBextra216.105->-14.392ms butordinaryearlierBextra-52.275->145.724
+  andotherforwardextra-5.635->51.483ms. The apparentfinalB/RSwaitreduction
+  is NOT anadditiveiterationgain. Full tables inNEP_A8B_SLOT_CACHE_20260917.md.
+- Native AG/RS, NEPGather/redistribution peer sets validated across allranks/
+  tenmeasurediterations. Matchedmanifestsonlydifferseq/positionlimit/outputpaths.
+- Submittedonefurtherboundedpoint3092074,GB3008nodes,segment4,30min,seq16384,
+  samefixedcodeMBS2GA8depth15. Started18:21:52theia0202-0208,0210.
+  Rawls nowmonitorsONLYthisjobat300s; allpreviousjobsfinished.
+- Olderfull-depth30MoEGB300compactjob3088020alsocompleted0:0,22:50,all60
+  profiles. It DOES NOT includeCPUslotcache. Profilehealthy8346.38/NEP9082.94ms;
+  post8293.10/8978.70ms. Keepseparatefromdepth15/currentfixcomparisons.
+
+## 2026-09-21: causal test of native expert host exposure
+
+- User requested an experiment attributing ordinary-backward slowdown to
+  non-hidden per-expert host work. Added an isolated native TE expert probe;
+  no production NEP changes. Exact a8b latent1152/F3072 squared-ReLU,32 versus
+  42/43experts,8K/16K-equivalent proportional token counts. Compare identical
+  eager operations normal versus prequeued behind an excluded ~50ms GPU delay.
+  This delay is a causal diagnostic, not an optimization or parity result.
+- Correctness checks all outputs/gradients bitwise; CUDA-event measurements,
+  native host time and separate CPU/CUDA kernel traces retained. Difference
+  of EP12-minus-EP16 penalties normal versus prequeued is the target metric.
+- First job3119924 canceled during container prep to correct draft activation
+  mismatch. Corrected3119944 started09:49:47PDT onGB200lyris0018,one node,
+  10min; monitoragentHarvey uses300second schedulerpolling.
+- Re-audited completed16K3092074: all60profiles,45steps/case,exit0:0,24:07.
+  Measuredparity97.09%,post97.41%. Allhealthysecond16ranks ordinaryB535.198ms
+  vsNEPreduced563.201ms,extra28.003ms. At8K3091888extra15.917ms. Therefore
+  better16Kiterationparity was NOT evidence of reduced absolute ordinaryB
+  overhead. Full setup and caveats:NEP_EXPERT_HOST_CAUSAL_20260921.md.
+
+### 2026-09-21: native expert headroom probe completed
+
+- 3119944 completed0:0,3:07,GB200lyris0018. Six shape cases,20event-profiled
+  samples/condition and4kernel-profiled diagnostics/case. Bitwise outputs/all
+  gradients match. Identical kernels/grids across normal/prequeued conditions;
+  all120prequeued samples finish submission>39ms before GPU starts.
+- WeightedEP12-minusEP16 backward penalty:8Knormal0.8284ms,prequeued0.2305ms
+  (72.2%removed);16Knormal0.3627ms,prequeued0.1975ms(45.5%removed).
+  Including expert forward recomputation:1.1791->0.2823ms at8K and
+  0.5832->0.2460ms at16K. Local host-exposure mechanism established; do NOT
+  equate this with attribution of72.2% of full distributed training slowdown.
+- Trace43experts8K: identical258GEMM+4otherworkkernels; no-kernel gaps
+  2.774->0.073ms, GEMMsum2.535->2.626ms (not faster service). Example~653us
+  GPUgap caused by launch API entered late inside native_GroupedLinearBackward.
+- Kernelprofiling distorts normal total17-45%,prequeued2-4%; separate diagnostic
+  times not mixed with headline event timing. Calling-thread backwardCPU metric
+  excludes autogradworker; use worker_GroupedLinearBackward scopes instead.
+- Detailed report/limits:NEP_EXPERT_HOST_CAUSAL_20260921.md; artifacts under
+  Lustre slurm_runs/expert_host_exposure/3119944,analysis.json validated.
+  Production branch unchanged. Monitor closed; no active jobs from this test.
+
+## 2026-09-21: workload-only native full-MoE CUDA graph smoke
+
+- User authorized workload changes only to enable native expert graph coverage.
+  Production checkout remains clean at e105bd46c3966d916a6cb0276866eb85530e0529.
+- Added launcher scripts/nonuniform/run_nep_native_moe_graph_smoke.sh. Job
+  3120137 requests two GB200/GB300 nodes, segment1,20min. Initial pending reason
+  Priority, no start estimate. Newton monitors at 300-second scheduler cadence.
+- One MoE layer, a8b H4608/latent1152/F3072/E512/topk6, TP2/ETP1/CP1,
+  MBS2/GA2/sequence1024. Healthy EP4/4 (8 GPUs,GBS16) and NEP EP4/2
+  (6 GPUs,GBS12), full/reduced replicas pinned 4+2 rather than 3+3.
+  DistOpt and Flex/HybridEP retained. Native capacity factor1 + expert padding
+  + exact uniform routing provide fixed expert counts for graph capture.
+  This changes routing semantics from the original dynamic workload.
+- Each topology runs moe_router versus moe capture, same padded workload;
+  12 iterations, existing all-rank event profiling steps8-11, native AG/RS
+  and NEP ranges. No runtime implementation modifications. Smoke performance
+  must not be presented as full a8b parity. Artifacts exclusively in Lustre
+  slurm_runs/native_moe_graph/3120137.
+
+### 2026-09-21: native full-MoE graphs run with NEP, workload-only
+
+- 3120137 failed pre-training: launcher set NVTE_FUSED_ATTN=0 but omitted
+  --attention-backend flash. Added that argument. Retry3120188 completed both
+  healthy cases, but NEP failed before model construction because Slurm supplied
+  WORLD_SIZE8 rather than6. Fixed only launcher: set world size/rendezvous inside
+  each task, retaining 4+2 placement and exiting unused ranks6/7.
+- Corrected3120243 completed0:0,6:50,onGB200lyris0018/0162. All four cases
+  completed12steps. Same clean production commit; no implementation edits.
+- Matched profiled log iterations8-10 mean milliseconds: healthy router83.733,
+  healthy full-MoE54.400; NEP router150.233, NEP full-MoE112.000. Reductions
+  35.0%healthy and25.4%NEP. This tiny communication-heavy EP4/2 smoke does NOT
+  establish a8b parity: healthy/NEP ratio55.7%router versus48.6%full-MoE.
+- All28rank profiles contain expected replay; full-MoE has8forward/8backward
+  replays perrank over4profilediterations, zero eager expert-forward calls.
+  Router-only has16expert-forward calls (GA2,recompute). AG/RS present on
+  all participating ranks, NEP Gather/redistribution PGs preserved. PGs,
+  payloads, host ranges and GPU event completion records checked.
+- Healthy loss/gradnorm logs match exactly between graph scopes. NEP losses
+  differ up to0.3671% and logged gradnorm by0.005; no NaNs/skipped steps.
+  Finite training plus collectives/replay is a compatibility smoke, NOT proof
+  of full numerical equivalence. Requires stronger correctness test before
+  adopting full-MoE graphs for benchmarks beyond this trial.
+- Instrumentation check only (not causal overhead estimate): profiled8-10
+  vs pre-profile4-6 changes +3.12%healthyrouter,+0.87%healthyfull,
+  +2.20%NEProuter,-0.03%NEPfull. Warmup/drift also affect this comparison.
+  All timings quoted above use matched measured iterations, not these controls.
+- Full report:NEP_NATIVE_MOE_GRAPHS_20260921.md. All artifacts in Lustre
+  slurm_runs/native_moe_graph/3120243. Monitor stopped after completion.
+
+## 2026-09-21: full-MoE graph parity and ordinary-backward attribution
+
+- User requested testing graphs on the high expert-host-work a8b workload.
+  Added workload-only launcher/entrypoint and all-rank microbatch analysis;
+  production checkout remains clean at e105bd46c3966d916a6cb0276866eb85530e0529.
+- Job3120323 allocated GB200lyris0135,0139-0140,0144,0210-0213 at11:26:51PDT,
+  eight nodes,segment4,45min. Avicenna monitors scheduler every300seconds.
+- Same previously studied depth15MoE a8b variant,H4608/latent1152/F3072,E512,
+  topk6,MBS2,GA8,sequence8192,TP2/CP1/ETP1,healthyEP16/16 versusNEPEP16/12.
+  GBS256 versus224,replica-local128/128 versus128/96. DistOpt/FlexHybridEP.
+- Four cases: both topologies with router-only and full-MoE graphs. Both
+  scopes use capacity1,pad-to-capacity,exactuniform routing; graph scope alone
+  differs within a topology. Mamba/attention graphs retained. This controls
+  padding/routing changes relative to original dropless-random tests.
+- Reused trusted topology-controlled launcher with replica-domain validation,
+  separate MNNVL cliques, all-rank transport diagnostics and AG/RS profiling.
+  Forty iterations, profile25-35, matched timing25-34. Added schedule-level
+  F/B event ranges to both cases since expert Python ranges disappear under
+  full graph capture. No model/optimizer/NEP implementation edits.
+- Local shell/compile and generated-argument A/B assertions passed. Host uv
+  and isort unavailable; formatting must use container tools before a commit.
+  Artifacts: Lustre slurm_runs/soft_clique_baseline/3120323.
+
+### 2026-09-21: EP16/12 native graph workload blocked by static dummy slots
+
+- 3120323 healthy router-only control completed40steps,32profiles. Matched
+  iterations25-34:3644.24ms mean,5.68ms populationSD. Legacy single-case
+  summary assumed random routing and rejected the uniform flag. New launcher
+  now uses existing analyze_case(...routing_mode='uniform') to validate each
+  completed case. Revalidation of3120323 healthy passed. No runtime edits.
+- Retry3120374 ranGB300theia0190-0197,segment4,NEPfirst,failed143:0 after7:47.
+  Bothreplicas physicallynvlblk27,separatecliques; no accepted performance
+  measurement. Failure occurred before first iteration, not during graph capture.
+- Root cause confirmed on reduced ranks with42realexperts: native drop/pad
+  manager allocates43slots*1152tokens=49536rows and43constant split counts.
+  NEP dispatch_postprocess selects42realexpert counts (48384total) but returns
+  the49536-row hidden/probability buffers unchanged. TEGroupedLinear torch.split
+  raises exact shape mismatch. Native padding at token_dispatcher.py1165-1178,
+  count-only filtering at2168-2179 in trusted checkout.
+- Previous EP4/2 graph smoke had divisible expert placement and cannot establish
+  compatibility with this nondivisible512-expert/EP12 case. Neither parity gain
+  nor removal of ordinary-backward host overhead is established for this workload.
+- User was asked whether to retain workload-only scope with528experts and
+  sequence8448 in BOTH graph modes (both+3.125%,preserving source tokens per
+  expert96, healthy1536/reduced1152), or authorize a minimal padding fix while
+  retaining512experts/sequence8192. No new job or implementation edits until
+  that decision. Both jobs are terminal; monitor told to stop.
+- Analysis boundary mapping verified against completed logs: traceiteration25
+  matches loggediteration25 (trace24 is profilerwarmup). New analysis corrected
+  before reporting results; comparisons use25-34 in both logs and profiles.
+
+### 2026-09-21: approved static-slot padding fix and incremental validation
+
+- Isolated branch nep/static-slot-capacity-20260921, worktree of the same name,
+  based on trusted e105bd46. Only token_dispatcher.py runtime changes: capacity
+  uses logical expert count, dummy slots have zero token rows/counts, and the
+  CPU static count vector is cached. No optimizer, NEP scheduler, or GEMM edits.
+- Added focused tests for 42/43 real experts, 512 logical versus 516 virtual
+  experts, 8K/16K source tokens, count/cache consistency, synthetic gradients,
+  and unchanged native defaults. All 17 selected tests passed in both jobs.
+- EP8/6, TP2, E512, one-MoE-layer smoke runs dropless control, static router
+  graphs, then full-MoE graphs, with DistOpt/Flex and all-rank profiles. Twelve
+  steps per case. Trusted old checkout remains unchanged.
+- 3120468 failed in unchanged dropless control: NCCL DMA-buffer registration
+  error524 on lyris0214, before any logged training iteration. Retry3120491
+  excluded that node but reproduced error524 on lyris0215, in native dense
+  gradient reduce-scatter. Neither run reached static-padding validation.
+- Next retry matches the existing trusted launcher's
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (missing in smoke wrapper).
+  This is a launch-setting diagnostic, not a runtime implementation change;
+  no claim yet that it fixes registration. No new parity results accepted.
+
+- 3120558 with the allocator setting and 3120581 with segment4 both reproduced
+  the same native dense-RS connection error on different nodes. Node exclusion,
+  allocator, and segment changes did not resolve this failure.
+- Diagnostic3120612 added NCCL_PXN_DISABLE=1 only; completed0:0 in7:22 on
+  GB200lyris0136-0138,0141. All three EP8/6 cases completed12steps and wrote
+  all14rank profiles. This setting is confined to the smoke, not carried into
+  the larger performance comparison. It establishes a working diagnostic
+  configuration, not a conclusive root cause of the underlying NCCL failure.
+- Static padded router graphs versus dropless control: all12 logged loss and
+  gradnorm values exactly match. Measured8-10 means71.1 vs71.0ms. Full-MoE
+  graphs45.9ms, with zero eager expert backward calls and nativeAG/RS retained.
+  Full capture changes BF16 numerical trajectory: max logged loss difference
+  2.395% bystep12, maxgradnorm absolute0.002. These runs establish patch
+  compatibility and exact padded-vs-dropless logged agreement, not bitwise
+  full-graph training equivalence.
+- Larger A/B launcher now points at the isolated patched checkout, retaining
+  original NCCL settings. Four matched EP16 cases will use 512experts,seq8192,
+  H4608/latent1152/F3072,MBS2,GA8,15MoE layers and all-rank25-34 profiles.
+- Padding patch frozen as b798119e9 (two files,96insertions/5deletions including
+  tests); previous trusted e105 checkout untouched. isort ran on the modified
+  test import in the container; git diff --check passed before commit.
+- Job3120733 started12:56:20PDT,8GB200nodes,segment4,45min. Replica0 contained
+  in nvlblk02 (lyris0025-0027,0032), replica1 in nvlblk07
+  (lyris0111-0113,0123). Original NCCL settings, no PXN override. Monitor
+  assigned300s cadence through terminal state. Artifacts under Lustre
+  slurm_runs/soft_clique_baseline/3120733.
+- 3120733 completed0:0 in25:48; all four40step cases and all120rank profiles
+  validated. Measured25-34 owner parity: router95.803% (healthy3630.405ms,
+  NEP3789.449ms), fullMoE95.515% (3191.940/3341.811ms). Absolute overhead
+  159.045->149.871ms, but healthy accelerates slightly more, so parity does
+  not improve. Post-profile parity95.792/95.512 supports this result.
+- Ordinary-backward reduced-versus-healthy-second-replica gap3.848->2.011ms.
+  Eager expert backward/recompute threadCPU85.105healthy/104.401reduced ms
+  disappears; full-MoE replay CPU1.339/1.410ms. Full graph mode120MoEbackward
+  replays/iteration and no eager expert scopes on anyrank. AG/RS retained.
+- Owner extra phase times under fullgraphs: firstF94.273ms, otherF0.997,
+  nonfinalB-5.333, finalB39.862, outsideF/B20.072. These disjoint phase
+  differences sum149.871ms; they are not kernel-only or collective service times.
+- Numerical caveat: padding-only smoke matched logged values exactly, but
+  fullgraph numerical equivalence is unverified. Both healthy and NEP graph
+  scopes diverge later on high-LR dummy data, despite initial agreement and
+  allstepsfinite. Do not attribute this to NEP or dismiss it as harmless
+  rounding without a controlled tensor-level check. Detailed result and
+  numerical limits added to NEP_NATIVE_MOE_GRAPHS_20260921.md. No new jobs.
+
+### 2026-09-21: Full-MoE graph residual attribution
+
+- Investigating job3120733 owner phase deltas: first forward94.273ms,
+  final backward39.862ms, outsideF/B20.072ms. Existing CUDA-event scopes
+  locate delays, but do not identify individual graph kernels or distinguish
+  device dependencies from resource contention.
+- First-forward rank0 CPU replay submission precedes GPU execution. Selected
+  MoE replay ranges grow from about3.5ms to17ms while next-bucket parameter
+  redistribution is in flight, particularly on full-replica followers.
+  This is evidence to investigate, not yet proof of bandwidth contention.
+- OutsideF/B includes additional pre-optimizer time and optimizer time;
+  it is not all unfinished expert reduce-scatter. Added diagnostic-only
+  gradient-finalization/scaling/optimizer scopes and combined all-rank
+  CUDA-event plus Nsight graph-node capture. Production remains b798119e9.
+- Submitted3120917,8nodes,segment4,gb200/gb300-backfill,30min. Same15MoE
+  a8b latent,H4608,F3072,E512,topk6,seq8192,MBS2,GA8,EP16/12 versus16/16,
+  full-MoE graphs,40steps; kernels and operation ranges captured25-27.
+  Artifacts: Lustre slurm_runs/soft_clique_baseline/3120917. Pending at
+  submission,StartTimeUnknown. Monitoring assigned300s cadence. New runtime
+  instrumentation lives only in the diagnostic entrypoint; Nsight launcher
+  adds optional event tracing with its existing default unchanged.
+- 3120917 failed before training (143:0): diagnostic entrypoint imported the
+  container Megatron before selecting CODE_REPO, producing ModuleNotFoundError
+  for nonuniform_ep. Fixed diagnostic sys.path initialization; resubmitted as
+  3120927 with identical workload/instrumentation and unchanged production code.
+- 3120927 NEP completed40steps and exported all28rank Nsight/event profiles.
+  Wrapper then failed its inherited single-profiler validation (intentional
+  dual profiling was mistaken for simultaneous Kineto+Nsight), before healthy.
+  Replaced only the diagnostic wrapper validation; healthy-only3121008 now
+  running on8GB200nodes,segment4. This comparator is on a different allocation;
+  use the original same-allocation3120733 for exact overhead totals.
+- New kernel evidence: rank0 first-MoE graph waits7.372ms between RMSNorm and
+  TPallgather; TPallgather starts2.912us after next-bucket NEP parameter
+  broadcast starts. Seven affected graph gaps follow this boundary within
+  1.1-2.9us. NCCL2.30.4 has LAUNCH_ORDER_IMPLICIT=1, introducing per-device
+  launch dependencies. Early owner's HybridEP ag_nvl_kernel then waits5.879ms
+  for followers traversing more parameter broadcasts. This is not a late
+  Python graph submission. Native reduced-replica firstMoE has no such gap.
+- Extra scopes also reveal both physical and owner gradients are scaled in
+  NEP finalize_model_grads; owner scaling adds about11ms onrank0. Optimizer
+  owner proxies are distinct from physical expert params. Checking which
+  physical gradient consumers remain before recommending a scoped removal.
+- Healthy-only3121008 completed0:0 in9:03;40steps,all32Nsight+event traces.
+  NEP3120927 training completed40steps with all28traces despite wrapper's
+  postprocessing failure. Required AG/RS/Gather/parameter redistribution
+  metadata and completion records validated for applicable ranks25-27.
+- Diagnostic owner healthy3274.483/NEP3437.260ms;firstFdelta94.340ms,
+  lastB32.144ms,outsideF/B20.450ms. Logged measured/post parity95.264/95.313%.
+  Separate allocations mean exact original job3120733 deltas remain the
+  reference; do not replace them or claim zero instrumentation distortion.
+- FirstF rank0 disjoint graph-span deltas:51.544ms graph progress gaps,
+  42.285ms HybridEP-only residency (predominantly waiting on delayed full
+  followers),3.368ms native NCCL,-0.482ms compute. Graph progress gaps are
+  not device idle; future prefetch traffic runs in them. Seven TP launches
+  follow future parameter broadcast launches within microseconds.
+- FinalB eight TP graph entries wait for expertRSlaunch (5-19us separation).
+  Entry delays14.04ms versus0.86ms healthy atstep25; CPUreplays are already
+  far ahead. Rank0 three-step disjoint graph-span increase18.233ms includes
+  nativeNCCL+11.580,HybridEP+12.279,compute+2.314,overlap+0.906,internal
+  gaps-8.846ms. Additional graph-entry delay is outside that partition.
+  Example latest HybridEP participant is full owner rank10, not reduced;
+  gradient communication delays progress within the full replica too.
+- OutsideF/B: redundant physical+owner gradient scaling25.362ms vs14.066ms,
+  Adam/update+copy17.423vs13.286ms,gradnorm6.435vs2.117ms. Extra owner zeroing
+  accounts for most pre-forward2.4ms. Proposed fixes: remove unintended
+  global launch-order dependency after correctness validation; skip redundant
+  physical-expert gradient scaling only in DistOpt mode; then investigate
+  remaining resource contention. More optimizer work per owner is expected.
+- Detailed evidence, uncertainty, code locations, and fix/test directions in
+  NEP_GRAPH_PHASE_ATTRIBUTION_20260921.md. No production implementation edits,
+  no new correctness claims for graph numerical equivalence, no remaining jobs.
+
+### 2026-09-21: Bounded graph launch-order fix validation
+
+- Preserve trusted b798119e9 and its worktree unchanged. New branch/worktree
+  nep-graph-launch-order-20260921 at 9212d8e9a adds only a launcher override
+  for NCCL_LAUNCH_ORDER_IMPLICIT; default remains 1. Runtime is byte-identical.
+- Hypothesis: setting implicit cross-communicator ordering to 0 removes the
+  next-prefetch-to-current-TP launch dependency while retaining explicit
+  AG-to-redistribution and redistribution-to-use device dependencies. This
+  also affects backward; validate correctness and both phases before promotion.
+- Submitted 3121140, four nodes/segment2, EP8/6, four MoE layers, MBS2/GA2,
+  seq1024, E512, full-MoE CUDA graphs, DistOpt and HybridEP. Compare healthy
+  and NEP with ordering 1 and 0; retain all-rank profiles and run compact
+  parameter/prefetch value correctness tests first. Both GB200/GB300 offered.
+- Prepared but not submitted an eight-node/segment4 a8b EP16/12 four-case
+  healthy/NEP ordering1/0 comparison using the unchanged 15-MoE-layer workload,
+  MBS2/GA8/seq8192, all-rank Nsight and CUDA-event profiles. Gate on small test.
+- No gradient scaling, buffer zeroing, SM margin, bucketing, or workload
+  changes to the a8b benchmark are part of this fix.
+- 3121140: compact and prefetch value tests passed with ordering0; healthy
+  ordering1 completed all12steps. Original NEP ordering1 failed on reduced
+  ranks8-11 in native dense-DP RS before the changed setting ran: NCCL
+  mlx5dv_reg_dmabuf_mr error524. Same small-case PXN registration failure
+  previously seen in graph-padding validation, not an ordering0 failure.
+  Retrying as3121169 with NCCL_PXN_DISABLE=1 for all four small cases;
+  the planned a8b comparison retains its original transport settings.
+- 3121169 completed0:0: all four graph-enabled healthy/NEP ordering1/0
+  cases ran12steps, with16/14 all-rank CUDA-event profiles respectively.
+  Compact/nondivisible parameter values and prefetch/reuse/force-sync checks
+  passed. Healthy losses/grad norms match across order settings; NEP matches
+  first2steps, then small differences (step3 loss relative4.5e-5, step12
+  relative0.00463). Do not claim bitwise training equivalence from this test.
+- Submitted3121210, immediately allocated GB200 eight nodes/segment4:
+  lyris0044,0045,0047,0048 and0217,0223,0225,0226. Four cases healthy1,
+  NEP1,NEP0,healthy0,40iterations each, profile25-27 after24warmup steps.
+  All-rank AG/RS/NEP redistribution metadata, CUDA-event completion ranges,
+  and Nsight graph-node traces retained. Original transport (no PXN override),
+  unchanged runtime SHA, same MBS2/GA8/seq8192 a8b depth15 workload.
+- 3121210 completed0:0, all160training steps and120 rank profile sets.
+  Owners0-11, matched measured25-27: healthy firstF173.228/order1 versus
+  173.211/order0; NEP271.061 ->205.679ms. FirstF parity63.907 ->84.214%.
+  Iteration healthy3244.446/3248.025, NEP3442.795 ->3331.767ms;
+  parity94.239 ->97.487%. FinalB293.803 ->276.237ms; no measured
+  backward/tail regression. Post-profile parity94.460 ->97.396% is only
+  a distortion cross-check, not the primary measurement.
+- Nsight rank0: seven >1ms firstF graph gaps become zero; total graph gaps
+  53.996 ->2.043ms, HybridEP-only residency51.099 ->33.548ms. All-rank
+  AG/RS/NEP completion metadata validated; placement domains03 and13.
+- Set ordering0 only as default for the validated graph-attribution launcher;
+  generic benchmark default remains1 and rollback is a single override.
+  Trusted runtime/worktree unchanged. No added host work or runtime LOC.
+- Correctness qualification: exact tensor-value smoke tests and no-hang graph
+  tests pass; NEP training trajectories are not bitwise-identical and full
+  graph-vs-eager correctness remains unproven. The long runs amplify initial
+  numerical differences. No claim of broad numerical equivalence or arbitrary
+  topology safety. Detailed report in the new branch's
+  NEP_GRAPH_LAUNCH_ORDER_20260921.md. No jobs left running from this experiment.
+
+### 2026-09-21: Save the graph launch-order performance checkpoint
+
+- User requested preserving the first-forward improvement. Save branch
+  nep-graph-launch-order-20260921 and annotated tag
+  nep-graph-order-parity-20260921 to the personal daiyaanarfeen fork only.
+- Result retained: first-forward parity63.907 ->84.214%, iteration parity
+  94.239 ->97.487%, job3121210, unchanged runtime, and documented numerical
+  equivalence limitations. Original trusted worktree remains untouched.
+- Exact local harness/dependency snapshot archived on Lustre under
+  slurm_runs/soft_clique_baseline/3121210/saved_checkpoint/
+  harness-snapshot-20260921.tar.gz; SHA-256
+  71a52045786db25d39f2fe01a60cd1333e03c6afcfb2f6f98171d8ba03767fb7.
+  Raw traces stay in their existing Lustre location. No new jobs or unrelated
+  implementation edits; only checkpoint provenance added to the result branch.
+
+### 2026-09-21: Hard small-microbatch/low-GA graph retest
+
+- User requested a difficult workload retest with per-phase parity and total
+  iteration overhead. Use the same depth15 a8b latent configuration as3121210,
+  changing MBS2 ->1 and GA8 ->2 only. This is a harder batching variant of
+  the existing workload, not an exact reproduction of an old low-GA result.
+- Preserve E512/F3072/H4608/latent1152/topk6/sharedF6144, seq8192, TP2/CP1,
+  ETP1/PP1, DistOpt, HybridEP, exact uniform padded routing, full-MoE graphs,
+  and launch ordering0. HealthyEP16/16 local16/16 GBS32; NEPEP16/12
+  local16/12 GBS28, proportional. GA2 retains one ordinary forward/backward
+  so all four requested phase categories are measurable. No runtime edits.
+- Saved runtime8abb29fca pinned; trusted checkpoint/worktree unchanged.
+  Only workload harness validation was parameterized (defaults remain2/8),
+  and a separate soft-clique wrapper overrides GA before GBS construction.
+  CPU argument tests confirm only MBS/GBS differences in model arguments.
+- Submitted3121678, allocated GB200 immediately, eight nodes/segment4,
+  lyris0170-0174,0176-0178. BothGB200/GB300 offered. Healthy then NEP,
+  45steps each; same measured25-34 after24warmup iterations, all-rank Nsight
+  graph nodes and CUDA-event phase/AG/RS/NEP-completion records. Post36-45
+  reserved solely as instrumentation/drift cross-check.20min allocation,
+ 8min per-case watchdog, namedNeMo26.06 cache, all output underLustre.
+- Completed3121678 0:0 in11:29; both45step cases validated, all60rank
+  profile sets checked for nativeAG/RS, NEP staging/redistribution and
+  two complete schedule forward/backward pairs per measured iteration.
+- Owner ranks0-11, steps25-34: healthy511.562 +/-1.596ms,
+  NEP608.547 +/-3.027ms; parity84.063%, extra96.985ms/+18.959%.
+  FirstF98.762 ->137.665ms (71.74%); otherF82.712 ->83.119 (99.51%);
+  nonfinalB128.213 ->128.587 (99.71%); finalB141.793 ->171.935 (82.47%);
+  outsideFB60.083 ->87.241ms. Disjoint phase gaps sum to iteration gap.
+- Post-profile log parity83.960%, versus measured log84.052%; low parity
+  persists outside profiling. Do not substitute post timing for phase data.
+- Placement: both physical replicas in nvlblk10, distinct software
+  cliques1000/1001 and cross-replica GDRDMA; not distinct physical domains.
+  Runtime unchanged; finite/no-hang execution does not establish broader
+  numerical equivalence. Existing checkpoint qualifications still apply.
+- Report NEP_A8B_HARD_GRAPH_20260921.md; raw traces/analysis in Lustre
+  slurm_runs/soft_clique_baseline/3121678. No further jobs needed.
+
+### 2026-09-21: Attribute the hard MBS1/GA2 phase gaps
+
+- Existing3121678 data only; no jobs or runtime changes. Added analysis script
+  scripts/nonuniform/analyze_hard_phase_causes.py and expanded the hard-run
+  report. Generated analysis stays in the job's Lustre phase_causes directory.
+- FirstF+38.903ms: serial post-AG broadcasts on follower transfer streams
+  create a chain across followers12-15, delaying late owners and hence native
+  HybridEP. Step28 bucket1 owner0 broadcast ends19.489ms, owner11 ends25.194ms.
+  Rank0 firstF ag_nvl residency1.977 ->30.934ms. Owner AG payload+34.375%;
+  actual expert bucket counts5 healthy/8 NEP (dense3/3), not iso-bucket.
+- FinalB+30.142ms: native GPU execution gaps while gradient synchronization
+  runs, with TP/HybridEP propagation. Rank2 graph2 RMSNorm gap0.003ms healthy
+  versus1.426-5.710ms NEP across10steps; step28 gap5.706ms overlaps Gather.
+  Host graph calls are already >=87.294ms ahead for full owners. Full owners,
+  not reduced ranks, reach RS later in92.08% of960 matched records, mean4.753ms.
+  Trace proves GPU stalls/propagation, but does not conclusively distinguish
+  scheduling/resource contention from an unrecorded captured-graph dependency.
+- OutsideFB+27.158ms: startup+2.384, B-to-optimizer+15.656, optimizer+9.035,
+  after-optimizer+0.084. B-to-opt is scaling+11.847, TP reductions+1.444,
+  token/scalar reductions+2.361; finish_grad_sync unchanged16.7ms. Optimizer
+  grad norm+3.708 (mainly participant wait), Adam/update+4.336 (larger owner
+  payload), clipping/other~0.99. Nested parameter-copy time not double counted.
+- OrdinaryF/B gaps remain0.407/0.374ms. Communication residency changes are
+  not additive causal costs. Findings and explicit uncertainty recorded in
+  NEP_A8B_HARD_GRAPH_20260921.md; no claim of a proven SM-vs-stream mechanism.
+## 2026-09-22 - Implement and validate cached parameter-transfer waves
+
+- User approved the bounded experiment. Created isolated branch/worktree
+  `nep-param-waves-20260922` from `ccb4b9726`; trusted/current branches remain intact.
+- Runtime change is confined to cached parameter-plan construction in
+  `nonuniform_ep.py`: deterministic first-fit disjoint membership waves, computed
+  before rank-local filtering. No changed groups, payloads, buffers, streams,
+  gradient path, dispatcher, or optimizer behavior.
+- Added plan-order/metadata/cache unit coverage for EP16/12, EP8/6, EP8/4, singleton
+  EP6/6 and nondivisible expert counts. Added a four-GPU real-plan NCCL test for
+  fresh parameter values, shared followers, two-slot reuse, sync/async and force-sync.
+- Submitted unit/correctness job3135093 to GB200/GB300 eligible partitions; it
+  allocated immediately. Optional launcher cases allow subsequent matched small
+  EP8/6 and hard EP16/12 comparisons without changing existing defaults.
+- Job3135093 completed on GB200 lyris0265 in2m41s:88 unit tests passed, four-GPU
+  real-plan parameter-wave smoke passed, existing native EP/AG/RS/prefetch smoke
+  passed. Container Black/isort completed. Committed candidate as8f840ff72.
+- Submitted EP8/6 same-allocation current/candidate comparison3135135: four MoE
+  layers, H4608/F3072/latent1152,512 experts/topk6,seq1024,MBS2/GA2,TP2/CP1,
+  Flex+DistOpt+native MoE graphs, margin32 in both cases, all-rank Nsight+CUDA events.
+  Four nodes/segment2, replica cliques separated; inherited small-test PXN disable.
+- EP8/6 job3135135 completed in8m24s on GB200 lyris[0064,0067,0223,0230]. All25
+  iterations/case finite, zero skips; all14 ranks have native AG/RS and NEP records
+  plus Nsight SQLites. Measured15-20 owner means current->waves: firstF42.090->41.314ms,
+  iteration155.786->155.208ms. OtherF4.497->4.526, nonfinalB7.716->7.713ms. FinalB
+  11.430->13.957 and outside90.053->87.698ms shift nearly oppositely; combined finalB
+  plus outside changes by+0.172ms. This is not a broad phase-improvement claim.
+  Follower7 broadcast order changes2/3/4/5->3/4/2/5, as intended; follower6 unchanged.
+- Submitted hard EP16/12 job3135236 after small validation, comparing healthy,
+  current ccb4b9726 and waves8f840ff72. Eight nodes/segment4, unchanged hard model,
+  MBS1/GA2/seq8192, all-rank profiling20-27,35 total iterations, margin32 throughout.
+## 2026-09-22 - Parameter waves improve hard EP16/12 first forward and iteration
+
+- Job3135236 completed in16m08s on GB300,theia[0028-0031,0275,0278-0279,0287],
+  replicas wholly in NVL domains18/32. Healthy/current/waves all35 iterations
+  complete; all-rank Nsight and AG/RS/NEP event records validated.
+- Matched measured20-27 owner means healthy/current/waves: firstF98.030/132.590/
+  115.128ms; iteration491.535/561.093/544.664ms. Wave ordering saves17.462ms firstF,
+  16.429ms iteration; parity87.60->90.25%,firstF73.94->85.15%. Other phases net
+  +1.033ms, not zero. Healthy one slower measured step retained; SD iteration
+  healthy5.071,current1.859,waves1.383ms. All8 candidate iterations faster than
+  every current iteration. No claim of95% parity or fully removed NEP overhead.
+- Trace mechanism: owner broadcast before-last-peer-start prefix30.973->8.293ms;
+  graph native model-EP exclusive residency25.284->12.764ms. Native expert AG
+  union56.811->57.165ms. Diagnostic intervals overlap; do not sum them as savings.
+- All17952 collective calls' payloads/counts/participants unchanged across28ranks.
+  Wave order verified;128 full-replica rank/step samples retain one staging stream
+  and no concurrent NEP broadcasts. Peak allocated/reserved116.394/134.453GiB
+  unchanged. Small real-plan exact-value test plus88 unit tests passed earlier.
+- Keep isolated candidate8f840ff72; old/trusted branches untouched. Full result,
+  profiler-window caveats, training numerical-equivalence limits, and artifact
+  locations:NEP_PARAMETER_WAVE_RESULTS_20260922.md. No additional jobs submitted.
+## 2026-09-28 - Explain latest outside-F/B overhead using existing traces
+
+- No new jobs/runtime changes. Job3135236 measured20-27 owner outside-F/B:
+  healthy58.918ms,waves73.404ms,excess14.486ms. Disjoint excess:parent finish-sync
+  +0.549ms,finish-to-scaling+5.002ms,scaling+3.126ms,optimizer+5.810ms;others~0.
+- Finish-to-scaling contains same-payload TP gradient reduction(1.484->3.474ms)
+  and4-byte token-count DP reduction(.275->3.287ms), including participant waits.
+  Existing stats-disable flag does not remove required token normalization.
+- Native optimizer costs rise32.45%,consistent with16/12 owner parameter-state
+  concentration. Nested ready-grad step12.879->17.062ms,parameter copies
+  2.878->3.813ms,grad norm2.052->2.724ms; these scopes must not be summed.
+- Candidate improvements: post-RS scaling of only optimizer-consumed shards,
+  and earlier asynchronous token-count reduction. Need correctness/performance
+  validation; no guaranteed savings. TP gradient sync cannot simply be removed.
+  Optimizer ownership or bucketwise updates are larger design changes. Eliminating
+  all14.486ms outside-F/B excess alone would yield only92.71% iteration parity.

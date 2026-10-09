@@ -389,8 +389,27 @@ def analyze_case(
     run_dir: Path,
     train_iters: int,
     timing_start: int,
+    global_batch_size: int,
+    timing_end: int | None = None,
+    routing_mode: str = 'random',
 ) -> dict[str, object]:
+    timing_end = train_iters if timing_end is None else timing_end
+    if not 1 <= timing_start <= timing_end <= train_iters:
+        raise ValueError('timing window must lie within completed training iterations')
     metadata = case_metadata(workload, case)
+    metadata["global_batch_size"] = global_batch_size
+    allocation_file = run_dir.parents[3] / 'allocation.txt'
+    if allocation_file.exists():
+        segment = re.search(r'\bSegmentSize=(\d+)', allocation_file.read_text())
+        if segment:
+            metadata['segment_nodes'] = int(segment[1])
+    placement_file = run_dir / 'placement' / 'validated.json'
+    if placement_file.exists():
+        placement = json.loads(placement_file.read_text())
+        if not placement.get('validated'):
+            raise RuntimeError(f'{case}: placement validation did not pass')
+        metadata['placement'] = placement
+        metadata['segment_nodes'] = placement['replicas'][0]['ranks'] // GPUS_PER_NODE
     log = run_dir / "driver.log"
     if not log.is_file():
         raise RuntimeError(f"{case}: missing {log}")
@@ -407,6 +426,11 @@ def analyze_case(
         "forced load balancing": r"moe_router_force_load_balancing\s+\.+\s+True",
         "NEP mode": rf"nonuniform_mode\s+\.+\s+{metadata['mode']}",
     }
+    if routing_mode == 'uniform':
+        required['forced load balancing'] = r'moe_router_force_load_balancing\s+\.+\s+False'
+        required['exact uniform routing'] = r'moe_router_force_uniform_routing\s+\.+\s+True'
+    elif routing_mode != 'random':
+        raise ValueError(f'Unsupported routing mode: {routing_mode}')
     for description, pattern in required.items():
         if re.search(pattern, text) is None:
             raise RuntimeError(f"{case}: runtime did not confirm {description}")
@@ -421,14 +445,25 @@ def analyze_case(
     rows_by_iteration = {}
     for iteration, elapsed_ms in TIMING_PATTERN.findall(text):
         iteration = int(iteration)
-        if iteration >= timing_start:
+        if timing_start <= iteration <= timing_end:
             rows_by_iteration[iteration] = float(elapsed_ms)
-    expected = list(range(timing_start, train_iters + 1))
+    expected = list(range(timing_start, timing_end + 1))
     if sorted(rows_by_iteration) != expected:
         raise RuntimeError(f"{case}: expected timing iterations {expected}, got {rows_by_iteration}")
     values = [rows_by_iteration[iteration] for iteration in expected]
     traces = sorted((run_dir / "torch_profile").glob("rank-*.json.gz"))
-    if len(traces) != metadata["world_size"]:
+    if 'PROFILE_EFFECTIVE mode=cupti' in text:
+        if traces:
+            raise RuntimeError(f"{case}: unexpected simultaneous Kineto and native CUPTI traces")
+        traces = sorted((run_dir / "cupti_profile").glob("rank-*.json"))
+    if 'PROFILE_EFFECTIVE mode=nsys' in text:
+        if traces:
+            raise RuntimeError(f"{case}: unexpected simultaneous Kineto and Nsight traces")
+        traces = sorted((run_dir / "nsys_profile").glob("rank-*.nsys-rep"))
+    control_only = 'PROFILE_EFFECTIVE mode=control_no_cupti' in text
+    if control_only and ('GPU_TRACE_CUPTI_VERSION' in text or traces):
+        raise RuntimeError(f"{case}: unprofiled control unexpectedly activated profiling")
+    if not control_only and len(traces) != metadata["world_size"]:
         raise RuntimeError(
             f"{case}: expected {metadata['world_size']} all-rank traces, found {len(traces)}"
         )
@@ -447,9 +482,43 @@ def analyze_pair(args: argparse.Namespace) -> None:
     repo = Path(args.repo).resolve()
     workload = workload_by_name(repo, args.workload)
     root = Path(args.root).resolve() / workload.slug
+    batch_configuration = {}
+    for case in ("healthy", "nep"):
+        topology = case_metadata(workload, case)["topology"]
+        replica_mbs_arg = getattr(args, f"{case}_replica_micro_batch_sizes")
+        replica_num_microbatches_arg = getattr(args, f"{case}_replica_num_microbatches")
+        replica_mbs = (
+            [int(value) for value in replica_mbs_arg.split()]
+            if replica_mbs_arg
+            else [workload.micro_batch_size] * len(topology)
+        )
+        replica_num_microbatches = (
+            [int(value) for value in replica_num_microbatches_arg.split()]
+            if replica_num_microbatches_arg
+            else [workload.grad_accumulation_steps] * len(topology)
+        )
+        if len(replica_mbs) != len(topology) or len(replica_num_microbatches) != len(
+            topology
+        ):
+            raise ValueError(f"{case}: replica-local batch settings must match {topology}")
+        if any(value < 1 for value in replica_mbs + replica_num_microbatches):
+            raise ValueError(f"{case}: replica-local batch settings must be positive")
+        global_batch_size = sum(
+            units * mbs * num_microbatches
+            for units, mbs, num_microbatches in zip(
+                topology, replica_mbs, replica_num_microbatches
+            )
+        )
+        batch_configuration[case] = {
+            "replica_micro_batch_sizes": replica_mbs,
+            "replica_num_microbatches": replica_num_microbatches,
+            "global_batch_size": global_batch_size,
+        }
     result = {
         "workload": asdict(workload),
         "source_commit": args.source_commit,
+        "batch_configuration": batch_configuration,
+        "routing_mode": args.routing_mode,
         "precision_note": (
             "Nemotron Super/Ultra use built-in --fp4-recipe nvfp4; the source script's "
             "cluster-local te_quant.cfg is unavailable."
@@ -464,7 +533,26 @@ def analyze_pair(args: argparse.Namespace) -> None:
             root / case / args.job_id,
             args.train_iters,
             args.timing_start,
+            batch_configuration[case]["global_batch_size"],
+            args.timing_end,
+            args.routing_mode,
         )
+    placements = [result[case].get('placement') for case in ('healthy', 'nep')]
+    if any(placements):
+        if not all(placements):
+            raise RuntimeError('Both comparison legs must have validated placement')
+        healthy_placement, nep_placement = placements
+        for key in ('gpu_name', 'packages'):
+            if healthy_placement[key] != nep_placement[key]:
+                raise RuntimeError(f'Healthy/NEP {key} differs')
+        for healthy_replica, nep_replica in zip(
+            healthy_placement['replicas'], nep_placement['replicas'], strict=True
+        ):
+            for key in ('domain', 'fabric'):
+                if healthy_replica[key] != nep_replica[key]:
+                    raise RuntimeError(f'Healthy/NEP replica {key} differs')
+            if not set(nep_replica['hosts']).issubset(healthy_replica['hosts']):
+                raise RuntimeError('NEP replica hosts differ from healthy allocation')
     healthy_ms = result["healthy"]["mean_elapsed_ms"]
     nep_ms = result["nep"]["mean_elapsed_ms"]
     result["comparison"] = {
@@ -510,7 +598,13 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--job-id", required=True)
     analyze.add_argument("--train-iters", type=int, default=10)
     analyze.add_argument("--timing-start", type=int, default=8)
+    analyze.add_argument("--timing-end", type=int)
+    analyze.add_argument('--routing-mode', choices=('random', 'uniform'), default='random')
     analyze.add_argument("--source-commit", default="8643ab867049f71fb751121366c078ac58f17326")
+    analyze.add_argument("--healthy-replica-micro-batch-sizes")
+    analyze.add_argument("--healthy-replica-num-microbatches")
+    analyze.add_argument("--nep-replica-micro-batch-sizes")
+    analyze.add_argument("--nep-replica-num-microbatches")
 
     subparsers.add_parser("validate")
     return parser

@@ -59,6 +59,9 @@ REPLICA_MICRO_BATCH_SIZES="${REPLICA_MICRO_BATCH_SIZES:-}"
 REPLICA_NUM_MICROBATCHES="${REPLICA_NUM_MICROBATCHES:-}"
 TRUE_GLOBAL_BATCH_SIZE="${TRUE_GLOBAL_BATCH_SIZE:-${GLOBAL_BATCH_SIZE}}"
 SEQ_LENGTH="${SEQ_LENGTH:-8192}"
+HIDDEN_SIZE="${HIDDEN_SIZE:-2688}"
+FFN_HIDDEN_SIZE="${FFN_HIDDEN_SIZE:-1856}"
+SHARED_EXPERT_INTERMEDIATE_SIZE="${SHARED_EXPERT_INTERMEDIATE_SIZE:-3712}"
 DDP_NUM_BUCKETS="${DDP_NUM_BUCKETS:-16}"
 NONUNIFORM_EP_TOPOLOGY="${NONUNIFORM_EP_TOPOLOGY:-4 4}"
 NAME="${NAME:-lyris_a3b_ep8_${NONUNIFORM_EP_TOPOLOGY// /_}_mbs${MICRO_BATCH_SIZE}_gbs${GLOBAL_BATCH_SIZE}}"
@@ -209,6 +212,7 @@ trap finish EXIT
 
 echo "[lyris-a3b] job=${SLURM_JOB_ID} nodes=${SLURM_JOB_NODELIST} image=${IMAGE}"
 echo "[lyris-a3b] topology=${NONUNIFORM_EP_TOPOLOGY} experts=${NUM_EXPERTS} mbs=${MICRO_BATCH_SIZE} gbs=${GLOBAL_BATCH_SIZE} seq=${SEQ_LENGTH} buckets=${DDP_NUM_BUCKETS} pattern=${HYBRID_LAYER_PATTERN}"
+echo "[lyris-a3b] hidden=${HIDDEN_SIZE} expert_ffn=${FFN_HIDDEN_SIZE} shared_expert_ffn=${SHARED_EXPERT_INTERMEDIATE_SIZE}"
 echo "[lyris-a3b] run_nodes=${RUN_NODELIST}"
 echo "[lyris-a3b] direct=${USE_DIRECT_SRUN_RANKS} world=${RUN_WORLD_SIZE} true_gbs=${TRUE_GLOBAL_BATCH_SIZE} replica_mbs='${REPLICA_MICRO_BATCH_SIZES}' replica_num_microbatches='${REPLICA_NUM_MICROBATCHES}'"
 echo "[lyris-a3b] zero_sm=${MEGATRON_NONUNIFORM_EP_ZERO_SM_RESHARD} benchmark_phase_limit=${MEGATRON_NONUNIFORM_EP_BENCHMARK_PHASE_LIMIT} skip_scatter=${MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_SCATTER} skip_owner_grad_check=${MEGATRON_NONUNIFORM_EP_BENCHMARK_SKIP_OWNER_GRAD_CHECK} cuda_connections=${CUDA_DEVICE_MAX_CONNECTIONS} nccl_implicit_order=${NCCL_LAUNCH_ORDER_IMPLICIT} torch_nccl_blocking_wait=${TORCH_NCCL_BLOCKING_WAIT}"
@@ -217,12 +221,21 @@ echo "[lyris-a3b] router_topk=${MOE_ROUTER_TOPK} router_force_balance=${MOE_ROUT
 echo "[lyris-a3b] log_params_norm=${LOG_PARAMS_NORM} log_num_zeros_in_grad=${LOG_NUM_ZEROS_IN_GRAD} log_energy=${LOG_ENERGY} manual_gc_interval=${MANUAL_GC_INTERVAL}"
 echo "[lyris-a3b] nonuniform_skip_optimizer_step=${NONUNIFORM_SKIP_OPTIMIZER_STEP}"
 
-container_args=(
-    --container-image="${IMAGE}"
-    --container-mounts="${REPO_DIR}:${REPO_DIR}"
-    --container-workdir="${REPO_DIR}"
-    --no-container-mount-home
-)
+if [[ -z "${ADDITIONAL_CONTAINER_MOUNTS:-}" ]]; then
+    container_args=(
+        --container-image="${IMAGE}"
+        --container-mounts="${REPO_DIR}:${REPO_DIR}"
+        --container-workdir="${REPO_DIR}"
+        --no-container-mount-home
+    )
+else
+    container_args=(
+        --container-image="${IMAGE}"
+        --container-mounts="${REPO_DIR}:${REPO_DIR},${ADDITIONAL_CONTAINER_MOUNTS}"
+        --container-workdir="${REPO_DIR}"
+        --no-container-mount-home
+    )
+fi
 if [[ -n "${CONTAINER_NAME}" ]]; then
     container_args+=(--container-name="${CONTAINER_NAME}")
 fi
@@ -309,12 +322,12 @@ options=" \
     --use-mcore-models \
     --hybrid-layer-pattern ${HYBRID_LAYER_PATTERN} \
     --spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec \
-    --hidden-size 2688 \
+    --hidden-size ${HIDDEN_SIZE} \
     --num-attention-heads 32 \
     --group-query-attention \
     --num-query-groups 2 \
     --mamba-num-heads 64 \
-    --ffn-hidden-size 1856 \
+    --ffn-hidden-size ${FFN_HIDDEN_SIZE} \
     --kv-channels 128 \
     --squared-relu \
     --untie-embeddings-and-output-weights \
@@ -326,7 +339,7 @@ options=" \
     --normalization RMSNorm \
     --num-experts ${NUM_EXPERTS} \
     --moe-router-topk ${MOE_ROUTER_TOPK} \
-    --moe-shared-expert-intermediate-size 3712 \
+    --moe-shared-expert-intermediate-size ${SHARED_EXPERT_INTERMEDIATE_SIZE} \
     --moe-token-dispatcher-type alltoall \
     --moe-router-score-function sigmoid \
     --moe-grouped-gemm \

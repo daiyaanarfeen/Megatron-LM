@@ -19,9 +19,13 @@ BENCH_REPO="${BENCH_REPO:-/home/darfeen/Megatron-LM}"
 CODE_REPO="${CODE_REPO:-/home/darfeen/Megatron-LM-nep-main-20260817}"
 ARTIFACT_ROOT="${ARTIFACT_ROOT:-/lustre/fsw/coreai_comparch_sysarch/darfeen}"
 MATRIX="${BENCH_REPO}/scripts/nonuniform/training_scripts_nep_matrix.py"
-RANK_LAUNCHER="${BENCH_REPO}/scripts/nonuniform/run_lyris_training_scripts_nep_rank.sh"
+RANK_LAUNCHER="${RANK_LAUNCHER:-${BENCH_REPO}/scripts/nonuniform/run_lyris_training_scripts_nep_rank.sh}"
 BASE_RANK_LAUNCHER="${BENCH_REPO}/scripts/nonuniform/run_lyris_a3b_direct_rank.sh"
+if [[ "${PROFILE_ACTIVITY_MODE:-}" == nsys ]]; then
+    BASE_RANK_LAUNCHER="${BENCH_REPO}/scripts/nonuniform/run_nsys_rank.sh"
+fi
 ENTRYPOINT="${CODE_REPO}/examples/nonuniform/pretrain_hybrid_nonuniform.py"
+ENTRYPOINT="${PRETRAIN_DIAGNOSTIC_ENTRYPOINT:-${ENTRYPOINT}}"
 ROOT_DIR="${ROOT_DIR:-${ARTIFACT_ROOT}/slurm_runs/training_scripts_nep_ab}"
 IMAGE="${IMAGE:-nvcr.io#nvidia/nemo:26.06}"
 CONTAINER_NAME="${CONTAINER_NAME:-nep_nemo_26_06}"
@@ -29,8 +33,20 @@ TRAIN_ITERS="${TRAIN_ITERS:-10}"
 PROFILE_STEP_START="${PROFILE_STEP_START:-5}"
 PROFILE_STEP_END="${PROFILE_STEP_END:-7}"
 TIMING_START="${TIMING_START:-8}"
+TIMING_END="${TIMING_END:-${TRAIN_ITERS}}"
+CASE_ORDER="${CASE_ORDER:-healthy nep}"
+if [[ "${CASE_ORDER}" != "healthy nep" && "${CASE_ORDER}" != "nep healthy" && "${CASE_ORDER}" != healthy ]]; then
+    echo "CASE_ORDER must be 'healthy nep', 'nep healthy', or 'healthy'" >&2
+    exit 2
+fi
+read -r -a case_order <<< "${CASE_ORDER}"
 CASE_TIMEOUT="${CASE_TIMEOUT:-35m}"
 WORKLOAD_FILTER="${WORKLOAD_FILTER:-}"
+cpu_binding_args=()
+if [[ -n "${BENCH_CPUS_PER_TASK:-}" ]]; then
+    [[ "${BENCH_CPUS_PER_TASK}" =~ ^[1-9][0-9]*$ ]] || exit 2
+    cpu_binding_args=(--cpus-per-task="${BENCH_CPUS_PER_TASK}" --cpu-bind=verbose,cores --distribution=block:block)
+fi
 
 mkdir -p "${ROOT_DIR}/${GROUP}" "${ARTIFACT_ROOT}/slurm_runs/lyris"
 mapfile -t allocated_nodes < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
@@ -116,8 +132,12 @@ failures=()
 case_index=0
 for workload in "${workloads[@]}"; do
     slug="${workload//\//__}"
+    healthy_replica_micro_batch_sizes=""
+    healthy_replica_num_microbatches=""
+    nep_replica_micro_batch_sizes=""
+    nep_replica_num_microbatches=""
     echo "[training-scripts-nep] $(date --iso-8601=seconds) workload=${workload}"
-    for case_name in healthy nep; do
+    for case_name in "${case_order[@]}"; do
         IFS=$'\t' read -r tp cp etp _ mbs accum topology mode world_size run_nodes gbs ddp_buckets segment_nodes source_hybrid_ep_domain < <(
             python3 "${MATRIX}" --repo "${BENCH_REPO}" case-fields "${workload}" "${case_name}"
         )
@@ -126,12 +146,32 @@ for workload in "${workloads[@]}"; do
             exit 2
         fi
         job_segment=$(scontrol show job "${SLURM_JOB_ID}" | sed -n 's/.*SegmentSize=\([0-9][0-9]*\).*/\1/p')
+        if [[ "${STRICT_NVL_PLACEMENT:-0}" == 1 ]]; then
+            read -r full_units _ <<< "${topology}"
+            segment_nodes=$((full_units * tp * cp / 4))
+        fi
+        if [[ -n "${SOFT_CLIQUE_ROOT:-}" ]]; then
+            segment_nodes=4
+        fi
         if [[ -n "${job_segment}" && "${job_segment}" != "${segment_nodes}" ]]; then
             echo "${workload}/${case_name}: expected segment=${segment_nodes}, got ${job_segment}" >&2
             exit 2
         fi
         run_dir="${ROOT_DIR}/${GROUP}/${slug}/${case_name}/${SLURM_JOB_ID}"
         mkdir -p "${run_dir}/tensorboard" "${run_dir}/torch_profile"
+        if [[ "${PROFILE_ACTIVITY_MODE:-}" == nsys ]]; then
+            export NSYS_OUTPUT_DIR="${run_dir}/nsys_profile"
+        fi
+        if [[ "${PROFILE_ACTIVITY_MODE:-}" == cupti ]]; then
+            export CUPTI_OUTPUT_DIR="${run_dir}/cupti_profile"
+        fi
+        if [[ "${STRICT_NVL_PLACEMENT:-0}" == 1 ]]; then
+            export NEP_PLACEMENT_METADATA_DIR="${run_dir}/placement"
+            export NEP_PLACEMENT_DOMAIN_FILE="${run_dir}/domains.json"
+            python3 "${BENCH_REPO}/scripts/nonuniform/nep_nvl_placement.py" --prepare "${NEP_PLACEMENT_DOMAIN_FILE}"
+        else
+            unset NEP_PLACEMENT_METADATA_DIR NEP_PLACEMENT_DOMAIN_FILE
+        fi
         graph_override_args=()
         if [[ -n "${CUDA_GRAPH_MODULES_OVERRIDE:-}" ]]; then
             graph_override_args+=(--cuda-graph-modules-override "${CUDA_GRAPH_MODULES_OVERRIDE}")
@@ -169,27 +209,51 @@ for workload in "${workloads[@]}"; do
         export EXPERT_TENSOR_PARALLEL_SIZE="${etp}"
         export SOURCE_HYBRID_EP_DOMAIN_SIZE="${source_hybrid_ep_domain}"
         export MICRO_BATCH_SIZE="${mbs}"
+        source_global_batch_size="${gbs}"
+        if [[ "${case_name}" == "healthy" ]]; then
+            healthy_mbs="${HEALTHY_MICRO_BATCH_SIZE:-${mbs}}"
+            healthy_num_microbatches="${HEALTHY_NUM_MICROBATCHES:-${accum}}"
+            replica_micro_batch_sizes="${healthy_mbs} ${healthy_mbs}"
+            replica_num_microbatches="${healthy_num_microbatches} ${healthy_num_microbatches}"
+        else
+            full_mbs="${NEP_FULL_MICRO_BATCH_SIZE:-${mbs}}"
+            reduced_mbs="${NEP_REDUCED_MICRO_BATCH_SIZE:-${mbs}}"
+            full_num_microbatches="${NEP_FULL_NUM_MICROBATCHES:-${accum}}"
+            reduced_num_microbatches="${NEP_REDUCED_NUM_MICROBATCHES:-${accum}}"
+            replica_micro_batch_sizes="${full_mbs} ${reduced_mbs}"
+            replica_num_microbatches="${full_num_microbatches} ${reduced_num_microbatches}"
+        fi
+
+        read -r -a topology_units <<< "${topology}"
+        read -r -a replica_mbs_values <<< "${replica_micro_batch_sizes}"
+        read -r -a replica_num_microbatches_values <<< "${replica_num_microbatches}"
+        if ((${#replica_mbs_values[@]} != ${#topology_units[@]} \
+            || ${#replica_num_microbatches_values[@]} != ${#topology_units[@]})); then
+            echo "${workload}/${case_name}: replica-local batch settings must match topology '${topology}'" >&2
+            exit 2
+        fi
+        gbs=0
+        for index in "${!topology_units[@]}"; do
+            for value in "${topology_units[index]}" "${replica_mbs_values[index]}" \
+                "${replica_num_microbatches_values[index]}"; do
+                if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+                    echo "${workload}/${case_name}: batch and topology values must be positive integers" >&2
+                    exit 2
+                fi
+            done
+            ((gbs += topology_units[index] * replica_mbs_values[index] * replica_num_microbatches_values[index]))
+        done
         export GLOBAL_BATCH_SIZE="${gbs}"
         export TRUE_GLOBAL_BATCH_SIZE="${gbs}"
-        replica_micro_batch_sizes="${mbs} ${mbs}"
-        replica_num_microbatches="${accum} ${accum}"
-        if [[ "${case_name}" == "nep" && -n "${NEP_REDUCED_MICRO_BATCH_SIZE:-}" ]]; then
-            : "${NEP_REDUCED_NUM_MICROBATCHES:?Set with NEP_REDUCED_MICRO_BATCH_SIZE}"
-            read -r full_replica_units reduced_replica_units <<< "${topology}"
-            override_gbs=$((
-                full_replica_units * mbs * accum
-                + reduced_replica_units * NEP_REDUCED_MICRO_BATCH_SIZE
-                    * NEP_REDUCED_NUM_MICROBATCHES
-            ))
-            if ((override_gbs != gbs)); then
-                echo "${workload}/${case_name}: replica-local batch override produces GBS=${override_gbs}, expected ${gbs}" >&2
-                exit 2
-            fi
-            replica_micro_batch_sizes="${mbs} ${NEP_REDUCED_MICRO_BATCH_SIZE}"
-            replica_num_microbatches="${accum} ${NEP_REDUCED_NUM_MICROBATCHES}"
-        fi
         export REPLICA_MICRO_BATCH_SIZES="${replica_micro_batch_sizes}"
         export REPLICA_NUM_MICROBATCHES="${replica_num_microbatches}"
+        if [[ "${case_name}" == "healthy" ]]; then
+            healthy_replica_micro_batch_sizes="${replica_micro_batch_sizes}"
+            healthy_replica_num_microbatches="${replica_num_microbatches}"
+        else
+            nep_replica_micro_batch_sizes="${replica_micro_batch_sizes}"
+            nep_replica_num_microbatches="${replica_num_microbatches}"
+        fi
         export MASTER_ADDR="${FIRST_NODE}"
         export MASTER_PORT="${master_port}"
         export MEGATRON_NONUNIFORM_EP_NCCL_EXPERT_BUCKET_GROUPS="${ddp_buckets}"
@@ -198,11 +262,15 @@ for workload in "${workloads[@]}"; do
         else
             unset NVTE_CPU_OFFLOAD_V1 || true
         fi
-        echo "[training-scripts-nep] starting ${workload}/${case_name}: world=${world_size} nodes=${run_nodes} topology='${topology}' mbs=${mbs} accum=${accum} gbs=${gbs} buckets=${ddp_buckets}"
+        echo "[training-scripts-nep] starting ${workload}/${case_name}:" \
+            "world=${world_size} nodes=${run_nodes} topology='${topology}'" \
+            "replica_mbs='${replica_micro_batch_sizes}'" \
+            "replica_num_microbatches='${replica_num_microbatches}' gbs=${gbs}" \
+            "source_gbs=${source_global_batch_size} buckets=${ddp_buckets}"
         set +e
         # shellcheck disable=SC2016
         timeout --foreground --signal=TERM --kill-after=45s "${CASE_TIMEOUT}" \
-            srun --overlap --nodes="${run_nodes}" --nodelist="${run_nodelist}" \
+            srun --overlap "${cpu_binding_args[@]}" --nodes="${run_nodes}" --nodelist="${run_nodelist}" \
             --ntasks="${world_size}" --ntasks-per-node=4 --kill-on-bad-exit=1 --mpi=none \
             "${container_args[@]}" \
             bash -lc 'export RANK="${SLURM_PROCID}" WORLD_SIZE="${RUN_WORLD_SIZE}" LOCAL_RANK=0 CUDA_VISIBLE_DEVICES="${SLURM_LOCALID}"; exec bash "${RANK_LAUNCHER}"' \
@@ -212,13 +280,35 @@ for workload in "${workloads[@]}"; do
         if ((status != 0)); then
             failures+=("${workload}/${case_name}:${status}")
             echo "[training-scripts-nep] FAILED ${workload}/${case_name}: status=${status}" >&2
+            if [[ "${PROFILE_ACTIVITY_MODE:-}" == nsys || "${PROFILE_ACTIVITY_MODE:-}" == cupti ]]; then
+                exit "${status}"
+            fi
         else
             echo "[training-scripts-nep] completed ${workload}/${case_name}"
         fi
     done
+    if [[ "${CASE_ORDER}" == healthy ]]; then
+        python3 - "${BENCH_REPO}" "${workload}" "${run_dir}" "${TRAIN_ITERS}" "${TIMING_START}" "${TIMING_END}" "${gbs}" <<'PY'
+import json,sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/nonuniform'))
+from training_scripts_nep_matrix import analyze_case, workload_by_name
+w = workload_by_name(Path(sys.argv[1]), sys.argv[2])
+result = analyze_case(w, 'healthy', Path(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[7]), int(sys.argv[6]))
+(Path(sys.argv[3]) / 'baseline.json').write_text(json.dumps(result, indent=2) + '\n')
+print(json.dumps(result, indent=2))
+PY
+        continue
+    fi
     if ! python3 "${MATRIX}" --repo "${BENCH_REPO}" analyze "${workload}" \
         --root "${ROOT_DIR}/${GROUP}" --job-id "${SLURM_JOB_ID}" \
-        --train-iters "${TRAIN_ITERS}" --timing-start "${TIMING_START}"; then
+        --train-iters "${TRAIN_ITERS}" --timing-start "${TIMING_START}" \
+        --timing-end "${TIMING_END}" \
+        --routing-mode "${BENCH_ROUTING_MODE:-random}" \
+        --healthy-replica-micro-batch-sizes "${healthy_replica_micro_batch_sizes}" \
+        --healthy-replica-num-microbatches "${healthy_replica_num_microbatches}" \
+        --nep-replica-micro-batch-sizes "${nep_replica_micro_batch_sizes}" \
+        --nep-replica-num-microbatches "${nep_replica_num_microbatches}"; then
         failures+=("${workload}/analysis")
     fi
 done
